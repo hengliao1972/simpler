@@ -612,7 +612,7 @@ int main(int argc, char **argv) {
         "median_startup_to_final_drain_us=%.3f "
         "lifecycle_timing=disabled semantic_status=%s postprocess_status=%s\n",
         options.runs, startup_to_final_drain_spans.size(),
-        pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
+        pa_scheduler::host::ActiveFinalBarrierName(options.final_barrier_shape),
         median_startup_to_final_drain_us,
         all_passed ? "PASS" : "FAIL",
         postprocess_ok ? "PASS" : "FAIL"
@@ -639,10 +639,10 @@ int main(int argc, char **argv) {
     std::printf(
         "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s "
         "median_submit_span_us=%.3f median_startup_barrier_us=%.3f "
-        "median_final_barrier_us=%.3f median_final_drain_us=%.3f median_lifecycle_us=%.3f "
+        "median_dispatch_exit_spread_us=%.3f median_final_drain_us=%.3f median_lifecycle_us=%.3f "
         "semantic_status=%s postprocess_status=%s\n",
         options.runs, spans.size(),
-        pa_scheduler::host::FinalBarrierShapeName(
+        pa_scheduler::host::ActiveFinalBarrierName(
             options.final_barrier_shape
         ),
         median_submit_span_us, median_startup_barrier_us,

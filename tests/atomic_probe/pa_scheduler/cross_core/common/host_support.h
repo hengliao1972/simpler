@@ -152,6 +152,17 @@ inline const char *FinalBarrierShapeName(FinalBarrierShape shape) {
     return "invalid";
 }
 
+inline const char *ActiveFinalBarrierName(
+    FinalBarrierShape shape
+) {
+#if PTO_FDWIC_SHARED_MAP
+    (void)shape;
+    return "none-exec-drain";
+#else
+    return FinalBarrierShapeName(shape);
+#endif
+}
+
 inline bool ParseFinalBarrierShape(const char *raw, FinalBarrierShape *shape) {
     struct Entry {
         const char *name;
@@ -1290,6 +1301,25 @@ inline bool FinalBarrierStateMatches(const FinalBarrierState &barrier, FinalBarr
     return matches;
 }
 
+inline bool FinalBarrierStateIsZero(
+    const FinalBarrierState &barrier
+) {
+    bool zero = true;
+    for (uint32_t group = 0;
+         group < kFinalBarrierMaxLeafGroups; ++group) {
+        zero &= barrier.leaf_arrivals[group].value == 0;
+        zero &= barrier.leaf_releases[group].value == 0;
+    }
+    for (uint32_t group = 0;
+         group < kFinalBarrierMaxMiddleGroups; ++group) {
+        zero &= barrier.middle_arrivals[group].value == 0;
+        zero &= barrier.middle_releases[group].value == 0;
+    }
+    zero &= barrier.root_arrival.value == 0;
+    zero &= barrier.root_release.value == 0;
+    return zero;
+}
+
 struct Uint64Distribution {
     uint64_t total = 0;
     double median = 0.0;
@@ -2389,7 +2419,7 @@ inline bool ExportSwimlaneRecords(
         PTO_FDWIC_SHARED_MAP ? "shared" : "private",
         static_cast<unsigned long long>(header.frequency_hz), kWorkers,
         header.version,
-        FinalBarrierShapeName(final_barrier_shape),
+        ActiveFinalBarrierName(final_barrier_shape),
         workload_mode == WinnerWorkloadMode::RealCompute ? "real-compute" : "scalar-nop",
         workload_counts.qk, workload_counts.sf, workload_counts.pv, workload_counts.up,
         workload_mode == WinnerWorkloadMode::RealCompute
@@ -4848,6 +4878,11 @@ inline Metrics Validate(
         state.config.final_barrier_shape <= static_cast<uint32_t>(FinalBarrierShape::ThreeLevel6x4x4);
     const auto final_barrier_shape = static_cast<FinalBarrierShape>(state.config.final_barrier_shape);
 #if PTO_FDWIC_SHARED_MAP
+    // shared cross-core 已由执行排空汇合取代 replay barrier；配置字段只为
+    // 结构布局保留，不参与协议选择。
+    (void)final_barrier_shape;
+#endif
+#if PTO_FDWIC_SHARED_MAP
     // 中央发放使每个逻辑 task 只形成一次 Submit。每个 worker 在完成
     // 自己取得的任务后还执行一次越界 FetchAdd 退场，因此物理 ticket
     // 调用数严格为 task_count + 96。
@@ -5756,8 +5791,18 @@ inline Metrics Validate(
     );
     Expect(lifecycle_timestamps_ok, "all lifecycle timing markers are valid", &metrics);
 #endif
-    Expect(final_barrier_shape_valid, "final barrier selector is valid", &metrics);
-    const bool flat_final_barrier = final_barrier_shape == FinalBarrierShape::Flat;
+#if PTO_FDWIC_SHARED_MAP
+    (void)final_barrier_shape_valid;
+#else
+    Expect(
+        final_barrier_shape_valid,
+        "final barrier selector is valid", &metrics
+    );
+#endif
+#if !PTO_FDWIC_SHARED_MAP
+    const bool flat_final_barrier =
+        final_barrier_shape == FinalBarrierShape::Flat;
+#endif
     Expect(
         state.started_count.value == static_cast<int64_t>(kWorkers),
         "startup barrier remains flat and reaches all workers", &metrics
@@ -5963,9 +6008,21 @@ inline Metrics Validate(
     );
 #endif
     Expect(
-        state.replay_done.value == (flat_final_barrier ? static_cast<int64_t>(kWorkers) : 0) &&
-            FinalBarrierStateMatches(state.final_barrier, final_barrier_shape),
-        "final barrier counters match selected tree", &metrics
+#if PTO_FDWIC_SHARED_MAP
+        state.replay_done.value == 0 &&
+            FinalBarrierStateIsZero(state.final_barrier),
+        "shared execution drain replaces replay barrier",
+#else
+        state.replay_done.value ==
+                (flat_final_barrier
+                     ? static_cast<int64_t>(kWorkers)
+                     : 0) &&
+            FinalBarrierStateMatches(
+                state.final_barrier, final_barrier_shape
+            ),
+        "final barrier counters match selected tree",
+#endif
+        &metrics
     );
     Expect(state.fatal.value == 0, "fatal remains clear", &metrics);
     Expect(placement_total == kernel_total, "EfDrain + RingBp + final placement covers every kernel", &metrics);
@@ -6556,20 +6613,35 @@ inline Metrics Validate(
         metrics.lifecycle_span_us = static_cast<double>(last_final_end - first_startup_begin) / 1000.0;
     }
     const Uint64Distribution startup_wait = SummarizeUint64(startup_wait_ticks);
+#if !PTO_FDWIC_SHARED_MAP
     const Uint64Distribution final_release_wait = SummarizeUint64(final_release_wait_ticks);
+#endif
     const Uint64Distribution post_release_drain = SummarizeUint64(post_release_drain_ticks);
+#if PTO_FDWIC_SHARED_MAP
+    std::printf(
+        "[LIFECYCLE] run=%u final_shape=%s startup_span_us=%.3f dispatch_exit_spread_us=%.3f "
+        "final_drain_span_us=%.3f lifecycle_span_us=%.3f "
+        "worker_startup_wait_median_us=%.3f worker_startup_wait_p95_us=%.3f "
+        "worker_final_drain_median_us=%.3f worker_final_drain_p95_us=%.3f\n",
+        run, ActiveFinalBarrierName(final_barrier_shape), metrics.startup_barrier_span_us,
+        metrics.final_barrier_span_us, metrics.final_drain_span_us, metrics.lifecycle_span_us,
+        startup_wait.median / 1000.0, static_cast<double>(startup_wait.p95) / 1000.0,
+        post_release_drain.median / 1000.0, static_cast<double>(post_release_drain.p95) / 1000.0
+    );
+#else
     std::printf(
         "[LIFECYCLE] run=%u final_shape=%s startup_span_us=%.3f final_barrier_span_us=%.3f "
         "final_drain_span_us=%.3f lifecycle_span_us=%.3f "
         "worker_startup_wait_median_us=%.3f worker_startup_wait_p95_us=%.3f "
         "worker_final_wait_median_us=%.3f worker_final_wait_p95_us=%.3f "
         "worker_post_release_drain_median_us=%.3f worker_post_release_drain_p95_us=%.3f\n",
-        run, FinalBarrierShapeName(final_barrier_shape), metrics.startup_barrier_span_us,
+        run, ActiveFinalBarrierName(final_barrier_shape), metrics.startup_barrier_span_us,
         metrics.final_barrier_span_us, metrics.final_drain_span_us, metrics.lifecycle_span_us,
         startup_wait.median / 1000.0, static_cast<double>(startup_wait.p95) / 1000.0,
         final_release_wait.median / 1000.0, static_cast<double>(final_release_wait.p95) / 1000.0,
         post_release_drain.median / 1000.0, static_cast<double>(post_release_drain.p95) / 1000.0
     );
+#endif
 #endif
     std::printf(
 #if PA_BUILD_PERF_CLOCK
@@ -6805,7 +6877,7 @@ inline void PrintBanner(const char *backend, const Options &options) {
         kCompiledTensorMapMode == TensorMapBuildMode::Private ? "private" : "shared",
         options.nops.qk, options.nops.sf,
         options.nops.pv, options.nops.up, sizeof(SchedulerState),
-        FinalBarrierShapeName(options.final_barrier_shape), options.trace_enabled ? "on" : "off",
+        ActiveFinalBarrierName(options.final_barrier_shape), options.trace_enabled ? "on" : "off",
         options.trace_atomics ? "on" : "off",
         options.trace_enabled ? kTraceBytes : 0
     );

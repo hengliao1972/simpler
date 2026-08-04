@@ -1605,8 +1605,9 @@ bool RunInsertReleaseBeforeBuildTest() {
         ) == 0 &&
         kernel_counts[0] == 4 && kernel_counts[1] == 4 &&
         kernel_counts[2] == 4 && kernel_counts[3] == 4 &&
-        pa_scheduler::host::FinalBarrierStateMatches(
-            state->final_barrier, options.final_barrier_shape
+        state->replay_done.value == 0 &&
+        pa_scheduler::host::FinalBarrierStateIsZero(
+            state->final_barrier
         );
     std::printf(
         "[ORDERED_SUBMIT] release_before_build=%s "
@@ -1724,8 +1725,9 @@ bool RunIndependentKernelExecutionTest() {
         ) == 0 &&
         kernel_counts[0] == 2 && kernel_counts[1] == 2 &&
         kernel_counts[2] == 2 && kernel_counts[3] == 2 &&
-        pa_scheduler::host::FinalBarrierStateMatches(
-            state->final_barrier, options.final_barrier_shape
+        state->replay_done.value == 0 &&
+        pa_scheduler::host::FinalBarrierStateIsZero(
+            state->final_barrier
         );
     std::printf(
         "[ORDERED_SUBMIT] independent_kernel_overlap=%s "

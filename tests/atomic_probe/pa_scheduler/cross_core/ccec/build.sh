@@ -215,16 +215,17 @@ SPLIT_STATE_STORAGE_BYTES=1728
 # CPU 动态协议测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
 # 内联/删除，又不把 CCEC 对等尾部的有益合并误判成覆盖缺失。
 # execution scanner 只解码通用 route 后，CCEC 的等价尾部合并形状为
-# perf-clock AIC 三个、AIV 四个。A5 placement 抽离时保留原 switch 形状，
+# perf-clock AIC 两个、AIV 四个。shared 删除重复 replay barrier 后，
+# AIC 尾部多一组等价出口被 CCEC 合并；A5 placement 仍保留原 switch 形状，
 # readelf 确认它们仍只指向本角色唯一 finish 符号；继续精确冻结实际
 # 机器码形状，不放宽为范围判断。
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=3
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=2
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=4
 # execution drain 分组 root 分支改变了 full-swimlane AIC 的尾合并形状；
-# A5 placement 抽离时保留原 switch 形状，对象文件仍为五个 relocation，
+# 删除 replay barrier 后 CCEC 又合并一组等价出口，对象文件为四个 relocation，
 # 且全部只指向本角色唯一 finish 符号。任务覆盖由 dispatch/动态门槛证明；
-# 这里精确锁定为 5，不放宽成范围。
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=5
+# 这里精确锁定为 4，不放宽成范围。
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=4
 # root 不再逐 task 扫描 execution cell 后，full-swimlane AIV 的等价
 # 尾部重新合并为三个 relocation；readelf 已逐条确认都只指向本角色
 # 唯一 finish 符号。任务覆盖由 CPU 动态门槛证明，这里精确冻结为 3，

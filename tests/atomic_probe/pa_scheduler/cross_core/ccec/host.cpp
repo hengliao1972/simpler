@@ -1232,7 +1232,7 @@ bool ExportPmuJson(
         "\"winner_workload\":{\"mode\":",
         options.device, options.batches, pa_scheduler::kWorkers, pa_scheduler::kAicWorkers,
         pa_scheduler::kAivWorkers,
-        pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
+        pa_scheduler::host::ActiveFinalBarrierName(options.final_barrier_shape),
         options.trace_enabled ? "true" : "false",
         options.trace_atomics ? "true" : "false",
         options.profile_phases ? "true" : "false"
@@ -2285,7 +2285,7 @@ int main(int argc, char **argv) {
         "lifecycle_timing=disabled "
         "execution_status=%s semantic_status=%s postprocess_status=%s\n",
         options.runs, startup_to_final_drain_spans.size(),
-        pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
+        pa_scheduler::host::ActiveFinalBarrierName(options.final_barrier_shape),
         median_startup_to_final_drain_us,
         execution_ok ? "PASS" : "FAIL",
         all_passed ? "PASS" : "FAIL",
@@ -2303,10 +2303,10 @@ int main(int argc, char **argv) {
     const double median_lifecycle_us = lifecycle_spans.empty() ? 0.0 : pa_scheduler::host::Median(lifecycle_spans);
     std::printf(
         "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s median_submit_span_us=%.3f "
-        "median_startup_barrier_us=%.3f median_final_barrier_us=%.3f "
+        "median_startup_barrier_us=%.3f median_dispatch_exit_spread_us=%.3f "
         "median_final_drain_us=%.3f median_lifecycle_us=%.3f "
         "execution_status=%s semantic_status=%s postprocess_status=%s\n",
-        options.runs, spans.size(), pa_scheduler::host::FinalBarrierShapeName(options.final_barrier_shape),
+        options.runs, spans.size(), pa_scheduler::host::ActiveFinalBarrierName(options.final_barrier_shape),
         median_submit_span_us, median_startup_barrier_us, median_final_barrier_us, median_final_drain_us,
         median_lifecycle_us, execution_ok ? "PASS" : "FAIL", all_passed ? "PASS" : "FAIL",
         postprocess_ok ? "PASS" : "FAIL"

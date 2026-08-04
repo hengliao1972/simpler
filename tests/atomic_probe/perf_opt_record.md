@@ -6413,3 +6413,24 @@ AIC/AIV lane、每 task 一 completion 且不超过 32 tensor/16 scalar/16 fanin
 的算子。Joint、固定 block、multicore、稀疏/复用 task-id 和可回收
 TensorMap 需要新的明确能力，不得用 PA 分支补洞。完整逐项表见
 实现过程 S6.54。
+
+### 15.53 复用执行排空证明，删除 shared ReplayDone 原子树
+
+shared cross-core 原先连续执行两次全员收口：ReplayDone 两级 16 组树先证明
+Build 停产，随后 execution drain 再证明每核 scanner/token 排空并汇总精确
+kernel completion。后者的到达条件更强，而且每个 worker 只有取得中央 ticket
+越界返回后才能进入 FinalDrain，因此本轮删除前一层重复树；private 路径不变。
+
+正确性不是用性能结果反推：延迟 `EMPTY/BUILDING` 候选仍以
+`production_closed=false` 保留 scanner 队头；只有终止 ticket、候选扫描结束、
+两个 token 全字段复位同时满足，才允许发布 drain arrival。root 继续要求
+16 组各 6 核及 completion 合计等于计划显式 `executable_task_count`；2 秒
+device watchdog 保留异常终止能力。CPU 新增延迟 Build 反例，完整 96 线程
+门槛、CCEC 两种构建及 A5 B1/B256 均 PASS。
+
+旧 B256 泳道中的 ReplayDone 为 129 次 RMW 加 6,257 次 poll；新泳道中两类
+事件均为 0。冻结旧 ELF 的 12+12 交错 perf-clock 中，旧/新中位为
+`1.439025/1.421489 ms`，改善 `1.219%`；均值改善 `1.179%`，10/12 对更快。
+该机制只依赖中央 ticket、不可变稠密计划、未发布候选不越过和单 completion
+执行排空，不依赖 PA 五段任务图；不具备这些能力的算子不能直接选择此快路。
+完整证明和逐项数据见实现过程 S6.55。

@@ -3384,3 +3384,88 @@ AIV lane、一 task 一 completion，且 payload 不超过 32 tensor/16 scalar/1
 当前没有发现第三个**正在生效且改变公共调度语义**的 PA 特例优化。
 但 PA adapter 仍然必然是 PA 代码，并且当前 A5 后端只支持上述单 lane
 算子集。后续迁移应复用协议与能力接口，不应整份复制 PA standalone。
+
+## 2026-08-04：S6.55 以执行排空汇合取代重复 ReplayDone 屏障
+
+### 重复同步的确认
+
+S6.54 底座在 shared cross-core 尾部先执行 ReplayDone tree，再执行
+execution drain：
+
+1. 每个 worker 取得中央 Build ticket 的越界返回后，到 ReplayDone leaf；
+2. 两级 16 组树完成 `96 + 16 + 1 + 16 = 129` 次 RMW，并轮询全局 release；
+3. release 后每核继续扫描 K2、排空两个 token；
+4. 每核再向 16 组 execution-drain word 到达一次，root 核对 96 个 worker
+   与计划显式发布的 `executable_task_count`。
+
+旧 B256 full-swimlane 实测 ReplayDone 另有 6,257 次返回型 poll。第二层
+execution drain 已经要求比第一层更强的终态，因此前置树属于重复同步。
+
+### 删除屏障后的正确性证明
+
+候选只修改 shared central-ticket 路径，private replay 协议完全不动。shared
+FinalDrain 始终以 `production_closed=false` 推进 scanner，成立条件为：
+
+- 每个 worker 只有在 `TakeSharedBuildTicket()` 返回越界后才离开 Build 循环；
+- metadata-only builder 也必须完成自己的 Build 并取得越界 ticket 后才能到达；
+- executable task 尚未发布时，其 K2 observer 在 `EMPTY/BUILDING` 保留队头，
+  不会把“暂时未生产”误判成不存在；
+- worker 只有在候选扫描结束、两个 owner-local token 全字段复位后，才能发布
+  一次带本核 completion 数的 drain arrival；
+- root 只有看到 16 组各 6 个 worker，并且 completion 合计等于不可变计划的
+  `executable_task_count`，才允许 device kernel 成功结束。
+
+因此 96 次 drain arrival 合在一起同时证明所有 Build owner 已退出、所有
+executor 候选已排空；不需要 ReplayDone 再证明一次。异常路径没有删掉终止
+能力：FinalDrain 建立独立时钟起点，每 1,024 次无进展检查既有 2 秒
+watchdog，超时发布 fatal，避免缺失 cell/到达变成永久自旋，也不会把前面
+合法的长 Build/Execute 时间计入尾部超时。
+
+新增 CPU 门槛让 executor 先观察延迟发布的 `EMPTY` cell：此时执行排空不得
+到达；builder 发布 `BUILT` 后，executor 必须恰好执行一次、复位 token，随后
+才允许到达。完整 96-thread ordered Submit 门槛还要求 ReplayDone 全部字段为
+零、execution drain 精确闭合。
+
+这项优化不解释 PA 的 Alloc/QK/SF/PV/UP、batch、fanin 形状或 heap 布局。
+它适用于满足以下公共合同的算子：中央唯一 ticket、稠密不可变计划、每个
+worker 独立取得终止 ticket、scanner 对未发布候选不越过、每 task 单一
+completion。不能满足这些条件的 adapter 必须保留自己的生产闭合协议，不能
+无条件套用本快路。
+
+### A5 结果
+
+冻结 S6.54 的 host/kernel ELF，与候选做 12+12 次独立进程、交错 B256
+perf-clock；口径均为最早 startup 起点到最晚 FinalDrain 结束：
+
+```text
+旧 ReplayDone + execution drain：
+min / median / max / mean =
+1.420088 / 1.439025 / 1.465740 / 1.439705 ms
+
+仅 execution drain：
+min / median / max / mean =
+1.397365 / 1.421489 / 1.474213 / 1.422731 ms
+
+中位改善 1.219%，均值改善 1.179%，12 对中 10 对更快。
+```
+
+full-swimlane B256 全量 PASS：
+
+- 1,280 个 Build、1,024 个 kernel、96 个 drain arrival 全部闭合；
+- ReplayDone increment/poll 事件均为 0；root 的 execution-drain poll 由一条
+  PollBatch 表示，本轮含 161 次逻辑 load；
+- 物理 atomic 记录由旧泳道的 33,379 降至 33,280。逻辑 atomic 总数会随
+  insert/fanin 等等待时序变化，不能用单次总数机械相减解释收益；
+- full-swimlane 完整周期 `1466.841 us`，无 trace drop；泳道位于
+  `outputs/pa_scheduler_cross_core_shared_swimlane_20260804_034549_851955/`
+  （输出目录不提交）。
+
+删除分支使 CCEC 合并一组等价 AIC 尾部，readelf 精确门槛同步更新为
+perf-clock AIC/AIV `2/4`、full-swimlane `4/3`，仍只允许本角色唯一 finish
+符号，没有放宽检查。诊断输出把旧 `final_barrier` 明确显示为
+`none-exec-drain`，原统计字段在 full-swimlane 中解释为 dispatch 退出偏斜，
+不再冒充已删除的 barrier 等待。
+
+结论：候选以更强的既有收口证明替代重复原子树，正确性和端到端性能均成立，
+予以保留；当前 `1.421489 ms` 中位距离 1 ms 目标仍有约 `0.421 ms`，继续审视
+其余必要返回型 atomic 与等待结构。

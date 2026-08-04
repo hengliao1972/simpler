@@ -42,7 +42,8 @@ Usage:
   --real-compute-counts QK,SF,PV,UP
   --real-compute-pattern constant|layout-diagnostic
   --shared-context-lens C0[,C1...]
-  --final-barrier flat|two-4|two-8|two-16|three-6x4x4
+
+shared cross-core 由 execution drain 直接收口，不再使用 final-barrier 选项。
 
 PA_SHARED_INSERT_TURN_GROUPS 可选择已有 shared 插入完成链身份：
   1|2|4|8|16|32|64|128（默认 1）。构建与运行必须使用同一值，

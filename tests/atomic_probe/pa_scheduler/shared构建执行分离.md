@@ -621,8 +621,13 @@ kernel 至多产生一个 Execute owner；placement 只在 completion flag 和 c
 高位合计为计划 kernel 数后结束整个 device kernel。它不再串行读取 1280 个
 cell control 和 1280 个 completion flag。host 在 kernel 返回后仍逐 task
 校验 owner、cell、flag 和 payload，保留精确故障定位；这不是设备收口的替代。
-反向 release 继续不需要，因为 replay barrier 已证明不会再生产 BUILT，root
-的最终退出仍是全局收口点。
+反向 release 继续不需要，但证明不再依赖一层独立 replay barrier：每个
+worker 只有在中央 ticket 返回越界后才能进入 FinalDrain；属于本核的候选若
+仍是 `EMPTY/BUILDING`，scanner 会保留在该 task，不能提前发布 drain arrival；
+arrival 又要求候选扫描结束、两个 token 全字段复位。因而 96 个 worker 全部
+到达同时证明所有 builder 已退出、所有可执行 cell 已完成，root 再核对显式
+`executable_task_count` 后成为全局收口点。缺失 cell 或缺失到达仍由既有
+2 秒 device watchdog 发布 fatal，不能退化成永久自旋。
 
 有界复用版才需要特别求证：新增加的 `DONE(g) -> FREE(g+1)` 与既有 completion atomic 之间采用什么硬件顺序。不能仅因源码中两个 atomic 前后相邻，就默认所有远端核观察顺序一致。
 

@@ -1336,6 +1336,19 @@ void TestMappedEmptyDelayedPublication() {
             ExecScanTestOps::execute_calls == 0 && NoFatal(*state),
         kTest, "mapped candidate waits at EMPTY"
     );
+    bool drain_arrived = false;
+    bool drain_closed = false;
+    const bool early_drain_ok =
+        ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
+            state, worker, 2, stats,
+            drain_arrived, drain_closed
+        );
+    Check(
+        early_drain_ok && !drain_arrived && !drain_closed &&
+            NoFatal(*state),
+        kTest,
+        "execution drain cannot pass a delayed BUILT without replay barrier"
+    );
 
     Check(
         PublishKernelCell(*state, 1, 1, TaskKind::Qk),
@@ -1349,6 +1362,11 @@ void TestMappedEmptyDelayedPublication() {
     const DecodedExecState done = DecodeExecState(
         state->exec_cells[1].control.state
     );
+    const bool completed_drain_ok =
+        ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
+            state, worker, 2, stats,
+            drain_arrived, drain_closed
+        );
     Check(
         built_progress == 1 &&
             !CandidateBitForTask(
@@ -1361,7 +1379,9 @@ void TestMappedEmptyDelayedPublication() {
             state->tasks[1].flag == 1 &&
             CrossCoreExecWorkerDrained(
                 state, worker, 2, stats
-            ) && NoFatal(*state),
+            ) &&
+            completed_drain_ok && drain_arrived &&
+            drain_closed && NoFatal(*state),
         kTest, "delayed BUILT is claimed exactly once"
     );
     std::printf("[PASS] %s\n", kTest);

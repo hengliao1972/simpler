@@ -5363,10 +5363,11 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         arrived = true;
     }
 
-    // replay barrier 已证明不会再产生 BUILT，且 arrival 只在本核
-    // scanner/token/engine 全部排空后发布。非 root 此后没有任何新的
-    // 可执行工作，可以直接结束本核；整个 device kernel 仍由固定 root
-    // 等待 16 组到齐并核对完成数后最后收口。
+    // 中央 ticket 循环保证本 worker 不会再生产 BUILT；arrival 又只在
+    // 本核 scanner/token/engine 全部排空后发布。非 root 此后没有新的
+    // 可执行工作，可以直接结束本核；固定 root 等待全部分组到齐并核对
+    // 精确完成数。所有 worker 的到达合在一起同时证明 Build 与 Execute
+    // 都已收口，不再依赖一层独立 replay barrier。
     if (worker_id != 0) {
         closed = true;
         return true;
@@ -6823,8 +6824,10 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         orchestration_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     }
 
-    // replay_done 表示所有 worker 都已拿到越界 ticket；成功路径下这同时
-    // 证明所有有效 task 已完成 Build 发布。之后仍需 drain K2 到终态。
+    // shared 的中央 ticket 循环保证每个 worker 只有在拿到越界 ticket
+    // 后才进入这里；执行排空到达又要求本核扫描完全部候选、两个 token
+    // 完整复位。因而 shared 可以直接用更强的执行排空汇合收口，不再先做
+    // 一遍 ReplayDone 树。private 仍保留原 replay barrier 协议。
     // 成功路径复用 orchestration end 作为 final drain start，使两个业务父区间
     // 首尾相接；父记录延后到 final drain 结束再写，避免记录自身落进任一业务 span。
     const uint64_t final_drain_begin = orchestration_end != 0
@@ -6835,6 +6838,81 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #else
     stats.result.final_barrier_begin = Ops::Now();
 #endif
+#if PTO_FDWIC_SHARED_MAP
+    // WorkerResult 的既有字段继续承载 FinalDrain 边界，但 shared 已没有
+    // 独立 replay barrier；release 与 begin 相等，host 必须把跨核差值
+    // 解释为 dispatch 退出偏斜，不能再称为 barrier 等待。
+#if !PA_BUILD_PERF_CLOCK
+    stats.result.final_barrier_release =
+        stats.result.final_barrier_begin;
+#endif
+    const uint32_t final_poll_region = AtomicPollRegionBegin<Ops>(
+        stats.trace, stats.result,
+        TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad) |
+            TraceAtomicPollBatchMask(AtomicSite::FatalPoll) |
+            TraceAtomicPollBatchMask(
+                AtomicSite::SharedExecDrainArrivalPoll
+            )
+    );
+    bool cross_core_exec_ok = true;
+    bool cross_core_drain_arrived = false;
+    bool cross_core_drain_closed = false;
+    uint32_t final_fatal_poll_iterations = 0;
+    uint32_t final_watchdog_polls = 0;
+    const uint64_t final_watchdog_begin = Ops::Now();
+    while (true) {
+        // 错误只需最终可见，不为成功路径的每次 progress 付出同地址返回型
+        // Atomic。第 0 轮立即检查，随后每 256 轮检查一次；命中后本核 token
+        // 进入 Faulted 并结束。正常成功路径由执行排空到达证明完整性。
+        if (cross_core_exec_ok &&
+            ((final_fatal_poll_iterations++ & 255U) == 0U) &&
+            ObserveCrossCoreFinalDrainFatal<Ops>(
+                state, worker_id, stats
+            )) {
+            cross_core_exec_ok = false;
+        }
+        const uint32_t freed = cross_core_exec_ok
+            ? ProgressCrossCoreExec<Ops>(
+                  state, worker, task_count,
+                  /*production_closed=*/false,
+                  DrainPlace::FinalDrain, stats
+              )
+            : 0;
+
+        // 不依赖 replay barrier 宣告 production_closed：尚未发布的
+        // EMPTY/BUILDING 候选会保留 scanner 队头；对应 builder 自己也要
+        // 完成越界 ticket 后才能到达。只有 scanner/token 全部排空的核
+        // 才能发布一次携带 owner-local completion 数的到达。
+        if (cross_core_exec_ok &&
+            CrossCoreExecWorkerDrained(
+                state, worker, task_count, stats
+            )) {
+            cross_core_exec_ok =
+                ProgressCrossCoreExecDrainClosure<Ops>(
+                    state, worker, task_count, stats,
+                    cross_core_drain_arrived,
+                    cross_core_drain_closed
+                );
+        }
+        if (!cross_core_exec_ok || cross_core_drain_closed) {
+            break;
+        }
+        if (freed == 0) {
+            // 删除 replay barrier 后，缺失 BUILT/到达不能退化成永久自旋。
+            // 以进入 FinalDrain 的独立时钟为起点，每 1024 次无进展才读
+            // 一次计数器；正常毫秒级运行只付出低频检查，异常在既有
+            // 2 秒门限内终止，也不会误伤前面合法的长 Build/Execute。
+            if (WatchdogExpired<Ops>(
+                    state, stats, final_watchdog_begin,
+                    final_watchdog_polls
+                )) {
+                cross_core_exec_ok = false;
+                break;
+            }
+            Ops::SpinHint();
+        }
+    }
+#else
     const auto final_barrier_shape = static_cast<FinalBarrierShape>(state->config.final_barrier_shape);
     const uint32_t final_two_level_groups = TwoLevelFinalBarrierGroupCount(final_barrier_shape);
     const bool hierarchical_final_barrier =
@@ -6851,11 +6929,6 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         TraceAtomicPollBatchMask(AtomicSite::ReplayDonePoll) |
             TraceAtomicPollBatchMask(AtomicSite::FaninFlagLoad) |
             TraceAtomicPollBatchMask(AtomicSite::FatalPoll)
-#if PTO_FDWIC_SHARED_MAP
-            | TraceAtomicPollBatchMask(
-                AtomicSite::SharedExecDrainArrivalPoll
-            )
-#endif
     );
     bool leaf_forwarded = false;
     bool middle_forwarded = false;
@@ -6863,35 +6936,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     bool middle_released = false;
     bool leaf_released = false;
     bool global_release_observed = false;
-#if PTO_FDWIC_SHARED_MAP
-    bool cross_core_exec_ok = true;
-    bool cross_core_drain_arrived = false;
-    bool cross_core_drain_closed = false;
-    uint32_t final_fatal_poll_iterations = 0;
-#endif
     while (true) {
-#if PTO_FDWIC_SHARED_MAP
-        // 错误只需最终可见，不为成功路径的每次 progress 付出同地址返回型
-        // Atomic。第 0 轮立即检查，随后每 256 轮检查一次；命中后本核 token
-        // 立即转 Faulted，但仍参与 replay barrier，确保所有 worker 可退出。
-        if (cross_core_exec_ok &&
-            ((final_fatal_poll_iterations++ & 255U) == 0U) &&
-            ObserveCrossCoreFinalDrainFatal<Ops>(
-                state, worker_id, stats
-            )) {
-            cross_core_exec_ok = false;
-        }
-        const uint32_t freed = cross_core_exec_ok
-            ? ProgressCrossCoreExec<Ops>(
-                  state, worker, task_count,
-                  global_release_observed,
-                  DrainPlace::FinalDrain, stats
-              )
-            : 0;
-#else
         const uint32_t freed =
             DrainReady<Ops>(state, worker, DrainPlace::FinalDrain, stats);
-#endif
         const bool all_replayed = hierarchical_final_barrier ?
                                       ProgressHierarchicalFinalBarrier<Ops>(
                                           state->final_barrier, final_barrier_shape, worker, stats,
@@ -6906,39 +6953,15 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #endif
             global_release_observed = true;
         }
-#if PTO_FDWIC_SHARED_MAP
-        // 第一层 final barrier 只证明不再生产新 BUILT cell。每个 worker
-        // 扫描完 closed prefix 且 token 完整复位后，再进入 execution
-        // drain 汇合。非 root 到达后即可结束；固定 root 等待 16 组
-        // 全部到齐并核对唯一完成数等于计划 kernel 数后最后结束。整个
-        // device kernel 的完成仍证明没有遗失 backlog，不依赖 host
-        // 事后发现，不做逐 task 原子扫描，也不需要反向 release 广播。
-        if (global_release_observed && cross_core_exec_ok &&
-            CrossCoreExecWorkerDrained(
-                state, worker, task_count, stats
-            )) {
-            cross_core_exec_ok =
-                ProgressCrossCoreExecDrainClosure<Ops>(
-                    state, worker, task_count, stats,
-                    cross_core_drain_arrived,
-                    cross_core_drain_closed
-                );
-        }
-        if (global_release_observed &&
-            (!cross_core_exec_ok ||
-             cross_core_drain_closed)) {
-            break;
-        }
-#else
         // 必须同时满足“无人再生产新 slot”和“本核旧 slot 全部完成”，否则继续帮助系统推进 completion。
         if (global_release_observed && worker.occupied_count == 0) {
             break;
         }
-#endif
         if (freed == 0) {
             Ops::SpinHint();
         }
     }
+#endif
     AtomicPollRegionEnd<Ops>(stats.trace, stats.result, final_poll_region);
 #if PA_BUILD_PERF_CLOCK
     // 权威性能终点在全部 execution cell 排空、两个 owner-local token
