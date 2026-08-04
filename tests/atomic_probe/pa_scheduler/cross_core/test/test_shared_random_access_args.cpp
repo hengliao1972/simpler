@@ -231,6 +231,7 @@ bool CheckCompactDispatchIdentity() {
     dispatch.task_count = kTasks;
     dispatch.batch_count = kBatches;
     uint32_t task_cursor = 0;
+    uint32_t executable_tasks = 0;
     for (uint32_t batch = 0; batch < kBatches; ++batch) {
         SharedPaBatchPlan plan{};
         if (!BuildSharedPaBatchPlan(
@@ -256,22 +257,44 @@ bool CheckCompactDispatchIdentity() {
                 planned.has_following_group,
                 task_id + 1U == kTasks
             );
-            identity.reserved = 0;
+            const bool executable =
+                planned.kind != TaskKind::Alloc;
+            const cross_core::ExecEngineClass engine_class =
+                !executable
+                    ? cross_core::ExecEngineClass::None
+                    : (planned.kind == TaskKind::Qk ||
+                       planned.kind == TaskKind::Pv
+                           ? cross_core::ExecEngineClass::Aic
+                           : cross_core::ExecEngineClass::Aiv);
+            identity.exec_route =
+                cross_core::EncodeExecDispatchRoute(
+                    executable, engine_class
+                );
+            executable_tasks += executable ? 1U : 0U;
         }
         task_cursor += plan.task_count;
     }
     if (task_cursor != kTasks) {
         return false;
     }
+    dispatch.executable_task_count = executable_tasks;
 
     PaOrchestrationState orch{};
     InitPaOrchestration(orch, kBatches, contexts);
     for (uint32_t task_id = 0; task_id < kTasks; ++task_id) {
         SharedBuildDispatchTask task{};
+        SharedExecDispatchRoute route{};
         if (!DecodeSharedBuildDispatchTask(
                 dispatch, task_id, task
             ) ||
+            !DecodeSharedExecDispatchRoute(
+                dispatch, task_id, route
+            ) ||
             task.task_id != task_id ||
+            route.task_id != task_id ||
+            route.executable != task.executable ||
+            route.engine_class != task.engine_class ||
+            !SharedPaDispatchRouteMatches(task) ||
             !BindSharedPaTaskForRandomAccess(
                 orch, task.batch, task.meta.batch_start,
                 task.task_id, task.meta.kind,
@@ -282,10 +305,17 @@ bool CheckCompactDispatchIdentity() {
     }
 
     SharedBuildDispatchTask ignored{};
-    dispatch.tasks[1].reserved = 1;
-    const bool rejects_reserved =
+    SharedExecDispatchRoute ignored_route{};
+    dispatch.tasks[1].exec_route = 0;
+    const bool rejects_missing_route =
+        !DecodeSharedExecDispatchRoute(
+            dispatch, 1, ignored_route
+        ) &&
         !DecodeSharedBuildDispatchTask(dispatch, 1, ignored);
-    dispatch.tasks[1].reserved = 0;
+    dispatch.tasks[1].exec_route =
+        cross_core::EncodeExecDispatchRoute(
+            true, cross_core::ExecEngineClass::Aic
+        );
     dispatch.tasks[1].batch = kBatches;
     const bool rejects_batch =
         !DecodeSharedBuildDispatchTask(dispatch, 1, ignored);
@@ -293,11 +323,31 @@ bool CheckCompactDispatchIdentity() {
     dispatch.tasks[kTasks - 1U].encoded_meta &=
         static_cast<uint8_t>(~kSharedPaTicketLastSubmit);
     const bool rejects_missing_last =
+        DecodeSharedExecDispatchRoute(
+            dispatch, kTasks - 1U, ignored_route
+        ) &&
         !DecodeSharedBuildDispatchTask(
             dispatch, kTasks - 1U, ignored
         );
-    return rejects_reserved && rejects_batch &&
+
+    // route 自身合法但与 PA kind 不一致时，公共执行解码仍成功；PA
+    // adapter 必须在发布 execution cell 前单独拒绝这份业务计划。
+    const uint8_t alloc_route = dispatch.tasks[0].exec_route;
+    dispatch.tasks[0].exec_route =
+        cross_core::EncodeExecDispatchRoute(
+            true, cross_core::ExecEngineClass::Aic
+        );
+    const bool adapter_rejects_route_mismatch =
+        DecodeSharedExecDispatchRoute(
+            dispatch, 0, ignored_route
+        ) &&
+        DecodeSharedBuildDispatchTask(dispatch, 0, ignored) &&
+        !SharedPaDispatchRouteMatches(ignored);
+    dispatch.tasks[0].exec_route = alloc_route;
+
+    return rejects_missing_route && rejects_batch &&
            rejects_missing_last &&
+           adapter_rejects_route_mismatch &&
            !DecodeSharedBuildDispatchTask(
                dispatch, kTasks, ignored
            );

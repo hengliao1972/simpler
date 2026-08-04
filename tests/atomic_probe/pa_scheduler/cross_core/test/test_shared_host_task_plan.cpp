@@ -691,7 +691,11 @@ int main() {
     bool dispatch_plan_ok =
         state->build_dispatch.next_task.value == 0 &&
         state->build_dispatch.task_count == mixed.total_tasks &&
-        state->build_dispatch.batch_count == mixed.batch_count;
+        state->build_dispatch.batch_count == mixed.batch_count &&
+        state->build_dispatch.executable_task_count ==
+            mixed.total_tasks - mixed.tasks_by_kind[
+                static_cast<uint32_t>(TaskKind::Alloc)
+            ];
     for (uint32_t task_id = 0;
          task_id < mixed.total_tasks; ++task_id) {
         const SharedBuildDispatchTaskIdentity &identity =
@@ -702,7 +706,10 @@ int main() {
                 EncodeSharedHostDispatchMeta(
                     mixed.tasks[task_id], mixed.total_tasks
                 ) &&
-            identity.reserved == 0;
+            identity.exec_route ==
+                EncodeSharedHostExecRoute(
+                    mixed.tasks[task_id].kind
+                );
     }
     for (uint32_t task_id = mixed.total_tasks;
          task_id < kMaxTasks; ++task_id) {
@@ -710,7 +717,7 @@ int main() {
             state->build_dispatch.tasks[task_id];
         dispatch_plan_ok &= identity.batch == 0 &&
             identity.encoded_meta == 0 &&
-            identity.reserved == 0;
+            identity.exec_route == 0;
     }
     ok &= Check(
         dispatch_plan_ok,

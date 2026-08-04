@@ -612,8 +612,10 @@ FinalDrain 中，每核证明 scanner 封口且两个 token 均已复位后，�
 统计猜测：中央 Build ticket 给出完整 task 集；`BUILT -> CLAIMED` CAS 使每个
 kernel 至多产生一个 Execute owner；placement 只在 completion flag 和 cell
 `DONE` 均发布成功后递增；每核又必须等 scanner 封口、两个 token 清空且 engine
-无 in-flight 才能到达。因此 16 组全部到齐且完成数合计等于
-`task_count - batches`，即可推出所有 kernel 恰好完成，不能由重复完成补齐缺口。
+无 in-flight 才能到达。因此 16 组全部到齐且完成数合计等于计划显式
+发布的 `executable_task_count`，即可推出所有可执行 task 恰好完成，不能由
+重复完成补齐缺口。公共收口不允许用“每 batch 一个 Alloc”之类算子形状反推
+该数量；host 算子计划器还必须独立重建预期值并与发布值交叉校验。
 
 非 root 发布后即可结束；固定 root 只读取 16 个分组 word，确认每组低位为 6、
 高位合计为计划 kernel 数后结束整个 device kernel。它不再串行读取 1280 个
@@ -903,7 +905,20 @@ PA 只是第一个算子，设计不得固化以下现状：
 - output 都能由 task-indexed SharedOutputRef 表达；
 - 最大 fanin、tensor、scalar 的有效前缀与 PA 相同。
 
-首版可以在 standalone PA 上缩小验证范围，但协议字段和失败检查必须为通用算子留出明确扩展点。PA adapter 特例不能进入通用 shared execution runtime。
+当前边界固定为三层：
+
+| 层次 | 允许知道的信息 | 不允许知道的信息 |
+| ---- | ---------------- | -------------------- |
+| 公共调度协议 | task-id、是否需要 engine、engine class、Build/Execute owner、fanin、completion | `TaskKind`、batch 形状、UP/INOUT 数量 |
+| A5 后端策略 | 32 AIC + 64 AIV 物理拓扑、K2 候选、16 组完成归约 | Alloc/QK/SF/PV/UP 的业务含义 |
+| 算子适配层 | 随机访问构参、function 路由、payload shape、输出与 INOUT 规则 | 不得让公共 scanner 反向解析这些信息 |
+
+当前 `exec_route` 是公共执行器唯一消费的任务路由，显式编码“是否执行 +
+engine class”。PA 的 `batch/encoded_meta` 只由 Build adapter 解码，并在发布
+execution cell 前交叉验证两份路由一致。终态完成数同样来自计划显式发布的
+`executable_task_count`，不再由 PA 任务拓扑推导。
+
+首版可以在 standalone PA 上缩小验证范围，但协议字段和失败检查必须为通用算子留出明确扩展点。K2、双 token 和 no-reclaim 都是必须显式选择的调度/生命周期能力，不是 PA 身份带来的默认事实。PA adapter 特例不能进入通用 shared execution runtime。
 
 ## 11. 失败、取消和终止
 
@@ -947,7 +962,7 @@ PA 只是第一个算子，设计不得固化以下现状：
 20. 第一个 token 未 ready 时允许领取第二项；任一 owner-local token ready 时，Execute 必须优先于新 Claim 和新 Build；
 21. 未被空闲 executor 领取的 task 保持 `BUILT`，不因某个忙核而移入无界私有队列；
 22. 正常路径先发布 completion 和 cell `DONE`，然后才把对应 execution token 恢复为 `IDLE`；
-23. FinalDrain 同时证明 builder 停止生产、所有 kernel cell 全部 DONE、每核两个 execution token 均为 `IDLE`、engine 无 in-flight；每个 worker 只向所属 arrival group 到达一次，并在同一次 FetchAdd 中携带本核已成功发布 DONE 的完成数；非 root 到达后可以结束，固定 root 只有看到 16 组各 6 个到达且完成数合计等于 `task_count - batches` 后才允许最后结束；
+23. FinalDrain 同时证明 builder 停止生产、所有可执行 cell 全部 DONE、每核两个 execution token 均为 `IDLE`、engine 无 in-flight；每个 worker 只向所属 arrival group 到达一次，并在同一次 FetchAdd 中携带本核已成功发布 DONE 的完成数；非 root 到达后可以结束，固定 root 只有看到 16 组各 6 个到达且完成数合计等于计划发布的 `executable_task_count` 后才允许最后结束；
 24. 后续 reuse 版额外证明慢 reader 不会把旧 generation 当新任务；
 25. AIC/AIV function 路由严格匹配；
 26. fatal 路径不会执行半构建或已取消 payload；
@@ -1495,24 +1510,26 @@ standalone state 尾部新增 `SharedBuildDispatchState`，不移动此前已验
 
 ```text
 cache line 0 : next_task atomic（device 可写）
-cache line 1 : task_count / batch_count / reserved（launch 前写定）
+cache line 1 : task_count / batch_count / executable_task_count（launch 前写定）
 remaining    : 4 B × task_count 的只读 identity
 ```
 
-每条 identity 只保存 `batch` 与已有 `encoded_meta`；task id 是下标，
+每条 identity 保存 PA Build adapter 所需的 `batch/encoded_meta`，以及
+公共执行器所需的 `exec_route`；task id 是下标，记录仍为 4 B。
 `batch_start` 从 task id 与 kind/group 恢复。计划不包含任何 descriptor、args、
-payload 或 owner 地址。host 从独立 task planner 填充，device 解码后继续调用已
-验证的随机访问构参入口。编译上限下 sidecar 为 17,536 B，B256 实际有效计划
-仅 5 KiB。
+payload 或 owner 地址。host 从独立 task planner 填充，Build adapter 解码 PA identity，
+execution scanner 只解码 `exec_route`。编译上限下 sidecar 仍为 17,536 B，
+B256 实际有效计划仅 5 KiB。
 
 混合 G0/G1/G2/G4 的 host 发布和 device 解码门槛已通过，CPU 全套与 CCEC
 perf-clock 构建也已通过。Submit 尚未切换到该计划，A5 尚未运行。
 
 ### 2026-08-03：执行发现切换到计划，发放尚未切换
 
-K2 scanner 现在以 immutable plan 的 kind/engine 为任务资格依据：Alloc 与错
-engine 直接越过，相关 `EMPTY/BUILDING` 保留队头，`BUILT` 后继续使用原 K2
-仲裁。旧 `exec_candidate_bitmap` 不再决定 scanner 是否读取 cell；它只因旧
+K2 scanner 现在以 immutable plan 的 `exec_route` 为任务资格依据：
+metadata-only task 与错 engine task 直接越过，相关 `EMPTY/BUILDING`
+保留队头，`BUILT` 后继续使用原 K2 仲裁。scanner 不解码 PA 的
+`batch/TaskKind/group`。旧 `exec_candidate_bitmap` 不再决定 scanner 是否读取 cell；它只因旧
 96 份 replay 尚未删除而暂时保留登记，并在游标推进时清理。
 
 CPU 全套、CCEC 构建、A5 B1/B256 均通过。五对同窗 B256 中位从旧路径

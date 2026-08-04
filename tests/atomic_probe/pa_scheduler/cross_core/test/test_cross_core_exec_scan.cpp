@@ -322,6 +322,28 @@ private:
     SchedulerState *state_ = nullptr;
 };
 
+uint8_t ExecRouteForTaskKind(TaskKind kind) {
+    switch (kind) {
+        case TaskKind::Alloc:
+            return EncodeExecDispatchRoute(
+                false, ExecEngineClass::None
+            );
+        case TaskKind::Qk:
+        case TaskKind::Pv:
+            return EncodeExecDispatchRoute(
+                true, ExecEngineClass::Aic
+            );
+        case TaskKind::Sf:
+        case TaskKind::Up:
+            return EncodeExecDispatchRoute(
+                true, ExecEngineClass::Aiv
+            );
+        case TaskKind::Count:
+            return 0;
+    }
+    return 0;
+}
+
 void EnsureDefaultDispatchPlan(SchedulerState &state) {
     if (state.build_dispatch.task_count != 0) {
         return;
@@ -330,6 +352,7 @@ void EnsureDefaultDispatchPlan(SchedulerState &state) {
         kMaxBatches * kTasksPerBatch;
     state.build_dispatch.task_count = kPlanTasks;
     state.build_dispatch.batch_count = kMaxBatches;
+    uint32_t executable_tasks = 0;
     for (uint32_t task_id = 0;
          task_id < kPlanTasks; ++task_id) {
         const uint32_t task_offset = task_id % kTasksPerBatch;
@@ -345,8 +368,10 @@ void EnsureDefaultDispatchPlan(SchedulerState &state) {
             kind, 0, false,
             task_id + 1U == kPlanTasks
         );
-        identity.reserved = 0;
+        identity.exec_route = ExecRouteForTaskKind(kind);
+        executable_tasks += kind == TaskKind::Alloc ? 0U : 1U;
     }
+    state.build_dispatch.executable_task_count = executable_tasks;
 }
 
 bool SetDispatchTaskKind(
@@ -368,8 +393,9 @@ bool SetDispatchTaskKind(
         kind, 0, false,
         task_id + 1U == state.build_dispatch.task_count
     );
-    identity.reserved = 0;
-    return identity.encoded_meta != 0;
+    identity.exec_route = ExecRouteForTaskKind(kind);
+    return identity.encoded_meta != 0 &&
+           identity.exec_route != 0;
 }
 
 WorkerState &PrepareWorker(
@@ -2451,6 +2477,25 @@ void TestFinalDrainClosesLastTask() {
         kTest, "prepare terminal prefix with either dynamic candidate"
     );
 
+    // 本用例只发布一个 PA batch 的五项计划。默认 helper 为其他 scanner
+    // 用例准备了完整上限计划，这里把 immutable header 和 last bit 收紧到
+    // 实际范围，使终态 validator 只消费显式计划而不重建 PA batch 形状。
+    state->build_dispatch.task_count = 5;
+    state->build_dispatch.batch_count = 1;
+    state->build_dispatch.executable_task_count = 4;
+    for (uint32_t task_id = 0; task_id < 5; ++task_id) {
+        const TaskKind kind = task_id == 0
+            ? TaskKind::Alloc
+            : static_cast<TaskKind>(task_id);
+        state->build_dispatch.tasks[task_id].batch = 0;
+        state->build_dispatch.tasks[task_id].encoded_meta =
+            EncodeSharedPaTaskMeta(
+                kind, 0, false, task_id == 4
+            );
+        state->build_dispatch.tasks[task_id].exec_route =
+            ExecRouteForTaskKind(kind);
+    }
+
     const uint32_t executor = 36;
     WorkerState &worker = PrepareWorker(
         *state, executor, CoreRole::Aiv
@@ -2651,6 +2696,9 @@ void TestDrainCompletionCountMismatchFailsClosed() {
             );
     }
     WorkerState &root = PrepareWorker(*state, 0, CoreRole::Aic);
+    state->build_dispatch.task_count = 5;
+    state->build_dispatch.batch_count = 1;
+    state->build_dispatch.executable_task_count = 4;
     LocalStats stats{};
     InitLocalStats(stats, 0, CoreRole::Aic);
     bool arrived = true;
@@ -2668,6 +2716,49 @@ void TestDrainCompletionCountMismatchFailsClosed() {
                 ExecFatalReason::CompletionStateConflict,
         kTest,
         "root rejects an all-arrived drain with one missing completion"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestDrainUsesPublishedExecutableTaskCount() {
+    constexpr const char *kTest =
+        "drain-uses-published-executable-task-count";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+
+    // 模拟一个与 PA 不同的计划：五个逻辑 task 中只有两个需要 engine
+    // 执行。config.batches 仍为 1；旧 task_count-batches 推导会错误期待
+    // 四个 completion，新协议必须只接受计划发布的精确值 2。
+    state->config.batches = 1;
+    for (uint32_t group = 0;
+         group < cross_core::kExecDrainArrivalGroups;
+         ++group) {
+        const uint64_t completions = group == 0 ? 2U : 0U;
+        state->exec_drain.arrivals[group].state =
+            static_cast<int64_t>(
+                6U +
+                (completions <<
+                 cross_core::kExecDrainArrivalCountBits)
+            );
+    }
+    WorkerState &root = PrepareWorker(*state, 0, CoreRole::Aic);
+    state->build_dispatch.task_count = 5;
+    state->build_dispatch.batch_count = 1;
+    state->build_dispatch.executable_task_count = 2;
+    LocalStats stats{};
+    InitLocalStats(stats, 0, CoreRole::Aic);
+    bool arrived = true;
+    bool closed = false;
+    const bool closure_ok =
+        ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
+            state, root, 5, stats, arrived, closed
+        );
+    Check(
+        closure_ok && arrived && closed && NoFatal(*state),
+        kTest,
+        "root closes against the explicit operator-independent count"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -2696,6 +2787,7 @@ int main() {
     TestTwoBlockedTokensStopClaimButPermitBuild();
     TestFinalDrainClosesLastTask();
     TestDrainCompletionCountMismatchFailsClosed();
+    TestDrainUsesPublishedExecutableTaskCount();
 
     if (g_failures != 0) {
         std::fprintf(

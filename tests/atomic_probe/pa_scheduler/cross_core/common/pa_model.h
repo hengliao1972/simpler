@@ -1394,11 +1394,12 @@ static_assert(
 );
 
 struct SharedBuildDispatchTaskIdentity {
-    // task_id 由数组下标给出；batch_start 可由 task_id、kind 和 group
-    // 反推，因此只需保存随机访问 view 所需的 batch 与既有 1B meta。
+    // task_id 由数组下标给出；batch/encoded_meta 属于 PA 前端身份。
+    // exec_route 则是公共执行器唯一允许消费的算子无关路由：是否执行及
+    // engine class。不得再由 TaskKind 或 batch 数反推。
     uint16_t batch;
     uint8_t encoded_meta;
-    uint8_t reserved;
+    uint8_t exec_route;
 };
 static_assert(
     sizeof(SharedBuildDispatchTaskIdentity) == 4,
@@ -1411,12 +1412,19 @@ struct alignas(64) SharedBuildDispatchState {
     AtomicLine next_task;
     uint32_t task_count;
     uint32_t batch_count;
-    uint8_t header_padding[64 - 2 * sizeof(uint32_t)];
+    // 由 host 计划逐 task 统计，不允许 FinalDrain 用 PA 的
+    // task_count-batches 形状反推。0 是合法值，可覆盖纯 metadata 计划。
+    uint32_t executable_task_count;
+    uint8_t header_padding[64 - 3 * sizeof(uint32_t)];
     SharedBuildDispatchTaskIdentity tasks[kMaxTasks];
 };
 static_assert(
     offsetof(SharedBuildDispatchState, tasks) == 128,
     "shared Build dispatch plan must start on its own cache line"
+);
+static_assert(
+    offsetof(SharedBuildDispatchState, executable_task_count) == 72,
+    "shared Build dispatch executable count offset changed"
 );
 static_assert(
     sizeof(SharedBuildDispatchState) ==

@@ -674,9 +674,20 @@ bool PortableBuildEvidenceMatches(
         }
         planned_tasks += plan.task_count;
     }
+    uint32_t expected_executable_tasks = 0;
+    for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
+        SharedExecDispatchRoute route{};
+        if (!DecodeSharedExecDispatchRoute(
+                state.build_dispatch, task_id, route
+            )) {
+            return false;
+        }
+        expected_executable_tasks += route.executable ? 1U : 0U;
+    }
     return exact && planned_tasks == task_count &&
-        portable_kernel_tasks ==
-            task_count - state.config.batches;
+        portable_kernel_tasks == expected_executable_tasks &&
+        expected_executable_tasks ==
+            state.build_dispatch.executable_task_count;
 }
 
 bool RunB256BuildTicketBudgetContractTest() {

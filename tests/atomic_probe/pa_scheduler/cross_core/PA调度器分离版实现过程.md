@@ -3175,3 +3175,81 @@ NOP 退避、DAG 传递约简和 youngest-producer-first，均已在原架构下
 代码。下一阶段不再继续翻旧 patch，而是审计所有**已保留**优化的适用前提：
 公共调度协议不得依赖 PA 的五类 task、每 batch 一个 Alloc、UP 三个 INOUT
 或固定 fanin 形状；这些信息只能由算子计划/适配层提供。
+
+## 2026-08-04：S6.52 已保留优化的第一轮泛化审计
+
+### 审计方法与发现的问题
+
+本轮不再以“PA B256 能跑通”代替泛化证明，而是把现有代码按三个边界反查：
+
+1. 公共调度协议只能读取 task-id、是否需要执行、engine class、owner、fanin
+   和 completion；
+2. A5 后端策略可以知道 32 AIC + 64 AIV、K2 和 16 个完成归约组，但不能
+   知道 Alloc/QK/SF/PV/UP；
+3. PA 适配器才允许解释 batch、TaskKind、function、参数形状与 UP/INOUT。
+
+反查确认存在一个真实泄漏：FinalDrain 和部分终态检查用
+`task_count - batches` 推导 kernel completion 数。这把“PA 每 batch 恰好一个
+Alloc 且 Alloc 不执行”写进了公共收口。对 metadata-only task 数量不同的
+算子，该公式会误报缺失 completion，甚至使正确任务图无法结束。
+
+### 代码收敛
+
+本阶段在既有 4 B/task 计划项和 header padding 内完成修正，没有扩大
+`SharedBuildDispatchState`：
+
+- 计划 header 显式发布 `executable_task_count`，由 host 逐 task 统计；
+- identity 原保留字节改为 `exec_route`，编码“是否执行 + engine class”；
+- 公共 scanner 新增窄解码入口，只读取 task-id 下标和 `exec_route`；
+- PA Build adapter 继续解码 `batch/encoded_meta`，并在发布 execution cell 前
+  独立验证 PA kind/function 与公共 route 一致；
+- FinalDrain 与公共终态检查只使用显式可执行数，不再读取 batch 或 TaskKind；
+- host PA oracle 用独立的 `tasks_by_kind[Alloc]` 重建预期值，再与 device
+  发布值交叉校验，避免 host/device 共用同一错误公式。
+
+CPU 新增了“五个逻辑 task、只有两个可执行”的非 PA 形状反例。旧公式会
+错误期待四个 completion，新合同按发布值 2 正常闭合。随机访问门槛还证明：
+损坏 PA batch/meta 只会使 Build adapter 拒绝，公共 scanner 仍能独立解码
+合法 route；反过来，合法但与 PA kind 不一致的 route 会被 PA adapter 拒绝。
+
+### 已保留优化的适用性结论
+
+| 分类 | 当前保留机制 | 泛化结论 |
+| ---- | ------------ | -------- |
+| 公共协议 | 本地无工作快退、中央唯一 Build ticket、双 token、取消跨 task 伪保序、scanner 快照复用 Claim CAS、fatal 只在不可逆边界观察、分组 completion | 都能用算子无关不变量表达；本轮 route/count 修正后不再依赖 PA 五段图 |
+| A5 后端策略 | K2 候选、32/64 role 路由、16 组各 6 核的单向 FinalDrain | 不依赖 PA，但依赖当前 A5 物理拓扑和单 engine task；迁移公共库时应作为后端策略，而不是算子适配逻辑 |
+| 生命周期能力 | no-reclaim TensorMap lookup | 只有 launch 明确保证整轮 `reclaim_upto == -1` 才能选择；通用可回收实例仍是默认路径，不能因某算子当前不回收而静默套用 |
+| 容量策略 | 每核两个 execution token | 是有界调度策略，不依赖 PA；若以后参数化，必须重做 state 大小、Claim 背压和 FinalDrain 门槛 |
+| PA 适配实现 | 随机访问 PA 构参、紧凑 batch/meta、QK/SF/PV/UP function 与 payload shape、UP writer group | 属于算子实现而非公共优化；其中 whole-symbol/writer-group 只有提炼成显式能力合同后才能供其他算子复用 |
+| 诊断 | full-swimlane split-finish 结构门槛、完整周期计时 | 不改变业务协议，不属于生产热路径优化 |
+
+7 月 31 日泛化复审已经撤回的五项 PA 特例仍未回流：slot0/1-only drain、
+按 PA AIC/AIV 消费矩阵少存 output、UP/PV 邻接身份复用、按 PA task 类型
+跳过校验、PA group 派生量下沉均不在当前生产行为中。
+
+仍需明确当前支持边界：公共 execution 协议已经保留 `Joint` 枚举，但首版
+K2/PA dispatch 只支持单 lane AIC 或 AIV task；需要固定 block、联合多 engine
+或一个逻辑 task 对应多个 execution completion 的算子，必须扩展后端 placement
+和 completion-unit 合同，不能伪装成现有单 engine route。这是尚未实现的通用
+能力，不是允许 PA 特判进入公共路径的理由。
+
+### 验证与性能
+
+- CPU 全套协议测试 PASS，包含新增的显式 executable-count 反例；
+- CCEC perf-clock 与 full-swimlane 构建 PASS；公共 route 解码改变了等价尾部
+  合并形状，精确冻结的 finish relocation 更新为 perf-clock AIC/AIV `3/4`、
+  swimlane AIC/AIV `5/3`，没有放宽为范围；
+- A5 B1 完整正确性 PASS，startup 到 FinalDrain 为 `234.890 us`；
+- 以 `253a2e8a` 冻结旧实现，与候选做 12+12 交错 B256：
+
+```text
+旧实现 min / median / max / mean =
+1.411427 / 1.440674 / 1.483415 / 1.442070 ms
+新实现 min / median / max / mean =
+1.388850 / 1.429966 / 1.460886 / 1.427579 ms
+
+新实现中位改善 0.743%，均值改善 1.005%，8/12 对更快。
+```
+
+收益来自 scanner 不再为每个候选解析 PA identity，不能外推为其他算子固定
+收益；重要结论是修正公共语义后没有性能回退，也没有增加 state 大小。

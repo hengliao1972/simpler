@@ -520,14 +520,52 @@ struct SharedBuildDispatchTask {
     uint32_t task_id;
     uint32_t batch;
     SharedPaTaskMeta meta;
+    bool executable;
+    cross_core::ExecEngineClass engine_class;
 };
+
+struct SharedExecDispatchRoute {
+    uint32_t task_id;
+    bool executable;
+    cross_core::ExecEngineClass engine_class;
+};
+
+// 公共执行器只解码算子无关路由，不读取 batch、TaskKind 或 group。
+// Build adapter 另行解析业务 identity；两者共用同一条 4B 计划项，但
+// execution scanner 不得因 PA 元数据格式变化而改变资格判断。
+PA_DEVICE bool DecodeSharedExecDispatchRoute(
+    PA_GM const SharedBuildDispatchState &dispatch,
+    uint32_t task_id, SharedExecDispatchRoute &route
+) {
+    if (dispatch.task_count == 0 ||
+        dispatch.task_count > kMaxTasks ||
+        dispatch.executable_task_count > dispatch.task_count ||
+        task_id >= dispatch.task_count) {
+        return false;
+    }
+    bool executable = false;
+    cross_core::ExecEngineClass engine_class =
+        cross_core::ExecEngineClass::None;
+    if (!cross_core::DecodeExecDispatchRoute(
+            dispatch.tasks[task_id].exec_route,
+            executable, engine_class
+        )) {
+        return false;
+    }
+    route.task_id = task_id;
+    route.executable = executable;
+    route.engine_class = engine_class;
+    return true;
+}
 
 PA_DEVICE bool DecodeSharedBuildDispatchTask(
     PA_GM const SharedBuildDispatchState &dispatch,
     uint32_t task_id, SharedBuildDispatchTask &task
 ) {
-    if (dispatch.task_count == 0 ||
-        dispatch.task_count > kMaxTasks ||
+    SharedExecDispatchRoute exec_route{};
+    if (!DecodeSharedExecDispatchRoute(
+            dispatch, task_id, exec_route
+        ) ||
         dispatch.batch_count == 0 ||
         dispatch.batch_count > kMaxBatches ||
         task_id >= dispatch.task_count) {
@@ -536,8 +574,7 @@ PA_DEVICE bool DecodeSharedBuildDispatchTask(
     PA_GM const SharedBuildDispatchTaskIdentity &identity =
         dispatch.tasks[task_id];
     SharedPaTaskMeta meta{};
-    if (identity.reserved != 0 ||
-        identity.batch >= dispatch.batch_count ||
+    if (identity.batch >= dispatch.batch_count ||
         !DecodeSharedPaTaskMeta(
             identity.encoded_meta, task_id, meta
         ) ||
@@ -548,7 +585,32 @@ PA_DEVICE bool DecodeSharedBuildDispatchTask(
     task.task_id = task_id;
     task.batch = identity.batch;
     task.meta = meta;
+    task.executable = exec_route.executable;
+    task.engine_class = exec_route.engine_class;
     return true;
+}
+
+// 这一步属于 PA adapter 校验，不属于公共 dispatch 解码：公共计划只说明
+// task 是否执行以及 engine；PA Build owner 在发布任何 execution cell 前，
+// 另行证明该通用路由与本算子的 kind/function 映射一致。
+PA_DEVICE bool SharedPaDispatchRouteMatches(
+    const SharedBuildDispatchTask &task
+) {
+    if (task.meta.kind == TaskKind::Alloc) {
+        return !task.executable &&
+               task.engine_class ==
+                   cross_core::ExecEngineClass::None;
+    }
+    if (!task.executable) {
+        return false;
+    }
+    cross_core::PaExecRoute expected{};
+    return cross_core::ResolvePaExecRoute(
+               task.meta.kind,
+               static_cast<int32_t>(KindIndex(task.meta.kind) - 1U),
+               expected
+           ) &&
+           task.engine_class == expected.engine_class;
 }
 #endif
 
@@ -4785,8 +4847,8 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             task_id >= replay_closed_exclusive) {
             break;
         }
-        SharedBuildDispatchTask planned{};
-        if (!DecodeSharedBuildDispatchTask(
+        SharedExecDispatchRoute planned{};
+        if (!DecodeSharedExecDispatchRoute(
                 state->build_dispatch, task_id, planned
             )) {
             PublishCrossCoreRuntimeFailure<Ops>(
@@ -4796,20 +4858,16 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             );
             return completed_count;
         }
-        bool executable = planned.meta.kind != TaskKind::Alloc;
-        cross_core::PaExecRoute route{};
+        bool executable = planned.executable;
         uint32_t primary = cross_core::kExecUnboundOwner;
         uint32_t secondary = cross_core::kExecUnboundOwner;
         if (executable) {
-            executable = cross_core::ResolvePaExecRoute(
-                             planned.meta.kind,
-                             FunctionId(planned.meta.kind), route
-                         ) &&
-                         cross_core::FixedPaExecuteCandidates(
-                             task_id, route.engine_class,
-                             primary, secondary
-                         ) &&
-                         primary != secondary;
+            executable =
+                cross_core::FixedPaExecuteCandidates(
+                    task_id, planned.engine_class,
+                    primary, secondary
+                ) &&
+                primary != secondary;
             if (!executable) {
                 PublishCrossCoreRuntimeFailure<Ops>(
                     state, stats,
@@ -4821,11 +4879,11 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
         }
         const cross_core::ExecEngineClass route_engine =
             CrossCoreEngineForRole(worker.role);
-        if (!executable || route.engine_class != route_engine ||
+        if (!executable || planned.engine_class != route_engine ||
             (worker_id != primary && worker_id != secondary)) {
-            // PotentialTaskAt 只按 task-id residue 枚举；计划中的 kind
-            // 决定真实 engine。Alloc 与错角色 task 直接越过，不等待
-            // 一个永远不会为本角色发布的本地登记位或 shared cell。
+            // PotentialTaskAt 只按 task-id residue 枚举；immutable plan 的
+            // 通用 exec_route 决定是否执行及 engine。metadata-only task
+            // 与错角色 task 直接越过，不等待永远不会为本角色发布的 cell。
             if (!AdvanceCrossCoreExecPlanCursor(
                     stats, worker_id, worker.role, task_id
                 )) {
@@ -5139,73 +5197,61 @@ PA_DEVICE bool ValidateCrossCoreExecTerminalCellsObserved(
 ) {
     first_bad_task = task_count;
     if (state == nullptr || task_count > kMaxTasks ||
-        state->config.batches == 0 ||
-        state->config.batches > kMaxBatches) {
+        state->build_dispatch.task_count != task_count ||
+        state->build_dispatch.executable_task_count > task_count) {
         return false;
     }
 
-    uint32_t task_cursor = 0;
-    for (uint32_t batch = 0;
-         batch < state->config.batches; ++batch) {
-        const int32_t context_length = state->context_lens[batch];
-        SharedPaBatchPlan plan{};
-        if (context_length < 0 ||
-            !BuildSharedPaBatchPlan(
-                static_cast<uint64_t>(context_length),
-                task_cursor, plan
+    uint32_t executable_tasks = 0;
+    for (uint32_t task_id = 0;
+         task_id < task_count; ++task_id) {
+        SharedExecDispatchRoute planned{};
+        if (!DecodeSharedExecDispatchRoute(
+                state->build_dispatch, task_id, planned
             )) {
-            first_bad_task = task_cursor;
+            first_bad_task = task_id;
             return false;
         }
-        for (uint32_t offset = 0;
-             offset < plan.task_count; ++offset) {
-            const uint32_t task_id = task_cursor + offset;
-            SharedPaPlannedTask planned{};
-            const cross_core::DecodedExecState decoded =
-                cross_core::DecodeExecState(
-                    observer.LoadCellState(
-                        &state->exec_cells[task_id]
-                             .control.state,
-                        task_id
-                    )
-                );
-            bool valid =
-                SharedPaPlannedTaskAt(plan, offset, planned) &&
-                decoded.valid &&
-                observer.LoadFaninFlag(
-                    &state->tasks[task_id].flag,
+        const cross_core::DecodedExecState decoded =
+            cross_core::DecodeExecState(
+                observer.LoadCellState(
+                    &state->exec_cells[task_id]
+                         .control.state,
                     task_id
-                ) == 1;
-            if (valid && planned.kind == TaskKind::Alloc) {
-                valid = decoded.phase ==
-                    cross_core::ExecPhase::Empty;
-            } else if (valid) {
-                const cross_core::ExecEngineClass expected_engine =
-                    planned.kind == TaskKind::Qk ||
-                            planned.kind == TaskKind::Pv
-                        ? cross_core::ExecEngineClass::Aic
-                        : cross_core::ExecEngineClass::Aiv;
-                valid =
-                    decoded.phase == cross_core::ExecPhase::Done &&
-                    decoded.task_id == task_id &&
-                    decoded.engine_class == expected_engine &&
-                    cross_core::PaBuildOwnerEligible(
-                        decoded.build_owner, expected_engine
-                    ) &&
-                    cross_core::PaExecuteOwnerEligible(
-                        task_id, decoded.build_owner,
-                        expected_engine, decoded.execute_owner
-                    ) &&
-                    decoded.build_owner != decoded.execute_owner;
-            }
-            if (!valid) {
-                first_bad_task = task_id;
-                return false;
-            }
+                )
+            );
+        bool valid = decoded.valid &&
+            observer.LoadFaninFlag(
+                &state->tasks[task_id].flag,
+                task_id
+            ) == 1;
+        if (valid && !planned.executable) {
+            valid =
+                planned.engine_class ==
+                    cross_core::ExecEngineClass::None &&
+                decoded.phase == cross_core::ExecPhase::Empty;
+        } else if (valid) {
+            ++executable_tasks;
+            valid =
+                decoded.phase == cross_core::ExecPhase::Done &&
+                decoded.task_id == task_id &&
+                decoded.engine_class == planned.engine_class &&
+                cross_core::PaBuildOwnerEligible(
+                    decoded.build_owner, planned.engine_class
+                ) &&
+                cross_core::PaExecuteOwnerEligible(
+                    task_id, decoded.build_owner,
+                    planned.engine_class, decoded.execute_owner
+                ) &&
+                decoded.build_owner != decoded.execute_owner;
         }
-        task_cursor += plan.task_count;
+        if (!valid) {
+            first_bad_task = task_id;
+            return false;
+        }
     }
-    return task_cursor == task_count;
+    return executable_tasks ==
+        state->build_dispatch.executable_task_count;
 }
 
 template <typename Ops>
@@ -5350,9 +5396,10 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         completed_tasks += group_completed;
     }
 
-    const uint32_t alloc_tasks = state->config.batches;
-    if (alloc_tasks > task_count ||
-        completed_tasks != task_count - alloc_tasks) {
+    const uint32_t expected_executable_tasks =
+        state->build_dispatch.executable_task_count;
+    if (expected_executable_tasks > task_count ||
+        completed_tasks != expected_executable_tasks) {
         PublishCrossCoreRuntimeFailure<Ops>(
             state, stats,
             cross_core::ExecFatalReason::CompletionStateConflict,
@@ -6131,7 +6178,8 @@ PA_DEVICE bool BuildDispatchedSharedTask(
 ) {
     const uint32_t task_id = planned.task_id;
     if (planned.meta.kind != Kind || task_id >= task_count ||
-        planned.batch >= state->build_dispatch.batch_count) {
+        planned.batch >= state->build_dispatch.batch_count ||
+        !SharedPaDispatchRouteMatches(planned)) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
@@ -6640,6 +6688,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // task_count，不再由任一 worker 的本地 replay 前缀反推。
     const uint32_t task_count = state->build_dispatch.task_count;
     if (task_count == 0 || task_count > kMaxTasks ||
+        state->build_dispatch.executable_task_count > task_count ||
         state->build_dispatch.batch_count != batches ||
         batches == 0 || batches > kMaxBatches) {
         SetFatal<Ops>(state, stats);

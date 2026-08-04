@@ -615,6 +615,31 @@ inline uint8_t EncodeSharedHostDispatchMeta(
     );
 }
 
+// PA host adapter 把业务 kind 映射为公共执行路由。公共 scanner 只消费
+// exec_route，不认识 Alloc/QK/SF/PV/UP；以后接入其他算子时由其计划生成器
+// 提供同一份“是否执行 + engine class”合同。
+inline uint8_t EncodeSharedHostExecRoute(TaskKind kind) {
+    switch (kind) {
+        case TaskKind::Alloc:
+            return cross_core::EncodeExecDispatchRoute(
+                false, cross_core::ExecEngineClass::None
+            );
+        case TaskKind::Qk:
+        case TaskKind::Pv:
+            return cross_core::EncodeExecDispatchRoute(
+                true, cross_core::ExecEngineClass::Aic
+            );
+        case TaskKind::Sf:
+        case TaskKind::Up:
+            return cross_core::EncodeExecDispatchRoute(
+                true, cross_core::ExecEngineClass::Aiv
+            );
+        case TaskKind::Count:
+            return 0;
+    }
+    return 0;
+}
+
 inline bool PopulateSharedBuildDispatchPlan(
     SchedulerState *state, const SharedHostTaskPlan &plan,
     std::string *error = nullptr
@@ -635,6 +660,7 @@ inline bool PopulateSharedBuildDispatchPlan(
     );
     state->build_dispatch.task_count = plan.total_tasks;
     state->build_dispatch.batch_count = plan.batch_count;
+    uint32_t executable_task_count = 0;
     for (uint32_t expected_task = 0;
          expected_task < plan.total_tasks; ++expected_task) {
         const SharedHostPlannedTask &task =
@@ -656,10 +682,18 @@ inline bool PopulateSharedBuildDispatchPlan(
             EncodeSharedHostDispatchMeta(
                 task, plan.total_tasks
             );
-        if (encoded == 0) {
+        const uint8_t exec_route =
+            EncodeSharedHostExecRoute(task.kind);
+        bool executable = false;
+        cross_core::ExecEngineClass engine_class =
+            cross_core::ExecEngineClass::None;
+        if (encoded == 0 || exec_route == 0 ||
+            !cross_core::DecodeExecDispatchRoute(
+                exec_route, executable, engine_class
+            )) {
             if (error != nullptr) {
                 *error =
-                    "shared Build dispatch task meta is invalid";
+                    "shared Build dispatch task meta or execution route is invalid";
             }
             std::memset(
                 &state->build_dispatch, 0,
@@ -671,8 +705,11 @@ inline bool PopulateSharedBuildDispatchPlan(
             state->build_dispatch.tasks[task.task_id];
         identity.batch = static_cast<uint16_t>(task.batch);
         identity.encoded_meta = encoded;
-        identity.reserved = 0;
+        identity.exec_route = exec_route;
+        executable_task_count += executable ? 1U : 0U;
     }
+    state->build_dispatch.executable_task_count =
+        executable_task_count;
     return true;
 }
 
@@ -4265,7 +4302,9 @@ ValidateCrossCoreExecPayloads(
     }
     validation.protocol_ok &=
         validation.validated_tasks ==
-            plan.total_tasks - plan.batch_count;
+            plan.total_tasks - plan.tasks_by_kind[
+                static_cast<uint32_t>(TaskKind::Alloc)
+            ];
     return validation;
 }
 
@@ -4944,8 +4983,10 @@ inline Metrics Validate(
               ]
         : 0;
     cross_core_exec_drain_ok &=
+        state.build_dispatch.executable_task_count ==
+            expected_exec_completions &&
         cross_core_exec_drain_completions ==
-        expected_exec_completions;
+            state.build_dispatch.executable_task_count;
     const bool cross_core_exec_fatal_clear =
         state.exec_fatal.state == 0;
     if (!cross_core_exec_fatal_clear) {
@@ -6219,6 +6260,8 @@ inline Metrics Validate(
     Expect(
         state.build_dispatch.task_count == task_count &&
             state.build_dispatch.batch_count == batches &&
+            state.build_dispatch.executable_task_count ==
+                expected_exec_completions &&
             state.build_dispatch.next_task.value ==
                 static_cast<int64_t>(expected_claims),
         "shared Build dispatch header and terminal ticket cursor are exact",

@@ -133,6 +133,60 @@ enum class ExecEngineClass : uint8_t {
     Joint = 3,
 };
 
+// immutable dispatch plan 对公共执行器只发布“本 task 是否需要执行”以及
+// 所需 engine。算子自己的 kind/batch/group 等身份不得被公共 scanner 或
+// FinalDrain 用来反推这两项。present 位使 metadata-only task 的合法编码
+// 仍不同于 host 清零后的未发布 entry。
+constexpr uint8_t kExecDispatchRoutePresent = 1U << 0;
+constexpr uint8_t kExecDispatchRouteExecutable = 1U << 1;
+constexpr uint8_t kExecDispatchRouteEngineShift = 2;
+constexpr uint8_t kExecDispatchRouteEngineMask = 0x7U;
+constexpr uint8_t kExecDispatchRouteKnownMask =
+    kExecDispatchRoutePresent |
+    kExecDispatchRouteExecutable |
+    (kExecDispatchRouteEngineMask <<
+     kExecDispatchRouteEngineShift);
+
+PA_DEVICE uint8_t EncodeExecDispatchRoute(
+    bool executable, ExecEngineClass engine_class
+) {
+    const uint32_t engine = static_cast<uint32_t>(engine_class);
+    if (engine > static_cast<uint32_t>(ExecEngineClass::Joint) ||
+        (executable && engine_class == ExecEngineClass::None) ||
+        (!executable && engine_class != ExecEngineClass::None)) {
+        return 0;
+    }
+    return static_cast<uint8_t>(
+        kExecDispatchRoutePresent |
+        (executable ? kExecDispatchRouteExecutable : 0U) |
+        (engine << kExecDispatchRouteEngineShift)
+    );
+}
+
+PA_DEVICE bool DecodeExecDispatchRoute(
+    uint8_t encoded, bool &executable,
+    ExecEngineClass &engine_class
+) {
+    executable = false;
+    engine_class = ExecEngineClass::None;
+    if ((encoded & kExecDispatchRoutePresent) == 0 ||
+        (encoded & ~kExecDispatchRouteKnownMask) != 0) {
+        return false;
+    }
+    const uint32_t engine =
+        (encoded >> kExecDispatchRouteEngineShift) &
+        kExecDispatchRouteEngineMask;
+    if (engine > static_cast<uint32_t>(ExecEngineClass::Joint)) {
+        return false;
+    }
+    executable =
+        (encoded & kExecDispatchRouteExecutable) != 0;
+    engine_class = static_cast<ExecEngineClass>(engine);
+    return executable
+        ? engine_class != ExecEngineClass::None
+        : engine_class == ExecEngineClass::None;
+}
+
 enum class ExecTokenPhase : uint32_t {
     Idle = 0,
     Binding = 1,

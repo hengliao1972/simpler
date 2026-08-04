@@ -6342,3 +6342,26 @@ ticket 等候选则已被新架构取代、存在明确大幅回退或有确定�
 下一阶段转为泛化审计：动态性能收益只能证明“当前 PA 实例更快”，不能证明
 实现可进入公共调度器。每项保留机制还必须用算子无关不变量表达；PA 的
 TaskKind、每 batch 一个 Alloc、UP/INOUT 形状和固定 fanin 只能留在适配层。
+
+### 15.50 已保留优化的泛化审计：执行路由与完成数脱离 PA 五段图
+
+反查当前保留路径后确认一个真实公共语义泄漏：FinalDrain 曾用
+`task_count - batches` 推导可执行 task 数，隐含“PA 每 batch 一个不执行的
+Alloc”。本轮在不增加 state 大小的前提下，把计划保留字节改为通用
+`exec_route`，并在 header padding 中发布精确 `executable_task_count`。
+公共 scanner/终态只消费 task-id、route 和显式计数；PA batch/kind 仅由
+Build adapter 解码，并在 execution cell 发布前交叉校验。
+
+新增 CPU 反例用五个逻辑 task、两个可执行 task 证明 FinalDrain 按 2 闭合，
+而不是按旧 PA 公式误等 4。CPU 全套、CCEC perf-clock/full-swimlane 与 A5 B1
+均 PASS。相对 `253a2e8a` 的 12+12 交错 B256 中，旧/新中位为
+`1.440674/1.429966 ms`，新实现改善 `0.743%`；均值改善 `1.005%`，8/12 对
+更快。该收益只说明 PA identity 解码已从 scanner 移除，不作为其他算子收益
+承诺。
+
+其余保留项分为三类：central Build ticket、双 token、快照 Claim 和 fatal
+边界属于公共协议；K2 与 16 组 FinalDrain 属于 A5 单 engine 后端策略；
+no-reclaim 属于必须显式选择的生命周期能力。PA 随机构参、payload shape 和
+UP writer-group 仍是适配实现，不能以当前 PA 正确性冒充通用能力。Joint、
+固定 block/multicore 以及一个逻辑 task 多 completion 尚未闭合，接入这类算子
+前必须扩展 placement/completion 合同。完整矩阵见实现过程 S6.52。
