@@ -26,6 +26,7 @@ try:
     # `python -m unittest tests.atomic_probe...` 以 namespace package 导入。
     from .swimlane_converter import (
         _derive_v4_task_kinds,
+        _iter_v5_cross_core_semantic_gap_spans,
         _restore_v5_shared_efdrain,
         convert,
     )
@@ -33,6 +34,7 @@ except ImportError:
     # 也保留从本目录直接执行脚本的用法。
     from swimlane_converter import (
         _derive_v4_task_kinds,
+        _iter_v5_cross_core_semantic_gap_spans,
         _restore_v5_shared_efdrain,
         convert,
     )
@@ -972,12 +974,12 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         )
         self.assertIn(
             "materialize.publish_shared_output_descriptors"
-            ".copy_tensor_descs#0",
+            ".copy_tensor_descs[GM]#0",
             names,
         )
         self.assertIn(
             "materialize.publish_shared_output_descriptors"
-            ".flush_tensor_descs#0",
+            ".flush_tensor_descs[DCCI]#0",
             names,
         )
         self.assertIn(
@@ -1015,7 +1017,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         self.assertLess(
             positions[
                 "materialize.publish_shared_output_descriptors"
-                ".flush_tensor_descs#0"
+                ".flush_tensor_descs[DCCI]#0"
             ],
             positions[
                 "dcci.shared_output_descriptor_flush"
@@ -2052,6 +2054,10 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         for row in rows:
             if row[0] == 0 and row[3] == 4 and row[5] == "WinnerBuild":
                 row[6:8] = [343, 380]
+            elif row[0] == 0 and row[3] == 4 and row[5] == "Materialize":
+                # Claim.end=315；把 Materialize.start 后移两个 tick，验证
+                # 同一条 residual 会按中央 ticket 语义重命名为 ArgBuild。
+                row[6] = 317
             elif row[0] == 0 and row[3] == 4 and row[5] == "Submit":
                 row[7] = 390
             elif row[0] == 0 and row[5] == "OrchestrationReplay":
@@ -2079,12 +2085,126 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             event
             for event in merged["traceEvents"]
             if event.get("name")
-            == "winner_build.pack_execution_payload#4"
+            == "winner_build.pack_execution_payload[GM+Scalar]#4"
         ]
         self.assertEqual(len(pack_events), 1)
         self.assertEqual(pack_events[0]["ts"], 0.339)
         self.assertEqual(pack_events[0]["dur"], 0.011)
         self.assertEqual(len(rows), raw_count)
+
+        # 同一条 Claim.end -> Materialize.start 原 residual 已按中央 ticket
+        # 的真实业务重命名，没有再并排生成第二条派生事件。
+        self.assertEqual(
+            sum(
+                event.get("name")
+                == "arg_build.plan_and_construct_args[GM+Scalar]#4"
+                for event in merged["traceEvents"]
+            ),
+            1,
+        )
+
+    def test_v5_cross_core_large_gaps_use_existing_boundaries_only(
+        self,
+    ) -> None:
+        # 这里只验证离线推导合同；时间刻意使用 1 GHz 下的 tick，使 1 us
+        # 门槛可直接读成 1000 tick。每段两端都来自现有父区间或原语 raw，
+        # generator 不得修改、复制或补造设备记录。
+        rows = [
+            # Materialize：Scalar layout -> heap atomic -> GM descriptor/delta
+            (0, 0, 0, 10, 0, "Materialize", 10_000, 30_000, 0, 0),
+            (0, 0, 0, 10, -1, "Atomic", 15_000, 16_000, 0x50, 15),
+            (0, 0, 0, 10, -1, "Atomic", 17_000, 18_000, 0x52, 18),
+            (
+                0, 0, 0, 10, 0,
+                "SharedMaterializePublishTaskOutputs",
+                21_000, 29_000, 0, 0,
+            ),
+            # Fanin：首次共享 Load、history invalidate 后的 GM 读取，以及
+            # 最后把验证结果提交到本地 fanin 前缀。
+            (0, 0, 0, 11, 1, "Fanin", 40_000, 52_000, 0, 0),
+            (0, 0, 0, 3, -1, "Atomic", 43_000, 44_000, 0x50, 23),
+            (0, 0, 0, 3, -1, "Dcci", 45_000, 46_000, 0x10C, 0),
+            (0, 0, 0, 4, -1, "Atomic", 48_000, 49_000, 0x50, 23),
+            (0, 0, 0, 4, -1, "Atomic", 49_000, 50_000, 0x50, 25),
+            # WinnerBuild：source resolve 中嵌套 DCCI，随后 reserve/pack/flush。
+            (0, 0, 0, 11, 1, "WinnerBuild", 60_000, 80_000, 0, 0),
+            (0, 0, 0, 11, -1, "Dcci", 62_000, 63_000, 0x10C, 10),
+            (0, 0, 0, 11, -1, "Atomic", 65_000, 66_000, 0x54, 46),
+            (0, 0, 0, 11, -1, "Dcci", 72_000, 73_000, 0x10D, 11),
+            (0, 0, 0, 11, -1, "Atomic", 74_000, 75_000, 0x54, 47),
+            # EfDrain：payload invalidate 后 GM copy/bind，再逐 fanin 推进。
+            (0, 0, 0, 12, -1, "EfDrain", 90_000, 130_500, 0, 0),
+            (0, 0, 0, 20, -1, "Atomic", 92_000, 93_000, 0x50, 45),
+            (0, 0, 0, 20, -1, "Atomic", 95_000, 96_000, 0x54, 48),
+            (0, 0, 0, 20, -1, "Dcci", 97_000, 98_000, 0x10C, 12),
+            (0, 0, 0, 7, -1, "Atomic", 103_000, 104_000, 0x50, 5),
+            (0, 0, 0, 8, -1, "Atomic", 106_000, 107_000, 0x50, 5),
+            (0, 0, 0, 21, -1, "Atomic", 109_000, 110_000, 0x50, 45),
+            (0, 0, 0, 22, -1, "Atomic", 112_000, 113_000, 0x50, 45),
+            (0, 0, 0, -1, -1, "Atomic", 115_000, 116_000, 0x50, 2),
+            (0, 0, 0, 20, -1, "Atomic", 117_000, 118_000, 0x54, 51),
+            (0, 0, 0, 9, -1, "Atomic", 120_000, 121_000, 0x50, 5),
+            # 500 tick 的尾缝低于 1 us，不能继续膨胀 merged。
+            (0, 0, 0, 23, -1, "Atomic", 129_500, 130_000, 0x50, 45),
+        ]
+        raw_count = len(rows)
+        spans = list(
+            _iter_v5_cross_core_semantic_gap_spans(
+                rows, 1_000_000_000, 5, "shared", "central_ticket"
+            )
+        )
+        self.assertEqual(len(rows), raw_count)
+        by_name = {span[5]: span[3:5] for span in spans}
+        self.assertEqual(
+            by_name["materialize.validate_output_layout[Scalar]#10"],
+            (10_000, 15_000),
+        )
+        self.assertEqual(
+            by_name[
+                "materialize.write_descriptors_and_prepare_writer_delta"
+                "[GM+Scalar]#10"
+            ],
+            (18_000, 21_000),
+        )
+        self.assertEqual(
+            by_name["fanin.scan_and_validate_refs[GM+Scalar]#11"],
+            (40_000, 43_000),
+        )
+        self.assertEqual(
+            by_name["fanin.read_writer_history[GM+Scalar]#11"],
+            (46_000, 48_000),
+        )
+        self.assertEqual(
+            by_name["fanin.commit_validated_edges[Scalar]#11"],
+            (50_000, 52_000),
+        )
+        self.assertEqual(
+            by_name[
+                "winner_build.resolve_payload_sources[GM+Scalar]#11"
+            ],
+            (60_000, 65_000),
+        )
+        self.assertEqual(
+            by_name[
+                "execute.bind_payload_and_rebuild_args[GM+Scalar]#20"
+            ],
+            (98_000, 103_000),
+        )
+        self.assertIn(
+            "execute.advance_fanin_prefix[GM+Scalar]", by_name
+        )
+        self.assertIn(
+            "efdrain.scan_exec_candidates[GM+Scalar]", by_name
+        )
+        self.assertIn(
+            "efdrain.evaluate_exec_claim[GM+Scalar]#20", by_name
+        )
+        self.assertIn(
+            "efdrain.return_and_check_fatal[GM+Scalar]", by_name
+        )
+        self.assertIn(
+            "execute.recycle_token_and_continue[GM+Scalar]#20", by_name
+        )
 
     def test_v4_shared_task_zero_forbids_insert_turn_poll_batch(self) -> None:
         capture = _v5_shared_register_atomic_capture()

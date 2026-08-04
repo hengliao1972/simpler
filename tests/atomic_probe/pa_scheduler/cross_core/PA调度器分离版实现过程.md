@@ -3469,3 +3469,72 @@ perf-clock AIC/AIV `2/4`、full-swimlane `4/3`，仍只允许本角色唯一 fin
 结论：候选以更强的既有收口证明替代重复原子树，正确性和端到端性能均成立，
 予以保留；当前 `1.421489 ms` 中位距离 1 ms 目标仍有约 `0.421 ms`，继续审视
 其余必要返回型 atomic 与等待结构。
+
+## 2026-08-04：S6.56 用既有端点归因泳道中的大块空白
+
+### 为什么先补观察、不先改热路径
+
+S6.55 的 B256 full-swimlane 中仍能看到多处 `1 us` 以上空白。如果只按相邻
+事件名字猜测，很容易把以下三类完全不同的时间混在一起：
+
+- direct Atomic/DCCI：设备已经记录精确调用点和起止时间；
+- PollBatch：从一轮等待的第一次到最后一次 Load 的 episode 包络，内部可以
+  穿插 Scalar 控制甚至同步 kernel，不能把整个 duration 当作单条 atomic；
+- 两个同步原语之间的普通代码：可能是 GM 搬运、owner-local GM 状态处理，
+  也可能只是 block-local Scalar 校验和布局计算。
+
+本阶段固定复用 S6.55 同一份 54,592 条 B256 raw，不增加设备端字段、记录或
+时间戳。转换器只在离线侧使用已有父区间和 Atomic/DCCI/Kernel 端点，对不少于
+`1 us` 且能由源码合同唯一解释的区间补业务名称。无法唯一解释的区间不猜测。
+名称中的 `[GM+Scalar]` 表示源码同时访问 GM 状态并执行 Scalar 校验/打包，
+不表示整段都是 GM stall；嵌套的 `atomic.*`、`dcci.*` 才是原语的精确位置。
+
+### 归因结果
+
+以下数值是 96 核各自父区间的累计 core-time，只用于判断代码组成，不能与
+`1.466841 ms` 的端到端泳道跨度直接相加减：
+
+| 父区间 | 父区间累计 | 已有精确证据 | 原先未解释的累计 | 主要结论 |
+| ---- | ----: | ---- | ----: | ---- |
+| EfDrain | 34.347 ms | kernel 19.005 ms、direct atomic 2.910 ms、DCCI 0.045 ms | 12.387 ms | 主要是执行包 GM 搬运/校验、token/plan 扫描和 fanin 前缀推进 |
+| Materialize | 12.228 ms | direct atomic 3.226 ms、DCCI 0.631 ms | 8.371 ms | shared heap 原语之外是输出布局 Scalar 计算、GM descriptor 写入和 writer delta 构造 |
+| Fanin | 4.726 ms | direct atomic 1.346 ms、DCCI 0.046 ms | 3.334 ms | 参数引用扫描、writer-history GM 读取和本地 fanin 结果提交 |
+| WinnerBuild | 8.721 ms | direct atomic 0.503 ms、DCCI 1.509 ms | 6.708 ms | 最大块是向 shared exec cell 写 portable payload |
+| Register | 28.711 ms | predecessor PollBatch 28.061 ms、direct atomic 0.543 ms | 0.107 ms | 几乎全部已由严格插入等待和 completion CAS 解释 |
+
+新泳道中最主要的非原语区间为：
+
+| 离线业务区间 | 条数 | 累计 core-time | 单条均值 | 单条最大值 | 源码含义 |
+| ---- | ----: | ----: | ----: | ----: | ---- |
+| `winner_build.pack_execution_payload[GM+Scalar]` | 1,024 | 4.557 ms | 4.450 us | 8.018 us | 预取目标后，把 TensorDesc/scalar/fanin 打包写入 shared exec payload；末端 DCCI 单独显示 |
+| `execute.bind_payload_and_rebuild_args[GM+Scalar]` | 715 | 4.039 ms | 5.649 us | 12.533 us | payload invalidate 结束后，把 shared cell 搬到 owner token，校验 header/layout 并重建 dispatch args |
+| `materialize.write_descriptors_and_prepare_writer_delta[GM+Scalar]` | 1,280 | 2.787 ms | 2.178 us | 4.468 us | heap 原语结束后写 GM TaskPayload descriptor，并在 Scalar 上准备 writer delta |
+| `efdrain.inspect_tokens_and_plan[GM+Scalar]` | 1,053 | 2.443 ms | 2.320 us | 5.625 us | 恢复本核 token、读取不可变 dispatch plan 并决定是否扫描执行候选 |
+| `arg_build.plan_and_construct_args[GM+Scalar]` | 1,280 | 2.410 ms | 1.883 us | 4.322 us | Claim 后解码 GM plan、绑定 winner context，并构造 block-local TaskArgs |
+| `execute.advance_fanin_prefix[GM+Scalar]` | 1,203 | 1.976 ms | 1.643 us | 6.608 us | 两次 fanin completion Load 之间读取 token edge、更新 owner-local ready 前缀 |
+| `materialize.validate_output_layout[Scalar]` | 1,055 | 1.762 ms | 1.670 us | 14.044 us | 首次 heap atomic 前扫描 TaskArgs/CreateInfo 并计算输出布局；源码没有 DCCI/atomic，早期长尾更像 Scalar 冷代码/数据效应 |
+
+`winner_build.resolve_payload_sources[GM+Scalar]` 外层共 1.881 ms，其中嵌套
+1.509 ms 的 descriptor DCCI，不能把两者再次相加；保留外层是为了在图上精确
+呈现“source 解析包含哪些 DCCI”，而不是把 DCCI 改名成 GM 时间。
+
+Register 和 FinalDrain 中的 PollBatch 继续保持原名。它只证明该 episode 内
+反复执行过返回型 Load；在没有增加逐 poll 记录前，不能可靠拆成“atomic 指令
+执行时间”和“两次 poll 之间时间”，因此本阶段没有伪造进一步细分。
+
+### 闭合与开销
+
+- 把 direct Atomic/DCCI/Kernel、既有业务 child 和新派生 span 做区间并集后，
+  EfDrain、Materialize、Fanin、WinnerBuild 中未解释的 `>=1 us` 空白均为 0；
+- raw 仍为 54,592 条，`fdwic_summary` 未改变；转换器新增的只是 merged 事件；
+- merged 从约 7.0 MiB 增到 7.9 MiB，避免了设备端记录增长和被测路径扰动；
+- standalone converter 64 项回归 PASS；cross-core Atomic/DCCI 源码覆盖 5 项
+  PASS，证明生产头中的受控原语均已观察或有逐行明确例外；
+- 本阶段没有重新上板，也没有性能结论：新泳道完全由同一份 S6.55 raw 离线
+  重放，设备执行代码未变。
+
+可审阅文件为
+`test_record/2026-8-4/cross_b256_attributed.json`（测试产物不提交）。下一轮
+优化应优先区分两条证据链：必要返回型 atomic 继续从原语数量/竞争协议入手；
+非 atomic 则优先检查 exec payload 的 GM 写入与跨核 bind 搬运，不能再把它们
+归入笼统空白或 atomic 波动。

@@ -57,10 +57,10 @@ PHASE_NAMES = {
         "materialize.publish_shared_output_descriptors"
     ),
     "SharedMaterializePublishTaskOutputsCopy": (
-        "materialize.publish_shared_output_descriptors.copy_tensor_descs"
+        "materialize.publish_shared_output_descriptors.copy_tensor_descs[GM]"
     ),
     "SharedMaterializePublishTaskOutputsFlush": (
-        "materialize.publish_shared_output_descriptors.flush_tensor_descs"
+        "materialize.publish_shared_output_descriptors.flush_tensor_descs[DCCI]"
     ),
     # 兼容迁移前已经落盘的 schema-v5 raw；新采集只会写上面的
     # SharedMaterialize* 名称，旧名称仍按其当时的 Register 归属解释。
@@ -1708,8 +1708,287 @@ def _iter_v5_cross_core_winner_build_pack_spans(
             int(parent[2]),
             pack_start,
             pack_end,
-            f"winner_build.pack_execution_payload#{int(parent[3])}",
+            (
+                "winner_build.pack_execution_payload[GM+Scalar]"
+                f"#{int(parent[3])}"
+            ),
         )
+
+
+def _iter_v5_cross_core_semantic_gap_spans(
+    rows: list[tuple[Any, ...]],
+    frequency_hz: int,
+    trace_schema_version: int,
+    tensormap_mode: str | None,
+    submit_topology: str | None,
+) -> Iterator[tuple[int, int, int, int, int, str]]:
+    """用现有原语端点标出 cross-core 中可证明的大块非原语代码。
+
+    这些 span 只解释两个已经相邻且有源码合同的 raw 边界之间执行了什么：
+    Atomic、DCCI 与 Kernel 本身仍由设备 raw 单独显示。只导出不少于 1 us
+    的区间，避免为了补小缝继续膨胀 merged；raw ABI、设备写入量和被测
+    调度路径均不改变。
+
+    名称中的 ``GM+Scalar`` 表示源码同时搬运/读取 GM 状态并执行 Scalar
+    校验或打包，不表示整段都是 GM stall；精确 DCCI/Atomic 仍以嵌套事件
+    为准。无法由现有端点唯一确定业务含义的区间不猜测、不生成。
+    """
+
+    if (
+        trace_schema_version != 5
+        or tensormap_mode != "shared"
+        or submit_topology != "central_ticket"
+    ):
+        return
+
+    minimum_ticks = max(1, (frequency_hz + 999_999) // 1_000_000)
+    rows_by_lane: dict[
+        tuple[int, int], list[tuple[Any, ...]]
+    ] = {}
+    for row in rows:
+        rows_by_lane.setdefault(
+            (int(row[0]), int(row[2])), []
+        ).append(row)
+
+    def emit_if_large(
+        parent: tuple[Any, ...], start: int, end: int, name: str
+    ) -> Iterator[tuple[int, int, int, int, int, str]]:
+        if end - start < minimum_ticks:
+            return
+        yield (
+            int(parent[0]), int(parent[1]), int(parent[2]),
+            start, end, name,
+        )
+
+    def contained(
+        parent: tuple[Any, ...],
+    ) -> list[tuple[Any, ...]]:
+        start = int(parent[6])
+        end = int(parent[7])
+        return [
+            row
+            for row in rows_by_lane[
+                (int(parent[0]), int(parent[2]))
+            ]
+            if row is not parent
+            and start <= int(row[6])
+            and int(row[7]) <= end
+        ]
+
+    # Materialize 前段只扫描 block-local TaskArgs/SubmitContext，计算输出
+    # 布局；第一个 shared-heap Load 是它首次进入共享 heap 协议的权威边界。
+    # heap 原语结束到 descriptor 发布开始之间，则会写 GM TaskPayload 并在
+    # Scalar 上准备 writer delta。两段都由既有端点唯一界定。
+    for parent in (row for row in rows if row[5] == "Materialize"):
+        children = contained(parent)
+        heap_loads = [
+            row for row in children
+            if row[5] == "Atomic" and int(row[9]) == 15
+        ]
+        heap_ops = [
+            row for row in children
+            if row[5] == "Atomic" and 15 <= int(row[9]) <= 18
+        ]
+        output_parents = [
+            row for row in children
+            if row[5] == "SharedMaterializePublishTaskOutputs"
+        ]
+        if (
+            len(heap_loads) != 1
+            or not heap_ops
+            or len(output_parents) != 1
+        ):
+            continue
+        first_heap = heap_loads[0]
+        last_heap_end = max(int(row[7]) for row in heap_ops)
+        output_parent = output_parents[0]
+        task_id = int(parent[3])
+        yield from emit_if_large(
+            parent, int(parent[6]), int(first_heap[6]),
+            f"materialize.validate_output_layout[Scalar]#{task_id}",
+        )
+        if last_heap_end <= int(output_parent[6]):
+            yield from emit_if_large(
+                parent, last_heap_end, int(output_parent[6]),
+                (
+                    "materialize.write_descriptors_and_prepare_writer_delta"
+                    f"[GM+Scalar]#{task_id}"
+                ),
+            )
+
+    # Fanin.start 到第一次共享原语之间固定执行参数引用扫描与合法性校验。
+    # SharedOutputRef 路径随后进入 output-published atomic；ordinary tensor
+    # 路径随后进入 TensorMap tail atomic。两种都可能读取描述符，因此使用
+    # GM+Scalar，而不把这段误标成第一次 atomic 的耗时。
+    for parent in (row for row in rows if row[5] == "Fanin"):
+        children = contained(parent)
+        first_boundaries = [
+            row for row in children
+            if row[5] in ("Atomic", "Dcci")
+            and not (
+                row[5] == "Atomic"
+                and int(row[8]) & ATOMIC_POLL_BATCH
+            )
+        ]
+        if not first_boundaries:
+            continue
+        first = min(
+            first_boundaries,
+            key=lambda row: (int(row[6]), int(row[7])),
+        )
+        yield from emit_if_large(
+            parent, int(parent[6]), int(first[6]),
+            f"fanin.scan_and_validate_refs[GM+Scalar]#{int(parent[3])}",
+        )
+        ordered_boundaries = sorted(
+            first_boundaries,
+            key=lambda row: (int(row[6]), int(row[7]), str(row[5])),
+        )
+        previous = ordered_boundaries[0]
+        cursor = int(previous[7])
+        for current in ordered_boundaries[1:]:
+            current_start = int(current[6])
+            if (
+                current_start > cursor
+                and previous[5] == "Dcci"
+                and int(previous[9]) == 0
+                and current[5] == "Atomic"
+                and int(current[9]) == 23
+            ):
+                yield from emit_if_large(
+                    parent, cursor, current_start,
+                    (
+                        "fanin.read_writer_history[GM+Scalar]"
+                        f"#{int(parent[3])}"
+                    ),
+                )
+            if int(current[7]) > cursor:
+                cursor = int(current[7])
+                previous = current
+        if (
+            previous[5] == "Atomic"
+            and int(previous[9]) == 25
+            and int(parent[7]) > cursor
+        ):
+            yield from emit_if_large(
+                parent, cursor, int(parent[7]),
+                f"fanin.commit_validated_edges[Scalar]#{int(parent[3])}",
+            )
+
+    # WinnerBuild 的 source 解析区可以包含若干 descriptor invalidate；用
+    # 外层 span 把它们与周围 GM 地址解析/Scalar 校验归在同一业务阶段，
+    # DCCI 子事件仍保持原有精确位置。reserve.end -> payload-flush.start 的
+    # payload 打包由上面的专用派生器生成，避免重复覆盖同一区间。
+    for parent in (row for row in rows if row[5] == "WinnerBuild"):
+        children = contained(parent)
+        reserves = [
+            row for row in children
+            if row[5] == "Atomic" and int(row[9]) == 46
+        ]
+        if len(reserves) != 1:
+            continue
+        reserve = reserves[0]
+        yield from emit_if_large(
+            parent, int(parent[6]), int(reserve[6]),
+            (
+                "winner_build.resolve_payload_sources[GM+Scalar]"
+                f"#{int(parent[3])}"
+            ),
+        )
+
+    # EfDrain 中只处理已由相邻 direct Atomic/DCCI/Kernel 端点证明的几类
+    # 高频大缝。PollBatch 是等待 episode 包络而非连续原子耗时，既不能拿来
+    # 切 direct gap，也不能把其内部时间重新命名成 GM/Scalar。
+    for parent in (row for row in rows if row[5] == "EfDrain"):
+        boundaries = [
+            row for row in contained(parent)
+            if row[5] in ("Atomic", "Dcci", "Kernel")
+            and not (
+                row[5] == "Atomic"
+                and int(row[8]) & ATOMIC_POLL_BATCH
+            )
+        ]
+        boundaries.sort(
+            key=lambda row: (int(row[6]), int(row[7]), str(row[5]))
+        )
+        cursor = int(parent[6])
+        previous: tuple[Any, ...] | None = None
+        for current in boundaries:
+            current_start = int(current[6])
+            current_end = int(current[7])
+            if current_start > cursor:
+                previous_phase = None if previous is None else str(previous[5])
+                previous_site = (
+                    None if previous is None else int(previous[9])
+                )
+                current_phase = str(current[5])
+                current_site = int(current[9])
+                name: str | None = None
+                task_id: int | None = None
+                if previous is None and (
+                    (current_phase == "Atomic" and current_site in (5, 45))
+                    or current_phase == "Kernel"
+                ):
+                    name = "efdrain.inspect_tokens_and_plan[GM+Scalar]"
+                elif previous_phase == "Dcci" and previous_site == 12 and (
+                    (current_phase == "Atomic" and current_site == 5)
+                    or current_phase == "Kernel"
+                ):
+                    task_id = int(previous[3])
+                    name = "execute.bind_payload_and_rebuild_args[GM+Scalar]"
+                elif (
+                    previous_phase == "Atomic"
+                    and previous_site == 5
+                    and current_phase == "Atomic"
+                    and current_site == 5
+                ):
+                    name = "execute.advance_fanin_prefix[GM+Scalar]"
+                elif (
+                    previous_phase == "Atomic"
+                    and previous_site == 5
+                    and current_phase == "Atomic"
+                    and current_site == 45
+                ):
+                    name = "efdrain.defer_token_and_scan_plan[GM+Scalar]"
+                elif (
+                    previous_phase == "Atomic"
+                    and previous_site == 45
+                    and current_phase == "Atomic"
+                    and current_site == 45
+                ):
+                    name = "efdrain.scan_exec_candidates[GM+Scalar]"
+                elif (
+                    previous_phase == "Atomic"
+                    and previous_site == 45
+                    and current_phase == "Atomic"
+                    and current_site == 48
+                ):
+                    task_id = int(previous[3])
+                    name = "efdrain.evaluate_exec_claim[GM+Scalar]"
+                elif (
+                    previous_phase == "Atomic"
+                    and previous_site == 45
+                    and current_phase == "Atomic"
+                    and current_site == 2
+                ):
+                    name = "efdrain.return_and_check_fatal[GM+Scalar]"
+                elif (
+                    previous_phase == "Atomic"
+                    and previous_site == 51
+                    and current_phase == "Atomic"
+                    and current_site in (5, 45)
+                ):
+                    task_id = int(previous[3])
+                    name = "execute.recycle_token_and_continue[GM+Scalar]"
+                if name is not None:
+                    if task_id is not None:
+                        name = f"{name}#{task_id}"
+                    yield from emit_if_large(
+                        parent, cursor, current_start, name,
+                    )
+            if current_end > cursor:
+                cursor = current_end
+                previous = current
 
 
 # 写一个 Chrome Trace Event，并统一处理数组元素间的逗号。
@@ -1723,6 +2002,8 @@ def _emit_event(output: TextIO, event: dict[str, Any], first: bool) -> bool:
 
 def _iter_v5_residual_spans(
     rows: list[tuple[Any, ...]],
+    tensormap_mode: str | None = None,
+    submit_topology: str | None = None,
 ) -> Iterator[tuple[int, int, int, int, int, str]]:
     """只用既有 Submit/child 边界生成逐段补集，不改 raw ABI。"""
 
@@ -1781,6 +2062,7 @@ def _iter_v5_residual_spans(
             children_by_task.get(task_key, []),
             key=lambda row: (int(row[6]), int(row[7]), str(row[5])),
         )
+        previous_phase: str | None = None
         for child in children:
             child_start = int(child[6])
             child_end = int(child[7])
@@ -1793,15 +2075,30 @@ def _iter_v5_residual_spans(
                     f"schema-v5 exclusive children overlap in Submit {task_key}"
                 )
             if child_start > cursor:
+                gap_name = "submit_residual"
+                if (
+                    tensormap_mode == "shared"
+                    and submit_topology == "central_ticket"
+                    and previous_phase == "Claim"
+                    and child[5] == "Materialize"
+                ):
+                    # 中央 ticket 的 Claim.end -> Materialize.start 恰好是
+                    # dispatch plan 解码、winner context 绑定和 TaskArgs 构造；
+                    # 复用原 residual 的同一条离线事件，不增加 merged 行数。
+                    gap_name = (
+                        "arg_build.plan_and_construct_args[GM+Scalar]"
+                        f"#{int(submit[3])}"
+                    )
                 yield (
                     int(submit[0]),
                     int(submit[1]),
                     int(submit[2]),
                     cursor,
                     child_start,
-                    "submit_residual",
+                    gap_name,
                 )
             cursor = max(cursor, child_end)
+            previous_phase = str(child[5])
         if submit_end > cursor:
             yield (
                 int(submit[0]),
@@ -2063,13 +2360,27 @@ def convert(  # noqa: PLR0912, PLR0915
         )
         ordered_items.extend(
             ("derived", *span)
+            for span in _iter_v5_cross_core_semantic_gap_spans(
+                rows,
+                frequency_hz,
+                trace_schema_version,
+                capture_metadata.get("tensormap_mode"),
+                capture_metadata.get("submit_topology"),
+            )
+        )
+        ordered_items.extend(
+            ("derived", *span)
             for span in _iter_v5_shared_register_derived_spans(
                 rows
             )
         )
         ordered_items.extend(
             ("derived", *span)
-            for span in _iter_v5_residual_spans(rows)
+            for span in _iter_v5_residual_spans(
+                rows,
+                capture_metadata.get("tensormap_mode"),
+                capture_metadata.get("submit_topology"),
+            )
         )
     ordered_items.sort(key=_merged_item_sort_key)
     first = True
