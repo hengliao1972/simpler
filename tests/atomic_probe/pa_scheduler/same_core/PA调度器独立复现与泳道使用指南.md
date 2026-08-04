@@ -267,8 +267,8 @@ submit-pmu 四件套都必须通过 manifest 的模式、CAP、insert-turn G、�
 
 shared 构建还读取 `PA_SHARED_INSERT_TURN_GROUPS`，默认 1，只接受
 1/2/4/8/16/32/64/128；private 只允许 1。该值只在构建期生效，不是
-benchmark 参数。默认 CAP=128 时，shared ABI generation 为 12，
-ABI version 为 `(12<<8)|G`；host/device 握手和 schema-v4 manifest
+benchmark 参数。默认 CAP=128 时，shared ABI generation 为 14，
+ABI version 为 `(14<<8)|G`；host/device 握手和 schema-v4 manifest
 都会拒绝不同 G 的混件。turn-G>1 只属于本阶段维护的 CPU/CCEC 后端；
 AscendC 和 `all` 会在任何构建或设备动作前被拒绝。
 
@@ -373,17 +373,23 @@ R4e-a 又在该 offset 追加 `reader_done[96]`，每个 worker 独占 64B，
 合计 6,144B，形成 generation-8 的 12,426,432B sidecar。R5c 保留原
 `committed_tasks` 作为 insert-turn lane 0，又在 `reader_done` 后追加
 `insert_turn_extra[7]`，形成历史 generation-9 的 12,426,880B sidecar。
-当前 generation-10 将同一尾数组扩为 `insert_turn_extra[127]`，比
-generation-9 再增加 7,680B，sidecar 为 12,434,560B。shared standalone
-的 batch 输入容量同时从 256 扩到 512，因此 CPU 非 split
-`SchedulerState` 为 1,019,551,552B，定义
-`PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC split 布局为 1,019,557,696B。
+generation-10 将同一尾数组扩为 `insert_turn_extra[127]`，比
+generation-9 再增加 7,680B，当时 sidecar 为 12,434,560B。当前
+generation-14 又把 8 个 shared heap cursor 从相邻 64B 行改为 8 个
+128B 冲突单元：物理数组扩为 16 行，仅偶数行有效，奇数行必须保持
+-1。因此当前 sidecar 为 12,435,072B，比 generation-12 增加 512B；
+此前 region/output 起点和 heap-cursor 起点均不变，后续 vend、Vector、
+history、reader 与 turn 尾字段统一顺延 512B。
+
+shared standalone 的 batch 输入容量为 512。当前每 task 两级 Claim
+Tournament 另占 20,054,016B；其后追加 128B 步长的插入完成表，占
+557,056B。最终 CPU non-split `SchedulerState` 为 1,040,163,136B，定义
+`PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC split 布局为 1,040,169,280B。
 private 的 batch 上限仍为 256，sidecar 仍为 2,113,664B，
 non-split/split `SchedulerState` 仍分别为 1,007,115,968B 和
-1,007,122,112B。新增 turn 控制线只追加在 shared sidecar 尾部，
-不移动此前 sidecar 字段；Vector 热路径仍使用 `task_id%8`。sidecar
-仍位于 standalone 控制区和 `results` 之后，不移动 `WorkerState`
-或 `RunConfig`。
+1,007,122,112B。上述 shared 状态均位于完整 production prefix、
+standalone 控制区和 `results` 之后，不移动 `WorkerState`、`RunConfig`
+或真实 PA `TaskCell` 字段。
 
 `reader_done[worker]=D` 表示该 worker 已经结束 task `[0,D]` 的全部
 ordinary-ring 读取，初值为 -1，只允许 CAS `D-1 -> D`。最慢完成值为
@@ -445,20 +451,27 @@ S4.16b 第一层性能门槛失败；这些数字只属于历史候选，不是�
 
 每 task 最多八个 fresh output，以 16B
 `FdwicOutputRef` 表达 `(producer_task_id, output_slot)`，返回句柄为
-8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 12。通用
+8B `SharedTaskOutputs`。当前构建身份 ABI generation 为 14。通用
 history 能力由 generation 7 引入，generation 8 追加 `reader_done`，
 generation 9 追加七条 insert-turn 物理线，generation 10 再将物理容量
-扩为 128 条并把 active G 扩到 128；generation 11 将 shared 热路径的
-有序插入完成链迁到 `TaskCell::deps_prepared`：task N 只等待
-`task[N-1]`，发布完整 writer 元数据后再用 CAS 发布 `task[N]=N`。
-Claim 仍使用原有 Cube/Alloc 四分片与 shared Vector 八分片 cursor。
-generation 11 暂时保留 generation 10 的 sidecar 物理线和 manifest
-字段作为历史 ABI，默认 G1 构建要求这些线保持初值，生产热路径不再访问
-它们。generation 12 不改变物理布局，而是把正式 PA 的三个 lockstep
-accumulator latest writer 收敛到 Alloc `last_writer[0]`：每个 UP 只做
-一次 group CAS，slot1/2 保持 Alloc producer。三条 slot2/1/0 history 和
-三个逻辑 INOUT commit 仍完整保留，generic shared resolver 也继续使用
-逐 slot writer；因此旧新 ELF 的字段解释不同，必须用 generation 拒绝
+扩为 128 条并把 active G 扩到 128；generation 11 曾将 shared 热路径的
+有序插入完成链迁到 `TaskCell::deps_prepared`。generation 12 不改变该
+物理布局，而是把正式 PA 的三个 lockstep accumulator latest writer
+收敛到 Alloc `last_writer[0]`：每个 UP 只做一次 group CAS，slot1/2
+保持 Alloc producer。
+
+generation 13 根据 A5 原子地址探针重新处理插入完成链：同一对齐 128B
+冲突单元中的两个 64B 原子地址会进入同一串行队列，因此历史上“每 task
+一条 64B `AtomicLine`”并没有隔离相邻 task。当前完成表位于 standalone
+尾部，只使用 `slots[2*N]`，`slots[2*N+1]`、全部
+`TaskCell::deps_prepared` 和旧 sidecar turn 均作为 -1 canary。generation
+14 再把 8 个 shared heap cursor 以相同原则改为有效行与隔离行交错，
+只使用 `shared_heap_cursor[2*shard]`。Claim 使用每 task 两级 CAS
+Tournament，root/local node 的物理步长已经是 512B，无需重复扩张。
+
+三条 slot2/1/0 history 和三个逻辑 INOUT commit 仍完整保留，generic
+shared resolver 也继续使用逐 slot writer；旧新 ELF 的字段解释和大小
+不同，必须用 generation、`sizeof(SchedulerState)` 与 manifest 共同拒绝
 混件。history、reader progress 与 per-task 插入完成链仍是不同协议能力，
 不能据此声称 PA 热路径已经接入 reader-progress reclaim。
 
@@ -466,8 +479,9 @@ accumulator latest writer 收敛到 Alloc `last_writer[0]`：每个 UP 只做
 构造本 task 参数、Materialize descriptor 和 writer delta。fresh output
 descriptor 在 Materialize 尾部写入 task 独占的
 `shared_outputs[task_id]`，不占用全局有序插入区。随后 owner 等待前一
-task 的 `deps_prepared`，只在有序区内发布 ordinary/symbol writer
-元数据，再发布本 task 的 `deps_prepared`；fanin lookup、Build 和执行
+task 的 128B insert-completion 有效槽，只在有序区内发布
+ordinary/symbol writer 元数据，再 CAS 发布本 task 的完成槽；fanin
+lookup、Build 和执行
 均在有序区外进行。lookup 统一只接受 `producer∈[N-H,N)`。Claim 判负后
 的 loser finish/replay 不等待 per-task 插入完成字、不读取 TensorMap，
 也不构造重参数，关闭轻量 Submit 后直接继续 replay；Claim 对 Vector
@@ -485,8 +499,10 @@ Local/GM 的 manual 与 ordinary writer；shared raw 从源头不生成
 `PrepareMap` 记录。负向测试覆盖 winner 内外以及零时长记录，避免为了兼容
 旧分析器重新引入没有业务语义的 marker。
 
-shared heap 使用 `task_id % 8` 的有界绝对 cursor，物理 shard span 默认为
-32MiB；b256 每 shard 精确使用 25,821,184B，不 wrap、不复用 generation。
+shared heap 使用 `task_id % 8` 的有界绝对 cursor，逻辑 shard 对应物理
+`shared_heap_cursor[2*shard]`，相邻有效地址保持 128B 步长；奇数隔离行
+必须保持 -1。物理 shard span 默认为 32MiB；b256 每 shard 精确使用
+25,821,184B，不 wrap、不复用 generation。
 非空 task 分别推进 shard cursor 和 aggregate vend，零输出 task 只读取 vend。
 shared 不调用 private per-worker ring 的 HeapGuard。host 直接核对 8-shard
 实际 descriptor 地址，再以 canonical 连续地址比较 private/shared 的
@@ -496,8 +512,8 @@ Materialize 只在 owner 上预留 heap、生成本地 descriptor，并把本 ta
 fresh output descriptor 发布到独占 task cell。正式 PA-UP 还在
 Materialize 尾部写入三条 slot-specific immutable writer history，并完成
 单行 DCCI+DSB；此时 history 尚不可达。取得 insert turn 后，有序区只发布
-ordinary writer entry 和 latest writer，再用 `deps_prepared[N]` 交出下一
-枚 turn。generation 12 的三个 accumulator latest 由 Alloc
+ordinary writer entry 和 latest writer，再用 128B 完成表的有效槽交出
+下一枚 turn。generation 12 起三个 accumulator latest 由 Alloc
 `last_writer[0]` 的一次 group CAS 统一发布。因此 `published=N` 只表示
 task N 的 descriptor 已可见，不能单独代表 writer metadata、Build、kernel
 或 completion 已完成；后几项分别由 group/latest 发布、fanin 与 task
@@ -695,8 +711,8 @@ builtin；检查后删除，不会进入正式 mixed ELF。静态链接只证明
 后端能生成完整设备代码，不证明 ordinary region 的跨核
 reader-progress/reclaim 可见性已经闭合。
 shared-protocol-litmus 自身虽是 CCEC mixed ELF，但没有定义 split-finish，
-因此其 GM `SchedulerState` 使用当前 generation-12 non-split 大小
-1,019,551,552B。history 场景会校验 96 条 `reader_done` 始终保持 -1；
+因此其 GM `SchedulerState` 使用当前 generation-14 non-split 大小
+1,040,163,136B。history 场景会校验 96 条 `reader_done` 始终保持 -1；
 reader-reclaim 场景则要求 96 条最终均为 task 2，且只允许被测 reader
 发生 `1->2`。两种场景还校验完整 128 线 insert-turn 终态。
 
@@ -704,11 +720,12 @@ reader-reclaim 场景则要求 96 条最终均为 task 2，且只允许被测 re
 为了证明 127 条 inactive lane 保持 -1，并不表示该 litmus 覆盖其他 G。
 各 turn-G 的 CCEC 证据由主 scheduler 构建矩阵提供。
 
-shared sidecar 的 atomic 当前会计入既有 Submit/业务阶段时间，但 heap
-cursor/vend、symbol writer/published 等尚未逐条接入 atomic 泳道 wrapper；
-所以这一版泳道不能声称完整列出了 shared 协议 atomic，也不能从现有事件拆出
-shared heap 或 symbol 单指令成本。这不影响 host 对 cursor/vend、descriptor、
-输出符号、依赖边和规范化 writer 签名的独立校验。shared raw 不生成
+shared 热路径的 heap、insert completion、symbol writer/published、
+ordinary map 与 Claim Tournament 已分别接入 atomic site 15～41；direct
+记录使用原始 SYS_CNT 括号，PollBatch 记录精确逻辑调用数与等待包络。
+这些累计值是全核工作量，不能直接与 Submit 墙钟相加。host 仍独立核对
+cursor/vend、隔离 canary、descriptor、输出符号、依赖边和规范化 writer
+签名，避免观察记录自身成为唯一 oracle。shared raw 不生成
 `PrepareMap`；converter/analyzer 直接按 shared 的真实稀疏阶段集合闭合，
 任何 `PrepareMap` 记录都会被当作协议错误。
 
@@ -2099,11 +2116,16 @@ R4e-a 追加 96 条 reader-progress cache line 后，generation-8 sidecar 为
 12,426,432 bytes。R5c 在尾部追加七条 insert-turn cache line，形成历史
 generation-9 的 12,426,880 bytes；generation-10 将该尾数组扩为
 127 条 extra line，sidecar 为 12,434,560 bytes；generation 11
-停止从热路径访问这些 turn line，当前 generation 12 继续保留同一物理
-布局并引入 PA accumulator group-writer 语义。shared batch 输入
-数组扩到 512 后，CPU non-split 与定义
+停止从热路径访问这些 turn line，generation 12 在同一布局引入 PA
+accumulator group-writer 语义。当前 generation 14 把 8 个 heap cursor
+扩成 16 条交错物理线，sidecar 为 12,435,072 bytes；heap cursor 起点
+不变，vend 及其后字段顺延 512 bytes。
+
+shared batch 输入数组为 512。standalone 尾部的两级 Claim Tournament
+占 20,054,016 bytes，紧随其后的 128B per-task insert-completion 表占
+557,056 bytes。因此 CPU non-split 与定义
 `PA_COMPETE_FIRST_SPLIT_FINISH` 的 CCEC 变体总大小分别为
-1,019,551,552/1,019,557,696 bytes；swimlane、perf-clock 以及 submit-PMU
+1,040,163,136/1,040,169,280 bytes；swimlane、perf-clock 以及 submit-PMU
 none/claim/efdrain 使用后者，submit-PMU materialize/register 和独立
 shared-protocol-litmus 使用 non-split 大小。既有 production prefix 和
 `WorkerState`/`RunConfig` offset 不变；`context_lens` 后的 standalone
@@ -2125,8 +2147,9 @@ S4.16a 的 host/device `sizeof(SchedulerState)` 握手、manifest 校验和
 cache line；二者都位于完整生产 DistGlobal 镜像之后，生产 DistGlobal/
 DistCore 关键偏移保持不变。
 默认泳道缓冲区另占 402,660,160 bytes；CCEC/AscendC `real-compute` 还在 device 分配
-12,713,984 bytes workspace。因此 scalar-nop+trace 的 A5 device 占用约
-1.313 GiB，real-compute+trace 约 1.325 GiB，host 侧也需分配相近内存。
+12,713,984 bytes workspace。因此当前 shared scalar-nop+trace 的 A5
+device 占用约 1.344 GiB，real-compute+trace 约 1.356 GiB，host 侧也需
+分配相近内存。
 CPU 后端只在 host 侧分配相同 workspace，不存在 device 内存口径。
 `smoke` 不缩小 State；只有 `--no-swimlane` 能省去泳道缓冲区。
 256 batch 的历史 phase-only 采集约有 86.3 万条事件。删除

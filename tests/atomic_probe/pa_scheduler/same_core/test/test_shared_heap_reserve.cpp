@@ -93,7 +93,8 @@ bool HeapInterleaveOps::advance_vend = false;
 
 void ResetHeapState(SharedTensorMapSidecar &map) {
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
-        map.shared_heap_cursor[shard].value = 0;
+        SharedHeapCursorLine(map, shard).value = 0;
+        map.shared_heap_cursor[shard * 2U + 1U].value = -1;
     }
     map.shared_heap_vend.value = 0;
 }
@@ -106,7 +107,8 @@ struct HeapSnapshot {
 HeapSnapshot Snapshot(const SharedTensorMapSidecar &map) {
     HeapSnapshot snapshot{};
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
-        snapshot.cursor[shard] = map.shared_heap_cursor[shard].value;
+        snapshot.cursor[shard] =
+            SharedHeapCursorLine(map, shard).value;
     }
     snapshot.vend = map.shared_heap_vend.value;
     return snapshot;
@@ -116,7 +118,9 @@ bool SameSnapshot(
     const SharedTensorMapSidecar &map, const HeapSnapshot &expected
 ) {
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
-        if (map.shared_heap_cursor[shard].value != expected.cursor[shard]) {
+        if (SharedHeapCursorLine(map, shard).value !=
+            expected.cursor[shard] ||
+            map.shared_heap_cursor[shard * 2U + 1U].value != -1) {
             return false;
         }
     }
@@ -246,9 +250,13 @@ void TestPaCase(uint32_t batches) {
     uint64_t cursor_sum = 0;
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
         Check(
-            static_cast<uint64_t>(map->shared_heap_cursor[shard].value) ==
+            static_cast<uint64_t>(SharedHeapCursorLine(*map, shard).value) ==
                 expected_cursor[shard],
             "PA Case1 final shard cursor is exact"
+        );
+        Check(
+            map->shared_heap_cursor[shard * 2U + 1U].value == -1,
+            "PA Case1 leaves every 128B heap isolation line untouched"
         );
         Check(
             expected_cursor[shard] <= shard_span,
@@ -305,7 +313,7 @@ void TestAlignmentAndShardTail() {
         "heap tail is excluded and shard base remains aligned"
     );
     Check(
-        map->shared_heap_cursor[7].value ==
+        SharedHeapCursorLine(*map, 7).value ==
             static_cast<int64_t>(kOutputAlignment),
         "rounded reservation advances only its shard"
     );
@@ -424,7 +432,7 @@ void TestBoundaryZeroAndPreflightFailures() {
         "out-of-range task id changes no heap state"
     );
 
-    map->shared_heap_cursor[1].value = 1;
+    SharedHeapCursorLine(*map, 1).value = 1;
     const HeapSnapshot unaligned_cursor = Snapshot(*map);
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
@@ -495,7 +503,7 @@ void TestBoundaryZeroAndPreflightFailures() {
     );
 
     ResetHeapState(*map);
-    map->shared_heap_cursor[2].value = -1;
+    SharedHeapCursorLine(*map, 2).value = -1;
     const HeapSnapshot negative_cursor = Snapshot(*map);
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
@@ -509,7 +517,7 @@ void TestBoundaryZeroAndPreflightFailures() {
     );
 
     ResetHeapState(*map);
-    map->shared_heap_cursor[2].value = 5120;
+    SharedHeapCursorLine(*map, 2).value = 5120;
     const HeapSnapshot oversized_cursor = Snapshot(*map);
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
@@ -627,7 +635,7 @@ void TestConcurrentReservations() {
             next = interval.second;
         }
         Check(
-            map->shared_heap_cursor[shard].value ==
+            SharedHeapCursorLine(*map, shard).value ==
                 static_cast<int64_t>(next - shard * shard_span),
             "concurrent shard cursor equals its reserved byte sum"
         );
@@ -652,7 +660,8 @@ void TestConcurrentReservations() {
 void TestInterleavingAndTerminalCapacityRace() {
     auto map = std::make_unique<SharedTensorMapSidecar>();
     ResetHeapState(*map);
-    HeapInterleaveOps::race_cursor = &map->shared_heap_cursor[0].value;
+    HeapInterleaveOps::race_cursor =
+        &SharedHeapCursorLine(*map, 0).value;
     HeapInterleaveOps::race_vend = &map->shared_heap_vend.value;
     HeapInterleaveOps::injected_delta = kOutputAlignment;
     HeapInterleaveOps::advance_vend = false;
@@ -669,7 +678,7 @@ void TestInterleavingAndTerminalCapacityRace() {
         "physical cursor and aggregate vend may linearize in different orders"
     );
     Check(
-        map->shared_heap_cursor[0].value == 2 * kOutputAlignment &&
+        SharedHeapCursorLine(*map, 0).value == 2 * kOutputAlignment &&
             map->shared_heap_vend.value == kOutputAlignment,
         "paused competitor may own a cursor interval before publishing vend"
     );
@@ -678,7 +687,7 @@ void TestInterleavingAndTerminalCapacityRace() {
         __ATOMIC_ACQ_REL
     );
     Check(
-        map->shared_heap_cursor[0].value == 2 * kOutputAlignment &&
+        SharedHeapCursorLine(*map, 0).value == 2 * kOutputAlignment &&
             map->shared_heap_vend.value == 2 * kOutputAlignment,
         "resumed competitor closes final cursor and vend byte sums"
     );
@@ -688,9 +697,10 @@ void TestInterleavingAndTerminalCapacityRace() {
     // 5KiB cursor 现场，绝不能 Exchange 回 3KiB 覆盖竞争者的合法 1KiB。
     ResetHeapState(*map);
     const uint64_t heap_size = kSharedHeapShards * 4096;
-    map->shared_heap_cursor[0].value = 3 * kOutputAlignment;
+    SharedHeapCursorLine(*map, 0).value = 3 * kOutputAlignment;
     map->shared_heap_vend.value = 3 * kOutputAlignment;
-    HeapInterleaveOps::race_cursor = &map->shared_heap_cursor[0].value;
+    HeapInterleaveOps::race_cursor =
+        &SharedHeapCursorLine(*map, 0).value;
     HeapInterleaveOps::race_vend = &map->shared_heap_vend.value;
     HeapInterleaveOps::injected_delta = kOutputAlignment;
     HeapInterleaveOps::advance_vend = true;
@@ -702,7 +712,7 @@ void TestInterleavingAndTerminalCapacityRace() {
         "capacity race fails after the competing reservation fills the shard"
     );
     Check(
-        map->shared_heap_cursor[0].value == 5 * kOutputAlignment &&
+        SharedHeapCursorLine(*map, 0).value == 5 * kOutputAlignment &&
             map->shared_heap_vend.value == 4 * kOutputAlignment,
         "terminal capacity race preserves competitor progress and overrun evidence"
     );

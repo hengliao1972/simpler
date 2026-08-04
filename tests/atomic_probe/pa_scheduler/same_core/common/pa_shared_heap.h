@@ -33,6 +33,24 @@ PA_DEVICE bool SharedHeapAligned(uint64_t value) {
     return (value & (kOutputAlignment - 1)) == 0;
 }
 
+PA_DEVICE PA_GM AtomicLine &SharedHeapCursorLine(
+    PA_GM SharedTensorMapSidecar &map, uint32_t shard
+) {
+    // 每个逻辑 shard 使用一个偶数槽；相邻有效地址因此保持 128B
+    // 步长，奇数槽只作隔离 canary。
+    return map.shared_heap_cursor[
+        shard * kA5AtomicIsolationStrideLines
+    ];
+}
+
+PA_DEVICE PA_GM const AtomicLine &SharedHeapCursorLine(
+    PA_GM const SharedTensorMapSidecar &map, uint32_t shard
+) {
+    return map.shared_heap_cursor[
+        shard * kA5AtomicIsolationStrideLines
+    ];
+}
+
 // 单元测试默认实例化 ObserveAtomics=false，保持原有简洁 Ops 接口；真实
 // scheduler 显式选择 true 并传入本 worker 独占 trace/result。trace-free
 // 构建中的 TraceAtomic* 会在编译期退化为原始 Ops，不给性能基线增加分支。
@@ -149,7 +167,7 @@ PA_DEVICE bool ReserveSharedOutputHeap(
 
     const uint32_t shard = task_id % kSharedHeapShards;
     PA_GM volatile int64_t *cursor_address =
-        &map.shared_heap_cursor[shard].value;
+        &SharedHeapCursorLine(map, shard).value;
     const int64_t signed_cursor_before =
         SharedHeapAtomicLoad<Ops, ObserveAtomics>(
             cursor_address, static_cast<int32_t>(task_id),

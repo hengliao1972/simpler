@@ -126,11 +126,11 @@ constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 constexpr uint32_t kBuildIdentityCompactGenericTraceBit =
     1U << 31U;
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 12;
+constexpr uint32_t kBuildIdentityAbiGeneration = 14;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
-// 默认 CAP=128 时，private 保留历史 ABI 值；shared generation 12 另把
+// 默认 CAP=128 时，private 保留历史 ABI 值；shared generation 14 另把
 // active insert-turn G 编入低位。这样既避免 private AIC/AIV 入口因身份
 // 元数据多一条大立即数构造，也让 manifest v4 和 host/device 握手共同
 // 拒绝不同 G 的 shared 混件。非默认隔离变体继续把 CAP 编进 ABI。
@@ -1245,6 +1245,14 @@ struct alignas(64) AtomicLine {
 // 因伪共享额外放大 Claim/frontier/start barrier 的竞争。
 static_assert(sizeof(AtomicLine) == 64, "AtomicLine must occupy one cache line");
 
+// 该步长来自当前 A5 实测，不是跨平台 cache ABI。所有有效热原子之间
+// 至少空出一个 64B AtomicLine，才能落入不同的对齐 128B 冲突单元。
+constexpr uint32_t kA5AtomicIsolationStrideLines = 2U;
+static_assert(
+    sizeof(AtomicLine) * kA5AtomicIsolationStrideLines == 128U,
+    "A5 atomic isolation stride must remain 128 bytes"
+);
+
 #if PTO_FDWIC_SHARED_MAP
 // 每个 task 使用全新的仲裁节点，后续 task 无法像单调 cursor 那样越过并
 // 覆盖尚未完成 root 仲裁的前序 task。root/local 都是 atomic-only 状态：
@@ -1281,6 +1289,22 @@ static_assert(
         kSharedClaimTournamentNodeStride,
     "shared Claim local nodes must follow the root"
 );
+
+// A5 atomic 地址探针表明：同一对齐 128B 冲突单元内的两个 64B 原子地址
+// 会进入同一条串行队列。完成链只使用偶数槽，使 task N 与 N+1 的有效
+// 原子行保持 128B 物理步长；奇数槽是必须保持 -1 的隔离 canary。
+// 该表位于 standalone-only 尾部，不移动 TaskCell 或任何生产前缀字段。
+struct alignas(64) SharedInsertCompletionTable {
+    AtomicLine slots[
+        kMaxTasks * kA5AtomicIsolationStrideLines
+    ];
+};
+static_assert(
+    sizeof(SharedInsertCompletionTable) ==
+        sizeof(AtomicLine) * kMaxTasks *
+            kA5AtomicIsolationStrideLines,
+    "shared insert-completion table size changed"
+);
 #endif
 
 // final 分层汇合把 arrival 与 release 分到不同 cache line：等待 release
@@ -1308,11 +1332,9 @@ struct alignas(64) TaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
 #if PTO_FDWIC_SHARED_MAP
-    // shared 热路径把该字作为 per-task TensorMap 插入完成原子：初值
-    // -1，task N 的唯一 Claim owner 完成 writer 元数据发布后用 CAS
-    // 写成 N；N+1 owner 只轮询这一字。它与 flag/vend 共处 TaskCell，
-    // 但当前热路径不对该 cache line 执行 DCCI。旧 writer-ready helper
-    // 只供隔离协议测试，不能与本热路径混用。
+    // 保留真实 PA TaskCell 的既有字段与 offset。shared standalone 热路径
+    // 已把插入完成链放到尾部 128B 步长表；该字仅供旧 writer-ready
+    // 隔离协议测试，正式 Case1 必须保持 -1，避免新旧路径混用。
     volatile int64_t deps_prepared;
     uint8_t padding[64 - 3 * sizeof(int64_t)];
 #else
@@ -1554,9 +1576,13 @@ struct alignas(64) SharedTensorMapSidecar {
     // slot 的全部 offset 不变。容量按 shared 最坏 17 task/batch 分配；
     // 现有 shared sidecar H2D/D2H 按 sizeof 搬运。
     SharedOutputCell shared_outputs[kMaxTasks];
-    // shared heap 控制字继续追加在 S3.1 output table 之后。每个 shard cursor
-    // 与全局 aggregate vend 独占 cache line，避免不同 winner 的原子更新伪共享。
-    AtomicLine shared_heap_cursor[kSharedHeapShards];
+    // shared heap 控制字继续追加在 S3.1 output table 之后。A5 的原子冲突
+    // 单元是对齐 128B，故每个 shard cursor 使用一个 64B 有效行和一个
+    // 64B 隔离行；有效行只取偶数下标。aggregate vend 紧随完整表，仍
+    // 从新的 128B 单元开始。
+    AtomicLine shared_heap_cursor[
+        kSharedHeapShards * kA5AtomicIsolationStrideLines
+    ];
     AtomicLine shared_heap_vend;
     // S4.14a 的 shared-only Vector Claim cursor 追加在既有 sidecar 尾部；
     // S4.14b 只启用此前已经预留的后四条物理线。production prefix 和
@@ -1604,7 +1630,7 @@ static_assert(
     "extra shared insert-turn lines must follow reader progress"
 );
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(sizeof(SharedTensorMapSidecar) == 12434560, "shared TensorMap sidecar size changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 12435072, "shared TensorMap sidecar size changed");
 static_assert(
     offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664,
     "shared output table offset mismatch"
@@ -1614,24 +1640,24 @@ static_assert(
     "shared heap cursor offset mismatch"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, shared_heap_vend) == 11027072,
+    offsetof(SharedTensorMapSidecar, shared_heap_vend) == 11027584,
     "shared heap vend offset mismatch"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 11027136,
+    offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 11027648,
     "shared Vector cursor offset mismatch"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, writer_history) == 11027648,
+    offsetof(SharedTensorMapSidecar, writer_history) == 11028160,
     "shared writer-history tail offset mismatch"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, reader_done) == 12420288,
+    offsetof(SharedTensorMapSidecar, reader_done) == 12420800,
     "shared reader-progress tail offset mismatch"
 );
 static_assert(
     offsetof(SharedTensorMapSidecar, insert_turn_extra) ==
-        12426432,
+        12426944,
     "shared insert-turn tail offset mismatch"
 );
 #endif
@@ -1996,6 +2022,9 @@ struct alignas(64) SchedulerState {
     // standalone-only owner-election 状态继续追加在 shared TensorMap 后面；
     // 它既不改变 production prefix，也不混入需要 DCCI 的 metadata。
     SharedClaimTournamentTask claim_tournament[kMaxTasks];
+    // 相邻 task 的完成原子不能再占据同一个 128B 冲突单元。仅使用偶数
+    // 槽，既复用 AtomicLine，也让未使用奇数槽成为地址计算 canary。
+    SharedInsertCompletionTable shared_insert_completion;
 #endif
 };
 static_assert(offsetof(SchedulerState, cube_cursor) == 0, "cube cursor offset must match PA DistGlobal");
@@ -2045,19 +2074,31 @@ static_assert(
             sizeof(SharedTensorMapSidecar),
     "shared Claim Tournament must follow the TensorMap sidecar"
 );
+static_assert(
+    offsetof(SchedulerState, shared_insert_completion) ==
+        offsetof(SchedulerState, claim_tournament) +
+            sizeof(SharedClaimTournamentTask) * kMaxTasks,
+    "shared insert completion must follow the Claim Tournament"
+);
+static_assert(
+    offsetof(SchedulerState, shared_insert_completion) % 64U == 0U,
+    "shared insert completion table must remain cache-line aligned"
+);
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 static_assert(
     sizeof(SchedulerState) ==
-        1019557696ULL +
-            sizeof(SharedClaimTournamentTask) * kMaxTasks,
+        1019558208ULL +
+            sizeof(SharedClaimTournamentTask) * kMaxTasks +
+            sizeof(SharedInsertCompletionTable),
     "shared split SchedulerState ABI changed"
 );
 #else
 static_assert(
     sizeof(SchedulerState) ==
-        1019551552ULL +
-            sizeof(SharedClaimTournamentTask) * kMaxTasks,
+        1019552064ULL +
+            sizeof(SharedClaimTournamentTask) * kMaxTasks +
+            sizeof(SharedInsertCompletionTable),
     "shared non-split SchedulerState ABI changed"
 );
 #endif

@@ -908,7 +908,7 @@ PA_DEVICE ClaimOutcome Claim(
     // 独立的两级 CAS Tournament 选出唯一 owner。两种模式都保持既有
     // 候选合同：shared Alloc/QK-PV/SF-UP 分别为 96/32/64，private
     // Alloc 仍为 96。shared 的 TensorMap 严格插入顺序不由 Claim 承担，
-    // 而由 winner 后续的 deps_prepared commit chain 单独保证。
+    // 而由 winner 后续的 128B per-task completion chain 单独保证。
     // role 来自 RunSchedulerImpl 的入口 SSA 值；不能在每个 task 中再从
     // WorkerState GM 回读同一字段，否则 B256 会产生 98,304 次冗余读取。
     ClaimOutcome outcome{false, false, 0, -1};
@@ -932,7 +932,7 @@ PA_DEVICE ClaimOutcome Claim(
         // Alloc 的 96 个 worker 全部可候选；worker_id 本身就是
         // 稳定的 [0,96) rank，取模后八个 local 节点各承担
         // 12 个候选。这只改变 owner 仲裁人口，不改变后续
-        // deps_prepared 严格插入链。
+        // 128B per-task completion 严格插入链。
         candidate_rank = worker_id;
         tournament_groups =
             kSharedAllocClaimTournamentGroups;

@@ -364,6 +364,15 @@ PA_DEVICE void RecordCommittedSharedTaskWriterStats(
     stats.result.shared_symbol_inout_commits += delta.symbol_count;
 }
 
+PA_DEVICE PA_GM volatile int64_t *SharedTaskInsertCompletionAddress(
+    PA_GM SchedulerState *state, uint32_t task_id
+) {
+    return &state->shared_insert_completion
+                .slots[
+                    task_id * kA5AtomicIsolationStrideLines
+                ].value;
+}
+
 template <typename Ops>
 PA_DEVICE bool HandoffSharedTaskInsertTurn(
     PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats,
@@ -376,12 +385,14 @@ PA_DEVICE bool HandoffSharedTaskInsertTurn(
     }
     // ordinary payload 的 DCCI、symbol history/latest 与 fresh descriptor
     // 都必须先于本 task 的插入完成字对 N+1 owner 可见。每个 task 使用
-    // 自己的 TaskCell，不再把一枚 baton 在 G 条 sidecar 线上轮换。
+    // 自己的 128B 步长 completion 行，不再把一枚 baton 在 G 条
+    // sidecar 线上轮换，也不让相邻 task 合并进同一 128B 原子队列。
     Ops::StoreBarrier();
     // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - swimlane 构建走 CaptureAtomicCompareExchange；这里只是无泳道构建和隔离测试出口
     cas_observed = Ops::CompareExchange(
-        &state->tasks[static_cast<uint32_t>(task_id)]
-             .deps_prepared,
+        SharedTaskInsertCompletionAddress(
+            state, static_cast<uint32_t>(task_id)
+        ),
         static_cast<int64_t>(-1),
         static_cast<int64_t>(task_id)
     );
@@ -409,8 +420,9 @@ PA_DEVICE bool TraceHandoffSharedTaskInsertTurn(
     Ops::StoreBarrier();
     cas_observed = CaptureAtomicCompareExchange<Ops>(
         stats.trace,
-        &state->tasks[static_cast<uint32_t>(task_id)]
-             .deps_prepared,
+        SharedTaskInsertCompletionAddress(
+            state, static_cast<uint32_t>(task_id)
+        ),
         static_cast<int64_t>(-1),
         static_cast<int64_t>(task_id),
         cas_trace_begin, cas_trace_end
@@ -436,7 +448,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
 ) {
     // fresh output cell 由本 task 的唯一 Claim winner 独占，不参与
     // ordinary/symbol 的 task-ID 串行插入。先发布 descriptor，再等待
-    // predecessor；最终 deps_prepared handoff 仍同时封口两类发布。
+    // predecessor；最终 128B completion handoff 仍同时封口两类发布。
     if (state == nullptr || !context.won || context.task_id < 0 ||
         context.task_id >= static_cast<int32_t>(kMaxTasks) ||
         // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic 组合入口只供隔离测试，正式 winner 入口已使用 SharedWinnerFatalGuardLoad
@@ -507,15 +519,16 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
     }
 
     // task 0 没有前驱，直接进入有序插入段。它完成后仍必须把自己的
-    // deps_prepared 从 -1 发布为 0，供 task 1 建立真实跨核依赖。
+    // 128B completion 有效槽从 -1 发布为 0，供 task 1 建立真实跨核依赖。
     if (task_id == 0) {
         ready_observed = -1;
         return true;
     }
 
     PA_GM volatile int64_t *predecessor =
-        &state->tasks[static_cast<uint32_t>(task_id - 1)]
-             .deps_prepared;
+        SharedTaskInsertCompletionAddress(
+            state, static_cast<uint32_t>(task_id - 1)
+        );
     const uint64_t begin = Ops::Now();
     uint32_t polls = 0;
     while (true) {
@@ -726,8 +739,9 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     const uint64_t materialize_end =
         TraceTimestamp<Ops>(stats.trace, stats.result);
 
-    // 仅这一段全局串行：N>0 只等待 task[N-1].deps_prepared，随后插入
-    // N 的 ordinary/symbol writer 元数据，再发布 task[N].deps_prepared。
+    // 仅这一段全局串行：N>0 只等待 task[N-1] 的 128B completion，
+    // 随后插入 N 的 ordinary/symbol writer 元数据，再发布 task[N] 的
+    // completion 有效槽。
     // fresh output descriptor 已在 Materialize 尾部按 task-cell 独占发布；
     // 空 writer 集合也必须推进，loser 完全不参与。
     const uint64_t register_begin = materialize_end;
@@ -795,7 +809,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         );
 #endif
     // 正常路径的父区间终点依赖 CAS 返回值，表示本核已经取得
-    // task[N].deps_prepared 的发布结果；不加 DSB，也不把它解释成
+    // task[N] completion CAS 的发布结果；不加 DSB，也不把它解释成
     // N+1 已经完成读取的时刻。
     const uint64_t register_end = metadata_published
         ? TraceTimestampAfterAtomicResult<Ops>(
@@ -806,7 +820,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         pmu_context
     );
 #if !PA_BUILD_TRACE_FREE
-    // task[N].deps_prepared 已经完成 CAS handoff，下一 owner 可开始推进；
+    // task[N] completion 已经完成 CAS handoff，下一 owner 可开始推进；
     // 现在才落 history DCCI 和单次 group writer CAS 的 raw，既保留端点
     // 与事件数量，也不再让 16B 记录写入延长全局有序发布链。
     if (writer_metadata_trace.history_dcci_lines != 0) {

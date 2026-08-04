@@ -127,9 +127,10 @@ if [[ "$TENSORMAP_MODE" == "private" ]]; then
         "$binary"
     done
 else
-    # shared writer 插入完成链位于 TaskCell::deps_prepared：task 0 无前驱，
-    # task N 只等 N-1，发布时只 CAS 自己的完成字。旧 sidecar turn 全部
-    # 写入 canary 并要求零触碰；另覆盖空写、损坏值与重复发布 fatal。
+    # shared writer 插入完成链位于 standalone 尾部的 128B 步长表：task 0
+    # 无前驱，task N 只等 N-1，发布时只 CAS 自己的偶数槽完成字。奇数
+    # 隔离槽、TaskCell 旧字段和旧 sidecar turn 均作 canary；另覆盖空写、
+    # 损坏值与重复发布 fatal。
     echo "[BUILD] shared per-task insert-completion self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
@@ -246,8 +247,9 @@ else
 
     # shared Claim 使用每 task 两级 CAS Tournament：96 worker 锁定
     # 96/32/64 候选数、每组一个 root 竞争者、最终唯一 owner、重复
-    # replay 全输，并证明未来 task 不会覆盖延迟的前序 task。Claim 仍不
-    # 触碰 deps_prepared；TensorMap 顺序由独立 completion 链门槛验证。
+    # replay 全输，并证明未来 task 不会覆盖延迟的前序 task。Claim 不
+    # 触碰 TaskCell 旧完成字段或 128B 完成表；TensorMap 顺序由独立
+    # completion 链门槛验证。
     echo "[BUILD] shared Claim Tournament self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \

@@ -6434,3 +6434,157 @@ device watchdog 保留异常终止能力。CPU 新增延迟 Build 反例，完�
 该机制只依赖中央 ticket、不可变稠密计划、未发布候选不越过和单 completion
 执行排空，不依赖 PA 五段任务图；不具备这些能力的算子不能直接选择此快路。
 完整证明和逐项数据见实现过程 S6.55。
+
+### 15.54 参考 128B 原子冲突单元优化 shared same-core 热地址布局
+
+**[已保留，2026-08-04]** 本轮在 `fdwic-swimlane-deps` 的 same-core shared
+路径上，参考分支末提交 `946d2cb2` 的 A5 原子地址探针结论继续优化。该探针
+不是从 cache-line 名称推断硬件行为，而是在 A5 DIE0 Core→GM0 上直接测得：
+
+- 同一对齐 128B 冲突单元中的两个不同 64B 原子地址仍进入同一串行队列；
+- 跨过 128B 边界后可以并行重叠；
+- 128/512/1024B 间距都能隔离，没有证据支持额外的 512B bank 规则；
+- 该结论只作为当前 A5 地址布局经验，不上升为跨平台 ABI。
+
+#### 15.54.1 为什么重新验证历史 §15.16
+
+§15.16 的旧候选只定义
+`AtomicLine shared_insert_completion[kMaxTasks]`。虽然每个 task 独占一条
+64B 行，但 task N/N+1 仍然分别落在同一个 128B 冲突单元的前后半行，因而
+并没有满足本轮探针确认的地址隔离条件。旧实验只能排除“与
+`TaskCell::flag/vend` 共 64B 行”这一种假共享，不能排除相邻 task 的 128B
+原子队列冲突。因此本轮不是无证据重复已撤回方案，而是用新的物理冲突单位
+修正旧实验的自变量。
+
+冻结原始基线为本分支未改布局的 CCEC shared B256/real-compute 构建。其一份
+完整 raw 中，insert predecessor poll（site 19）有 70,858 次逻辑调用、
+21,576.752 us 全核累计包络，约 304.507 ns/call；insert completion CAS
+（site 20）为 1,280 次、428.814 us，均值 335.011 ns。该累计值是 96 核
+工作量，不可直接从 Submit 墙钟相减。
+
+#### 15.54.2 保留改动与 ABI 边界
+
+| 项目 | 旧布局 | 当前布局 | 增量与约束 |
+| --- | --- | --- | --- |
+| insert completion | `TaskCell::deps_prepared`，相邻 task 步长 64B | standalone 尾部 `SharedInsertCompletionTable::slots[2*N]`，有效地址步长 128B | 表占 557,056B；奇数槽、全部 `TaskCell::deps_prepared` 和旧 turn line 必须保持 -1 |
+| shared heap cursor | `shared_heap_cursor[shard]`，8 条相邻 64B 行 | `shared_heap_cursor[2*shard]`，8 条有效行与 8 条隔离行交错 | sidecar 增加 512B；奇数行必须保持 -1 |
+| Claim Tournament | root/local node 步长 512B | 不变 | 已跨越 128B，不重复扩张 |
+| production prefix | 真实 `TaskCell`、cursor、fatal、worker offset | 不变 | 两张新表均在完整 production prefix 之后 |
+
+insert owner 只等待前一 task 的偶数槽，完整发布 writer metadata 后再 CAS
+自己的偶数槽。host 对 active/inactive 有效槽、全部奇数槽、TaskCell 旧字段和
+旧 turn line 分别校验，避免地址公式写错后仍因最终 task 数正确而蒙混通过。
+shared heap 初始化、设备寻址、D2H 校验和日志统一经过同一逻辑 shard helper；
+有效 cursor 的终值仍精确为 8×25,821,184B。
+
+shared ABI generation 从 12 提升到 14；generation 13 对应 128B insert
+completion，generation 14 再加入 heap cursor 隔离。当前 sidecar 为
+12,435,072B；两级 Claim Tournament 为 20,054,016B；insert completion 表为
+557,056B。non-split/split `SchedulerState` 分别为
+1,040,163,136/1,040,169,280B。host/device size 握手、manifest ABI、独立
+H2D/D2H completion-table 搬运共同拒绝新旧混件。
+
+#### 15.54.3 第一步：128B insert completion 的局部与墙钟结果
+
+完整 atomic raw 对比中：
+
+| 点位 | 原始基线 | 128B completion | 变化 |
+| --- | ---: | ---: | ---: |
+| site 19 逻辑调用 | 70,858 | 79,395 | +8,537 / +12.0% |
+| site 19 全核累计 | 21,576.752 us | 21,030.139 us | -546.613 us / -2.53% |
+| site 19 每调用均值 | 304.507 ns | 264.880 ns | -39.627 ns / -13.0% |
+| site 20 调用 | 1,280 | 1,280 | 不变 |
+| site 20 全核累计 | 428.814 us | 371.489 us | -57.325 us / -13.37% |
+| 第一个 Submit 到最终 FinalDrain | 1,752.211 us | 1,746.768 us | -5.443 us |
+| 最后 Submit 到最终 FinalDrain | 77.953 us | 67.369 us | -10.584 us |
+
+site 19 的逻辑 poll 次数反而增加，但总时间和单次均值下降；这比只观察
+poll 次数更直接地支持 128B 地址冲突被解除。无泳道冻结 ELF 做 20 对正反
+交错，原始/候选中位为 1,458.956/1,456.201 us；候选胜 13/20，配对差
+median/mean/10% trimmed mean 为 -2.505/-4.113/-4.428 us。该项属于约
+0.2%～0.3% 的小收益，不把单份 raw 的尾部变化外推为固定墙钟比例。
+
+#### 15.54.4 第二步：128B heap cursor 的真实 atomic 迁移量
+
+heap cursor 的 site 16（Load）和 site 17（FetchAdd）各固定 1,024 次。
+旧布局取一份 raw；新布局连续取 5 份 raw，所有运行均为 A5 device 0、B256、
+real-compute、trace drop 0、完整 host 语义 PASS。下表“新版”使用 5 轮中位：
+
+| 指标 | 旧 64B 相邻布局 | 新 128B 有效步长 | 变化 |
+| --- | ---: | ---: | ---: |
+| site 16 累计 | 266.993 us | 264.293 us | -2.700 us |
+| site 17 累计 | 267.025 us | 258.907 us | -8.118 us |
+| site 16+17 累计 | 534.018 us | 522.586 us | -11.432 us / -2.14% |
+| site 16+17 单次均值 | 260.751 ns | 255.169 ns | -5.582 ns |
+| site 16+17 1% trimmed mean | 255.069 ns | 254.134 ns | -0.935 ns |
+| site 16+17 p95 | 343 ns | 329 ns | -14 ns |
+| site 16+17 p99 | 466 ns | 407 ns | -59 ns |
+| 大于等于 1 us 的事件 | 7 / 2,048 | 0 / 10,240 | 长尾消失 |
+
+收益主要来自长尾消减，而不是把所有普通样本整体平移；trimmed mean 只下降
+0.935 ns，不能写成每次 cursor atomic 固定节省 5.6 ns。新版五轮
+site16+17 累计范围为 520.820～526.009 us，均低于旧 raw 的 534.018 us。
+
+cursor 更快通过后，请求会更早抵达同一个 aggregate vend。site 15+18 的
+全核累计中位从 685.060 us 增到 688.186 us，即约 +3.126 us 的后级同地址
+压力；但四个 heap 原子 site 15～18 合计仍从 1,219.078 us 降至五轮中位
+1,214.195 us，净减少 4.883 us。也就是说部分时间确实迁移到 vend，但没有
+把 cursor 收益全部吃掉。
+
+无泳道 incremental A/B 以第一步为冻结底座交错 12 对：deps-only/heap-128B
+中位为 1,454.335/1,450.454 us；heap 版胜 7/12，配对差 median/mean/去掉
+一端离群后的 mean 为 -2.728/-6.088/-3.538 us。结合局部原子和墙钟方向，
+该小改动没有明确回退，按“无明确回退则保留”的裁决规则进入当前实现。
+
+#### 15.54.5 最终版相对原始分支的直接配对
+
+两项改动合并后，再用原始与最终冻结 perf-clock ELF 做 12 对正反顺序交错。
+设备未加独占锁，不能用单个最好值裁决；每次完整语义均 PASS：
+
+| pair | 原始 / us | 最终 / us | 最终减原始 / us |
+| ---: | ---: | ---: | ---: |
+| 1 | 1,467.370 | 1,444.821 | -22.549 |
+| 2 | 1,453.247 | 1,442.271 | -10.976 |
+| 3 | 1,502.565 | 1,440.165 | -62.400 |
+| 4 | 1,471.218 | 1,442.934 | -28.284 |
+| 5 | 1,467.449 | 1,447.703 | -19.746 |
+| 6 | 1,457.701 | 1,447.591 | -10.110 |
+| 7 | 1,463.327 | 1,442.550 | -20.777 |
+| 8 | 1,488.528 | 1,456.498 | -32.030 |
+| 9 | 1,464.986 | 1,465.662 | +0.676 |
+| 10 | 1,464.813 | 1,445.702 | -19.111 |
+| 11 | 1,459.653 | 1,462.236 | +2.583 |
+| 12 | 1,463.907 | 1,448.757 | -15.150 |
+
+| 汇总 | 原始 | 最终 | 变化 |
+| --- | ---: | ---: | ---: |
+| 中位 | 1,464.899 us | 1,446.646 us | -18.253 us / -1.246% |
+| 均值 | 1,468.730 us | 1,448.908 us | -19.822 us |
+| 去掉两端各一项后的均值 | 1,466.895 us | 1,448.106 us | -18.789 us |
+| 配对差 | — | 10/12 改善 | median -19.428 us，mean -19.823 us |
+
+最终整体配对的幅度明显大于两个分步实验各自约 -2.5/-2.7 us 的中位收益；
+未锁卡负载和并发调度交互会放大这类小布局改动的数值波动，因此保留结论是
+“地址隔离有局部因果证据、分步和整体墙钟方向一致”，不是承诺每轮固定减少
+19 us。最终版 fanin load 中位反而从 36,769.5 增到 37,149.5，排除了
+“恰好少轮询几百次”作为整体加速解释。
+
+#### 15.54.6 验证闭环与剩余边界
+
+- shared CPU 全量构建与 PollBatch、completion、host plan、CAP ring、trace
+  codec、output、writer intent、heap、Claim Tournament、materialize、ordered
+  Submit 定向测试全部 PASS；
+- CCEC perf-clock 与 full-swimlane AIC/AIV 编译、mixed ELF、manifest 和
+  host/device size 门槛全部 PASS；
+- A5 B256 的 1,280 task、73,728 Claim、1,024 kernel、8 路 heap cursor、
+  1,280 insert completion、全部 active/inactive/canary 终态均 PASS；
+- 当前分支公共 `swimlane_converter.py` 已按 cross-core 的 site 20
+  FetchAdd 解释 flags，而 same-core site 20 仍是 result-used CAS；因此 raw
+  采集和 host 分析成功后，公共 converter 会报 `invalid direct Atomic
+  site=20 flags=0x54`。raw 数据和设备语义不受影响，但这是既有后处理
+  身份缺口；本性能提交不在缺少实现 discriminator 的 raw schema 上猜测兼容
+  规则，也不把 merged 文件写成已通过。
+
+本轮没有扩张 production `TaskCell`，也没有改 final barrier、shared output
+cell 或 ordinary ring。后者即使存在相邻 64B 原子行，也需要先证明同一时段
+确有跨核并发访问；不能仅凭结构体相邻就继续批量填充 64B padding。

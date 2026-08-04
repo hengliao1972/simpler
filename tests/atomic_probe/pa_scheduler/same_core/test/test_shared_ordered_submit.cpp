@@ -327,16 +327,19 @@ struct OrderedSubmitTestOps {
             reinterpret_cast<uintptr_t>(address);
         const uintptr_t begin =
             reinterpret_cast<uintptr_t>(
-                &observed_state->tasks[0].deps_prepared
+                &observed_state->shared_insert_completion
+                     .slots[0].value
             );
         if (current < begin) {
             return -1;
         }
         const uintptr_t delta = current - begin;
-        if (delta % sizeof(TaskCell) != 0) {
+        constexpr uintptr_t kCompletionStride =
+            sizeof(AtomicLine) * 2U;
+        if (delta % kCompletionStride != 0) {
             return -1;
         }
-        const uintptr_t task = delta / sizeof(TaskCell);
+        const uintptr_t task = delta / kCompletionStride;
         return task < kMaxTasks
             ? static_cast<int32_t>(task)
             : -1;
@@ -712,8 +715,13 @@ bool ClaimAndInsertEvidenceMatches(
                          : -1);
             }
             exact &=
-                state.tasks[task_id].deps_prepared ==
+                state.shared_insert_completion
+                        .slots[task_id * 2U].value ==
                 static_cast<int64_t>(task_id);
+            exact &=
+                state.shared_insert_completion
+                        .slots[task_id * 2U + 1U].value == -1 &&
+                state.tasks[task_id].deps_prepared == -1;
             exact &=
                 OrderedSubmitTestOps::
                     completion_cas_by_task[task_id]
@@ -884,6 +892,8 @@ bool RunLoserZeroTensorMapAccessTest() {
         stats.result.submits == 1 &&
         stats.declared_task_count == 0 &&
         turns_unchanged &&
+        state->shared_insert_completion
+                .slots[kTask * 2U].value == -1 &&
         state->tasks[kTask].deps_prepared == -1 &&
         OrderedSubmitTestOps::shared_map_accesses.load(
             std::memory_order_relaxed
@@ -1295,6 +1305,8 @@ bool RunPaUpWriterShapeContractTest() {
         non_up_empty_ok && up_empty_rejected &&
         state->fatal.value == 1 &&
         state->shared_map.writer_history[kTask].magic == 0 &&
+        state->shared_insert_completion
+                .slots[kTask * 2U].value == -1 &&
         state->tasks[kTask].deps_prepared == -1;
     std::printf(
         "[ORDERED_SUBMIT] pa_up_writer_shape_contract=%s\n",
@@ -1360,8 +1372,13 @@ bool RunInsertReleaseBeforeBuildTest() {
     for (uint32_t task = 0; task < kTaskCount; ++task) {
         all_tasks_ready &= state->tasks[task].flag == 1;
         claim_cells_match &=
-            state->tasks[task].deps_prepared ==
+            state->shared_insert_completion
+                    .slots[task * 2U].value ==
             static_cast<int64_t>(task);
+        claim_cells_match &=
+            state->shared_insert_completion
+                    .slots[task * 2U + 1U].value == -1 &&
+            state->tasks[task].deps_prepared == -1;
     }
     // 正式 PA 将三个 lockstep accumulator 的 latest 收敛为 slot0 的
     // group word；slot1/2 保持 Alloc producer，供 generic slot-specific

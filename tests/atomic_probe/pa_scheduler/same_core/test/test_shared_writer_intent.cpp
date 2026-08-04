@@ -207,6 +207,10 @@ void ResetProtocolState(SchedulerState &state) {
     }
     for (uint32_t task = 0; task < kMaxTasks; ++task) {
         state.tasks[task].deps_prepared = -1;
+        state.shared_insert_completion
+            .slots[task * 2U].value = -1;
+        state.shared_insert_completion
+            .slots[task * 2U + 1U].value = -1;
         SharedOutputCell &outputs =
             state.shared_map.shared_outputs[task];
         for (uint32_t output = 0;
@@ -228,7 +232,8 @@ void SetInsertCompletionsAfterTasks(
 ) {
     for (uint32_t task = 0; task < completed_tasks;
          ++task) {
-        state.tasks[task].deps_prepared =
+        state.shared_insert_completion
+            .slots[task * 2U].value =
             static_cast<int64_t>(task);
     }
 }
@@ -239,14 +244,19 @@ bool InsertCompletionsMatch(
     for (uint32_t task = 0; task < completed_tasks;
          ++task) {
         if (WriterIntentTestOps::Load(
-                &state.tasks[task].deps_prepared
-            ) != static_cast<int64_t>(task)) {
+                &state.shared_insert_completion
+                     .slots[task * 2U].value
+            ) != static_cast<int64_t>(task) ||
+            state.shared_insert_completion
+                    .slots[task * 2U + 1U].value != -1 ||
+            state.tasks[task].deps_prepared != -1) {
             return false;
         }
     }
     if (completed_tasks < kMaxTasks &&
         WriterIntentTestOps::Load(
-            &state.tasks[completed_tasks].deps_prepared
+            &state.shared_insert_completion
+                 .slots[completed_tasks * 2U].value
         ) != -1) {
         return false;
     }
@@ -267,6 +277,10 @@ bool InsertCompletionsMatch(
 void ResetTaskGate(SchedulerState &state, int32_t task_id) {
     state.tasks[static_cast<uint32_t>(task_id)].flag = 0;
     state.tasks[static_cast<uint32_t>(task_id)].deps_prepared = -1;
+    state.shared_insert_completion
+        .slots[static_cast<uint32_t>(task_id) * 2U].value = -1;
+    state.shared_insert_completion
+        .slots[static_cast<uint32_t>(task_id) * 2U + 1U].value = -1;
 }
 
 TensorDesc MakeTensor(
@@ -2016,7 +2030,7 @@ void TestCommitStatsRequireCompletionCas(
 
     // metadata 可以完整落地，但 task-level completion CAS 必须因非法旧值
     // 失败。成功统计只描述完成事务，不能把这个 terminal 前缀算进去。
-    state.tasks[1].deps_prepared = 77;
+    state.shared_insert_completion.slots[2].value = 77;
     const uint32_t bucket = TensorMapHash(ordinary.buffer_addr);
     Check(
         !PublishSharedTaskWriterDelta<WriterIntentTestOps>(
@@ -2026,7 +2040,8 @@ void TestCommitStatsRequireCompletionCas(
     );
     Check(
         state.fatal.value == 1 &&
-            state.tasks[1].deps_prepared == 77 &&
+            state.shared_insert_completion.slots[2].value == 77 &&
+            state.tasks[1].deps_prepared == -1 &&
             state.shared_map.buckets[bucket].tail.value == 1 &&
             symbol.last_writer[0].value == 1 &&
             state.shared_map.writer_history[1].count == 1 &&

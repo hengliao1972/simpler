@@ -1994,9 +1994,9 @@ int main(int argc, char **argv) {
         }
 #endif
 #if PTO_FDWIC_SHARED_MAP
-        // shared map 与 Claim Tournament 位于 results 之后，不能扩大
-        // ControlBytes 或把它们混入每核结果范围；两次初始化搬运都发生
-        // 在 launch 计时开始之前。
+        // shared map、Claim Tournament 与 128B 完成链位于 results 之后，
+        // 不能扩大 ControlBytes 或把它们混入每核结果范围；三次初始化
+        // 搬运都发生在 launch 计时开始之前。
         if (!CheckAcl(
                 aclrtMemcpy(
                     &static_cast<pa_scheduler::SchedulerState *>(state_device)->shared_map,
@@ -2014,6 +2014,16 @@ int main(int argc, char **argv) {
                     ACL_MEMCPY_HOST_TO_DEVICE
                 ),
                 "aclrtMemcpy(H2D shared Claim Tournament)"
+            ) ||
+            !CheckAcl(
+                aclrtMemcpy(
+                    &static_cast<pa_scheduler::SchedulerState *>(state_device)->shared_insert_completion,
+                    pa_scheduler::host::SharedInsertCompletionBytes(),
+                    &state->shared_insert_completion,
+                    pa_scheduler::host::SharedInsertCompletionBytes(),
+                    ACL_MEMCPY_HOST_TO_DEVICE
+                ),
+                "aclrtMemcpy(H2D shared 128B insert completion)"
             )) {
             execution_ok = false;
             break;
@@ -2086,6 +2096,16 @@ int main(int argc, char **argv) {
                     ACL_MEMCPY_DEVICE_TO_HOST
                 ),
                 "aclrtMemcpy(D2H shared Claim Tournament)"
+            ) ||
+            !CheckAcl(
+                aclrtMemcpy(
+                    &state->shared_insert_completion,
+                    pa_scheduler::host::SharedInsertCompletionBytes(),
+                    &static_cast<pa_scheduler::SchedulerState *>(state_device)->shared_insert_completion,
+                    pa_scheduler::host::SharedInsertCompletionBytes(),
+                    ACL_MEMCPY_DEVICE_TO_HOST
+                ),
+                "aclrtMemcpy(D2H shared 128B insert completion)"
             )) {
             execution_ok = false;
             break;

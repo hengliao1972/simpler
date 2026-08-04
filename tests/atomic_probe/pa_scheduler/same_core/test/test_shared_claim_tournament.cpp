@@ -225,6 +225,10 @@ void ResetTournamentTask(
         &state.claim_tournament[task_id], 0xff,
         sizeof(state.claim_tournament[task_id])
     );
+    state.shared_insert_completion
+        .slots[task_id * 2U].value = -1;
+    state.shared_insert_completion
+        .slots[task_id * 2U + 1U].value = -1;
     state.tasks[task_id].deps_prepared = -1;
 }
 
@@ -348,6 +352,10 @@ bool RunConcurrentClaim(
         root_attempts == expected_root_attempts &&
         physical_cas == expected_physical_cas &&
         TournamentStateMatches(state, task_id, kind) &&
+        state.shared_insert_completion
+                .slots[task_id * 2U].value == -1 &&
+        state.shared_insert_completion
+                .slots[task_id * 2U + 1U].value == -1 &&
         state.tasks[task_id].deps_prepared == -1 &&
         state.fatal.value == 0;
 }
@@ -381,7 +389,7 @@ void TestAllTaskKindsAndReplay() {
     Check(
         exact,
         "all task kinds preserve 96/32/64 candidates, exact-one "
-        "owner, immediate replay losers, untouched deps_prepared, "
+        "owner, immediate replay losers, untouched completion state, "
         "and untouched legacy cursors"
     );
     (void)munmap(state, sizeof(*state));
@@ -416,11 +424,15 @@ void TestFutureTaskCannotOverwriteDelayedTask() {
             TournamentStateMatches(
                 *state, kEarlierTask, TaskKind::Up
             ) &&
+            state->shared_insert_completion
+                    .slots[kEarlierTask * 2U].value == -1 &&
+            state->shared_insert_completion
+                    .slots[kFutureTask * 2U].value == -1 &&
             state->tasks[kEarlierTask].deps_prepared == -1 &&
             state->tasks[kFutureTask].deps_prepared == -1 &&
             LegacyCursorsMatch(*state, legacy),
         "future task election cannot overwrite a delayed earlier task; "
-        "TensorMap order remains delegated to deps_prepared"
+        "TensorMap order remains delegated to the 128B completion table"
     );
     (void)munmap(state, sizeof(*state));
 }

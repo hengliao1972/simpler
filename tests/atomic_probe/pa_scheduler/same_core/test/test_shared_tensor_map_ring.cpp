@@ -66,7 +66,7 @@ static_assert(offsetof(SharedRegionSlot, seq) == 64, "shared seq cache line offs
 static_assert(sizeof(SharedBucketState) == 128, "shared bucket control ABI changed");
 static_assert(offsetof(SharedBucketState, tail) == 64, "shared head/tail cache lines merged");
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
-static_assert(sizeof(SharedTensorMapSidecar) == 12434560, "shared sidecar ABI changed");
+static_assert(sizeof(SharedTensorMapSidecar) == 12435072, "shared sidecar ABI changed");
 #endif
 static_assert(alignof(SharedTensorMapSidecar) == 64, "shared sidecar alignment changed");
 static_assert(offsetof(SharedTensorMapSidecar, buckets) == 128, "shared bucket offset changed");
@@ -94,19 +94,19 @@ static_assert(offsetof(SharedTensorMapSidecar, slots) == 16512, "default shared 
 static_assert(offsetof(SharedTensorMapSidecar, shared_outputs) == 2113664, "default shared output offset changed");
 static_assert(offsetof(SharedTensorMapSidecar, shared_heap_cursor) == 11026560, "default shared heap offset changed");
 static_assert(
-    offsetof(SharedTensorMapSidecar, shared_heap_vend) == 11027072,
+    offsetof(SharedTensorMapSidecar, shared_heap_vend) == 11027584,
     "default shared heap vend offset changed"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 11027136,
+    offsetof(SharedTensorMapSidecar, shared_vector_cursor) == 11027648,
     "default shared Vector cursor offset changed"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, writer_history) == 11027648,
+    offsetof(SharedTensorMapSidecar, writer_history) == 11028160,
     "default shared writer-history offset changed"
 );
 static_assert(
-    offsetof(SharedTensorMapSidecar, reader_done) == 12420288,
+    offsetof(SharedTensorMapSidecar, reader_done) == 12420800,
     "default shared reader-progress offset changed"
 );
 #endif

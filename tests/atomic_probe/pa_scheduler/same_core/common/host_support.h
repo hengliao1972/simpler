@@ -39,6 +39,22 @@ constexpr uint32_t kHostPaBlocksPerRequest = 64;
 constexpr uint32_t kHostSharedPaMaxContextLength =
     kSharedPaMaxBlockGroups * kHostPaBlocksPerRequest *
     kHostPaBlockSize;
+
+inline AtomicLine &SharedHeapCursorLineHost(
+    SharedTensorMapSidecar &map, uint32_t shard
+) {
+    return map.shared_heap_cursor[
+        shard * kA5AtomicIsolationStrideLines
+    ];
+}
+
+inline const AtomicLine &SharedHeapCursorLineHost(
+    const SharedTensorMapSidecar &map, uint32_t shard
+) {
+    return map.shared_heap_cursor[
+        shard * kA5AtomicIsolationStrideLines
+    ];
+}
 #endif
 
 // 三种后端共用同一套命令行配置，保证 CPU 语义回归与 A5 上板使用完全相同的工作量。
@@ -765,7 +781,11 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     // shared heap 允许不同 winner 并发推进分片 cursor 与 aggregate vend；
     // 每轮仍必须从绝对零点开始，不能继承上一轮 sidecar 的终态。
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
-        state->shared_map.shared_heap_cursor[shard].value = 0;
+        SharedHeapCursorLineHost(state->shared_map, shard).value = 0;
+        state->shared_map
+            .shared_heap_cursor[
+                shard * kA5AtomicIsolationStrideLines + 1U
+            ].value = -1;
     }
     state->shared_map.shared_heap_vend.value = 0;
     // 旧 shared Vector cursor 已退出 owner 仲裁，但继续作为 canary 保留
@@ -784,6 +804,12 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     std::memset(
         state->claim_tournament, 0xff,
         sizeof(state->claim_tournament)
+    );
+    // 完成链只使用偶数槽；整表置 -1 让奇数隔离槽也成为可校验的
+    // 地址计算 canary，并保证每轮不会继承上次执行结果。
+    std::memset(
+        &state->shared_insert_completion, 0xff,
+        sizeof(state->shared_insert_completion)
     );
 #endif
     state->heap_window = kHeapWindow;
@@ -1021,7 +1047,7 @@ inline constexpr size_t ResultBytes() { return sizeof(WorkerResult) * kWorkers; 
 
 inline constexpr size_t SharedSidecarBytes() { return sizeof(SharedTensorMapSidecar); }
 #if PTO_FDWIC_SHARED_MAP
-static_assert(SharedSidecarBytes() == 12434560, "shared TensorMap transfer size changed");
+static_assert(SharedSidecarBytes() == 12435072, "shared TensorMap transfer size changed");
 #else
 static_assert(SharedSidecarBytes() == 2113664, "private TensorMap transfer size changed");
 #endif
@@ -1033,6 +1059,14 @@ inline constexpr size_t SharedClaimTournamentBytes() {
 static_assert(
     SharedClaimTournamentBytes() == 20054016,
     "shared Claim Tournament transfer size changed"
+);
+
+inline constexpr size_t SharedInsertCompletionBytes() {
+    return sizeof(SharedInsertCompletionTable);
+}
+static_assert(
+    SharedInsertCompletionBytes() == 557056,
+    "shared insert-completion transfer size changed"
 );
 #endif
 
@@ -4095,27 +4129,42 @@ inline Metrics Validate(
     }
 #if PTO_FDWIC_SHARED_MAP
     bool shared_heap_state_ok = shared_heap_capacity_ok;
-    // 每个实际回放 task 的插入完成字最终必须恰好保存自己的 task_id；
-    // 未使用的 TaskCell 必须继续保持 -1。
+    // 每个实际回放 task 的 128B 步长完成字最终必须恰好保存自己的
+    // task_id；未使用有效槽、全部奇数隔离槽以及 production-prefix
+    // TaskCell 旧字段都必须继续保持 -1。
     bool shared_per_task_insert_completions_ok = true;
-    for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
+    for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
         const SharedHostPlannedTask *planned_task =
-            shared_plan.TaskAt(task_id);
+            task_id < task_count
+                ? shared_plan.TaskAt(task_id)
+                : nullptr;
+        const int64_t expected_completion =
+            task_id < task_count
+                ? static_cast<int64_t>(task_id)
+                : -1;
         shared_per_task_insert_completions_ok &=
-            planned_task != nullptr &&
-            state.tasks[task_id].deps_prepared ==
-                static_cast<int64_t>(task_id);
-    }
-    for (uint32_t task_id = task_count;
-         task_id < kMaxTasks; ++task_id) {
-        shared_per_task_insert_completions_ok &=
+            (task_id >= task_count || planned_task != nullptr) &&
+            state.shared_insert_completion
+                    .slots[
+                        task_id * kA5AtomicIsolationStrideLines
+                    ].value ==
+                expected_completion &&
+            state.shared_insert_completion
+                    .slots[
+                        task_id * kA5AtomicIsolationStrideLines + 1U
+                    ].value == -1 &&
             state.tasks[task_id].deps_prepared == -1;
     }
     uint64_t actual_shared_cursor_sum = 0;
     uint64_t expected_shared_cursor_sum = 0;
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
         const int64_t raw_cursor =
-            state.shared_map.shared_heap_cursor[shard].value;
+            SharedHeapCursorLineHost(state.shared_map, shard).value;
+        shared_heap_state_ok &=
+            state.shared_map
+                    .shared_heap_cursor[
+                        shard * kA5AtomicIsolationStrideLines + 1U
+                    ].value == -1;
         shared_heap_state_ok &= raw_cursor >= 0;
         const uint64_t actual_cursor =
             raw_cursor < 0 ? 0 : static_cast<uint64_t>(raw_cursor);
@@ -4185,7 +4234,7 @@ inline Metrics Validate(
         shared_output_validation.allocated_bytes == actual_shared_vend;
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
         const int64_t raw_cursor =
-            state.shared_map.shared_heap_cursor[shard].value;
+            SharedHeapCursorLineHost(state.shared_map, shard).value;
         shared_output_heap_layout_ok &=
             shared_output_validation.shard_bytes[shard] ==
                 expected_shared_heap_cursor[shard] &&
@@ -4665,7 +4714,7 @@ inline Metrics Validate(
     );
     Expect(
         shared_per_task_insert_completions_ok,
-        "shared per-task insert-completion words reach exact task ids",
+        "shared 128B insert-completion words are exact and isolation canaries stay untouched",
         &metrics
     );
 #else
@@ -4825,7 +4874,7 @@ inline Metrics Validate(
         std::printf(
             "%s%lld", shard == 0 ? "" : ",",
             static_cast<long long>(
-                state.shared_map.shared_heap_cursor[shard].value
+                SharedHeapCursorLineHost(state.shared_map, shard).value
             )
         );
     }
@@ -4861,7 +4910,7 @@ inline Metrics Validate(
         &metrics
     );
     std::printf(
-        "[TENSORMAP] mode=shared insert_order=per_task_deps_prepared "
+        "[TENSORMAP] mode=shared insert_order=per_task_128b_completion "
         "completed_tasks=%u legacy_turns=[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld] "
         "reclaim_upto=%lld "
         "region_appends=%llu region_physical=%llu region_logical=%llu "
@@ -5377,14 +5426,14 @@ inline Metrics Validate(
             first_not_ready, first_bad_vend,
             static_cast<unsigned long long>(first_bad_vend_minimum),
             static_cast<unsigned long long>(first_bad_vend_actual),
-            static_cast<long long>(state.shared_map.shared_heap_cursor[0].value),
-            static_cast<long long>(state.shared_map.shared_heap_cursor[1].value),
-            static_cast<long long>(state.shared_map.shared_heap_cursor[2].value),
-            static_cast<long long>(state.shared_map.shared_heap_cursor[3].value),
-            static_cast<long long>(state.shared_map.shared_heap_cursor[4].value),
-            static_cast<long long>(state.shared_map.shared_heap_cursor[5].value),
-            static_cast<long long>(state.shared_map.shared_heap_cursor[6].value),
-            static_cast<long long>(state.shared_map.shared_heap_cursor[7].value),
+            static_cast<long long>(SharedHeapCursorLineHost(state.shared_map, 0).value),
+            static_cast<long long>(SharedHeapCursorLineHost(state.shared_map, 1).value),
+            static_cast<long long>(SharedHeapCursorLineHost(state.shared_map, 2).value),
+            static_cast<long long>(SharedHeapCursorLineHost(state.shared_map, 3).value),
+            static_cast<long long>(SharedHeapCursorLineHost(state.shared_map, 4).value),
+            static_cast<long long>(SharedHeapCursorLineHost(state.shared_map, 5).value),
+            static_cast<long long>(SharedHeapCursorLineHost(state.shared_map, 6).value),
+            static_cast<long long>(SharedHeapCursorLineHost(state.shared_map, 7).value),
             static_cast<long long>(state.shared_map.shared_heap_vend.value),
             static_cast<unsigned long long>(shared_heap_shard_span),
             shared_heap_capacity_ok ? 1 : 0,

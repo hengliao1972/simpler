@@ -100,7 +100,7 @@ HeapSnapshot Snapshot(const Fixture &fixture) {
     HeapSnapshot snapshot{};
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
         snapshot.cursor[shard] =
-            fixture.map->shared_heap_cursor[shard].value;
+            SharedHeapCursorLine(*fixture.map, shard).value;
     }
     snapshot.vend = fixture.map->shared_heap_vend.value;
     snapshot.worker_heap_next = fixture.worker->heap_next;
@@ -111,7 +111,7 @@ bool SameSnapshot(
     const Fixture &fixture, const HeapSnapshot &expected
 ) {
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
-        if (fixture.map->shared_heap_cursor[shard].value !=
+        if (SharedHeapCursorLine(*fixture.map, shard).value !=
             expected.cursor[shard]) {
             return false;
         }
@@ -151,7 +151,7 @@ void TestValidQkMaterialize() {
     const uint64_t shard_span =
         SharedHeapAlignDown(kHeapBytes / kSharedHeapShards);
     Check(
-        fixture.map->shared_heap_cursor[1].value ==
+        SharedHeapCursorLine(*fixture.map, 1).value ==
             static_cast<int64_t>(bytes),
         "valid QK advances only shard one"
     );
