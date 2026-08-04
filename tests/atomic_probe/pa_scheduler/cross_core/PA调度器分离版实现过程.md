@@ -3005,3 +3005,31 @@ candidate mean   改善 0.025497 ms / 1.742%
 目标点位从 1280 次降为 0。这组新证据满足当前的正确性合同与
 完整周期性能门槛，因此将该历史回撤项重新恢复。改善不按泳道
 Atomic 聚合核时推算，也不声称能与历史 S6.34 的旧底座数据直接相减。
+
+## 2026-08-04：S6.47 用完整周期复审 Fanin 发布位回读（仍不保留）
+
+S6.41 利用严格插入 completion 链已传递 producer output 发布顺序的
+事实，在可信 ordered/latest-writer 实例中省略
+`SharedFaninOutputPublishedLoad`，曾从 2048 次降为 0。这一正确性论证
+仍成立，且不会删除真正决定依赖的 last-writer/history/fanin 检查。
+但它在 S6.41 旧底座上已回退，本轮必须用最新 S6.46 底座和完整
+startup 到 FinalDrain 口径重新独立裁决。
+
+候选的 CPU 完整协议回归和 CCEC perf-clock 构建 PASS。以提交
+`253a2e8a` 冻结基线，按 B-C/C-B 交错各运行 12 个独立 A5 B256
+trace-free 进程：
+
+```text
+S6.46 frozen baseline: min / median / max / mean
+                       1.402488 / 1.434364 / 1.452503 / 1.430565 ms
+S6.47 candidate      : min / median / max / mean
+                       1.417571 / 1.436281 / 1.486135 / 1.438867 ms
+candidate median 回退 0.001917 ms / 0.134%
+candidate mean   回退 0.008302 ms / 0.580%
+```
+
+候选只有 6/12 对更快，中位数和均值都没有改善。这与 S6.41 的
+旧证据同向：形式上减少 2048 次返回型读取，仍不等于全局关键路径
+受益。候选代码已完整撤回，正式 ordered Fanin 继续显式确认 output
+publication。该结果不否定 completion 链的内存顺序论证，只是否决它在
+当前机器码和并发相位下的性能保留价值。
