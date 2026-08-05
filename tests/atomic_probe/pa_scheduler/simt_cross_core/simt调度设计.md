@@ -37,7 +37,7 @@ builder 与 executor 必须严格分工：
 | 12 | launch 形态由实现查证决定；本设计选择一次 mixed kernel launch 为主路线。 |
 | 13 | 不再使用容易混淆的 `block0/block1`，统一称为 AIV0/AIV1。 |
 | 14 | 不产生对 `cross_core` 或 `ops-nn` 的源码依赖；公共泳道解析工具可按需调用。 |
-| 15 | 状态机与 `cross_core` 一致；GM 路径不做 DCCI，UBUF 路径自行管理 UB 和 MTE3。 |
+| 15 | 状态机与 `cross_core` 一致；GM 是否需要 DCCI 先由最小 A5 对照实验决定，UBUF 路径自行管理 UB 和 MTE3。 |
 | 16 | 单 Vector/Cube 阶段使用可校验的最小任务，不直接搬入完整 PA 计算。 |
 | 17 | 完整 PA 阶段只替换构建侧，原有 task DAG 和 task 数量保持不变。 |
 | 18 | `gm/` 与 `ubuf/` 分目录长期保留。 |
@@ -144,6 +144,10 @@ GM 与 UBUF 两条路径都保留同一共享终态：
 
 control、fatal 和 drain word 使用独立 atomic-only cacheline；普通 payload
 不得与原子控制字共行。Claim loser 不读取 payload，也不执行可见性操作。
+`BUILDING` 只保留 builder owner 与 task id，executor 为 unbound，engine 为
+`None`，payload lines 为 0；engine 与非零 payload lines 只能随 `BUILT` 一起
+发布，executor owner 只能从 `CLAIMED` 开始绑定。decoder 对每个 phase 分别
+校验，任何提前发布或畸形组合都 fail-closed。
 
 ### 3.2 GM 直接构建路径
 
@@ -160,10 +164,15 @@ SIMT 64-bit CAS 取得 BUILDING
   -> SIMT 64-bit CAS 发布 BUILT
 ```
 
-按已对齐要求，该路径不执行 DCCI。`thread fence` 只建立 SIMT 普通 GM store
-先于发布 CAS 的顺序，不等价于 DCCI。它是否足以让 AIC/AIV Main Scalar 在
-跨核、重复 launch、地址复用场景稳定读取新 payload，必须由最小 A5 探针
-证明；在证明前不能接入完整 PA。
+`thread fence` 只建立 SIMT 普通 GM store 先于发布 CAS 的顺序，不能先验地
+等价为 DCCI，也不能先验地断言 GM 路径一定不需要 DCCI。S0/S1 先用同一地址
+重复复用的最小 A5 探针对照以下四种可见性组合：writer/reader 都不做 DCCI、
+SIMT writer 做单行 DCCI、Claim winner 做 payload 单行 DCCI、两侧都做。随后
+还要分别覆盖 AIV0 到其他 AIV、AIV0 到 AIC 的跨核读取。
+
+正式 GM 路径只采用硬件证据支持的最小序列：如果无 DCCI 组合在重复 launch、
+地址复用和两类跨核方向都稳定通过，则保留纯 thread-fence 路径；如果失败，
+就保留能闭合正确性的最小 writer/reader DCCI，不能为了减少指令而省略。
 
 ### 3.3 UBUF 构建路径
 
@@ -294,7 +303,7 @@ G0、G1、U2 至少检查：
 
 - AIV ELF 被标记为 SIMT-only，或出现额外全局 SIMT entry；
 - 无法证明 `async_invoke` 后的可靠完成边界；
-- GM 无 DCCI 路径出现旧 payload、部分 payload 或重复 launch 不稳定；
+- GM 的所有候选可见性序列都出现旧 payload、部分 payload或重复 launch 不稳定；
 - 64-bit SIMT CAS 与 Main Scalar CAS 对同一 control 的结果不一致；
 - UBUF slot 在 MTE3 完成前被复用，或 UB 预算侵占最小 Data Cache；
 - builder 执行 task、executor 构建 task，或 host 只能靠推断而不能取证；

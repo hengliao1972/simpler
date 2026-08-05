@@ -85,6 +85,12 @@ launch 方式在需求对齐时没有现成答案，用户授权根据查证结�
 7. 现有 `cross_core` 的 CPU 模型、CCEC 混合 ELF、host oracle 和构建产物
    检查方式可以参考，但新目录必须重新形成独立源码闭包。
 
+逐字段核对还确认了 phase 约束：`BUILDING` 只有合法 builder owner 和 task id，
+executor 必须为 unbound，engine 必须为 `None`，payload lines 必须为 0；只有
+`BUILT` 才发布非空 engine 和 1～68 条 payload line。`CLAIMED/DONE` 才允许
+绑定合法 executor owner。S0 的独立 decoder 按这套约束 fail-closed，而不是
+只检查字段位宽。
+
 `docs/investigations/` 没有发现已经否决“固定 AIV 上 SIMT 构建 task”的记录。
 已有 Case1 性能调查提醒：standalone 与真实 PA 不等价，不能在正确性机制尚未
 闭合时用单个时延数字驱动微优化。本路线因此先做协议和完整 PA golden，
@@ -139,7 +145,8 @@ SIMT 至少需要 32 KB Data Cache。示例还展示了 SIMT 写 UBUF、建立�
 
 1. AIV entry 发起真实 SIMT VF 后，哪一组 V/S event 能可靠证明 VF 完成；
 2. SIMT 普通 GM store、thread fence、64-bit CAS 发布后，其他 AIC/AIV
-   Main Scalar 是否能在完全无 DCCI 的情况下稳定读取新 payload；
+   Main Scalar 是否能稳定读取新 payload；writer/reader 哪一侧需要 DCCI
+   不能预设，由四组最小对照决定；
 3. 上述 GM 可见性在多次 kernel launch、复用同一地址时是否仍成立；
 4. SIMT 64-bit CAS 与 Main Scalar 64-bit CAS 竞争同一 control 时的返回值
    和全序是否一致；
@@ -177,12 +184,203 @@ S0 将在同一阶段建立独立 portable ABI、CPU 受控交错和最小 CCEC 
 timeout，不模拟 A5 cache 或 SIMT 指令时延；CCEC 和真实 A5 部分负责证明
 SIMT 线程、GM 写入与完成边界。S0 通过并提交后自动进入单 Vector task。
 
-## 3. 阶段状态索引
+## 3. 2026-08-05：S0 基础协议与 SIMT 自检
+
+### 3.1 目标、范围与需求校正
+
+S0 只回答两类问题：portable CPU 状态机是否闭合；AIV0 能否用直接 CCEC
+发起 64-thread SIMT VF，并完成 GM 写入、64-bit CAS、V/S completion 和
+Main Scalar 领取。S0 使用单 AIV launch，不包含真实 Vector/Cube task，也不
+对跨 AIV、跨 AIC 可见性下结论。
+
+开发过程中用户进一步指出，GM 经过 Data Cache 时不能先验地断言“不需要
+DCCI”。本阶段据此把原设计中的绝对口径改为四组硬件对照：
+
+| 模式 | SIMT writer payload DCCI | Claim winner payload DCCI |
+| --- | --- | --- |
+| `NO_DCCI` | 无 | 无 |
+| `WRITER_DCCI` | 有 | 无 |
+| `READER_DCCI` | 无 | 有 |
+| `WRITER_AND_READER_DCCI` | 有 | 有 |
+
+四种模式共用一份 kernel 机器码和同一 GM 地址。每次 launch 更换 nonce 并由
+host 重置整个状态，专门暴露冷 cache 首轮成功、地址复用后读旧值这一类问题。
+只有在全部重复轮次通过的模式才有资格成为后续协议候选；候选模式失败是
+实验结论，不会被误报成探针框架失败。
+
+### 3.2 修改文件与独立源码闭包
+
+新增：
+
+- `common/shared_protocol.h`：独立定义与 `cross_core` 数值一致的
+  `EMPTY -> BUILDING -> BUILT -> CLAIMED -> DONE` 64-bit control 编码，
+  以及首错 fatal 编码；
+- `protocol_probe/common/s0_probe.h`：64 B 对齐的 S0 host/device ABI、
+  四种 DCCI 模式、固定 payload/thread oracle；
+- `protocol_probe/test/test_s0_protocol.cpp`：CPU 受控半包交错、16 actor
+  Claim 竞争、首错 fatal 和有界 timeout；
+- `protocol_probe/cpu/build.sh`：optimized、ASan/UBSan、TSan 三套构建；
+- `protocol_probe/ccec/kernel.cpp`：AIV0 Main Scalar、内部 SIMT VF、GM
+  可见性矩阵和 `st_dev` 结果发布；
+- `protocol_probe/ccec/host.cpp`：独立 ACL loader、重复地址复用、四模式
+  分类和 SoC 身份校验；
+- `protocol_probe/ccec/build.sh`：CCEC、bitcode inventory、ELF metadata、
+  symbol 和 ACL host 构建门槛；
+- `run.sh`：S0 的统一 build/run 入口。
+
+修改：
+
+- `simt调度设计.md`：把“GM 不做 DCCI”修正为“小 case 先决定最小
+  writer/reader DCCI”；
+- 本过程文档：记录实际构建和 A5 结果。
+
+所有新增源码都位于 `simt_cross_core/`。构建脚本扫描 C/C++ include，确认
+没有 include `cross_core` 或本机 `ops-nn` 源码；PTO metadata、CCEC builtin、
+SIMT API 和 ACL 是工具链依赖，不是其他调度实现的源码依赖。
+
+### 3.3 CPU 命令与结果
+
+统一命令：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-s0
+```
+
+其中 CPU 部分得到：
+
+```text
+[PASS] S0 CPU protocol rounds=128: half-packet hidden, unique claim,
+       first fatal and bounded timeout
+[PASS] S0 CPU protocol rounds=64:  ASan+UBSan
+[PASS] S0 CPU protocol rounds=32:  TSan
+```
+
+CPU oracle 使用显式暂停点让 builder 在写完 4/8 payload word 后停住，确认：
+
+1. control 保持 `BUILDING` 时 executor 不得 Claim，payload read 计数为 0；
+2. 第二个 builder 的 `EMPTY -> BUILDING` CAS 失败且不能改写半包；
+3. 发布 `BUILT` 后 16 个并发 executor 只有一个 Claim winner；
+4. winner 精确读取 8 个 word 并发布 `DONE`，15 个 loser 不读 payload；
+5. 8 个 fatal reporter 只有一个成功发布可解码的首错；
+6. 固定 64 次 poll 能返回 timeout，不使用无界死循环。
+7. phase-specific decoder 拒绝 `BUILDING` 提前携带 engine/payload、`BUILT`
+   提前绑定 executor、`DONE` 未绑定 executor、payload 超过 68 line 和保留位
+   非零等畸形状态。
+
+CPU 只证明 C++ 内存模型下的协议角色和状态转换，不模拟 A5 DCache、SIMT
+指令时延或跨核可见性。
+
+### 3.4 CCEC、bitcode 与 ELF 静态结果
+
+CCEC 使用 `dav-c310-vec`，并显式关闭 compiler 自动 scalar DCCI 和
+kernel-end DCCI。构建脚本检查并得到：
+
+```text
+[CHECK] S0 source closure and publication sequence
+[CHECK] bitcode contains SIMT launch, 64-bit CAS, fence, DCCI matrix
+        and V/S completion intrinsics
+[CHECK] ELF exports only AIV Main entry; SIMT entry is local;
+        metadata is MIX_AIV_MAIN [0:1]
+```
+
+具体证据为：
+
+- source publication 顺序固定为 payload stores、可选 writer DCCI、
+  `asc_threadfence`、`BUILDING -> BUILT` CAS；
+- optimized bitcode 可以由 `llvm-bcanalyzer` 完整解析，包含
+  `store.vfsimt.info`、`get.TID.X`、`atom.CAS.G.u64`、
+  `fence.workitems`、`DCCI.DST`、`SET/WAIT.FLAG.IMM`、`LD/ST.DEV`；
+- 最终 ELF 只有一个非空 GLOBAL entry：
+  `simt_cross_core_s0_0_mix_aiv`；
+- `S0SimtBuild..._simt_entry` 是唯一非空 LOCAL SIMT function，没有被注册为
+  第二个 device entry；
+- ELF 无 undefined GLOBAL、无 relocation，且只有预期 metadata section；
+- CANN `msobjdump` 将 metadata 解码为 `MIX_AIV_MAIN`、ratio `[0:1]`。
+
+当前环境的 `/opt/mlir-debug/llvm-dis` 不能读取 CCEC 新 SIMT bitcode 中的
+`amdgpu_cs_chain`，会以“需要 `llvm.amdgpu.cs.chain`”为由拒绝模块。这里没有
+把工具版本不兼容伪写成逐 SSA IR PASS；S0 静态门槛使用可成功解析的
+`llvm-bcanalyzer` intrinsic inventory、source 顺序、ELF symbol/metadata 和
+真实 A5 动态结果。后续若取得匹配 CCEC 的 `llvm-dis`，再补逐 SSA 检查。
+
+### 3.5 真实 A5 命令、环境与结果
+
+运行硬件前已执行：
+
+```bash
+.claude/skills/onboard-arch-precheck/check.sh a5
+command -v task-submit
+```
+
+当前 shell 没有 `npu-smi`，precheck 因而无法自动识别 silicon；也没有
+`task-submit`。检查时只有 `/dev/davinci0`，没有发现当前用户可见的计算进程，
+因此按仓库无队列降级规则在 device 0 未加锁串行运行。ACL runtime 在实际
+打开 device 后报告 `Ascend950PR_958b`，host 也显式拒绝非 `Ascend950*`
+设备，补上了真实 A5 身份证据。
+
+最终命令：
+
+```bash
+timeout --foreground 180s \
+  tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-s0 --device 0 --runs 100
+```
+
+100 次地址复用、每次四种模式的完整结果：
+
+| 模式 | control/CAS/64-thread | payload | 是否稳定 | S0 结论 |
+| --- | ---: | ---: | --- | --- |
+| `NO_DCCI` | 100/100 | 1/100 | 否 | 只有冷 cache 首轮成功，地址复用后不可靠，淘汰。 |
+| `WRITER_DCCI` | 100/100 | 0/100 | 稳定失败 | 只处理 writer 不能让 Scalar reader 的旧 line 失效，淘汰。 |
+| `READER_DCCI` | 100/100 | 100/100 | 是 | 当前同 AIV 的最小可靠序列。 |
+| `WRITER_AND_READER_DCCI` | 100/100 | 100/100 | 是 | 保守序列通过，但比最小序列多 writer DCCI。 |
+
+最终输出：
+
+```text
+[DEVICE] id=0 soc=Ascend950PR_958b
+[CHARACTERIZATION] same-AIV minimum=READER_DCCI;
+                   cross-AIV/AIC remains unresolved
+[PASS] S0 A5 SIMT-GM visibility runs=100 modes=4 reused_address=yes
+```
+
+四种模式的 control、SIMT reserve/publish CAS、Main Scalar claim/done CAS、
+duplicate reserve 拒绝和 64 个 thread oracle 全部 100/100。thread/report 由
+Main Scalar 用 `ld_dev` 读取，payload 才走被测的普通 GM load，避免诊断数据
+自己的 cache 行为污染四组 payload 结论。control 独占第一条 64 B，payload
+独占第二条 64 B，reader DCCI 不接触 atomic-only control line。
+
+### 3.6 失败现象的边界解释
+
+`NO_DCCI` 的 1/100 不是“偶尔大概率能用”：成功样本正好是同地址尚未被
+Scalar reader 缓存的首轮，之后更换 nonce 便持续读到旧 line。因此重复地址
+场景必须淘汰该路径。`WRITER_DCCI` 的 0/100 也不能外推为“writer DCCI 在
+所有跨核方向都无效”；它只证明 writer 操作不能替代当前 Scalar reader 对
+自身旧 payload line 的失效处理。
+
+S0 唯一能冻结的硬件规则是：同 AIV、同 GM 地址重复复用时，Claim winner
+成功把 `BUILT -> CLAIMED` 线性化后，对 payload 单行执行 reader DCCI 和 DSB，
+再做普通 GM load，可以稳定得到新 payload。AIV0 到其他 AIV、AIV0 到 AIC
+可能具有不同 cache 拓扑，S1/S2 必须各自重复四模式实验，不能直接复用这个
+结论。
+
+### 3.7 阶段结论与提交
+
+S0 已闭合 CPU 状态机、直接 CCEC SIMT 语法、64-thread execution、64-bit GM
+CAS 返回值、V->S completion、同 AIV 地址复用和 DCCI 最小序列。没有写入
+性能数字，也没有生成泳道文件。阶段作为本次独立中文提交交付；提交 SHA 以
+本分支紧随 D0 的 S0 commit 为准，下一阶段记录会回填该固定 SHA。
+
+S1 将进入同一次 mixed launch：AIV0 仍只做 builder，至少一个其他 AIV 只做
+单 Vector task executor，并在真实跨 AIV 方向重新执行 DCCI 可见性矩阵和
+golden 校验。
+
+## 4. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | --- | --- | --- |
-| D0 文档与查证 | 文档完成 | 范围/链接/空白检查通过，随本次 D0 提交交付。 |
-| S0 基础协议与 SIMT 自检 | 未开始 | - |
+| D0 文档与查证 | 完成 | `64e3d5d5`：范围、链接和空白检查通过。 |
+| S0 基础协议与 SIMT 自检 | 完成 | CPU 三套 PASS；A5 同 AIV 100×4 模式完成，reader DCCI 为最小可靠序列；随本次 S0 提交交付。 |
 | S1 单 Vector task | 未开始 | - |
 | S2 单 Cube task | 未开始 | - |
 | S3 Vector + Cube | 未开始 | - |
