@@ -13,8 +13,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 S0_ROOT="$SCRIPT_DIR/protocol_probe"
 S0_BUILD="$S0_ROOT/build/ccec"
-S1_ROOT="$SCRIPT_DIR/gm"
-S1_BUILD="$S1_ROOT/build/ccec"
+GM_ROOT="$SCRIPT_DIR/gm"
+GM_BUILD="$GM_ROOT/build/ccec"
 
 usage() {
     cat <<'EOF'
@@ -23,11 +23,15 @@ Usage:
   ./run.sh run-s0 --device N [--runs N]
   ./run.sh build-s1
   ./run.sh run-s1 --device N [--runs N]
+  ./run.sh build-s2
+  ./run.sh run-s2 --device N [--runs N]
 
 build-s0 运行 CPU optimized/ASan/UBSan/TSan，并构建、静态检查 CCEC/ELF。
 run-s0 只运行已构建的真实 A5 探针；调用前仍需按仓库规则执行 A5 precheck。
 build-s1 运行单 Vector 的 CPU 三套测试，并构建、静态检查 1:2 mixed CCEC/ELF。
 run-s1 运行 AIV0 SIMT builder -> AIV1 Vector executor 的真实 A5 四模式探针。
+build-s2 运行单 Cube 的 CPU 三套测试，并构建、静态检查 1:2 mixed CCEC/ELF。
+run-s2 运行 AIV0 SIMT builder -> AIC Cube executor 的真实 A5 四模式探针。
 EOF
 }
 
@@ -61,17 +65,34 @@ case "$ACTION" in
             echo "build-s1 does not accept additional arguments." >&2
             exit 1
         fi
-        "$S1_ROOT/cpu/build_s1.sh"
-        "$S1_ROOT/ccec/build_s1.sh"
+        "$GM_ROOT/cpu/build_s1.sh"
+        "$GM_ROOT/ccec/build_s1.sh"
         ;;
     run-s1)
-        if [[ ! -x "$S1_BUILD/simt_cross_core_s1_host" ||
-              ! -s "$S1_BUILD/simt_cross_core_s1_kernel.o" ]]; then
+        if [[ ! -x "$GM_BUILD/simt_cross_core_s1_host" ||
+              ! -s "$GM_BUILD/simt_cross_core_s1_kernel.o" ]]; then
             echo "S1 artifacts are missing; run: $0 build-s1" >&2
             exit 1
         fi
-        "$S1_BUILD/simt_cross_core_s1_host" \
-            --kernel "$S1_BUILD/simt_cross_core_s1_kernel.o" "$@"
+        "$GM_BUILD/simt_cross_core_s1_host" \
+            --kernel "$GM_BUILD/simt_cross_core_s1_kernel.o" "$@"
+        ;;
+    build-s2)
+        if [[ $# -ne 0 ]]; then
+            echo "build-s2 does not accept additional arguments." >&2
+            exit 1
+        fi
+        "$GM_ROOT/cpu/build_s2.sh"
+        "$GM_ROOT/ccec/build_s2.sh"
+        ;;
+    run-s2)
+        if [[ ! -x "$GM_BUILD/simt_cross_core_s2_host" ||
+              ! -s "$GM_BUILD/simt_cross_core_s2_kernel.o" ]]; then
+            echo "S2 artifacts are missing; run: $0 build-s2" >&2
+            exit 1
+        fi
+        "$GM_BUILD/simt_cross_core_s2_host" \
+            --kernel "$GM_BUILD/simt_cross_core_s2_kernel.o" "$@"
         ;;
     *)
         usage >&2

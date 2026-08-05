@@ -22,7 +22,7 @@ builder 与 executor 必须严格分工：
 ### 1.2 二十项需求对齐结论
 
 | 序号 | 已冻结结论 |
-| ---: | --- |
+| ---: | ---------- |
 | 1 | 工作分支固定为 `fdwic-swimlane-deps`。所有新增和修改代码只能位于本目录。 |
 | 2 | 本实现独立演进，不与 `cross_core` 共享源码。 |
 | 3 | CPU 只模拟协议语义；设备实现直接由 CCEC 编译，不新增 AscendC 实现。 |
@@ -136,7 +136,7 @@ AIV entry 同时承载 SIMT builder 和普通 AIV task executor，最终 ELF 必
 GM 与 UBUF 两条路径都保留同一共享终态：
 
 | 转换 | 唯一责任方 | 合同 |
-| --- | --- | --- |
+| ---- | ---------- | ---- |
 | `EMPTY -> BUILDING` | builder | CAS 成功者取得该 task 的唯一构建权。 |
 | `BUILDING -> BUILT` | builder | payload 全部可见后才能发布。 |
 | `BUILT -> CLAIMED` | compatible executor | 只能有一个 CAS winner。 |
@@ -165,22 +165,23 @@ SIMT 64-bit CAS 取得 BUILDING
 ```
 
 `thread fence` 只建立 SIMT 普通 GM store 先于发布 CAS 的顺序，不能先验地
-等价为 DCCI，也不能先验地断言 GM 路径一定不需要 DCCI。S0/S1 先用同一地址
+等价为 DCCI，也不能先验地断言 GM 路径一定不需要 DCCI。S0～S2 用同一地址
 重复复用的最小 A5 探针对照以下四种可见性组合：writer/reader 都不做 DCCI、
 SIMT writer 做单行 DCCI、Claim winner 做 payload 单行 DCCI、两侧都做。随后
-还要分别覆盖 AIV0 到其他 AIV、AIV0 到 AIC 的跨核读取。
+分别覆盖同 AIV、AIV0 到其他 AIV、AIV0 到 AIC 的读取。
 
 正式 GM 路径只采用硬件证据支持的最小序列：如果无 DCCI 组合在重复 launch、
 地址复用和两类跨核方向都稳定通过，则保留纯 thread-fence 路径；如果失败，
 就保留能闭合正确性的最小 writer/reader DCCI，不能为了减少指令而省略。
 
-截至 S1，已有两条各 100 轮、每轮四模式的 A5 证据：S0 的同 AIV 读取与
-S1 的 AIV0 builder 到 AIV1 executor 跨 AIV 读取都得到
+截至 S2，已有三条各 100 轮、每轮四模式的 A5 证据：S0 的同 AIV读取、
+S1 的 AIV0 builder 到 AIV1 executor 跨 AIV 读取，以及 S2 的 AIV0 builder
+到 AIC executor 跨引擎读取都得到
 `NO_DCCI=1/100`、`WRITER_DCCI=0/100`、`READER_DCCI=100/100`、双侧
-DCCI `100/100`。因此 GM 路径在同 AIV和跨 AIV 方向均冻结为 Claim winner
-成功后对 payload 做 reader DCCI + DSB；writer DCCI 不是这两个方向的必要
-条件。AIV builder 到 AIC executor 仍未验证，必须由 S2 单 Cube task 独立
-取证后才能决定最终统一序列。
+DCCI `100/100`。因此当前 GM 路径在已覆盖的三种方向上统一冻结为 Claim
+winner 成功后对 payload 做 reader DCCI + DSB；writer DCCI 不是必要条件。
+这个结论只覆盖 A5、当前普通 GM payload、同地址重复复用和现有 compiler
+DCCI 配置，不能外推为所有 GM 访问都使用相同 cache 协议。
 
 ### 3.3 UBUF 构建路径
 
@@ -255,7 +256,7 @@ simt_cross_core/
 ### 4.2 阶段顺序
 
 | 阶段 | 交付内容 | 关键通过条件 |
-| --- | --- | --- |
+| ---- | -------- | ------------ |
 | D0 | 两份设计/过程文档 | 边界、风险和门槛完整，不写伪结果。 |
 | S0 | 基础协议与 SIMT 自检 | CPU 状态机及 AIV0 SIMT 的线程、GM 写入、完成等待在 A5 闭合。 |
 | S1 | 单 Vector task | AIV0 构建，AIV executor 唯一领取并通过 golden。 |

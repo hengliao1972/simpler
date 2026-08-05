@@ -9,27 +9,28 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-// S1 固定启动一个 1 AIC + 2 AIV mixed block。AIV0 只启动 SIMT builder，
-// AIV1 只 Claim 并执行一个真实 Vector add，AIC 只观察终态。
+// S2 固定启动一个 1 AIC + 2 AIV mixed block。AIV0 只启动 SIMT builder，
+// AIC 只 Claim 并执行一个真实 Cube matmul，AIV1 只观察终态。
 
 #include <pto/common/kernel_meta.hpp>
 
 #include "cce_aicore_intrinsics.h"
 
 #if defined(__DAV_VEC__)
-#include <pto/pto-inst.hpp>
 #include "simt_api/asc_simt.h"
+#else
+#include <pto/pto-inst.hpp>
 #endif
 
-#include "../common/s1_vector.h"
+#include "../common/s2_cube.h"
 
 namespace {
 
 using namespace pa_scheduler::simt_cross_core;
-using namespace pa_scheduler::simt_cross_core::s1;
+using namespace pa_scheduler::simt_cross_core::gm;
+using namespace pa_scheduler::simt_cross_core::s2;
 
 constexpr int kSingleCacheLine = 0;
-constexpr int kCacheLineOut = 2;
 constexpr uint32_t kFatalPollMask = 0x3FFU;
 
 __aicore__ __attribute__((always_inline)) inline uint64_t LoadDev64(__gm__ uint64_t *address) {
@@ -70,9 +71,6 @@ InitializeResult(ProbeRoleResult *result, ProbeRole role, __gm__ const ProbeStat
 
 __aicore__ __attribute__((always_inline)) inline void
 PublishRoleResult(__gm__ ProbeRoleResult *destination, const ProbeRoleResult &result) {
-    // CCEC 对较大 Scalar 局部 aggregate 做标量替换后，其通用地址不再保证
-    // 能按源码字段顺序线性遍历。逐字段 st_dev 既保留 128B ABI，也避免把
-    // 编译器内部 spill 次序误当作 C++ 对象布局。
     StoreDev64(&destination->magic, result.magic);
     StoreDev64(&destination->identity, result.identity);
     StoreDev64(&destination->status, result.status);
@@ -98,9 +96,6 @@ __aicore__ __attribute__((always_inline)) inline uint64_t LoadFatal(__gm__ Probe
 
 __aicore__ __attribute__((always_inline)) inline void
 PublishFatal(__gm__ ProbeState *state, ExecFatalReason reason, uint32_t owner) {
-    // shared_protocol 的 constexpr encoder 同时承担 host 静态断言；CCEC
-    // 不允许运行时从 __aicore__ 调用未标注地址空间的 constexpr 函数，
-    // 因此这里按同一已锁定位布局就地编码，不引入第二套字段定义。
     const uint64_t encoded = (static_cast<uint64_t>(reason) << kFatalReasonShift) |
                              (static_cast<uint64_t>(owner) << kFatalOwnerShift) |
                              (static_cast<uint64_t>(kTaskId) << kFatalTaskIdShift);
@@ -159,8 +154,6 @@ __aicore__ bool WaitForBuilt(__gm__ ProbeState *state, uint32_t owner) {
 
 #if defined(__DAV_VEC__)
 
-using namespace pto;
-
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
 SimtRotateLeft(uint64_t value, uint32_t shift) {
     return (value << shift) | (value >> (64U - shift));
@@ -173,7 +166,7 @@ SimtFoldDescriptorChecksum(uint64_t checksum, uint64_t word, uint32_t index) {
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
 SimtComputePayloadChecksum(uint64_t nonce, uint64_t input_a, uint64_t input_b, uint64_t output) {
-    uint64_t checksum = 0x243F6A8885A308D3ULL;
+    uint64_t checksum = 0x13198A2E03707344ULL;
     checksum = SimtFoldDescriptorChecksum(checksum, kPayloadMagic, kPayloadMagicWord);
     checksum = SimtFoldDescriptorChecksum(checksum, kPayloadVersion, kPayloadVersionWord);
     checksum = SimtFoldDescriptorChecksum(checksum, nonce, kPayloadNonceWord);
@@ -186,7 +179,7 @@ SimtComputePayloadChecksum(uint64_t nonce, uint64_t input_a, uint64_t input_b, u
     return checksum;
 }
 
-static __simt_vf__ __aicore__ LAUNCH_BOUND(kThreadCount) void S1SimtBuildVectorTask(
+static __simt_vf__ __aicore__ LAUNCH_BOUND(kThreadCount) void S2SimtBuildCubeTask(
     __gm__ uint64_t *state_word, __gm__ uint64_t *payload_words, __gm__ uint64_t *report_words, uint64_t launch_nonce,
     uint64_t input_a, uint64_t input_b, uint64_t output, uint64_t visibility_mode
 ) {
@@ -230,35 +223,10 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kThreadCount) void S1SimtBuildVectorT
     asc_threadfence();
 }
 
-static __aicore__ __attribute__((noinline, used)) void
-RunVectorAdd(__gm__ float *input_a, __gm__ float *input_b, __gm__ float *output) {
-    constexpr int kRows = static_cast<int>(kTileRows);
-    constexpr int kColumns = static_cast<int>(kTileColumns);
-    using GlobalData = GlobalTensor<float, Shape<1, 1, 1, kRows, kColumns>, pto::Stride<1, 1, 1, kColumns, 1>>;
-    using TileData = Tile<TileType::Vec, float, kRows, kColumns, BLayout::RowMajor, -1, -1>;
-
-    GlobalData input_a_global(input_a);
-    GlobalData input_b_global(input_b);
-    GlobalData output_global(output);
-    TileData input_a_tile(kRows, kColumns);
-    TileData input_b_tile(kRows, kColumns);
-    TileData output_tile(kRows, kColumns);
-    TASSIGN(input_a_tile, 0x0);
-    TASSIGN(input_b_tile, 0x10000);
-    TASSIGN(output_tile, 0x20000);
-
-    TLOAD(input_a_tile, input_a_global);
-    TLOAD(input_b_tile, input_b_global);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    TADD(output_tile, input_a_tile, input_b_tile);
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    TSTORE(output_global, output_tile);
-    // DONE 必须晚于 MTE3 写回 GM 的完成边界。
-    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
-    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
-}
+// S2 的 AIV 角色运行时不执行 SIMD task；这个本地、永不进入的 companion
+// 只让 compiler 为 mixed entry 生成 SIMD_SIMT_MIX_VF metadata，避免把
+// 同一调度入口标成 SIMT_VF_ONLY。动态条件来自 GM，防止编译期删除。
+static __simd_vf__ __aicore__ void S2SimdMetadataAnchor(__ubuf__ uint32_t *scratch) { scratch[0] = scratch[0] + 1U; }
 
 __aicore__ void RunBuilder(__gm__ ProbeState *state) {
     ProbeRoleResult result{};
@@ -271,7 +239,7 @@ __aicore__ void RunBuilder(__gm__ ProbeState *state) {
     }
     result.status |= kResultConfigValid;
 
-    cce::async_invoke<S1SimtBuildVectorTask>(
+    cce::async_invoke<S2SimtBuildCubeTask>(
         cce::dim3{kThreadCount, 1U, 1U}, &state->cell.state, &state->payload.words[0],
         reinterpret_cast<__gm__ uint64_t *>(&state->simt_report), state->control.launch_nonce,
         reinterpret_cast<uint64_t>(&state->input_a.values[0]), reinterpret_cast<uint64_t>(&state->input_b.values[0]),
@@ -295,13 +263,83 @@ __aicore__ void RunBuilder(__gm__ ProbeState *state) {
     PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::Aiv0Builder)], result);
 }
 
-__aicore__ void RunExecutor(__gm__ ProbeState *state) {
+__aicore__ void RunAivObserver(__gm__ ProbeState *state) {
     ProbeRoleResult result{};
-    InitializeResult(&result, ProbeRole::Aiv1Executor, state);
+    InitializeResult(&result, ProbeRole::Aiv1Observer, state);
+    if (!ConfigValid(state)) {
+        PublishFatal(state, ExecFatalReason::InvalidBuildInput, kObserverOwner);
+    } else {
+        result.status |= kResultConfigValid;
+        if (WaitForDone(state, kObserverOwner)) {
+            result.status |= kResultWaitDone;
+        }
+    }
+    result.final_state = ScalarAtomicLoad(&state->cell.state);
+    result.fatal_state = LoadFatal(state);
+    PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::Aiv1Observer)], result);
+}
+
+#else
+
+using namespace pto;
+
+static __aicore__ __attribute__((noinline, used)) void
+RunCubeMatmul(__gm__ float *input_a, __gm__ float *input_b, __gm__ float *output) {
+    constexpr int kRows = static_cast<int>(kTileRows);
+    constexpr int kColumns = static_cast<int>(kTileColumns);
+    constexpr int kBlockAlign = C0_SIZE_BYTE / sizeof(float);
+    static_assert(kRows % 16 == 0, "S2 Cube M must be 16-aligned");
+    static_assert(kColumns % kBlockAlign == 0, "S2 Cube K/N must satisfy C0 alignment");
+
+    using GlobalData = GlobalTensor<
+        float, Shape<1, 1, 1, kRows, kColumns>,
+        pto::Stride<kRows * kColumns, kRows * kColumns, kRows * kColumns, kColumns, 1>>;
+    using TileMatA =
+        Tile<TileType::Mat, float, kRows, kColumns, BLayout::ColMajor, kRows, kColumns, SLayout::RowMajor, 512>;
+    using TileMatB =
+        Tile<TileType::Mat, float, kRows, kColumns, BLayout::ColMajor, kRows, kColumns, SLayout::RowMajor, 512>;
+    using LeftTile = TileLeft<float, kRows, kColumns, kRows, kColumns>;
+    using RightTile = TileRight<float, kRows, kColumns, kRows, kColumns>;
+    using AccTile = TileAcc<float, kRows, kColumns, kRows, kColumns>;
+
+    GlobalData input_a_global(input_a);
+    GlobalData input_b_global(input_b);
+    GlobalData output_global(output);
+    TileMatA input_a_mat;
+    TileMatB input_b_mat;
+    LeftTile input_a_l0;
+    RightTile input_b_l0;
+    AccTile output_l0;
+    TASSIGN(input_a_mat, 0x0);
+    TASSIGN(input_b_mat, 0x20000);
+    TASSIGN(input_a_l0, 0x0);
+    TASSIGN(input_b_l0, 0x0);
+    TASSIGN(output_l0, 0x0);
+
+    TLOAD(input_a_mat, input_a_global);
+    TLOAD(input_b_mat, input_b_global);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    TMOV(input_a_l0, input_a_mat);
+    TMOV(input_b_l0, input_b_mat);
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+    TMATMUL(output_l0, input_a_l0, input_b_l0);
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+    TSTORE(output_global, output_l0);
+    // DONE 必须晚于 FIX 写回 GM 的完成边界。
+    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+}
+
+__aicore__ void RunAicExecutor(__gm__ ProbeState *state) {
+    ProbeRoleResult result{};
+    InitializeResult(&result, ProbeRole::AicExecutor, state);
     if (!ConfigValid(state)) {
         PublishFatal(state, ExecFatalReason::InvalidBuildInput, kExecutorOwner);
         result.fatal_state = LoadFatal(state);
-        PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::Aiv1Executor)], result);
+        PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::AicExecutor)], result);
         return;
     }
     result.status |= kResultConfigValid;
@@ -309,7 +347,7 @@ __aicore__ void RunExecutor(__gm__ ProbeState *state) {
     if (!WaitForBuilt(state, kExecutorOwner)) {
         result.final_state = ScalarAtomicLoad(&state->cell.state);
         result.fatal_state = LoadFatal(state);
-        PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::Aiv1Executor)], result);
+        PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::AicExecutor)], result);
         return;
     }
 
@@ -319,7 +357,7 @@ __aicore__ void RunExecutor(__gm__ ProbeState *state) {
         PublishFatal(state, ExecFatalReason::InvalidBuiltControl, kExecutorOwner);
         result.final_state = ScalarAtomicLoad(&state->cell.state);
         result.fatal_state = LoadFatal(state);
-        PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::Aiv1Executor)], result);
+        PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::AicExecutor)], result);
         return;
     }
     result.role_counts = PackRoleCounts(0U, 0U, 1U, 1U);
@@ -351,15 +389,12 @@ __aicore__ void RunExecutor(__gm__ ProbeState *state) {
         payload[kPayloadChecksumWord] == result.expected_payload_checksum;
     if (payload_valid) {
         result.status |= kResultPayloadValid;
-    }
-
-    if (payload_valid) {
-        RunVectorAdd(
+        RunCubeMatmul(
             reinterpret_cast<__gm__ float *>(payload[kPayloadInputAWord]),
             reinterpret_cast<__gm__ float *>(payload[kPayloadInputBWord]),
             reinterpret_cast<__gm__ float *>(payload[kPayloadOutputWord])
         );
-        result.status |= kResultVectorExecuted;
+        result.status |= kResultTaskExecuted;
     }
 
     result.done_observed = ScalarCas(&state->cell.state, kClaimedState, kDoneState);
@@ -371,57 +406,43 @@ __aicore__ void RunExecutor(__gm__ ProbeState *state) {
     }
     result.final_state = ScalarAtomicLoad(&state->cell.state);
     result.fatal_state = LoadFatal(state);
-    PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::Aiv1Executor)], result);
+    PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::AicExecutor)], result);
 }
 
 #endif  // defined(__DAV_VEC__)
-
-__aicore__ void RunAicObserver(__gm__ ProbeState *state) {
-    ProbeRoleResult result{};
-    InitializeResult(&result, ProbeRole::AicObserver, state);
-    if (!ConfigValid(state)) {
-        PublishFatal(state, ExecFatalReason::InvalidBuildInput, 0U);
-    } else {
-        result.status |= kResultConfigValid;
-        if (WaitForDone(state, 0U)) {
-            result.status |= kResultWaitDone;
-        }
-    }
-    result.final_state = ScalarAtomicLoad(&state->cell.state);
-    result.fatal_state = LoadFatal(state);
-    PublishRoleResult(&state->roles[static_cast<uint32_t>(ProbeRole::AicObserver)], result);
-}
 
 }  // namespace
 
 #if defined(__DAV_VEC__)
 
-PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_s1_0_mix_aiv, 1, 2);
+PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_s2_0_mix_aiv, 1, 2);
 
 extern "C" __global__ __aicore__ void
-simt_cross_core_s1_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::s1::ProbeState *state) {
-    // host 每轮复用同一状态地址；配置输入不是 DCCI 对照对象，入口先显式失效。
+simt_cross_core_s2_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::s2::ProbeState *state) {
     dcci(static_cast<__gm__ void *>(&state->control), kSingleCacheLine);
     dsb(DSB_ALL);
+    if (state->control.version == UINT64_MAX) {
+        S2SimdMetadataAnchor(reinterpret_cast<__ubuf__ uint32_t *>(0));
+    }
 
     const uint32_t vector_id = static_cast<uint32_t>(get_block_idx() * get_subblockdim() + get_subblockid());
     if (vector_id == 0U) {
         RunBuilder(state);
     } else if (vector_id == 1U) {
-        RunExecutor(state);
+        RunAivObserver(state);
     }
 }
 
 #else
 
-PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_s1_0_mix_aic, 1, 2);
+PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_s2_0_mix_aic, 1, 2);
 
 extern "C" __global__ __aicore__ void
-simt_cross_core_s1_0_mix_aic(__gm__ pa_scheduler::simt_cross_core::s1::ProbeState *state) {
+simt_cross_core_s2_0_mix_aic(__gm__ pa_scheduler::simt_cross_core::s2::ProbeState *state) {
     dcci(static_cast<__gm__ void *>(&state->control), kSingleCacheLine);
     dsb(DSB_ALL);
     if (get_block_idx() == 0U) {
-        RunAicObserver(state);
+        RunAicExecutor(state);
     }
 }
 

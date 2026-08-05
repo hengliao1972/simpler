@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "../common/s1_vector.h"
+#include "../common/s2_cube.h"
 
 #include "acl/acl.h"
 
@@ -29,7 +29,8 @@
 namespace {
 
 using namespace pa_scheduler::simt_cross_core;
-using namespace pa_scheduler::simt_cross_core::s1;
+using namespace pa_scheduler::simt_cross_core::gm;
+using namespace pa_scheduler::simt_cross_core::s2;
 
 struct Options {
     std::string kernel_path;
@@ -195,12 +196,12 @@ public:
         struct KernelArgs {
             uint64_t state_pointer;
         } args{reinterpret_cast<uint64_t>(device_state_)};
-        static_assert(sizeof(KernelArgs) == sizeof(uint64_t), "unexpected S1 kernel argument ABI");
+        static_assert(sizeof(KernelArgs) == sizeof(uint64_t), "unexpected S2 kernel argument ABI");
         if (!CheckAcl(
                 aclrtLaunchKernelWithHostArgs(function_, 1U, stream_, nullptr, &args, sizeof(args), nullptr, 0U),
-                "aclrtLaunchKernelWithHostArgs(S1 mixed 1:2)"
+                "aclrtLaunchKernelWithHostArgs(S2 mixed 1:2)"
             ) ||
-            !CheckAcl(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream(S1)") ||
+            !CheckAcl(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream(S2)") ||
             !CheckAcl(
                 aclrtMemcpy(state, sizeof(*state), device_state_, sizeof(*state), ACL_MEMCPY_DEVICE_TO_HOST),
                 "aclrtMemcpy(D2H ProbeState)"
@@ -243,10 +244,13 @@ void InitializeState(ProbeState *state, uint64_t nonce, VisibilityMode mode) {
     InitializeGuard(&state->guard_before_input_b, nonce, 1U);
     InitializeGuard(&state->guard_before_output, nonce, 2U);
     InitializeGuard(&state->guard_after_output, nonce, 3U);
-    for (uint32_t index = 0U; index < kElementCount; ++index) {
-        state->input_a.values[index] = ExpectedInputA(nonce, index);
-        state->input_b.values[index] = ExpectedInputB(nonce, index);
-        state->output.values[index] = kOutputSentinel;
+    for (uint32_t row = 0U; row < kTileRows; ++row) {
+        for (uint32_t column = 0U; column < kTileColumns; ++column) {
+            const uint32_t index = row * kTileColumns + column;
+            state->input_a.values[index] = ExpectedInputA(row, column);
+            state->input_b.values[index] = ExpectedInputB(nonce, row, column);
+            state->output.values[index] = kOutputSentinel;
+        }
     }
 }
 
@@ -260,19 +264,25 @@ bool GuardValid(const ProbeGuard &guard, uint64_t nonce, uint32_t guard_index) {
 }
 
 bool InputsValid(const ProbeState &state, uint64_t nonce) {
-    for (uint32_t index = 0U; index < kElementCount; ++index) {
-        if (state.input_a.values[index] != ExpectedInputA(nonce, index) ||
-            state.input_b.values[index] != ExpectedInputB(nonce, index)) {
-            return false;
+    for (uint32_t row = 0U; row < kTileRows; ++row) {
+        for (uint32_t column = 0U; column < kTileColumns; ++column) {
+            const uint32_t index = row * kTileColumns + column;
+            if (state.input_a.values[index] != ExpectedInputA(row, column) ||
+                state.input_b.values[index] != ExpectedInputB(nonce, row, column)) {
+                return false;
+            }
         }
     }
     return true;
 }
 
 bool OutputMatchesGolden(const ProbeState &state, uint64_t nonce) {
-    for (uint32_t index = 0U; index < kElementCount; ++index) {
-        if (state.output.values[index] != ExpectedOutput(nonce, index)) {
-            return false;
+    for (uint32_t row = 0U; row < kTileRows; ++row) {
+        for (uint32_t column = 0U; column < kTileColumns; ++column) {
+            const uint32_t index = row * kTileColumns + column;
+            if (state.output.values[index] != ExpectedOutput(nonce, row, column)) {
+                return false;
+            }
         }
     }
     return true;
@@ -314,9 +324,9 @@ Validation Validate(
     uint64_t expected_output
 ) {
     Validation validation{};
-    const ProbeRoleResult &aic = state.roles[static_cast<uint32_t>(ProbeRole::AicObserver)];
+    const ProbeRoleResult &aic = state.roles[static_cast<uint32_t>(ProbeRole::AicExecutor)];
     const ProbeRoleResult &builder = state.roles[static_cast<uint32_t>(ProbeRole::Aiv0Builder)];
-    const ProbeRoleResult &executor = state.roles[static_cast<uint32_t>(ProbeRole::Aiv1Executor)];
+    const ProbeRoleResult &observer = state.roles[static_cast<uint32_t>(ProbeRole::Aiv1Observer)];
 
     const bool guards_ok =
         GuardValid(state.guard_before_input_a, nonce, 0U) && GuardValid(state.guard_before_input_b, nonce, 1U) &&
@@ -336,42 +346,40 @@ Validation Validate(
         state.simt_report.participating_threads == kThreadCount &&
         state.simt_report.payload_words_written == kPayloadWords && state.simt_report.launch_nonce == nonce &&
         state.simt_report.builder_thread == 0U && state.simt_report.writer_dcci == (WriterUsesDcci(mode) ? 1U : 0U);
-    const bool aic_ok = RoleCommonValid(aic, ProbeRole::AicObserver, nonce, mode) && aic.role_counts == 0U &&
-                        !HasStatus(aic, kResultVectorExecuted) && HasStatus(aic, kResultWaitDone);
+    const bool aic_ok = RoleCommonValid(aic, ProbeRole::AicExecutor, nonce, mode) &&
+                        CountField(aic, kCountBuildAttemptShift) == 0U && CountField(aic, kCountBuildWinShift) == 0U &&
+                        CountField(aic, kCountClaimAttemptShift) == 1U && CountField(aic, kCountClaimWinShift) == 1U &&
+                        aic.claim_observed == kBuiltState && aic.done_observed == kClaimedState &&
+                        HasStatus(aic, kResultWaitDone);
     const bool builder_ok =
         RoleCommonValid(builder, ProbeRole::Aiv0Builder, nonce, mode) &&
         IdentityByte(builder, kIdentitySubblockShift) == 0U &&
         IdentityByte(builder, kIdentitySubblockCountShift) == 2U &&
         CountField(builder, kCountBuildAttemptShift) == 1U && CountField(builder, kCountBuildWinShift) == 1U &&
         CountField(builder, kCountClaimAttemptShift) == 0U && CountField(builder, kCountClaimWinShift) == 0U &&
-        !HasStatus(builder, kResultVectorExecuted) && HasStatus(builder, kResultWaitDone) &&
+        !HasStatus(builder, kResultTaskExecuted) && HasStatus(builder, kResultWaitDone) &&
         builder.reserve_observed == kEmptyState && builder.publish_observed == kBuildingState;
-    const bool executor_ok =
-        RoleCommonValid(executor, ProbeRole::Aiv1Executor, nonce, mode) &&
-        IdentityByte(executor, kIdentitySubblockShift) == 1U &&
-        IdentityByte(executor, kIdentitySubblockCountShift) == 2U &&
-        CountField(executor, kCountBuildAttemptShift) == 0U && CountField(executor, kCountBuildWinShift) == 0U &&
-        CountField(executor, kCountClaimAttemptShift) == 1U && CountField(executor, kCountClaimWinShift) == 1U &&
-        executor.claim_observed == kBuiltState && executor.done_observed == kClaimedState &&
-        HasStatus(executor, kResultWaitDone);
+    const bool observer_ok = RoleCommonValid(observer, ProbeRole::Aiv1Observer, nonce, mode) &&
+                             IdentityByte(observer, kIdentitySubblockShift) == 1U &&
+                             IdentityByte(observer, kIdentitySubblockCountShift) == 2U && observer.role_counts == 0U &&
+                             !HasStatus(observer, kResultTaskExecuted) && HasStatus(observer, kResultWaitDone);
 
     validation.control_ok = state.cell.state == kDoneState && state.fatal.state == 0U && guards_ok &&
                             InputsValid(state, nonce) && payload_bytes_ok && simt_ok && aic_ok && builder_ok &&
-                            executor_ok;
+                            observer_ok;
     if (!validation.control_ok) {
         validation.reason = "protocol-role-guard";
         return validation;
     }
 
-    const bool executor_payload_ok =
-        HasStatus(executor, kResultPayloadValid) && HasStatus(executor, kResultVectorExecuted) &&
-        executor.observed_payload_checksum == expected_checksum &&
-        executor.expected_payload_checksum == expected_checksum && executor.observed_elements == kElementCount;
-    validation.payload_ok = executor_payload_ok && OutputMatchesGolden(state, nonce);
+    const bool aic_payload_ok = HasStatus(aic, kResultPayloadValid) && HasStatus(aic, kResultTaskExecuted) &&
+                                aic.observed_payload_checksum == expected_checksum &&
+                                aic.expected_payload_checksum == expected_checksum &&
+                                aic.observed_elements == kElementCount;
+    validation.payload_ok = aic_payload_ok && OutputMatchesGolden(state, nonce);
     if (!validation.payload_ok) {
-        validation.reason = OutputIsSentinel(state) && !HasStatus(executor, kResultVectorExecuted) ?
-                                "payload-visibility" :
-                                "vector-golden";
+        validation.reason =
+            OutputIsSentinel(state) && !HasStatus(aic, kResultTaskExecuted) ? "payload-visibility" : "cube-golden";
     }
     return validation;
 }
@@ -379,25 +387,18 @@ Validation Validate(
 void PrintRoleDiagnostic(const char *name, const ProbeRoleResult &result) {
     std::fprintf(
         stderr,
-        "[ROLE] %s magic=0x%llx role=%llu block=%llu/%llu core=%llu subblock=%llu/%llu "
-        "config=%llu build=%llu/%llu claim=%llu/%llu vector=%llu payload=%llu wait=%llu "
+        "[ROLE] %s magic=0x%llx role=%u block=%u/%u core=%u subblock=%u/%u "
+        "config=%u build=%u/%u claim=%u/%u task=%u payload=%u wait=%u "
         "nonce=0x%llx mode=%llu reserve=0x%llx publish=0x%llx claim_old=0x%llx "
         "done_old=0x%llx final=0x%llx fatal=0x%llx elements=%llu\n",
-        name, static_cast<unsigned long long>(result.magic),
-        static_cast<unsigned long long>(IdentityByte(result, kIdentityRoleShift)),
-        static_cast<unsigned long long>(IdentityByte(result, kIdentityBlockIndexShift)),
-        static_cast<unsigned long long>(IdentityByte(result, kIdentityBlockCountShift)),
-        static_cast<unsigned long long>(IdentityField(result.identity, kIdentityCoreIdShift, kIdentityCoreMask)),
-        static_cast<unsigned long long>(IdentityByte(result, kIdentitySubblockShift)),
-        static_cast<unsigned long long>(IdentityByte(result, kIdentitySubblockCountShift)),
-        static_cast<unsigned long long>(HasStatus(result, kResultConfigValid)),
-        static_cast<unsigned long long>(CountField(result, kCountBuildWinShift)),
-        static_cast<unsigned long long>(CountField(result, kCountBuildAttemptShift)),
-        static_cast<unsigned long long>(CountField(result, kCountClaimWinShift)),
-        static_cast<unsigned long long>(CountField(result, kCountClaimAttemptShift)),
-        static_cast<unsigned long long>(HasStatus(result, kResultVectorExecuted)),
-        static_cast<unsigned long long>(HasStatus(result, kResultPayloadValid)),
-        static_cast<unsigned long long>(HasStatus(result, kResultWaitDone)),
+        name, static_cast<unsigned long long>(result.magic), IdentityByte(result, kIdentityRoleShift),
+        IdentityByte(result, kIdentityBlockIndexShift), IdentityByte(result, kIdentityBlockCountShift),
+        IdentityField(result.identity, kIdentityCoreIdShift, kIdentityCoreMask),
+        IdentityByte(result, kIdentitySubblockShift), IdentityByte(result, kIdentitySubblockCountShift),
+        HasStatus(result, kResultConfigValid), CountField(result, kCountBuildWinShift),
+        CountField(result, kCountBuildAttemptShift), CountField(result, kCountClaimWinShift),
+        CountField(result, kCountClaimAttemptShift), HasStatus(result, kResultTaskExecuted),
+        HasStatus(result, kResultPayloadValid), HasStatus(result, kResultWaitDone),
         static_cast<unsigned long long>(result.launch_nonce), static_cast<unsigned long long>(result.visibility_mode),
         static_cast<unsigned long long>(result.reserve_observed),
         static_cast<unsigned long long>(result.publish_observed),
@@ -407,10 +408,7 @@ void PrintRoleDiagnostic(const char *name, const ProbeRoleResult &result) {
     );
 }
 
-void PrintProtocolDiagnostic(
-    const ProbeState &state, uint64_t nonce, uint64_t expected_input_a, uint64_t expected_input_b,
-    uint64_t expected_output
-) {
+void PrintProtocolDiagnostic(const ProbeState &state) {
     std::fprintf(
         stderr,
         "[SIMT] reserve=0x%llx publish=0x%llx threads=%llu words=%llu nonce=0x%llx thread=%llu writer_dcci=%llu\n",
@@ -422,20 +420,9 @@ void PrintProtocolDiagnostic(
         static_cast<unsigned long long>(state.simt_report.builder_thread),
         static_cast<unsigned long long>(state.simt_report.writer_dcci)
     );
-    std::fprintf(
-        stderr,
-        "[HOST-CHECK] guards=%u inputs=%u payload_addr={0x%llx,0x%llx,0x%llx} expected={0x%llx,0x%llx,0x%llx}\n",
-        GuardValid(state.guard_before_input_a, nonce, 0U) && GuardValid(state.guard_before_input_b, nonce, 1U) &&
-            GuardValid(state.guard_before_output, nonce, 2U) && GuardValid(state.guard_after_output, nonce, 3U),
-        InputsValid(state, nonce), static_cast<unsigned long long>(state.payload.words[kPayloadInputAWord]),
-        static_cast<unsigned long long>(state.payload.words[kPayloadInputBWord]),
-        static_cast<unsigned long long>(state.payload.words[kPayloadOutputWord]),
-        static_cast<unsigned long long>(expected_input_a), static_cast<unsigned long long>(expected_input_b),
-        static_cast<unsigned long long>(expected_output)
-    );
-    PrintRoleDiagnostic("AIC", state.roles[static_cast<uint32_t>(ProbeRole::AicObserver)]);
+    PrintRoleDiagnostic("AIC", state.roles[static_cast<uint32_t>(ProbeRole::AicExecutor)]);
     PrintRoleDiagnostic("AIV0", state.roles[static_cast<uint32_t>(ProbeRole::Aiv0Builder)]);
-    PrintRoleDiagnostic("AIV1", state.roles[static_cast<uint32_t>(ProbeRole::Aiv1Executor)]);
+    PrintRoleDiagnostic("AIV1", state.roles[static_cast<uint32_t>(ProbeRole::Aiv1Observer)]);
 }
 
 }  // namespace
@@ -454,7 +441,7 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     if (session.SocName().rfind("Ascend950", 0U) != 0U) {
-        std::fprintf(stderr, "S1 requires A5/Ascend950, but ACL reports: %s\n", session.SocName().c_str());
+        std::fprintf(stderr, "S2 requires A5/Ascend950, but ACL reports: %s\n", session.SocName().c_str());
         return EXIT_FAILURE;
     }
     std::printf(
@@ -472,7 +459,7 @@ int main(int argc, char **argv) {
     for (uint32_t run = 0U; run < options.runs; ++run) {
         for (uint32_t mode_index = 0U; mode_index < kVisibilityModeCount; ++mode_index) {
             const auto mode = static_cast<VisibilityMode>(mode_index);
-            const uint64_t nonce = 0xA551000000000000ULL ^ (static_cast<uint64_t>(run + 1U) << 8U) ^ mode_index;
+            const uint64_t nonce = 0xA552000000000000ULL ^ (static_cast<uint64_t>(run + 1U) << 8U) ^ mode_index;
             InitializeState(state.get(), nonce, mode);
             if (!session.Run(state.get())) {
                 return EXIT_FAILURE;
@@ -483,29 +470,19 @@ int main(int argc, char **argv) {
             control_passes[mode_index] += validation.control_ok ? 1U : 0U;
             payload_passes[mode_index] += validation.control_ok && validation.payload_ok ? 1U : 0U;
             if ((!validation.control_ok || !validation.payload_ok) && printed_failures < 8U) {
-                const ProbeRoleResult &executor = state->roles[static_cast<uint32_t>(ProbeRole::Aiv1Executor)];
+                const ProbeRoleResult &aic = state->roles[static_cast<uint32_t>(ProbeRole::AicExecutor)];
                 std::fprintf(
                     stderr,
                     "[RAW-FAIL] run=%u mode=%s reason=%s cell=0x%llx fatal=0x%llx "
-                    "builder=%llu/%llu claim=%llu/%llu payload=%llu vector=%llu "
-                    "observed_checksum=0x%llx expected_checksum=0x%llx\n",
+                    "claim=%u/%u payload=%u cube=%u observed_checksum=0x%llx expected_checksum=0x%llx\n",
                     run, ModeName(mode), validation.reason, static_cast<unsigned long long>(state->cell.state),
-                    static_cast<unsigned long long>(state->fatal.state),
-                    static_cast<unsigned long long>(
-                        CountField(state->roles[static_cast<uint32_t>(ProbeRole::Aiv0Builder)], kCountBuildWinShift)
-                    ),
-                    static_cast<unsigned long long>(
-                        CountField(state->roles[static_cast<uint32_t>(ProbeRole::Aiv0Builder)], kCountBuildAttemptShift)
-                    ),
-                    static_cast<unsigned long long>(CountField(executor, kCountClaimWinShift)),
-                    static_cast<unsigned long long>(CountField(executor, kCountClaimAttemptShift)),
-                    static_cast<unsigned long long>(HasStatus(executor, kResultPayloadValid)),
-                    static_cast<unsigned long long>(HasStatus(executor, kResultVectorExecuted)),
-                    static_cast<unsigned long long>(executor.observed_payload_checksum),
-                    static_cast<unsigned long long>(executor.expected_payload_checksum)
+                    static_cast<unsigned long long>(state->fatal.state), CountField(aic, kCountClaimWinShift),
+                    CountField(aic, kCountClaimAttemptShift), HasStatus(aic, kResultPayloadValid),
+                    HasStatus(aic, kResultTaskExecuted), static_cast<unsigned long long>(aic.observed_payload_checksum),
+                    static_cast<unsigned long long>(aic.expected_payload_checksum)
                 );
                 if (!validation.control_ok) {
-                    PrintProtocolDiagnostic(*state, nonce, expected_input_a, expected_input_b, expected_output);
+                    PrintProtocolDiagnostic(*state);
                 }
                 ++printed_failures;
             }
@@ -516,11 +493,10 @@ int main(int argc, char **argv) {
     int32_t minimum_mode = -1;
     for (uint32_t mode_index = 0U; mode_index < kVisibilityModeCount; ++mode_index) {
         const auto mode = static_cast<VisibilityMode>(mode_index);
-        const bool stable = payload_passes[mode_index] == 0U || payload_passes[mode_index] == options.runs;
         const bool control_exact = control_passes[mode_index] == options.runs;
         std::printf(
-            "[SUMMARY] mode=%-24s protocol=%u/%u payload+golden=%u/%u stable=%s\n", ModeName(mode),
-            control_passes[mode_index], options.runs, payload_passes[mode_index], options.runs, stable ? "YES" : "NO"
+            "[SUMMARY] mode=%-24s protocol=%u/%u payload+golden=%u/%u\n", ModeName(mode), control_passes[mode_index],
+            options.runs, payload_passes[mode_index], options.runs
         );
         passed = passed && control_exact;
         if (minimum_mode < 0 && payload_passes[mode_index] == options.runs) {
@@ -532,12 +508,12 @@ int main(int argc, char **argv) {
     passed = passed && payload_passes[conservative_mode] == options.runs && minimum_mode >= 0;
     if (minimum_mode >= 0) {
         std::printf(
-            "[CHARACTERIZATION] AIV0-builder -> AIV1-executor minimum=%s; this S1 probe does not test AIC reads\n",
+            "[CHARACTERIZATION] AIV0-builder -> AIC-executor minimum=%s\n",
             ModeName(static_cast<VisibilityMode>(minimum_mode))
         );
     }
     std::printf(
-        "[%s] S1 mixed single-Vector runs=%u modes=%llu reused_address=yes golden_elements=%u\n",
+        "[%s] S2 mixed single-Cube runs=%u modes=%llu reused_address=yes golden_elements=%u\n",
         passed ? "PASS" : "FAIL", options.runs, static_cast<unsigned long long>(kVisibilityModeCount), kElementCount
     );
     return passed ? EXIT_SUCCESS : EXIT_FAILURE;
