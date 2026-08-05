@@ -331,6 +331,60 @@ Cube 做对角左矩阵的 matmul。不同 task 的输入包含 task ordinal 且
 不同，host 必须逐 task、逐元素核对 golden，不允许用一块共享输出伪装
 多 task 执行。
 
+### 3.8 G0 纯 SIMT 多 warp 构建与严格插入链
+
+S4 的 128-thread 映射用于 16 个互不依赖的探针 task，不能直接搬到 G0。
+完整 PA 的 shared TensorMap writer metadata 必须按 task id 严格提交；若同一
+warp 的多个 lane 分别负责相邻 task，并让后继 lane 在分歧路径中等待前驱，
+A1 已经证明先进入等待的分支可能阻止同 warp 的前驱分支取得 forward
+progress。因此 G0 不允许用 Main Scalar 代替 SIMT 顺序提交，也不允许同一
+warp 内有两个 task builder。
+
+G0 固定发射 2048 个 SIMT thread，即已经由 A0 验证过的 64 个 warp。每个
+warp 只有 lane 0 是 builder，其他 31 个 lane 不得读取、预留、构造或发布
+任何 task 状态。task 映射固定为：
+
+```text
+builder_warp(task_id) = task_id % 64
+builder_tid(task_id)  = builder_warp(task_id) * 32
+first_task(warp)      = warp
+next_task             = current_task + 64
+```
+
+B256/context8192 共 1280 个 task，因此 64 个有效 warp leader 各构建 20 个
+task。任意 `task[N]` 与 `task[N-1]` 都位于不同 warp，包含 `63 -> 64` 的
+回绕边界；所以严格插入等待只发生在不同 warp 之间。host 必须逐 task 核对
+实际 builder tid，并证明 1984 个 inactive lane 的访问和构建计数均为 0。
+
+每个 warp leader 对自己的 task 完整执行以下流程：
+
+```text
+可执行 task: EMPTY --CAS--> BUILDING
+  -> 在 8-shard shared heap 上并发预留输出区间
+  -> 写完整 fresh-output descriptor 并发布每个 output
+  -> 写完整 inline execution payload，但保持 BUILDING
+  -> 原子等待 task[N-1].insert_completion（task0 无前驱）
+  -> 提交 writer history 与 last_writer
+  -> 发布本 task 的 insert_completion
+  -> Alloc 发布 vend/flag；kernel task 发布 BUILT
+```
+
+heap task base 由真实的分 shard atomic reservation 决定，不能按 task id
+伪造一个串行地址。后继 task 若需要前驱输出 descriptor，只读取前驱独占的
+atomic task-base 报告，再按已冻结 PA shape 重新构造 descriptor；它不能在
+发布位之前普通读取另一个 SIMT warp 尚未完成的 descriptor。这样既保留并发
+heap 分配，又不新增未经验证的 SIMT 普通 DCache 一致性假设。
+
+最后一个 task 的 SIMT builder 在观察到完整严格前缀后发布
+`builder_finished`。AIV0 Main Scalar 只允许发起 VF、等待 V→S 完成并以零
+执行数参加最终 drain；它不能构造 descriptor/payload，不能提交 history、
+last_writer 或 insert-completion，也不能发布任何 task 的 `BUILT`。
+其 role build/commit/claim/execute 计数也必须全部为 0；构建总数只从 64 份
+SIMT thread report 求和，不能归因给 Main Scalar。executor
+仍使用 AIC/AIV 两条 immutable ticket 表和每 worker 四个 token，在 task
+尚未发布时停留于 `WaitingBuilt`，不能因一次观察到 `EMPTY/BUILDING` 就丢失
+该 task。
+
 ## 4. 目录与分阶段实施
 
 ### 4.1 计划目录
@@ -415,6 +469,8 @@ G0、G1、U2 至少检查：
 - 每 batch 精确 5 个 task，Alloc 无 kernel，四个 kernel task 各执行一次；
 - QK/PV 只由 AIC 执行，SF/UP 只由非 builder AIV 执行；
 - fanin、vend、completion flag 和 DONE 顺序正确；
+- execution witness 记录 executor 实际推进到的 `fanin_ready_prefix`，host 按
+  task 的 0/1/1/3 条 fanin 精确核对；
 - builder AIV 零执行，executor 零构建；
 - `[task_count, capacity)` 未被写入，所有 guard 和 padding 保持不变；
 - 多次 fresh launch 与同地址复用都不读到上一轮 payload。

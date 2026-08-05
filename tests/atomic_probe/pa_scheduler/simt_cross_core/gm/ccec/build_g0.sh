@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SIMT_ROOT="$(cd "$GM_ROOT/.." && pwd)"
+BUILD_DIR="$GM_ROOT/build/ccec"
+KERNEL_SOURCE="$SCRIPT_DIR/g0_full_pa_kernel.cpp"
+WORKLOAD_SOURCE="$SCRIPT_DIR/full_pa_workloads.h"
+MODEL_SOURCE="$SIMT_ROOT/common/full_pa_model.h"
+HOST_SOURCE="$SCRIPT_DIR/g0_full_pa_host.cpp"
+AIC_OBJECT="$BUILD_DIR/simt_cross_core_g0_aic.o"
+AIV_OBJECT="$BUILD_DIR/simt_cross_core_g0_aiv.o"
+AIC_BITCODE="$BUILD_DIR/simt_cross_core_g0_aic.bc"
+AIV_BITCODE="$BUILD_DIR/simt_cross_core_g0_aiv.bc"
+AIC_BITCODE_DUMP="$BUILD_DIR/simt_cross_core_g0_aic.bc.dump"
+AIV_BITCODE_DUMP="$BUILD_DIR/simt_cross_core_g0_aiv.bc.dump"
+KERNEL_ELF="$BUILD_DIR/simt_cross_core_g0_kernel.o"
+HOST_BINARY="$BUILD_DIR/simt_cross_core_g0_host"
+BUILD_MANIFEST="$BUILD_DIR/g0_build_manifest.sha256"
+AIC_ENTRY="simt_cross_core_g0_0_mix_aic"
+AIV_ENTRY="simt_cross_core_g0_0_mix_aiv"
+G0_BUILD_INPUTS=(
+    common/full_pa_exec_protocol.h
+    common/full_pa_model.h
+    gm/common/g0_full_pa.h
+    gm/ccec/full_pa_workloads.h
+    gm/ccec/g0_full_pa_kernel.cpp
+    gm/ccec/g0_full_pa_host.cpp
+    gm/ccec/build_g0.sh
+)
+
+if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
+    echo "ASCEND_HOME_PATH is not set; source the CANN environment first." >&2
+    exit 1
+fi
+
+CCEC="$ASCEND_HOME_PATH/bin/ccec"
+LD_LLD="$ASCEND_HOME_PATH/bin/ld.lld"
+READELF_BIN="${READELF:-readelf}"
+if command -v llvm-bcanalyzer >/dev/null 2>&1; then
+    LLVM_BCANALYZER="$(command -v llvm-bcanalyzer)"
+else
+    LLVM_BCANALYZER="/opt/mlir-debug/bin/llvm-bcanalyzer"
+fi
+if command -v g++-15 >/dev/null 2>&1; then
+    GXX15="$(command -v g++-15)"
+elif [[ -n "${GCC15_ROOT:-}" && -x "$GCC15_ROOT/usr/bin/g++-15" ]]; then
+    GXX15="$GCC15_ROOT/usr/bin/g++-15"
+else
+    echo "g++-15 is required for the ACL host runner." >&2
+    exit 1
+fi
+
+for tool in "$CCEC" "$LD_LLD" "$LLVM_BCANALYZER" "$GXX15"; do
+    if [[ ! -x "$tool" ]]; then
+        echo "required executable is missing: $tool" >&2
+        exit 1
+    fi
+done
+if ! command -v "$READELF_BIN" >/dev/null 2>&1; then
+    echo "readelf is required for mixed-ELF validation." >&2
+    exit 1
+fi
+if ! command -v rg >/dev/null 2>&1; then
+    echo "rg is required for G0 source validation." >&2
+    exit 1
+fi
+if ! python3 -c 'import msobjdump' >/dev/null 2>&1; then
+    echo "the CANN msobjdump module is required for metadata validation." >&2
+    exit 1
+fi
+for source in "$KERNEL_SOURCE" "$WORKLOAD_SOURCE" "$MODEL_SOURCE" "$HOST_SOURCE"; do
+    if [[ ! -s "$source" ]]; then
+        echo "required G0 source is missing: $source" >&2
+        exit 1
+    fi
+done
+
+mkdir -p "$BUILD_DIR"
+
+COMMON_DEVICE_FLAGS=(
+    -c -O3 -g -x cce -Wall -std=c++17
+    --cce-aicore-only
+    -Wno-logical-op-parentheses
+    -Wno-unused-but-set-variable
+    -Wno-bitwise-op-parentheses
+    -Wno-unused-local-typedef
+    -Wno-missing-braces
+    -Wno-unused-variable
+    -Wno-unused-function
+    -Wno-unneeded-internal-declaration
+    -mllvm -cce-aicore-stack-size=0x8000
+    -mllvm -cce-aicore-function-stack-size=0x8000
+    -mllvm -cce-aicore-record-overflow=false
+    -mllvm -cce-aicore-addr-transform
+    -mllvm -cce-aicore-dcci-insert-for-scalar=false
+    -mllvm -cce-aicore-dcci-before-kernel-end=false
+    -I"$ASCEND_HOME_PATH/x86_64-linux/include"
+    -I"$ASCEND_HOME_PATH/x86_64-linux/asc"
+    -I"$ASCEND_HOME_PATH/x86_64-linux/asc/include"
+    -I"$GM_ROOT/common"
+    -I"$SIMT_ROOT/common"
+)
+
+echo "[CHECK] G0 source closure, 64-warp builder and publication order"
+if rg -n '#include.*(cross_core|ops-nn)' "$SIMT_ROOT" -g '*.h' -g '*.cpp'; then
+    echo "G0 must not include cross_core or ops-nn source files." >&2
+    exit 1
+fi
+if ! grep -Fq 'constexpr uint32_t kBuilderWarpCount = 64U;' "$MODEL_SOURCE" ||
+   ! grep -Fq 'constexpr uint32_t kBuilderThreadCount = kBuilderWarpCount * kWarpSize;' "$MODEL_SOURCE" ||
+   ! grep -Fq 'constexpr uint32_t kBuilderTaskStride = kBuilderWarpCount;' "$MODEL_SOURCE" ||
+   ! grep -Fq 'static_assert(kBuilderThreadCount == 2048U && kBuilderLeaderCount == 64U' "$MODEL_SOURCE" ||
+   ! grep -Fq 'const bool active = lane == 0U && warp < kBuilderWarpCount;' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'task_id = warp; task_id < task_count; task_id += kBuilderTaskStride' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'cce::dim3{kBuilderThreadCount, 1U, 1U}' "$KERNEL_SOURCE"; then
+    echo "G0 must launch 2048 SIMT threads and let only lane 0 of each of 64 warps build tasks." >&2
+    exit 1
+fi
+
+vf_start_line="$(grep -nF 'void G0SimtBuildTasks(' "$KERNEL_SOURCE" | cut -d: -f1)"
+vf_end_line="$(grep -nF '#endif  // defined(__DAV_VEC__)' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
+builder_publish_line="$(grep -nF 'asc_atomic_cas(builder_finished' "$KERNEL_SOURCE" | cut -d: -f1)"
+async_line="$(grep -nF 'cce::async_invoke<G0SimtBuildTasks>' "$KERNEL_SOURCE" | cut -d: -f1)"
+builder_wait_line="$(awk '/cce::async_invoke<G0SimtBuildTasks>/ {inside=1} inside && /wait_flag\(PIPE_V, PIPE_S, EVENT_ID0\)/ {print NR; exit}' "$KERNEL_SOURCE")"
+if [[ -z "$vf_start_line" || -z "$vf_end_line" || -z "$builder_publish_line" || -z "$async_line" ||
+      -z "$builder_wait_line" ]] ||
+   ! (( vf_start_line < builder_publish_line && builder_publish_line < vf_end_line &&
+         vf_end_line < async_line && async_line < builder_wait_line )); then
+    echo "G0 builder_finished must be published inside the SIMT VF; Main Scalar may only wait for VF completion." >&2
+    exit 1
+fi
+if grep -Fq 'ScalarCas(&state->drain.builder_finished' "$KERNEL_SOURCE"; then
+    echo "G0 Main Scalar must not publish builder_finished." >&2
+    exit 1
+fi
+if grep -Eq 'result(->|\.)build_count[[:space:]]*=[[:space:]]*state->control.task_count|result(->|\.)commit_count[[:space:]]*=[[:space:]]*state->control.task_count' \
+    "$KERNEL_SOURCE"; then
+    echo "G0 Main Scalar role must not receive SIMT task build or commit attribution." >&2
+    exit 1
+fi
+
+prepare_start_line="$(grep -nF 'inline bool SimtPrepareTask(' "$KERNEL_SOURCE" | cut -d: -f1)"
+descriptor_line="$(grep -nF 'SimtOutputDescriptorWord(task_id, output, task_base, word)' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
+descriptor_fence_line="$(awk '/SimtOutputDescriptorWord\(task_id, output, task_base, word\)/ {inside=1; next} inside && /asc_threadfence\(\);/ {print NR; exit}' "$KERNEL_SOURCE")"
+fresh_publish_line="$(grep -nF 'asc_atomic_cas(published, UINT64_MAX, task_id)' "$KERNEL_SOURCE" | cut -d: -f1)"
+commit_start_line="$(grep -nF 'inline bool SimtCommitTask(' "$KERNEL_SOURCE" | cut -d: -f1)"
+predecessor_wait_line="$(grep -nF 'predecessor, static_cast<uint64_t>(task_id - 1U)' "$KERNEL_SOURCE" | cut -d: -f1)"
+if [[ -z "$prepare_start_line" || -z "$descriptor_line" || -z "$descriptor_fence_line" || -z "$fresh_publish_line" ||
+      -z "$commit_start_line" || -z "$predecessor_wait_line" ]] ||
+   ! (( prepare_start_line < descriptor_line && descriptor_line < descriptor_fence_line &&
+         descriptor_fence_line < fresh_publish_line &&
+         fresh_publish_line < commit_start_line && commit_start_line < predecessor_wait_line )); then
+    echo "G0 fresh outputs must publish after descriptor construction and before the strict predecessor wait." >&2
+    exit 1
+fi
+
+invalidate_start_line="$(grep -nF 'InvalidatePayloadLines(__gm__ FullPaTask *task' "$KERNEL_SOURCE" | cut -d: -f1)"
+invalidate_dcci_line="$(awk '/InvalidatePayloadLines\(__gm__/ {inside=1} inside && /dcci\(/ {print NR; exit}' "$KERNEL_SOURCE")"
+invalidate_dsb_line="$(awk '/InvalidatePayloadLines\(__gm__/ {inside=1} inside && /dsb\(DSB_ALL\);/ {print NR; exit}' "$KERNEL_SOURCE")"
+invalidate_call_line="$(grep -nF 'InvalidatePayloadLines(task, layout.payload_lines);' "$KERNEL_SOURCE" | cut -d: -f1)"
+first_payload_read_line="$(awk '/InvalidatePayloadLines\(task, layout.payload_lines\);/ {inside=1; next} inside && /PayloadWord\(task,/ {print NR; exit}' "$KERNEL_SOURCE")"
+if [[ -z "$invalidate_start_line" || -z "$invalidate_dcci_line" || -z "$invalidate_dsb_line" ||
+      -z "$invalidate_call_line" || -z "$first_payload_read_line" ]] ||
+   ! (( invalidate_start_line < invalidate_dcci_line && invalidate_dcci_line < invalidate_dsb_line &&
+         invalidate_call_line < first_payload_read_line )) ||
+   ! grep -Fq 'for (uint32_t line = 0U; line < payload_lines; ++line)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'payload + line * kCacheLineBytes' "$KERNEL_SOURCE"; then
+    echo "G0 executors must invalidate every published payload cache line before ordinary reads." >&2
+    exit 1
+fi
+
+reset_dcci_count="$(awk '
+    /ResetToken\(__gm__/ {inside=1}
+    /PublishTerminalTokenState\(__gm__/ {inside=0}
+    inside && /dcci\(/ {count++}
+    END {print count + 0}
+' "$KERNEL_SOURCE")"
+if [[ "$reset_dcci_count" -ne 0 ]] ||
+   ! grep -Fq 'PublishTerminalTokenState(state, owner, result->ticket_count);' "$KERNEL_SOURCE"; then
+    echo "G0 token reset must retain dispatch and publish cache lines only once at executor drain." >&2
+    exit 1
+fi
+if ! grep -Fq 'dcci(static_cast<__gm__ void *>(dispatch), kSingleCacheLine);' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'dispatch + kCacheLineBytes' "$KERNEL_SOURCE"; then
+    echo "G0 terminal retained-dispatch publication is missing line 0 or 1." >&2
+    exit 1
+fi
+for dispatch_line in 6U 7U; do
+    if ! grep -Fq "dispatch + $dispatch_line * kCacheLineBytes" "$KERNEL_SOURCE"; then
+        echo "G0 terminal retained-dispatch publication is missing line $dispatch_line." >&2
+        exit 1
+    fi
+done
+
+poison_store_line="$(grep -nF 'StoreDev64(reinterpret_cast<__gm__ uint64_t *>(output), output_poison);' "$KERNEL_SOURCE" | cut -d: -f1)"
+poison_dsb_line="$(awk '/StoreDev64\(reinterpret_cast<__gm__ uint64_t \*>\(output\), output_poison\);/ {inside=1; next} inside && /dsb\(DSB_ALL\);/ {print NR; exit}' "$KERNEL_SOURCE")"
+first_workload_line="$(grep -nE 'RunG0(VectorAdd|VectorMultiply|CubeMatmul)\(' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
+last_workload_line="$(grep -nE 'RunG0(VectorAdd|VectorMultiply|CubeMatmul)\(' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
+witness_line="$(grep -nF 'if (!PublishExecutionWitness(' "$KERNEL_SOURCE" | cut -d: -f1)"
+vend_line="$(grep -nF 'token->control.completion_vend' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
+flag_line="$(grep -nF 'ScalarExchange(&task->completion.flag, 1U)' "$KERNEL_SOURCE" | cut -d: -f1)"
+done_line="$(grep -nF 'DoneState(task_id, owner)' "$KERNEL_SOURCE" | cut -d: -f1)"
+if [[ -z "$poison_store_line" || -z "$poison_dsb_line" || -z "$first_workload_line" ||
+      -z "$last_workload_line" || -z "$witness_line" || -z "$vend_line" || -z "$flag_line" ||
+      -z "$done_line" ]] ||
+   ! (( poison_store_line < poison_dsb_line && poison_dsb_line < first_workload_line )) ||
+   ! (( last_workload_line < witness_line && witness_line < vend_line && vend_line < flag_line &&
+         flag_line < done_line )); then
+    echo "G0 completion must poison output before workload, then follow workload -> witness -> vend -> flag -> DONE." >&2
+    exit 1
+fi
+if ! grep -Fq 'StoreDev64(words + 7U, fanin_ready_prefix);' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'state, owner, task_id, kind, checksum, token->control.fanin_ready_prefix' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'witness.fanin_ready_prefix == expected.fanin_count' "$HOST_SOURCE"; then
+    echo "G0 execution witness must record the runtime token fanin-ready prefix and host must validate it." >&2
+    exit 1
+fi
+if ! grep -Fq 'constexpr uint32_t kDrainExpectedArrivals = 6U;' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'for (uint32_t group = 0U; group < kDrainGroupCount; ++group)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'constexpr uint32_t kDrainGroupCount = 16U;' "$SIMT_ROOT/common/full_pa_exec_protocol.h"; then
+    echo "G0 final drain must preserve 16 groups with 6 arrivals per group." >&2
+    exit 1
+fi
+for workload in RunG0VectorAdd RunG0VectorMultiply RunG0CubeMatmul; do
+    if ! grep -Fq "$workload(" "$KERNEL_SOURCE" || ! grep -Fq "void $workload(" "$WORKLOAD_SOURCE"; then
+        echo "G0 is missing real workload definition/call: $workload" >&2
+        exit 1
+    fi
+done
+
+echo "[BUILD] CCEC G0 AIC Cube executors (dav-c310-cube)"
+"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
+    -o "$AIC_OBJECT" "$KERNEL_SOURCE"
+
+echo "[BUILD] CCEC G0 AIV 64-warp SIMT builder/Vector executors (dav-c310-vec)"
+"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" --cce-aicore-arch=dav-c310-vec \
+    -o "$AIV_OBJECT" "$KERNEL_SOURCE"
+
+echo "[BUILD] CCEC G0 optimized bitcode inventory"
+"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
+    -Xclang -emit-llvm-bc -o "$AIC_BITCODE" "$KERNEL_SOURCE"
+"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" --cce-aicore-arch=dav-c310-vec \
+    -Xclang -emit-llvm-bc -o "$AIV_BITCODE" "$KERNEL_SOURCE"
+"$LLVM_BCANALYZER" -dump "$AIC_BITCODE" > "$AIC_BITCODE_DUMP"
+"$LLVM_BCANALYZER" -dump "$AIV_BITCODE" > "$AIV_BITCODE_DUMP"
+
+required_aiv_symbols=(
+    "G0SimtBuildTasks"
+    "llvm.hivm.store.vfsimt.info"
+    "llvm.hivm.get.TID.X"
+    "llvm.hivm.atom.CAS.G.u64"
+    "llvm.hivm.atom.ADD.G.u64"
+    "llvm.hivm.fence.workitems"
+    "llvm.hivm.DCCI.DST"
+    "llvm.hivm.vldsx1.v64f32"
+    "llvm.hivm.vadd.s.x.v64f32"
+    "llvm.hivm.vmul.s.x.v64f32"
+    "llvm.hivm.vstsx1.v64f32"
+    "llvm.hivm.SET.FLAG.IMM"
+    "llvm.hivm.WAIT.FLAG.IMM"
+)
+for symbol in "${required_aiv_symbols[@]}"; do
+    if ! grep -Fq "$symbol" "$AIV_BITCODE_DUMP"; then
+        echo "optimized G0 AIV bitcode is missing: $symbol" >&2
+        exit 1
+    fi
+done
+required_aic_symbols=(
+    "RunG0CubeMatmul"
+    "llvm.hivm.atom.CAS.G.s64"
+    "llvm.hivm.atom.ADD.G.s64"
+    "llvm.hivm.DCCI.DST"
+    "llvm.hivm.SET.MTE2.NZ.PARA"
+    "llvm.hivm.MOV.OUT.TO.L1.MULTI.ND2NZ.U32.V310"
+    "llvm.hivm.LOAD.L1.TO.L0A.2Dv2.f32"
+    "llvm.hivm.LOAD.L1.TO.L0B.2Dv2.f32"
+    "llvm.hivm.MAD.f322f32.c310"
+    "llvm.hivm.FIX.L0C.TO.OUT.f32.EXT"
+    "llvm.hivm.SET.FLAG.IMM"
+    "llvm.hivm.WAIT.FLAG.IMM"
+)
+for symbol in "${required_aic_symbols[@]}"; do
+    if ! grep -Fq "$symbol" "$AIC_BITCODE_DUMP"; then
+        echo "optimized G0 AIC bitcode is missing: $symbol" >&2
+        exit 1
+    fi
+done
+echo "[CHECK] bitcode contains SIMT atomics/fence, line DCCI, Vector add/multiply, Cube matmul and drain atomics"
+
+echo "[BUILD] Static G0 1:2 mixed AICore ELF"
+"$LD_LLD" -m aicorelinux -Ttext=0 -static -o "$KERNEL_ELF" "$AIC_OBJECT" "$AIV_OBJECT"
+
+SYMBOLS="$("$READELF_BIN" --symbols --wide --sym-base=10 "$KERNEL_ELF")"
+SECTIONS="$("$READELF_BIN" --sections --wide "$KERNEL_ELF")"
+RELOCATIONS="$("$READELF_BIN" --relocs --wide "$KERNEL_ELF")"
+for entry in "$AIC_ENTRY" "$AIV_ENTRY"; do
+    if ! awk -v name="$entry" \
+        '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" && $NF == name && $3 + 0 > 0 {count++}
+         END {exit count != 1}' <<<"$SYMBOLS"; then
+        echo "final G0 ELF must define one non-empty GLOBAL entry: $entry" >&2
+        exit 1
+    fi
+    if [[ "$SECTIONS" != *".ascend.meta.$entry"* ]]; then
+        echo "final G0 ELF is missing metadata: .ascend.meta.$entry" >&2
+        exit 1
+    fi
+done
+global_functions="$(awk '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" {print $NF}' <<<"$SYMBOLS")"
+expected_global_functions="$(printf '%s\n%s\n' "$AIC_ENTRY" "$AIV_ENTRY")"
+if [[ "$global_functions" != "$expected_global_functions" ]]; then
+    echo "final G0 ELF exports unexpected GLOBAL functions:" >&2
+    printf '%s\n' "$global_functions" >&2
+    exit 1
+fi
+for local_pattern in 'G0SimtBuildTasks.*_simt_entry$' 'RunG0VectorAdd' 'RunG0VectorMultiply' 'RunG0CubeMatmul'; do
+    if ! awk -v pattern="$local_pattern" \
+        '$4 == "FUNC" && $5 == "LOCAL" && $3 + 0 > 0 && $NF ~ pattern {count++}
+         END {exit count != 1}' <<<"$SYMBOLS"; then
+        echo "final G0 ELF must retain one non-empty LOCAL function matching: $local_pattern" >&2
+        exit 1
+    fi
+done
+undefined_globals="$(awk '$5 == "GLOBAL" && $7 == "UND" {print $NF}' <<<"$SYMBOLS")"
+if [[ -n "$undefined_globals" ]]; then
+    echo "final G0 ELF contains undefined GLOBAL symbols:" >&2
+    printf '%s\n' "$undefined_globals" >&2
+    exit 1
+fi
+if [[ "$RELOCATIONS" != *"There are no relocations"* ]]; then
+    echo "final G0 ELF unexpectedly retains relocations." >&2
+    exit 1
+fi
+
+METADATA_OUTPUT="$(python3 -m msobjdump -d "$KERNEL_ELF")"
+if [[ "$(grep -Fc 'KERNEL_TYPE: MIX_AIC_MAIN' <<<"$METADATA_OUTPUT")" -ne 2 ||
+      "$(grep -Fc 'MIX_TASK_RATION: [1:2]' <<<"$METADATA_OUTPUT")" -ne 2 ]]; then
+    echo "G0 mixed metadata is not an exact pair of MIX_AIC_MAIN [1:2] entries:" >&2
+    printf '%s\n' "$METADATA_OUTPUT" >&2
+    exit 1
+fi
+AIV_META_HEX="$("$READELF_BIN" -x ".ascend.meta.$AIV_ENTRY" "$KERNEL_ELF")"
+if [[ "$AIV_META_HEX" != *"0c000400 04000000"* || "$AIV_META_HEX" != *"07000400 00200000"* ]]; then
+    echo "G0 AIV metadata must encode SIMD_SIMT_MIX_VF=4 and 8 KiB SIMT share memory." >&2
+    printf '%s\n' "$AIV_META_HEX" >&2
+    exit 1
+fi
+if ! grep -Fq 'constexpr int kG0WorkloadTile = 128;' "$WORKLOAD_SOURCE" ||
+   ! grep -Fq 'TASSIGN(input_a_tile, 0x0);' "$WORKLOAD_SOURCE" ||
+   ! grep -Fq 'TASSIGN(input_b_tile, 0x10000);' "$WORKLOAD_SOURCE" ||
+   ! grep -Fq 'TASSIGN(output_tile, 0x20000);' "$WORKLOAD_SOURCE"; then
+    echo "G0 Vector workload must retain three non-overlapping 128x128 FP32 UB tiles." >&2
+    exit 1
+fi
+VECTOR_TILE_BYTES=$((128 * 128 * 4))
+VECTOR_UB_BYTES=$((0x20000 + VECTOR_TILE_BYTES))
+SIMT_SHARE_BYTES=$((8 * 1024))
+MAX_LOCAL_BYTES=$((224 * 1024))
+if (( VECTOR_TILE_BYTES != 64 * 1024 || VECTOR_UB_BYTES != 192 * 1024 ||
+      VECTOR_UB_BYTES + SIMT_SHARE_BYTES > MAX_LOCAL_BYTES )); then
+    echo "G0 Vector UB plus SIMT share memory exceeds the 224 KiB A5 budget." >&2
+    exit 1
+fi
+echo "[CHECK] ELF has exact mixed entries/functions/metadata and a 192+8/224 KiB AIV local-memory budget"
+
+echo "[BUILD] GCC 15 G0 ACL host ($("$GXX15" -dumpfullversion))"
+"$GXX15" -O2 -std=c++17 -Wall -Wextra -Werror \
+    -Wno-deprecated-declarations \
+    -I"$GM_ROOT/common" \
+    -I"$SIMT_ROOT/common" \
+    -I"$ASCEND_HOME_PATH/include" \
+    -I"$ASCEND_HOME_PATH/pkg_inc" \
+    -I"$ASCEND_HOME_PATH/pkg_inc/runtime" \
+    -I"$ASCEND_HOME_PATH/pkg_inc/runtime/runtime" \
+    "$HOST_SOURCE" \
+    -L"$ASCEND_HOME_PATH/x86_64-linux/lib64" \
+    -Wl,-rpath,"$ASCEND_HOME_PATH/x86_64-linux/lib64" \
+    -lascendcl -lruntime -ldl \
+    -o "$HOST_BINARY"
+
+if [[ ! -s "$KERNEL_ELF" || ! -x "$HOST_BINARY" ]]; then
+    echo "G0 build did not produce the required kernel and host artifacts." >&2
+    exit 1
+fi
+
+manifest_tmp="$(mktemp "$BUILD_DIR/g0_build_manifest.XXXXXX")"
+trap 'rm -f -- "$manifest_tmp"' EXIT
+(
+    cd "$SIMT_ROOT"
+    sha256sum \
+        "${G0_BUILD_INPUTS[@]}" \
+        gm/build/ccec/simt_cross_core_g0_kernel.o \
+        gm/build/ccec/simt_cross_core_g0_host
+) > "$manifest_tmp"
+mv -f -- "$manifest_tmp" "$BUILD_MANIFEST"
+trap - EXIT
+
+echo "[BUILD] G0 CCEC complete"
+echo "[BUILD] kernel: $KERNEL_ELF"
+echo "[BUILD] host:   $HOST_BINARY"
+echo "[BUILD] manifest: $BUILD_MANIFEST"

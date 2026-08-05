@@ -14,7 +14,8 @@
 - 性能不是阶段强制项；一旦给出性能数字，必须同时给出对照、参数、轮数、
   构建身份和结果文件；
 - 每个阶段只提交 `simt_cross_core/` 内的文件；
-- 阶段提交和 push 完成后自动继续，不等待人工确认；
+- 阶段性本地 commit 完成后自动继续，不等待人工确认；未经用户明确授权不得
+  push；
 - 若遇到设计停止线，先停下定位，不能用减少校验或扩大超时继续推进。
 
 阶段记录统一使用以下结构：
@@ -1231,8 +1232,10 @@ timeout 120s tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
 映射不是简单让 `tid=0..15` 构建 16 个 task，因为那样仍全部落在 warp 0；
 task 0..3 分别由 tid 0/32/64/96 构建，task 4..7 分别由
 tid 1/33/65/97 构建，依此类推。host 逐 task 校验实际 thread id，因而不能
-由某一个 warp 代替其他 warp 完成后仍误判通过。该映射也可直接扩到 G0：
-1280 个 task 时 128 个 thread 都参与，每个 thread 构建 10 个 task。
+由某一个 warp 代替其他 warp 完成后仍误判通过。该映射只用于 S4 的无前后继
+探针 task，不直接扩到有严格插入顺序的 G0。G0 改为发射 2048 thread/
+64 warp，每个 warp 仅 lane 0 工作；1280 个 task 按 `task_id%64`
+分给 64 个 leader，每个 leader 构建 20 个 task。
 
 ### 8.7 阶段结论
 
@@ -1356,7 +1359,256 @@ span 接近较慢单分支和两段总区间重叠，可以推断本例 work 阶
 A1 不生成泳道图，不把未加锁 host 墙钟写成性能结论。本阶段只做本地阶段性
 commit，不 push。
 
-## 10. 阶段状态索引
+## 10. G0：纯 SIMT 多 warp 构建完整 PA
+
+### 10.1 阶段目标与不可越过的角色边界
+
+G0 首次把前面探针证明的原语接入完整 shared TensorMap PA 流程。源码继续在
+`simt_cross_core` 内独立闭合，不 include `cross_core` 或 `ops-nn` 源码；但
+task ABI、五类 task、DAG、payload、writer history、四 token 执行和最终
+drain 均逐项对照现有生产实现，而不是另造一套简化协议。
+
+本阶段采用以下固定分工：
+
+| 设备角色 | 数量 | 允许的工作 | 明确禁止 |
+| -------- | ---: | ---------- | -------- |
+| AIV0 SIMT | 2048 thread/64 warp | 每个 warp 仅 lane 0 构建、发布并提交自己的 task。 | inactive lane 访问 task；执行任何 PA task。 |
+| AIV0 Main Scalar | 1 | 发起 VF、等待 VF 并参加 drain。 | 获得 task build/commit 计数；构造 descriptor/payload；提交 history/last-writer/insert-completion；发布 BUILT；Claim 或执行 task。 |
+| AIC executor | 32 | 从 AIC ticket 表 Claim、执行 QK/PV、发布完成。 | 构建 task。 |
+| AIV executor | 63 | 从 AIV ticket 表 Claim、执行 SF/UP、发布完成。 | 构建 task。 |
+
+Main Scalar 的 role build/commit/execute/claim 计数全部为 0。实际构建数由
+64 份 SIMT thread report 独立求和，`builder_finished` 也由最后一个 SIMT task
+在 VF 内发布，Main Scalar 不能代发或取得 task 归因。
+
+### 10.2 完整 PA task、payload 与 heap 口径
+
+每个 batch 固定五个 task，`task_id=5*batch+kind`：
+
+| kind | 名称 | engine | tensor/scalar/fanin | payload | output reserve |
+| ---: | ---- | ------ | ------------------: | ------: | -------------: |
+| 0 | Alloc | 不进入执行器 | 0/0/0 | 无执行 payload | 10,240 B |
+| 1 | QK | AIC | 4/2/0 | 592 B，10 line | 524,288 B |
+| 2 | SF | AIV | 4/3/1 | 604 B，10 line | 264,192 B |
+| 3 | PV | AIC | 4/2/1 | 596 B，10 line | 8,192 B |
+| 4 | UP | AIV | 7/2/3 | 988 B，16 line | 0 B |
+
+DAG 固定为 `SF<-QK`、`PV<-SF`、`UP<-SF,PV,Alloc`，即每 batch 五条
+fanin edge。UP writer history 固定记录 Alloc 的 output key `3/2/1`；最终仅
+Alloc slot0 的 last-writer 从 Alloc 更新为 UP，slot1/2 仍保持 Alloc。
+
+B1 共 5 个 task、4 个可执行 task，heap reserve 为 806,912 B。B256 共
+1,280 个 task、1,024 个可执行 task，heap reserve 为 206,569,472 B。heap
+分成 8 个 25,821,184 B shard；SIMT leader 真实执行分 shard atomic reserve，
+所以 task base 的先后次序允许随并发变化，host 改为按 shard 排序检查区间，
+不把某一种偶然分配顺序写成 golden。
+
+### 10.3 64 warp 全并发构建与严格 insert
+
+G0 发射 2048 个 thread，但只让每个 warp 的 lane0 工作。task 映射为
+`warp=task_id%64`、`tid=warp*32`、下一 task 为 `task_id+64`。B256 中每个
+leader 精确构建 20 个 task，另外 1,984 个 lane 的 prepare/commit/state
+访问计数必须全为 0。
+
+prepare 与严格 insert 被有意分开：
+
+1. leader 先 CAS `EMPTY->BUILDING`，预留 heap，写 plan 和完整 fresh-output
+   descriptor；
+2. descriptor 后执行 SIMT thread fence，立即 CAS 发布 fresh output 及初始
+   last-writer；该步骤不进入全局严格链；
+3. 构造完整 inline payload，仍保持 `BUILDING`；需要前驱输出时只原子等待
+   前驱独占的 task-base report，再按冻结 shape 重建 descriptor；
+4. 等待 `task[N-1].insert_completion==N-1` 后，才提交 UP history、跨 task
+   last-writer、本 task insert-completion，以及 Alloc completion 或 kernel
+   task 的 `BUILT`。
+
+相邻 task 总在不同 warp，包括 `63->64` 回绕，因此不会出现同 warp 的一条
+分歧路径等待另一条路径。等待值只允许从 `N-2` 变为 `N-1`；观察到第三种值
+立即报告 `InsertProtocolFailed`，不能伪装成普通超时。构建报告逐 thread 保存
+tid/warp/lane、首尾 task、prepare/commit/等待次数、nonce 和 checksum，host
+逐项检查 64 个 active leader 与 1,984 个 inactive lane。
+
+### 10.4 四 token 执行、真实 workload 与终态发布
+
+AIC/AIV 各自使用 immutable ticket 表，每个 executor owner 固定四个
+`ExecutionToken`。扫描器即使先看到 `EMPTY/BUILDING`，也保留该 ticket 并停在
+`WaitingBuilt`，而不是丢弃 task。B1 的最终 cursor 为 AIC/AIV `34/65`，
+B256 为 `544/575`，即有效 task 数再加每个 executor 精确一次越界 ticket。
+
+四类 kernel task 都执行真实 128×128 FP32 workload：QK/PV 做 128 项
+`2*3` 累加，抽样结果为 768；SF 做 `2+3`，结果为 5；UP 做 `2*3`，结果为
+6。每个 owner 使用独立输出 tile，host 检查实际结果且确认两个输入 tile 未被
+改写。完成顺序固定为：
+
+```text
+workload -> execution witness -> vend -> flag -> DONE
+```
+
+DONE CAS 冲突单独报告 `CompletionStateConflict`，不再与普通 vend/flag/witness
+发布失败混成一个原因。
+
+executor 进入 workload 前逐条原子读取 producer completion，并只在真实
+`fanin_ready_prefix` 推进到 task 所需的 0/1/1/3 后继续。该运行时 prefix
+随 execution witness 一起发布，host 按 task kind 精确核对；因此 fanin
+不再只由 payload 和终态 completion 自洽证明。`completion_sequence` 仍是
+终态路径标记，不把它误称为独立的逐阶段时间线。
+
+生产 `ResetExecutionToken` 只清 control、保留 dispatch，G0 也保持这一语义。
+首版终态检查只验证 control 恢复初值，无法证明中间确实发生过 binding；最终版
+还检查每个实际用过 token 保留的最后一份 tensor/scalar args、local/global
+context、自指针、task/owner/layout/vend。为避免给每个 task 增加 DCCI，executor
+只在彻底排空后，对最多四个已用 token 集中 clean+invalidate control，以及
+dispatch 的有效 line 0/1/6/7，最后执行一次 DSB。未用 token、args 9..47、
+padding 和 builder owner32 的四个 token 必须保持初始化 poison。
+
+最终 drain 仍为 16 组、每组 6 个物理参与者；每组 atomic 值同时编码到达数
+和该组完成数。固定 root 只有在 96 个角色全部到达后，才核对 1,024 个完成、
+AIC/AIV 各 512 个完成、256 个 Alloc completion、精确 cursor 和所有 token
+排空，并发布 `root_finished`。
+
+### 10.5 CPU 语义模型与独立 host oracle
+
+CPU 模型覆盖 B1/B256、64 个 builder leader、8-shard heap、精确 payload/DAG、
+四 token、fanin、completion、16 组 drain、inactive tail 与同地址复用。除完整
+case 外还包含：
+
+- 半包 payload 在 BUILT 前不可 Claim；
+- 多 owner 对同一 task 只能唯一 Claim；
+- 四个 token 同时停在 `WaitingBuilt` 后仍能继续推进；
+- strict insert prefix 必须从 task0 连续增长，不能跳号；
+- retained dispatch 与 control-only reset 必须同时成立；
+- 两份不同 nonce 在同一 materialized state 上复用，旧 witness/poison 不得泄漏。
+
+完整 CPU case 让 64 个 builder 与 95 个 executor owner 从同一闸门并发启动，
+executor 按 owner 推进 `WaitingBuilt` 和单调 `fanin_ready_prefix`，不再采用
+“BuildAll 后 ExecuteAll”的串行自洽模型。95 个 executor 各自原子到达 drain，
+64 个 builder join 后 AIV0 只发布 `builder_finished` 并作为零 task 角色到达；
+root 必须实际等齐 16 组各 6 个参与者。AIV0 Main Scalar 的 role
+build/commit/claim/execute 始终为 0，1280 个 prepare/commit 只由 64 份 SIMT
+leader report 求和。
+
+materialize 后再次从独立 ABI 对象复核 active task、heap、role、token、builder
+report 和 drain；retained token 中的 tensor/local/global/self pointer 全部重绑
+到目标 `FullPaState`，不能继续指向 CPU 模型的源对象。DONE control、运行时
+fanin witness、奇数 fanin 高 32 位、plan 保留字段、history 尾部及连续 vend
+区间也纳入检查。`completion_sequence` 仍只是终态见证，真实指令先后另外由
+设备源码顺序、atomic 发布和 host 终态共同约束，不把一个常量夸大为完整
+时间线证明。
+
+统一构建入口：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-g0
+```
+
+它依次运行 optimized、ASan+UBSan、TSan，并构建 AIC/AIV CCEC object、optimized
+bitcode、1:2 mixed ELF 和 GCC 15 ACL host。
+
+### 10.6 CCEC、bitcode 与 ELF 静态门槛
+
+构建脚本除编译外还锁定以下事实：
+
+- 源码闭包不 include `cross_core`/`ops-nn`；发射 2048 thread、64 warp，且
+  仅 lane0 按 `warp+64*k` 构建；
+- fresh descriptor store、SIMT fence、fresh publish 均位于严格前驱等待之前；
+- `builder_finished` 的 CAS 位于 VF 内，Main Scalar 只能 invoke/join；
+- reader 对 payload 每条 cacheline 执行 DCCI+DSB 后才普通读取；
+- workload 前先按 task/nonce 毒化抽样输出并 DSB，随后真实 TSTORE 必须覆盖；
+- execution witness 保存运行时 token 的 `fanin_ready_prefix`，host 按 task
+  的 fanin 数核对；
+- optimized bitcode 含 SIMT TID、GM uint64 CAS/add、workitem fence、逐行 DCCI、
+  Vector add/multiply、Cube matmul 和 drain atomic；
+- 最终 ELF 仅有两个 global kernel entry，无 relocation；metadata 为
+  `MIX_AIC_MAIN [1:2]`，AIV entry 为 `SIMD_SIMT_MIX_VF`、share memory 8 KiB；
+- AIV metadata 给出 8 KiB SIMT share memory；源码门槛同时冻结 128×128 FP32
+  三个不重叠 Vector tile，据此计算 `192+8 KiB`，不超过 224 KiB 上限；
+- workload、witness、vend、flag、DONE 的源码顺序固定。
+- 成功构建后原子生成 SHA-256 清单，覆盖 G0 device/host 构建输入及配对的
+  kernel/host；
+  `run-g0` 遇到缺失或任一哈希不匹配时拒绝访问设备。
+
+### 10.7 真机暴露并修复的问题
+
+真实 A5 首轮没有死锁，但独立 oracle 连续暴露了两个仅靠 CPU 终态不容易发现的
+问题：
+
+1. B1 首轮 AIC0 role 的 kind 计数出现 `0x4c600000/0x1200`。它们正是
+   `0x12004c600000` GM state 地址的片段。原因是 CCEC 会标量替换 128 B
+   Scalar 局部 aggregate，不能用 `reinterpret_cast<uint64_t*>(&result)` 假定
+   它仍是连续对象。修复为从每个命名字段显式打包 16 个 ABI word 并逐 word
+   `st_dev`，同时增加字段 offset static_assert；随后 B1 通过。
+2. B1 通过后，B256 在 owner37/slot0 报 token control 未复位，但 phase 已是
+   Idle。O3 IR 证明成功和错误清理路径都写了全部 control 字段；真正原因是
+   B256 cache 压力曾把 busy 中间态逐出到 GM，最终普通 reset 留在 Scalar
+   DCache，而构建明确关闭 kernel-end DCCI。B1 因 backing memory 仍是初始
+   Idle，反而可能假通过。修复为上一节的 executor 终态集中 DCCI，并把 host
+   诊断细化为 control 8 个 64-bit word 的 actual/expected/xor；B256 随后通过。
+
+静态复核还在真机前修正了 `shape_and_scalar_offset` 位域打包，以及 fresh output
+曾被错误放入严格 insert 链的问题。后者虽然终态值相同，却会把本应并发的
+descriptor publication 串行化，因此增加了源码顺序门槛防止回归。
+
+终审又发现 owner 会复用同 kind output tile，而所有同 kind task 的 golden
+相同；若某次 workload/TSTORE 被跳过，旧 tile 仍可能产生合法 witness。最终版
+在每个 task 的 workload 紧前，用 task/nonce 派生值 `st_dev` 毒化首 64 bit
+并执行 DSB，随后只有真实 TSTORE 覆盖后 checksum 才能通过。该动作只服务功能
+见证，所以本阶段不报告其性能数据。
+
+### 10.8 真实 A5 结果与结论边界
+
+本轮 A5 precheck 因 shell 无 `npu-smi` 无法检测 silicon；独立的
+`command -v task-submit` 检查也确认队列工具不在 PATH，但 device0 存在。按本
+会话已有授权，每次运行前均输出 precheck-unavailable 与 unlocked 两条警告，
+只做功能验证。ACL 报告 SoC 为 `Ascend950PR_958b`；
+`32*(1AIC+2AIV)` 是本探针 launch/ELF 固定并由 host 输出的拓扑配置，不归因
+给 ACL 自动探测。最终 state 为 31,876,160 B，workspace 为 12,713,984 B；
+同一进程的多轮测试保持 device state/workspace 地址不变。
+
+若环境提供 `task-submit`，标准调用必须先在锁外完成 precheck，再提交；锁内
+`run-g0` 自动把 `$TASK_DEVICE` 注入 host，禁止再次传 `--device`：
+
+```bash
+.claude/skills/onboard-arch-precheck/check.sh a5 && \
+task-submit --timeout 600 --max-time 600 --device auto --device-num 1 \
+  --run "cd $PWD && tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+    run-g0 --batches 256 --runs 10"
+```
+
+入口还会做一次锁内 precheck 作为二次防护：exit 2 的确定架构不匹配无条件
+拒绝；只有 exit 1 的无法检测、`task-submit` 又确实缺失时，才走本会话已经
+明确授权的 unlocked fallback。入口另有 600 秒 host timeout 和成功构建清单
+校验，不能裸跑陈旧或不配对的产物。
+
+最终复现命令为：
+
+```bash
+timeout --foreground 120s tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-g0 --device 0 --batches 1 --runs 10
+timeout --foreground 180s tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-g0 --device 0 --batches 256 --runs 10
+```
+
+当前环境的 `run-g0` 先输出 precheck-unavailable warning，再输出 unlocked
+warning。两条命令的原始汇总分别为：
+
+```text
+[SUMMARY] G0 B1 passes=10/10 fresh_initialization=yes same_address_reuse=validated
+[SUMMARY] G0 B256 passes=10/10 fresh_initialization=yes same_address_reuse=validated
+```
+
+| case | task/kernel task | heap reserve | 结果 | 覆盖 |
+| ---- | ---------------: | -----------: | ---- | ---- |
+| B1 | 5/4 | 806,912 B | 10/10 PASS | 首轮 fresh allocation；随后同地址、逐轮 nonce/poison 重置。 |
+| B256 | 1280/1024 | 206,569,472 B | 10/10 PASS | 首轮 fresh allocation；64 leader 各 20 task 及同地址复用。 |
+
+这些运行没有生成泳道图，也不把未加锁 host 墙钟当作性能数据。G0 的结论限于：
+纯 SIMT 64-warp/lane0 builder 与 AIC/AIV executor 能在同一次 mixed kernel
+中协同完成 B1 和 B256 的完整 PA 语义。代码允许构建和执行并发推进，但本阶段
+没有设备侧 overlap 时间见证，因此不把终态结果夸大为时间区间重叠证据；也不
+声称 64 个 warp 每周期同时 issue 或当前实现已经性能最优。阶段只做本地
+commit，不 push。
+
+## 11. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -1368,7 +1620,7 @@ commit，不 push。
 | A0 SIMT atomic 竞争 | 完成 | `dc61c014`：CPU 三套 PASS；CCEC/ELF 门槛 PASS；A5 32/64/1024/2048 线程各 100/100。 |
 | S4 多 task、单 builder | 完成 | 初版 `a29fa08e` 完成 4-lane 基线；随后修正为 4-warp/128-thread 交错映射，CPU/CCEC/ELF PASS，A5 同地址复用 100/100，完成计数 `1/8/8/16` 精确闭合。 |
 | A1 warp 推进语义 | 完成 | CPU 三套和 CCEC/ELF 门槛 PASS；A5 同地址复用 100/100，SameWarp 始终 T/S+disjoint，CrossWarp 始终 S/S+overlap。 |
-| G0 GM 完整 PA | 未开始 | - |
+| G0 GM 完整 PA | 完成 | 64-warp/lane0 纯 SIMT 构建；CPU 三套与 CCEC/ELF 门槛 PASS；A5 B1/B256 首轮 fresh 及同地址 10 轮全部 PASS。 |
 | G1 双 builder GM | 未开始 | - |
 | U0 UBUF 单槽 | 未开始 | - |
 | U1 UBUF 多槽/多 task | 未开始 | - |
