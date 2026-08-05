@@ -37,7 +37,7 @@ builder 与 executor 必须严格分工：
 | 12 | launch 形态由实现查证决定；本设计选择一次 mixed kernel launch 为主路线。 |
 | 13 | 不再使用容易混淆的 `block0/block1`，统一称为 AIV0/AIV1。 |
 | 14 | 不产生对 `cross_core` 或 `ops-nn` 的源码依赖；公共泳道解析工具可按需调用。 |
-| 15 | 状态机与 `cross_core` 一致；GM 是否需要 DCCI 先由最小 A5 对照实验决定，UBUF 路径自行管理 UB 和 MTE3。 |
+| 15 | 状态机与 `cross_core` 一致；GM 可见性由最小 A5 对照实验决定。当前 CCEC 没有 SIMT-native MTE3 接口，因此 U0 先验证 SIMT 自管 UB 单槽生命周期和 `UBUF -> SIMT load -> GM store`，不伪称 MTE3。 |
 | 16 | 单 Vector/Cube 阶段使用可校验的最小任务，不直接搬入完整 PA 计算。 |
 | 17 | 完整 PA 阶段只替换构建侧，原有 task DAG 和 task 数量保持不变。 |
 | 18 | `gm/` 与 `ubuf/` 分目录长期保留。 |
@@ -81,8 +81,17 @@ builder 与 executor 必须严格分工：
    `hash/embedding_hash_table_export/op_kernel/arch35/`
    `embedding_hash_table_export.h` 已展示同一 SIMT VF 同时接收 GM 与 UBUF
    指针；adaptive-pool 示例还展示了调用前建立 UB 可见性边界。
-7. 官方混合编程示例展示了 `SIMT -> UBUF -> MTE3 -> GM` 的基本链路，
-   并要求为 SIMT Data Cache 至少保留 32 KB，同时保留编译器预留空间。
+7. 本机 CCEC 的 `copy_ubuf_to_gm_align_v2` 位于
+   `namespace __cce_scalar`，包装层通过
+   `CCE_SCALAR(copy_ubuf_to_gm_align_v2)` 调用；SIMT API 中没有对应
+   UBUF→GM/MTE3 接口。将该 Scalar intrinsic 强行保留在
+   `__simt_vf__` 内的最小 CCEC 探针不能生成合法代码，因此不能把
+   普通 aicore 代理 MTE3 冒充为纯 SIMT 实现。
+8. 本机 `ops-nn` 的 `embedding_hash_table_export.h` 给出了当前可行
+   边界：普通 aicore 仅分配 UB 并将 `__ubuf__ *` 传给 VF，SIMT thread
+   从 UBUF 读取中间值后直接写 GM。这是逐线程 GM store，不是 MTE3。
+   U0 只使用这条已有真实代码证据的路径，并继续为 SIMT Data Cache
+   至少保留 32 KB。
 
 官方接口参考：
 
@@ -95,7 +104,7 @@ builder 与 executor 必须严格分工：
 正式协议使用一个静态 1:2 mixed AICore ELF 和一次 kernel launch：
 
 ```text
-AIV0 Main Scalar       启动 SIMT builder ───────────── 等待并收口 builder
+AIV0 __aicore__ entry  只启动/等待 VF，不承担任何 task 语义
 SIMT threads(AIV0)       领取构建权 -> 写 payload -> 发布 BUILT ...
 AIC0..AIC31            观察 BUILT -> Claim -> 执行 AIC task -> DONE
 AIV1..AIV63            观察 BUILT -> Claim -> 执行 AIV task -> DONE
@@ -115,8 +124,9 @@ AIV1..AIV63            观察 BUILT -> Claim -> 执行 AIV task -> DONE
   AIV2..AIV63；AIC executor 数量始终不变；
 - host 终态必须分别证明 builder 的执行次数为 0、executor 的构建次数为 0。
 
-AIV0 的 `__aicore__` Main Scalar 负责发起 SIMT VF，但真正 payload 构造发生在
-SIMT 执行域。AIV0 不因为保留了一段 Main Scalar 控制代码就被算作 executor。
+AIV0 的 `__aicore__` entry 是工具链要求的 VF 启动壳，不是
+builder、executor 或调度角色。payload 构造、严格插入、发布和
+归因全部发生在 SIMT 执行域。
 
 ### 2.4 AIV ELF 分类约束
 
@@ -126,7 +136,8 @@ AIV entry 同时承载 SIMT builder 和普通 AIV task executor，最终 ELF 必
 - AIV metadata 的 VF 类型为 MIX；
 - AIC entry 没有错误的 SIMT VF 分类；
 - 只有预期的 AIC/AIV 两个全局 device entry；
-- 内部 SIMT VF 使用 internal linkage，不额外注册 `_simt_entry`；
+- 内部 SIMT VF 使用 internal linkage，不额外导出 GLOBAL
+  `_simt_entry`；
 - UB metadata 与静态/动态 UB 预算满足至少 32 KB Data Cache 的要求。
 
 ## 3. 协议与内存合同
@@ -194,24 +205,45 @@ DCache 读取，不代替正式 executor 的 reader DCCI 合同。
 ### 3.3 UBUF 构建路径
 
 UBUF 是每个 AIV 私有、不可跨核共享的暂存区。第一版只做单槽，之后扩展
-双槽或小型 ring；任何槽在 MTE3 完成前都不能被下一 task 复用。
+双槽或小型 ring。当前工具链只支持 SIMT 从 UBUF 读取后直接写
+GM，不支持 VF 内发起 MTE3；因此 U0 的每个槽在有效 payload 全部直接
+GM store、`asc_threadfence()` 和 `BUILT` 发布完成前，都不能被下一
+task 复用。
 
-基础顺序固定为：
+U0 固定发射 2048 thread/64 warp，仅每个 warp 的 lane0 工作。
+64 个 leader 分别负责一个独立 task，先并发竞争各自的
+`EMPTY -> BUILDING`，然后竞争同一个 UBUF staging slot。slot owner
+必须位于独立 GM atomic-only cacheline，不得假设 UBUF 支持所需的
+跨 warp atomic。单槽的基础顺序固定为：
 
 ```text
-AIV Main Scalar 预留 cell，置为 BUILDING
-  -> SIMT VF 逐 word 写本 AIV 的 __ubuf__ staging slot
-  -> 建立 VF/UB 完成边界
-  -> MTE3 将有效 payload 精确复制到 GM cell
-  -> 等待 MTE3 完成
-  -> Main Scalar CAS 发布 BUILT
-  -> 释放并复用 UBUF slot
+SIMT warp leader: EMPTY --CAS--> BUILDING
+  -> 用 GM atomic CAS 取得唯一 UBUF slot
+  -> 逐 word 写本 AIV 的 __ubuf__ staging slot
+  -> 同一 leader 逐 word 从 __ubuf__ 读回并直接写目标 GM payload
+  -> asc_threadfence()
+  -> 同一 leader CAS 发布 BUILT
+  -> 同一 leader 用 GM atomic CAS 释放 UBUF slot
 ```
 
-直接 CCEC 路径优先使用编译器的 `copy_ubuf_to_gm_align_v2` 一类 MTE3
-intrinsic，并显式检查 V/MTE3/S 事件顺序。不得通过引入 AscendC `TPipe`、
-`LocalTensor` 或 `DataCopy` 来绕过生命周期设计。UB 大小、对齐、slot owner、
-有效字节数和复用状态都必须是显式 ABI。
+AIV0 `__aicore__` entry 仅允许提供固定、对齐的 UB 基址，将基础指针传入 VF，
+并执行 `async_invoke -> join -> drain`；它不能预留 task cell、填充 UBUF、
+搬运 payload、发布 `BUILT` 或释放 slot。role report 的聚合
+`main_scalar_build_action_count`、task claim/finish 必须全为 0，task 构建
+细分阶段另由 SIMT report 和源码/bitcode 门槛取证。UB region 大小、payload
+偏移、64 B 对齐、slot 数、slot owner、有效 cacheline 数和搬运方式必须是
+显式 ABI；`slot_ticket + launch_nonce` 共同标识槽的本轮复用次序。U0 用
+`1/10/16/68` 条 64 B payload 覆盖最小、当前 PA 常用规模和最大执行包边界，
+每个 task 只复制自己的有效行，不得固定搬满 68 行。
+
+U0 的诊断必须显式记录
+`transport=SIMT_UBUF_READ_TO_GM_WORD_STORE`、
+`mte3_count=0`、slot 最大 busy depth 为 1，并验证 slot acquire/release
+各恰好 64 次。这一阶段只证明 UBUF 指针、单槽生命周期和 SIMT
+直接 GM 发布正确，不证明 MTE3 能力，也不把它写成性能优化。若后续
+必须验证批量 UBUF→GM MTE3，需要先获得 SIMT-native 工具链接口，
+或另行对齐“普通 aicore 仅作 transport engine”的新角色边界；本设计
+不默认引入该回退。
 
 ### 3.4 executor 与结束条件
 
@@ -377,11 +409,11 @@ atomic task-base 报告，再按已冻结 PA shape 重新构造 descriptor；它
 heap 分配，又不新增未经验证的 SIMT 普通 DCache 一致性假设。
 
 最后一个 task 的 SIMT builder 在观察到完整严格前缀后发布
-`builder_finished`。AIV0 Main Scalar 只允许发起 VF、等待 V→S 完成并以零
+`builder_finished`。AIV0 `__aicore__` entry 只允许发起 VF、等待 V→S 完成并以零
 执行数参加最终 drain；它不能构造 descriptor/payload，不能提交 history、
 last_writer 或 insert-completion，也不能发布任何 task 的 `BUILT`。
 其 role build/commit/claim/execute 计数也必须全部为 0；构建总数只从 64 份
-SIMT thread report 求和，不能归因给 Main Scalar。executor
+SIMT thread report 求和，不能归因给 entry 壳。executor
 仍使用 AIC/AIV 两条 immutable ticket 表和每 worker 四个 token，在 task
 尚未发布时停留于 `WaitingBuilt`，不能因一次观察到 `EMPTY/BUILDING` 就丢失
 该 task。
@@ -432,7 +464,7 @@ loss    = (builder_count - 1) * task_count
 ```
 
 inactive lane 的整份 thread report 必须保持 host poison；G0 未发射的第二实例
-`[2048,4096)` 同样必须保持 host poison。两份 Main Scalar 仅允许
+`[2048,4096)` 同样必须保持 host poison。两份 `__aicore__` entry 仅允许
 `async_invoke -> V/S join -> drain`，其 role 的 build/commit/claim/execute/
 ticket 均为 0。AIV executor 因此从 owner34 开始，G1 总 executor 为
 32 AIC + 62 AIV = 94；16 个 drain group 仍各有 6 个物理参与者，owner32
@@ -490,9 +522,9 @@ simt_cross_core/
 | S4 | 多 task、单 builder | task-id 扫描、fanin、token busy 和无遗失。 |
 | G0 | GM 完整 PA | shared TensorMap 主 Case 的五类 task、DAG 和 golden 闭合。 |
 | G1 | AIV0+AIV1 GM | 两 builder 竞争构建；两者仍零 task execute。 |
-| U0 | UBUF 单槽探针 | VF->UB、MTE3、publish 顺序和重复复用正确。 |
-| U1 | UBUF 多槽/多 task | 无提前复用、无覆盖、异常可收口。 |
-| U2 | UBUF 完整 PA | 与 G0 相同 task/DAG/golden，GM 与 UBUF 长期共存。 |
+| U0 | UBUF 单槽探针 | 64 个 warp leader 的 VF→UB、SIMT 直接 GM store、publish 顺序和重复复用正确；明确 `mte3_count=0`。 |
+| U1 | UBUF 多槽/多 task | 纯 SIMT 槽所有权、无提前复用、无覆盖、异常可收口。 |
+| U2 | UBUF 完整 PA | 与 G0 相同 task/DAG/golden，GM 与当前可用的 UBUF 路径长期共存。 |
 
 S0 允许使用单独 AIV-only launch 先确认 SIMT 语法和线程行为；从 S1 开始必须
 进入同一次 mixed kernel launch。G1 的首版只做正确性竞争，静态分片、批次分片
@@ -507,8 +539,11 @@ S0 允许使用单独 AIV-only launch 先确认 SIMT 语法和线程行为；从
 1. CPU 严格告警构建与协议测试；涉及并发时增加确定性交错和随机压力，
    可运行的 portable 代码还要经过 ASan/UBSan，TSan 只作 CPU 证据；
 2. CCEC 分别按 `dav-c310-cube`、`dav-c310-vec` 构建需要的对象，静态检查
-   entry、metadata、未定义符号、UB 大小以及关键 atomic/fence/MTE3 顺序；
-3. 按仓库规范先执行 A5 arch precheck，再通过 `task-submit` 运行真实 A5；
+   entry、metadata、未定义符号、UB 大小以及本阶段实际 transport 的关键
+   atomic/fence 顺序；使用 MTE3 的阶段才检查 MTE3 顺序，不使用的阶段反向
+   检查对应 intrinsic 不存在；
+3. 按仓库规范先执行 A5 arch precheck；环境提供 `task-submit` 时通过它运行
+   真实 A5，否则明确记录为用户授权的 unlocked 单卡功能验证；
 4. host oracle 检查 golden、task 数、唯一 builder/executor、最终 control、
    guard、inactive tail、fatal 和超时；
 5. 将命令、结果、失败过程和边界写入实现过程文档；
@@ -540,8 +575,9 @@ G0、G1、U2 至少检查：
 - AIV ELF 被标记为 SIMT-only，或出现额外全局 SIMT entry；
 - 无法证明 `async_invoke` 后的可靠完成边界；
 - GM 的所有候选可见性序列都出现旧 payload、部分 payload或重复 launch 不稳定；
-- 64-bit SIMT CAS 与 Main Scalar CAS 对同一 control 的结果不一致；
-- UBUF slot 在 MTE3 完成前被复用，或 UB 预算侵占最小 Data Cache；
+- 64-bit SIMT CAS 与 executor Scalar CAS 对同一 control 的结果不一致；
+- UBUF slot 在有效 UBUF→GM 直接 store、fence 和 `BUILT` 发布完成前被复用，
+  或 UB 预算侵占最小 Data Cache；
 - builder 执行 task、executor 构建 task，或 host 只能靠推断而不能取证；
 - fatal/timeout 无法让 kernel 有界退出；
 - 完整 PA 的 DAG、task 数或 golden 与基线不一致。
