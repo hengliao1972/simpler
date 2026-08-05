@@ -274,6 +274,29 @@ Main Scalar 在 V→S completion 之后用 `ld_dev` 建立设备侧诊断摘要�
 对所有逐线程返回值再做一次精确 oracle。这里故意不使用 Scalar 普通
 GM load，避免把 SIMT/Scalar 普通 DCache 可见性与 atomic 返回值语义混在一起。
 
+### 3.7 多 task 扫描、busy token 与 fan-in 合同
+
+S4 使用 16 个交错编号的 task：偶数 task 为 Vector，奇数 task 为
+Cube，各 8 个。AIV0 发射 4 个 SIMT builder thread，thread `tid` 以步长
+4 构建 `tid/tid+4/tid+8/tid+12`；每个 task 仍由单 thread 完整写一条
+descriptor，不在多 thread 之间拼包。
+
+AIV1 只扫描偶数 task，AIC 只扫描奇数 task。两个 executor 各自只有一个
+busy token：只有 token free 时才能 CAS `BUILT -> CLAIMED`；真实 MTE3/FIX
+写回完成、`CLAIMED -> DONE` 成功且完成计数发布后才能释放 token。
+CPU 模型必须受控暂停在第一个 task 的 busy 区间，并证明第二个 task 不会被
+提前 Claim；CCEC 源码和设备结果同时检查最大 busy depth 恰好为 1。
+
+drain cacheline 独立记录 `builder_finished`、`vector_done`、`cube_done`
+和 `done_count`。三个角色只有同时观察到 `1/8/8/16` 才能退出；每个
+task 的 `DONE` CAS 必须早于分 engine 计数，分 engine 计数必须早于全局
+`done_count`。这是 S4 的完成 fan-in，不代替 G0 中真实 PA DAG 的依赖 fan-in。
+
+每个 task 使用独立的 16×16 FP32 input/output tile；Vector 做逐元素 add，
+Cube 做对角左矩阵的 matmul。不同 task 的输入包含 task ordinal 且输出地址
+不同，host 必须逐 task、逐元素核对 golden，不允许用一块共享输出伪装
+多 task 执行。
+
 ## 4. 目录与分阶段实施
 
 ### 4.1 计划目录

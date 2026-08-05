@@ -31,6 +31,8 @@ Usage:
   ./run.sh run-s2 --device N [--runs N]
   ./run.sh build-s3
   ./run.sh run-s3 --device N [--runs N]
+  ./run.sh build-s4
+  ./run.sh run-s4 --device N [--runs N]
 
 build-s0 运行 CPU optimized/ASan/UBSan/TSan，并构建、静态检查 CCEC/ELF。
 run-s0 只运行已构建的真实 A5 探针；调用前仍需按仓库规则执行 A5 precheck。
@@ -42,6 +44,8 @@ build-s2 运行单 Cube 的 CPU 三套测试，并构建、静态检查 1:2 mixe
 run-s2 运行 AIV0 SIMT builder -> AIC Cube executor 的真实 A5 四模式探针。
 build-s3 运行 Vector+Cube 双 task 的 CPU 三套测试和 mixed CCEC/ELF 静态检查。
 run-s3 运行 AIV0 双 task builder、AIV1 Vector executor、AIC Cube executor 的真实 A5 探针。
+build-s4 运行 4 个 SIMT thread 构建 16 task 的 CPU 三套测试和 mixed CCEC/ELF 静态检查。
+run-s4 运行 AIV0 构建 16 task、AIV1/AIC 各以 busy depth 1 执行 8 task 的真实 A5 探针。
 EOF
 }
 
@@ -137,6 +141,23 @@ case "$ACTION" in
         fi
         "$GM_BUILD/simt_cross_core_s3_host" \
             --kernel "$GM_BUILD/simt_cross_core_s3_kernel.o" "$@"
+        ;;
+    build-s4)
+        if [[ $# -ne 0 ]]; then
+            echo "build-s4 does not accept additional arguments." >&2
+            exit 1
+        fi
+        "$GM_ROOT/cpu/build_s4.sh"
+        "$GM_ROOT/ccec/build_s4.sh"
+        ;;
+    run-s4)
+        if [[ ! -x "$GM_BUILD/simt_cross_core_s4_host" ||
+              ! -s "$GM_BUILD/simt_cross_core_s4_kernel.o" ]]; then
+            echo "S4 artifacts are missing; run: $0 build-s4" >&2
+            exit 1
+        fi
+        "$GM_BUILD/simt_cross_core_s4_host" \
+            --kernel "$GM_BUILD/simt_cross_core_s4_kernel.o" "$@"
         ;;
     *)
         usage >&2

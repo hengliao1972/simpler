@@ -1078,7 +1078,158 @@ thread 可继续使用 GM `uint64_t asc_atomic_cas/add`，且同地址语义在
 规则。本阶段没有测量性能，没有生成泳道图。A0 随本节所在提交独立交付，
 然后继续 S4。
 
-## 8. 阶段状态索引
+## 8. 2026-08-05：S4 多 task、单 builder
+
+### 8.1 目标与冻结合同
+
+S4 不再用一个 Vector task 和一个 Cube task 代表调度，而是在同一次
+`1 AIC + 2 AIV` mixed kernel launch 中完成 16 个相互独立的 task：
+
+- 偶数 task 为 Vector，共 8 个；奇数 task 为 Cube，共 8 个；
+- AIV0 只构建 task，AIV1 只执行 Vector，AIC 只执行 Cube；
+- AIV0 发射 4 个 SIMT thread，thread `tid` 完整构建
+  `tid/tid+4/tid+8/tid+12`，不跨 thread 拼 descriptor；
+- AIV1 和 AIC 各只有一个 busy token，完成当前 workload、发布 `DONE` 和
+  fan-in 计数后，才允许处理下一个兼容 task；
+- 最终 drain 必须精确等于 `builder_finished/vector_done/cube_done/done_count
+  = 1/8/8/16`，16 个 task 必须分别到达合法 `DONE`；
+- 每个 task 使用独立的 16×16 FP32 输入和输出，不能通过重复写同一个地址
+  假装完成多 task 调度。
+
+这仍是独立 GM 探针。它验证的是多 task 扫描、路由、单 token 占用和完成
+fan-in，不把当前线性扫描声称为正式 PA DAG scheduler，也没有引入
+`cross_core` 或 `ops-nn` 源码依赖。
+
+### 8.2 修改文件与作用
+
+- `gm/common/s4_multi_task.h`：冻结 16 task ABI、动态 state 编码、每 task
+  payload/checksum、executor busy 统计、独立 tile 和 7 条 guard；
+- `gm/test/test_s4_multi_task.cpp`：CPU 协议模型，包含半包不可见、4-thread
+  stride 分工、错误 engine 路由拒绝、busy 时第二次 Claim 拒绝、完整 fan-in
+  和逐元素 golden；
+- `gm/cpu/build_s4.sh`：optimized、ASan/UBSan、TSan 三套测试；
+- `gm/ccec/s4_multi_task_kernel.cpp`：AIV0 SIMT builder、AIV1 Vector executor、
+  AIC Cube executor 和三个角色共同参与的 drain；
+- `gm/ccec/s4_multi_task_host.cpp`：真实 A5 host，复用同一 device allocation，
+  对 16 份 state/payload/report 和全部输入输出做精确校验；
+- `gm/ccec/build_s4.sh`：源码时序、bitcode intrinsic、ELF symbol/relocation、
+  mixed metadata 和 AIV 本地内存预算门槛；
+- `run.sh`：增加 `build-s4`、`run-s4` 统一入口。
+
+### 8.3 协议与 workload 边界
+
+每个 builder thread 对自己负责的 task 执行：
+
+```text
+EMPTY --CAS--> BUILDING
+  -> 写完整 8-word descriptor
+  -> asc_threadfence
+  -> BUILDING --CAS--> BUILT
+```
+
+AIV0 等待 SIMT launch 的 V→S completion 后，逐 task 用 `ld_dev` 校验
+reserve/publish 返回值和 thread 归属，全部 16 项成功才发布
+`builder_finished=1`。writer 不执行 DCCI；与 S0～S3 的实测结论保持一致，
+AIV1/AIC Claim 后对 payload cacheline 执行 reader `dcci + dsb`。
+
+两个 executor 只扫描自己的奇偶 task。每个 task 严格执行：
+
+```text
+等待 BUILT -> 确认 token free -> CAS Claim -> reader DCCI
+  -> 真实 Vector add 或 Cube matmul并等待写回
+  -> CAS DONE -> engine_done atomic-add -> done_count atomic-add
+  -> 释放 token
+```
+
+CPU 模型在首个 task 的 busy 区间主动尝试第二次 Claim，并要求它被拒绝、
+第二个 task 仍为 `BUILT`；所以 CPU 的 `busy_blocked=1` 是负向测试证据。
+设备 kernel 不主动制造违规 Claim，host 要求设备侧 `max_busy=1` 且
+`busy_blocked=0`。两者验证的是同一个合同，不是数据不一致。
+
+### 8.4 CPU、CCEC 与 ELF 结果
+
+统一构建命令：
+
+```bash
+export ASCEND_HOME_PATH=/home/q00473782/Ascend/cann-9.1.0-weekly-20260708/cann-9.1.0
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-s4
+```
+
+CPU 三套结果：
+
+```text
+[PASS] S4 CPU multi-task rounds=16: 4-thread stride builds 16 tasks,
+       busy depth 1, fan-in and goldens
+[PASS] S4 CPU multi-task rounds=8:  4-thread stride builds 16 tasks,
+       busy depth 1, fan-in and goldens (ASan+UBSan)
+[PASS] S4 CPU multi-task rounds=4:  4-thread stride builds 16 tasks,
+       busy depth 1, fan-in and goldens (TSan)
+```
+
+CCEC/ELF 门槛实际通过：
+
+- dav-c310-vec bitcode 包含 4-thread SIMT launch/TID、GM uint64 CAS、
+  atomic-add、thread fence、reader DCCI、Vector load/add/store 和 V/S event；
+- dav-c310-cube bitcode 包含 CAS、atomic-add、reader DCCI、MTE2、ND2NZ、
+  L1→L0A/L0B、MAD、FIX 写回和 event；
+- 最终 ELF 只导出两个非空 mixed GLOBAL entry，并保留非空 LOCAL
+  `S4SimtBuildTasks`、`RunVectorAdd`、`RunCubeMatmul`；无 undefined GLOBAL
+  和 relocation；
+- 两份 metadata 都是 `MIX_AIC_MAIN [1:2]`；AIV metadata 为
+  `SIMD_SIMT_MIX_VF` 且 SIMT share 为 8 KiB；
+- 三块 1024 B Vector tile 加 8 KiB SIMT share 合计 11 KiB，未超过
+  224 KiB 上限。
+
+编译过程中实际发现 `shared_protocol.h` 的 `constexpr EncodeExecState` 是
+host-only，CCEC 禁止从 `__aicore__` 调用。修正方式不是放宽检查，而是在 S4
+公共头中按同一位域常量实现设备可调用的编码器；SIMT VF 内则直接按已查证的
+位域编码，CPU 继续用同一个协议解码器检查最终 state。
+
+### 8.5 真实 A5 结果
+
+当前 shell 无 `npu-smi`、无 `task-submit`，本轮沿用用户已经明确授权的
+device 0 未加锁验证；结果只用于功能正确性，不进入性能结论。先跑 1 次
+冒烟，再在同一个 device allocation 上复用相同地址 100 次：
+
+```bash
+timeout 60s tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-s4 --device 0 --runs 1
+timeout 120s tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-s4 --device 0 --runs 100
+```
+
+真实输出：
+
+```text
+[DEVICE] id=0 soc=Ascend950PR_958b topology=1AIC+2AIV
+         state_bytes=53248 builder_threads=4 tasks=16
+[SUMMARY] 4-thread-build+16-state+drain+8-vector+8-cube=100/100
+[PASS] S4 mixed multi-task runs=100 reused_address=yes
+       vector_tasks=8 cube_tasks=8 busy_depth=1
+```
+
+每一轮均逐项满足：
+
+- 16/16 reserve 从 `EMPTY` 成功，publish 返回对应 `BUILDING`；
+- 每个 report 的 builder thread 精确等于 `task_index % 4`；
+- 16 份 payload 的 magic/version/nonce/三个 GM 地址/shape/checksum 全匹配；
+- AIV0 Build 16/16、Claim 0；AIV1 和 AIC 都是 Build 0、Claim 8/8、
+  execute 8、最大 busy depth 1；
+- 16 个 control 全部到达匹配 engine/owner/task id 的 `DONE`；
+- drain 精确为 `1/8/8/16`，fatal=0；
+- 8 份 Vector 输出、8 份 Cube 输出、全部输入和 7 条 guard 逐元素通过。
+
+### 8.6 阶段结论
+
+S4 已证明一个固定 AIV0 可以用多个 SIMT thread 构建多份独立 task，AIV1
+和 AIC 在同一次 kernel launch 中按 engine 过滤并各自以 busy depth 1 连续
+执行，且完整 workload 写回后才能发布 per-engine/global fan-in。真实 A5
+100/100 说明结果不是 CPU 模型或静态 IR 推断。
+
+本阶段没有测性能、没有生成泳道图；未加锁设备墙钟不作性能结论。S4 随本次
+阶段提交交付，不 push。下一阶段 G0 才把这一能力接入 GM 版完整 PA DAG。
+
+## 9. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -1087,8 +1238,8 @@ thread 可继续使用 GM `uint64_t asc_atomic_cas/add`，且同地址语义在
 | S1 单 Vector task | 完成 | `975da5ea`：CPU 三套 PASS；1:2 mixed ELF 静态门槛 PASS；A5 跨 AIV 100×4 模式完成，reader DCCI 为最小可靠序列。 |
 | S2 单 Cube task | 完成 | `2e3034d7`：CPU 三套 PASS；1:2 mixed ELF/Cube intrinsic 门槛 PASS；A5 AIV→AIC 100×4 模式完成，reader DCCI 为最小可靠序列。 |
 | S3 Vector + Cube | 完成 | `5dff1124`；CPU 三套 PASS；双 task mixed ELF/Vector/Cube 门槛 PASS；A5 同地址复用 100/100，完成计数和 drain 精确闭合。 |
-| A0 SIMT atomic 竞争 | 完成 | CPU 三套 PASS；CCEC/ELF 门槛 PASS；A5 32/64/1024/2048 线程各 100/100；随本次 A0 提交交付。 |
-| S4 多 task、单 builder | 未开始 | - |
+| A0 SIMT atomic 竞争 | 完成 | `dc61c014`：CPU 三套 PASS；CCEC/ELF 门槛 PASS；A5 32/64/1024/2048 线程各 100/100。 |
+| S4 多 task、单 builder | 完成 | CPU 三套 PASS；CCEC/ELF 门槛 PASS；A5 同地址复用 100/100，完成计数 `1/8/8/16` 精确闭合；随本次阶段提交交付。 |
 | G0 GM 完整 PA | 未开始 | - |
 | G1 双 builder GM | 未开始 | - |
 | U0 UBUF 单槽 | 未开始 | - |
