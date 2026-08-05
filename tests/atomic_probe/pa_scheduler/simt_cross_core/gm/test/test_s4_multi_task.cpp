@@ -313,7 +313,8 @@ bool RunRound(uint32_t round) {
             while (!start.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
-            for (uint32_t task_index = thread; task_index < kTaskCount; task_index += kBuilderThreadCount) {
+            for (uint32_t task_index = BuilderFirstTask(thread); task_index < kTaskCount;
+                 task_index += kBuilderThreadCount) {
                 if (BuildTask(&tasks[task_index], data, nonce, task_index, nullptr)) {
                     builder_thread[task_index] = thread;
                     build_wins.fetch_add(1U, std::memory_order_relaxed);
@@ -333,7 +334,7 @@ bool RunRound(uint32_t round) {
     }
     for (uint32_t task_index = 0U; task_index < kTaskCount; ++task_index) {
         if (tasks[task_index].state.load(std::memory_order_acquire) != BuiltState(task_index) ||
-            builder_thread[task_index] != task_index % kBuilderThreadCount ||
+            builder_thread[task_index] != BuilderThreadForTask(task_index) ||
             !PayloadValid(tasks[task_index], data, nonce, task_index)) {
             return false;
         }
@@ -433,7 +434,8 @@ int main(int argc, char **argv) {
         }
     }
     std::printf(
-        "[PASS] S4 CPU multi-task rounds=%u: 4-thread stride builds 16 tasks, busy depth 1, fan-in and goldens\n",
+        "[PASS] S4 CPU multi-task rounds=%u: 4-warp/128-thread mapping builds 16 tasks, busy depth 1, fan-in and "
+        "goldens\n",
         rounds
     );
     return EXIT_SUCCESS;

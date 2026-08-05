@@ -44,7 +44,9 @@ constexpr uint64_t kPayloadVersion = 1U;
 constexpr uint64_t kVectorPayloadMagic = 0x5334564543544F52ULL;
 constexpr uint64_t kCubePayloadMagic = 0x533443554245544BULL;
 constexpr uint64_t kResultMagic = 0x5334524553554C54ULL;
-constexpr uint32_t kBuilderThreadCount = 4U;
+constexpr uint32_t kWarpSize = 32U;
+constexpr uint32_t kBuilderWarpCount = 4U;
+constexpr uint32_t kBuilderThreadCount = kWarpSize * kBuilderWarpCount;
 constexpr uint32_t kTaskCount = 16U;
 constexpr uint32_t kVectorTaskCount = kTaskCount / 2U;
 constexpr uint32_t kCubeTaskCount = kTaskCount / 2U;
@@ -99,6 +101,18 @@ SIMT_CROSS_CORE_S4_INLINE bool TaskIsVector(uint32_t task_index) { return (task_
 SIMT_CROSS_CORE_S4_INLINE uint32_t TaskOrdinal(uint32_t task_index) { return task_index / 2U; }
 
 SIMT_CROSS_CORE_S4_INLINE uint32_t TaskId(uint32_t task_index) { return kTaskIdBase + task_index; }
+
+SIMT_CROSS_CORE_S4_INLINE uint32_t BuilderFirstTask(uint32_t thread) {
+    const uint32_t warp = thread / kWarpSize;
+    const uint32_t lane = thread % kWarpSize;
+    return lane * kBuilderWarpCount + warp;
+}
+
+SIMT_CROSS_CORE_S4_INLINE uint32_t BuilderThreadForTask(uint32_t task_index) {
+    const uint32_t warp = task_index % kBuilderWarpCount;
+    const uint32_t lane = (task_index / kBuilderWarpCount) % kWarpSize;
+    return warp * kWarpSize + lane;
+}
 
 SIMT_CROSS_CORE_S4_INLINE ExecEngineClass TaskEngine(uint32_t task_index) {
     return TaskIsVector(task_index) ? ExecEngineClass::Aiv : ExecEngineClass::Aic;
@@ -228,7 +242,8 @@ struct alignas(kCacheLineBytes) ProbeState {
     ProbeGuard guard_after_cube_output;
 };
 
-static_assert(kTaskCount % kBuilderThreadCount == 0U, "S4 thread-stride distribution must be exact");
+static_assert(kBuilderThreadCount == 128U, "S4 must launch four 32-thread warps");
+static_assert(kTaskCount <= kBuilderThreadCount, "S4 task-to-warp mapping assumes at most one task per thread");
 static_assert(kTileBytes == 1024U, "S4 tile size changed");
 static_assert(sizeof(ProbePayload) == kCacheLineBytes, "S4 payload ABI changed");
 static_assert(sizeof(ProbeTaskSlot) == 2U * kCacheLineBytes, "S4 task-slot ABI changed");

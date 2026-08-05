@@ -316,7 +316,7 @@ bool PayloadAndReportValid(
            payload.words[kPayloadChecksumWord] == ComputePayloadChecksum(task_index, nonce, input_a, input_b, output) &&
            report.reserve_observed == 0U && report.publish_observed == BuildingState(task_index) &&
            report.participating_threads == kBuilderThreadCount && report.payload_words_written == kPayloadWords &&
-           report.launch_nonce == nonce && report.builder_thread == task_index % kBuilderThreadCount &&
+           report.launch_nonce == nonce && report.builder_thread == BuilderThreadForTask(task_index) &&
            report.writer_dcci == 0U;
 }
 
@@ -454,8 +454,9 @@ int main(int argc, char **argv) {
         session.DeviceFieldAddress(offsetof(ProbeState, cube_output)),
     };
     std::printf(
-        "[DEVICE] id=%d soc=%s topology=1AIC+2AIV state_bytes=%zu builder_threads=%u tasks=%u\n", options.device,
-        session.SocName().c_str(), sizeof(ProbeState), kBuilderThreadCount, kTaskCount
+        "[DEVICE] id=%d soc=%s topology=1AIC+2AIV state_bytes=%zu builder_warps=%u builder_threads=%u tasks=%u\n",
+        options.device, session.SocName().c_str(), sizeof(ProbeState), kBuilderWarpCount, kBuilderThreadCount,
+        kTaskCount
     );
 
     auto state = std::make_unique<ProbeState>();
@@ -475,7 +476,7 @@ int main(int argc, char **argv) {
         }
     }
     const bool passed = passes == options.runs;
-    std::printf("[SUMMARY] 4-thread-build+16-state+drain+8-vector+8-cube=%u/%u\n", passes, options.runs);
+    std::printf("[SUMMARY] 4-warp-build+16-state+drain+8-vector+8-cube=%u/%u\n", passes, options.runs);
     std::printf(
         "[%s] S4 mixed multi-task runs=%u reused_address=yes vector_tasks=%u cube_tasks=%u busy_depth=1\n",
         passed ? "PASS" : "FAIL", options.runs, kVectorTaskCount, kCubeTaskCount

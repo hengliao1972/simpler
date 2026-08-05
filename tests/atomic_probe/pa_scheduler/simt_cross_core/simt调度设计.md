@@ -277,8 +277,11 @@ GM load，避免把 SIMT/Scalar 普通 DCache 可见性与 atomic 返回值语�
 ### 3.7 多 task 扫描、busy token 与 fan-in 合同
 
 S4 使用 16 个交错编号的 task：偶数 task 为 Vector，奇数 task 为
-Cube，各 8 个。AIV0 发射 4 个 SIMT builder thread，thread `tid` 以步长
-4 构建 `tid/tid+4/tid+8/tid+12`；每个 task 仍由单 thread 完整写一条
+Cube，各 8 个。AIV0 发射 128 个 SIMT thread，即 4 个 32-thread warp。
+task `i` 映射到
+`tid=(i%4)*32+((i/4)%32)`；等价地，thread 从
+`lane*4+warp` 开始并按 128 递增。这样 16 个 task 均匀落到 4 个 warp，
+而不是由同一 warp 的相邻 lane 完成。每个 task 仍由单 thread 完整写一条
 descriptor，不在多 thread 之间拼包。
 
 AIV1 只扫描偶数 task，AIC 只扫描奇数 task。两个 executor 各自只有一个
@@ -364,7 +367,7 @@ S0 允许使用单独 AIV-only launch 先确认 SIMT 语法和线程行为；从
 4. host oracle 检查 golden、task 数、唯一 builder/executor、最终 control、
    guard、inactive tail、fatal 和超时；
 5. 将命令、结果、失败过程和边界写入实现过程文档；
-6. 只提交本阶段文件，使用详细中文 commit，并 push 当前分支；
+6. 只提交本阶段文件并使用详细中文 commit；只有用户明确授权后才能 push；
 7. 自动进入下一阶段。
 
 泳道图不是阶段门槛。性能数据也不是强制门槛；如果顺手测量，必须记录

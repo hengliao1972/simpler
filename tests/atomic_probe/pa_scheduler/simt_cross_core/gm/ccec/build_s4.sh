@@ -95,9 +95,10 @@ if rg -n '#include.*(cross_core|ops-nn)' "$SIMT_ROOT" -g '*.h' -g '*.cpp'; then
     echo "S4 must not include cross_core or ops-nn source files." >&2
     exit 1
 fi
-if ! grep -Fq 'task_index += kBuilderThreadCount' "$KERNEL_SOURCE" ||
+if ! grep -Fq 'first_task = lane * kBuilderWarpCount + warp' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'task_index += kBuilderThreadCount' "$KERNEL_SOURCE" ||
    ! grep -Fq 'cce::dim3{kBuilderThreadCount, 1U, 1U}' "$KERNEL_SOURCE"; then
-    echo "S4 must use four SIMT builder threads with an exact stride-4 distribution." >&2
+    echo "S4 must use four SIMT warps with warp-interleaved task mapping and a 128-thread stride." >&2
     exit 1
 fi
 
@@ -190,7 +191,7 @@ for symbol in "${required_aic_symbols[@]}"; do
         exit 1
     fi
 done
-echo "[CHECK] bitcode contains four-thread SIMT publication, Vector add, Cube matmul and drain atomics"
+echo "[CHECK] bitcode contains four-warp SIMT publication, Vector add, Cube matmul and drain atomics"
 
 echo "[BUILD] Static S4 1:2 mixed AICore ELF"
 "$LD_LLD" -m aicorelinux -Ttext=0 -static -o "$KERNEL_ELF" "$AIC_OBJECT" "$AIV_OBJECT"

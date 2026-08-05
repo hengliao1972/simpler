@@ -10,7 +10,7 @@
  */
 
 // S4 在同一个 1 AIC + 2 AIV mixed block 中，由 AIV0 的 4 个 SIMT
-// thread 以 stride 4 构建 16 个 task；AIV1/AIC 各持有一个执行 token。
+// warp 按 warp-interleaved 映射构建 16 个 task；AIV1/AIC 各持有一个执行 token。
 
 #include <pto/common/kernel_meta.hpp>
 #include <pto/pto-inst.hpp>
@@ -247,10 +247,13 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void S4SimtBuild
     if (thread >= kBuilderThreadCount) {
         return;
     }
+    const uint32_t warp = thread / kWarpSize;
+    const uint32_t lane = thread % kWarpSize;
+    const uint32_t first_task = lane * kBuilderWarpCount + warp;
     constexpr uint32_t kTaskStrideWords = sizeof(ProbeTaskSlot) / sizeof(uint64_t);
     constexpr uint32_t kPayloadOffsetWords = offsetof(ProbeTaskSlot, payload) / sizeof(uint64_t);
     constexpr uint32_t kReportStrideWords = sizeof(ProbeSimtReport) / sizeof(uint64_t);
-    for (uint32_t task_index = thread; task_index < kTaskCount; task_index += kBuilderThreadCount) {
+    for (uint32_t task_index = first_task; task_index < kTaskCount; task_index += kBuilderThreadCount) {
         __gm__ uint64_t *state_word = task_words + task_index * kTaskStrideWords;
         __gm__ uint64_t *payload_words = state_word + kPayloadOffsetWords;
         __gm__ uint64_t *report = report_words + task_index * kReportStrideWords;
@@ -363,7 +366,7 @@ __aicore__ void RunBuilder(__gm__ ProbeState *state) {
         const uint64_t publish = LoadDev64(&state->simt_reports[task_index].publish_observed);
         const uint64_t builder_thread = LoadDev64(&state->simt_reports[task_index].builder_thread);
         if (reserve == 0U && publish == BuildingState(task_index) &&
-            builder_thread == task_index % kBuilderThreadCount) {
+            builder_thread == BuilderThreadForTask(task_index)) {
             ++build_wins;
         } else {
             PublishFatal(state, ExecFatalReason::PublishConflict, kBuilderOwner, TaskId(task_index));

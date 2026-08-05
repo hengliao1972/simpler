@@ -44,7 +44,7 @@ build-s2 运行单 Cube 的 CPU 三套测试，并构建、静态检查 1:2 mixe
 run-s2 运行 AIV0 SIMT builder -> AIC Cube executor 的真实 A5 四模式探针。
 build-s3 运行 Vector+Cube 双 task 的 CPU 三套测试和 mixed CCEC/ELF 静态检查。
 run-s3 运行 AIV0 双 task builder、AIV1 Vector executor、AIC Cube executor 的真实 A5 探针。
-build-s4 运行 4 个 SIMT thread 构建 16 task 的 CPU 三套测试和 mixed CCEC/ELF 静态检查。
+build-s4 运行 4 个 SIMT warp/128 thread 构建 16 task 的 CPU 三套测试和 mixed CCEC/ELF 静态检查。
 run-s4 运行 AIV0 构建 16 task、AIV1/AIC 各以 busy depth 1 执行 8 task 的真实 A5 探针。
 EOF
 }

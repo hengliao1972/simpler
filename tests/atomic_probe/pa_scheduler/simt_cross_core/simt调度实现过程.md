@@ -1087,8 +1087,9 @@ S4 不再用一个 Vector task 和一个 Cube task 代表调度，而是在同�
 
 - 偶数 task 为 Vector，共 8 个；奇数 task 为 Cube，共 8 个；
 - AIV0 只构建 task，AIV1 只执行 Vector，AIC 只执行 Cube；
-- AIV0 发射 4 个 SIMT thread，thread `tid` 完整构建
-  `tid/tid+4/tid+8/tid+12`，不跨 thread 拼 descriptor；
+- AIV0 发射 128 个 SIMT thread，即 4 个 warp；task `i` 映射到
+  `tid=(i%4)*32+((i/4)%32)`，16 个 task 均匀分布到 4 个 warp，
+  不跨 thread 拼 descriptor；
 - AIV1 和 AIC 各只有一个 busy token，完成当前 workload、发布 `DONE` 和
   fan-in 计数后，才允许处理下一个兼容 task；
 - 最终 drain 必须精确等于 `builder_finished/vector_done/cube_done/done_count
@@ -1104,8 +1105,8 @@ fan-in，不把当前线性扫描声称为正式 PA DAG scheduler，也没有引
 
 - `gm/common/s4_multi_task.h`：冻结 16 task ABI、动态 state 编码、每 task
   payload/checksum、executor busy 统计、独立 tile 和 7 条 guard；
-- `gm/test/test_s4_multi_task.cpp`：CPU 协议模型，包含半包不可见、4-thread
-  stride 分工、错误 engine 路由拒绝、busy 时第二次 Claim 拒绝、完整 fan-in
+- `gm/test/test_s4_multi_task.cpp`：CPU 协议模型，包含半包不可见、4-warp
+  交错分工、错误 engine 路由拒绝、busy 时第二次 Claim 拒绝、完整 fan-in
   和逐元素 golden；
 - `gm/cpu/build_s4.sh`：optimized、ASan/UBSan、TSan 三套测试；
 - `gm/ccec/s4_multi_task_kernel.cpp`：AIV0 SIMT builder、AIV1 Vector executor、
@@ -1158,17 +1159,17 @@ tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-s4
 CPU 三套结果：
 
 ```text
-[PASS] S4 CPU multi-task rounds=16: 4-thread stride builds 16 tasks,
+[PASS] S4 CPU multi-task rounds=16: 4-warp/128-thread mapping builds 16 tasks,
        busy depth 1, fan-in and goldens
-[PASS] S4 CPU multi-task rounds=8:  4-thread stride builds 16 tasks,
+[PASS] S4 CPU multi-task rounds=8:  4-warp/128-thread mapping builds 16 tasks,
        busy depth 1, fan-in and goldens (ASan+UBSan)
-[PASS] S4 CPU multi-task rounds=4:  4-thread stride builds 16 tasks,
+[PASS] S4 CPU multi-task rounds=4:  4-warp/128-thread mapping builds 16 tasks,
        busy depth 1, fan-in and goldens (TSan)
 ```
 
 CCEC/ELF 门槛实际通过：
 
-- dav-c310-vec bitcode 包含 4-thread SIMT launch/TID、GM uint64 CAS、
+- dav-c310-vec bitcode 包含 4-warp/128-thread SIMT launch/TID、GM uint64 CAS、
   atomic-add、thread fence、reader DCCI、Vector load/add/store 和 V/S event；
 - dav-c310-cube bitcode 包含 CAS、atomic-add、reader DCCI、MTE2、ND2NZ、
   L1→L0A/L0B、MAD、FIX 写回和 event；
@@ -1202,8 +1203,8 @@ timeout 120s tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
 
 ```text
 [DEVICE] id=0 soc=Ascend950PR_958b topology=1AIC+2AIV
-         state_bytes=53248 builder_threads=4 tasks=16
-[SUMMARY] 4-thread-build+16-state+drain+8-vector+8-cube=100/100
+         state_bytes=53248 builder_warps=4 builder_threads=128 tasks=16
+[SUMMARY] 4-warp-build+16-state+drain+8-vector+8-cube=100/100
 [PASS] S4 mixed multi-task runs=100 reused_address=yes
        vector_tasks=8 cube_tasks=8 busy_depth=1
 ```
@@ -1211,7 +1212,8 @@ timeout 120s tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
 每一轮均逐项满足：
 
 - 16/16 reserve 从 `EMPTY` 成功，publish 返回对应 `BUILDING`；
-- 每个 report 的 builder thread 精确等于 `task_index % 4`；
+- 每个 report 的 builder thread 精确等于
+  `(task_index%4)*32+((task_index/4)%32)`；
 - 16 份 payload 的 magic/version/nonce/三个 GM 地址/shape/checksum 全匹配；
 - AIV0 Build 16/16、Claim 0；AIV1 和 AIC 都是 Build 0、Claim 8/8、
   execute 8、最大 busy depth 1；
@@ -1219,9 +1221,22 @@ timeout 120s tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
 - drain 精确为 `1/8/8/16`，fatal=0；
 - 8 份 Vector 输出、8 份 Cube 输出、全部输入和 7 条 guard 逐元素通过。
 
-### 8.6 阶段结论
+### 8.6 同 warp 缺口与跨 warp 修正
 
-S4 已证明一个固定 AIV0 可以用多个 SIMT thread 构建多份独立 task，AIV1
+首个 S4 提交 `a29fa08e` 使用 `tid=0..3`。这四个 lane 都属于 warp 0，
+能够证明同一 warp 内的多 lane 分工，但不能证明多个 warp 独立推进 task
+构建。用户指出该缺口后，本阶段没有把“4 thread”继续解释成充分的并发证据，
+而是把 launch 扩为 128 thread/4 warp，并采用 warp-interleaved 映射。
+
+映射不是简单让 `tid=0..15` 构建 16 个 task，因为那样仍全部落在 warp 0；
+task 0..3 分别由 tid 0/32/64/96 构建，task 4..7 分别由
+tid 1/33/65/97 构建，依此类推。host 逐 task 校验实际 thread id，因而不能
+由某一个 warp 代替其他 warp 完成后仍误判通过。该映射也可直接扩到 G0：
+1280 个 task 时 128 个 thread 都参与，每个 thread 构建 10 个 task。
+
+### 8.7 阶段结论
+
+S4 已证明一个固定 AIV0 可以用 4 个 SIMT warp 构建多份独立 task，AIV1
 和 AIC 在同一次 kernel launch 中按 engine 过滤并各自以 busy depth 1 连续
 执行，且完整 workload 写回后才能发布 per-engine/global fan-in。真实 A5
 100/100 说明结果不是 CPU 模型或静态 IR 推断。
@@ -1239,7 +1254,7 @@ S4 已证明一个固定 AIV0 可以用多个 SIMT thread 构建多份独立 tas
 | S2 单 Cube task | 完成 | `2e3034d7`：CPU 三套 PASS；1:2 mixed ELF/Cube intrinsic 门槛 PASS；A5 AIV→AIC 100×4 模式完成，reader DCCI 为最小可靠序列。 |
 | S3 Vector + Cube | 完成 | `5dff1124`；CPU 三套 PASS；双 task mixed ELF/Vector/Cube 门槛 PASS；A5 同地址复用 100/100，完成计数和 drain 精确闭合。 |
 | A0 SIMT atomic 竞争 | 完成 | `dc61c014`：CPU 三套 PASS；CCEC/ELF 门槛 PASS；A5 32/64/1024/2048 线程各 100/100。 |
-| S4 多 task、单 builder | 完成 | CPU 三套 PASS；CCEC/ELF 门槛 PASS；A5 同地址复用 100/100，完成计数 `1/8/8/16` 精确闭合；随本次阶段提交交付。 |
+| S4 多 task、单 builder | 完成 | 初版 `a29fa08e` 完成 4-lane 基线；随后修正为 4-warp/128-thread 交错映射，CPU/CCEC/ELF PASS，A5 同地址复用 100/100，完成计数 `1/8/8/16` 精确闭合。 |
 | G0 GM 完整 PA | 未开始 | - |
 | G1 双 builder GM | 未开始 | - |
 | U0 UBUF 单槽 | 未开始 | - |
