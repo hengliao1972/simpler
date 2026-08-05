@@ -368,20 +368,194 @@ S0 唯一能冻结的硬件规则是：同 AIV、同 GM 地址重复复用时，
 
 S0 已闭合 CPU 状态机、直接 CCEC SIMT 语法、64-thread execution、64-bit GM
 CAS 返回值、V->S completion、同 AIV 地址复用和 DCCI 最小序列。没有写入
-性能数字，也没有生成泳道文件。阶段作为本次独立中文提交交付；提交 SHA 以
-本分支紧随 D0 的 S0 commit 为准，下一阶段记录会回填该固定 SHA。
+性能数字，也没有生成泳道文件。阶段已由提交 `399d5704` 独立交付并推送。
 
-S1 将进入同一次 mixed launch：AIV0 仍只做 builder，至少一个其他 AIV 只做
-单 Vector task executor，并在真实跨 AIV 方向重新执行 DCCI 可见性矩阵和
-golden 校验。
+S1 随后进入同一次 mixed launch：AIV0 仍只做 builder，AIV1 只做单 Vector
+task executor，并在真实跨 AIV 方向重新执行 DCCI 可见性矩阵和 golden 校验。
 
-## 4. 阶段状态索引
+## 4. 2026-08-05：S1 单 Vector task
+
+### 4.1 目标、拓扑与任务合同
+
+S1 不扩展到多 task，也不引入 Cube。host 固定 launch 一个 mixed block，
+metadata 比例为 1 AIC + 2 AIV：
+
+| 参与者 | 固定职责 | 明确禁止 |
+| --- | --- | --- |
+| AIC | 只观察 `DONE` 并报告身份。 | 不 Build、不 Claim、不执行 Vector。 |
+| AIV0 / owner 32 | 启动 64-thread SIMT VF；thread 0 构建唯一 task。 | 不 Claim、不执行 task。 |
+| AIV1 / owner 33 | 轮询 `BUILT`，唯一 Claim，校验 payload，执行 Vector add，完成后发布 `DONE`。 | 不参与 Build。 |
+
+task payload 独占一条 64 B cacheline，共 8 个 `uint64_t`：magic、version、
+launch nonce、input A/B/output 的 GM 地址、`task_id + element_count` 和覆盖前
+7 个 word 的 checksum。状态仍严格使用
+`EMPTY -> BUILDING -> BUILT -> CLAIMED -> DONE`；`BUILT` 标记 AIV engine
+和一条 payload line。AIV1 只有 CAS 成功后才能按被测 DCCI 模式读取 payload。
+
+真实任务采用 128×128 float tile，共 16,384 个元素。AIV1 按以下顺序执行：
+
+```text
+TLOAD input A/B
+  -> MTE2->V wait
+  -> TADD
+  -> V->MTE3 wait
+  -> TSTORE output
+  -> MTE3->S wait
+  -> CLAIMED->DONE CAS
+```
+
+因此 `DONE` 是 GM output 已完成写回后的边界，不是仅完成 Vector 指令发射。
+四条 64 B guard 分隔 control、输入与输出；host 还逐元素检查两个输入未改写。
+
+### 4.2 新增文件与入口
+
+- `gm/common/s1_vector.h`：S1 独立 ABI、角色/状态常量、8-word payload、
+  128 B role result、128×128 tile 和 host golden；
+- `gm/test/test_s1_vector.cpp`：CPU 半包暂停、角色互斥、Claim、畸形
+  descriptor fail-closed 与逐元素 golden；
+- `gm/cpu/build_s1.sh`：optimized、ASan/UBSan、TSan 三套门槛；
+- `gm/ccec/s1_vector_kernel.cpp`：AIC observer、AIV0 SIMT builder、AIV1
+  Vector executor 两个 mixed entry；
+- `gm/ccec/s1_vector_host.cpp`：ACL loader、同地址复用、角色/guard/payload/
+  golden oracle 和四模式分类；
+- `gm/ccec/build_s1.sh`：源码顺序、bitcode intrinsic、mixed ELF、metadata、
+  UB 预算与 host 构建检查；
+- `run.sh`：新增 `build-s1` 与 `run-s1` 统一入口。
+
+所有源文件仍只位于 `simt_cross_core/`。构建脚本扫描 include，确认没有引用
+`cross_core` 或 `ops-nn` 源码；PTO/CANN 只作为已安装工具链头使用。
+
+### 4.3 CPU 结果
+
+统一命令：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-s1
+```
+
+CPU 部分结果：
+
+```text
+[PASS] S1 CPU vector rounds=64: optimized
+[PASS] S1 CPU vector rounds=32: ASan+UBSan
+[PASS] S1 CPU vector rounds=16: TSan
+```
+
+每轮使用显式暂停点让 AIV0 在写完 4/8 payload word 后停住，验证：
+
+1. `BUILDING` 期间 AIV1 Claim 失败且 payload read 为 0；
+2. AIC、AIV0 调用 execute route 均被拒绝，AIC、AIV1 调用 build route 均被
+   拒绝；
+3. AIV0 恢复后唯一发布 `BUILT`，AIV1 唯一 Claim 并只读取 8 个 word；
+4. AIV1 精确执行一次 16,384-element add，逐元素 golden 相等；
+5. checksum 被破坏的已领取 descriptor 不执行 Vector，output 全部保持 sentinel，
+   但探针可有界发布 `DONE`，便于将候选可见性失败归类而不制造设备死锁。
+
+CPU 仍只证明 C++ 语义和角色路由，不替代 A5 DCache 证据。
+
+### 4.4 CCEC 与 mixed ELF 静态门槛
+
+CCEC 分别使用 `dav-c310-cube` 和 `dav-c310-vec` 编译同一源码，显式关闭
+compiler 自动 scalar DCCI 与 kernel-end DCCI。检查结果为：
+
+```text
+[CHECK] S1 source closure and publication/completion order
+[CHECK] bitcode contains SIMT publication, atomic polling, DCCI and
+        real Vector-add intrinsics
+[CHECK] ELF exports only two mixed entries; AIV is SIMD_SIMT_MIX_VF
+        and UB budget is 200/224 KiB
+[BUILD] S1 CCEC complete
+```
+
+具体证据：
+
+- source 顺序锁定 payload store、可选 writer DCCI、SIMT fence、`BUILT` CAS；
+- source 顺序还锁定 `TLOAD < TADD < TSTORE < MTE3->S wait`，且
+  `RunVectorAdd < DONE CAS`；
+- AIV bitcode inventory 同时包含 SIMT launch/TID、64-bit CAS、atomic load、
+  work-item fence、DCCI/DSB、V/S event、`vldsx1/vadd/vstsx1` 和 `st_dev`；
+- 最终 ELF 只有 `simt_cross_core_s1_0_mix_aic` 与
+  `simt_cross_core_s1_0_mix_aiv` 两个 GLOBAL function；SIMT builder 与
+  Vector add 都是非空 LOCAL function，且无 undefined GLOBAL 与 relocation；
+- 两个 metadata 都是 `MIX_AIC_MAIN [1:2]`；AIV metadata 的 TLV12 为 4，
+  即 `SIMD_SIMT_MIX_VF`，不是会拒绝 SIMD 的 `SIMT_VF_ONLY`；
+- AIV metadata 的 SIMT share memory 为 8 KiB；三块 64 KiB Vector tile 共
+  192 KiB，总计 200 KiB，不超过保留 32 KiB DCache 后的 224 KiB 上限。
+
+与 S0 一样，新 SIMT bitcode 使用当前 `/opt/mlir-debug` 的 `llvm-dis` 不支持的
+`amdgpu_cs_chain`。因此仍使用可成功解析的 `llvm-bcanalyzer` 做 intrinsic
+inventory，并用源码顺序检查补足发布/完成顺序；没有伪称完成逐 SSA IR 审计。
+
+### 4.5 上板前发现并修正的诊断发布问题
+
+首版 role result 使用 256 B 局部 aggregate，再将其 `reinterpret_cast` 为
+`uint64_t*` 循环执行 `st_dev`。真实 A5 上 task 主链和 Vector golden 已完成，
+但 D2H 后 role 字段发生重排，例如 magic 位置读到 status，说明该通用局部地址
+遍历不能作为 CCEC Scalar 结果 ABI。把结构单纯缩到 128 B 后问题仍存在，因而
+“只是结构太大”被排除。
+
+最终保留 128 B 打包 ABI，并把 16 个命名字段逐一 `st_dev`，不再线性遍历
+Scalar 局部 aggregate。修正后所有字段连续稳定。现有证据能确定故障边界和
+有效规避方式，但没有编译器内部证据精确断言是哪一步 scalar replacement 或
+spill 造成重排；过程文档不把推测写成根因。该修正只影响诊断发布，不改变
+task 状态机、DCCI 矩阵或 Vector 执行。
+
+### 4.6 真实 A5 四模式结果
+
+precheck 再次报告当前 shell 无 `npu-smi`，且没有 `task-submit`；
+`/dev/davinci0` 存在，按仓库无队列降级规则直接在 device 0 串行运行。ACL
+实际报告 `Ascend950PR_958b`。最终命令：
+
+```bash
+timeout --foreground 180s \
+  tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-s1 --device 0 --runs 100
+```
+
+同一块约 193 KiB device state 地址复用 100 次、每次四模式：
+
+| 模式 | 状态机/角色/guard | payload + 16,384 元素 golden | 稳定性 | S1 结论 |
+| --- | ---: | ---: | --- | --- |
+| `NO_DCCI` | 100/100 | 1/100 | 不稳定 | 仅冷 cache 首轮成功，淘汰。 |
+| `WRITER_DCCI` | 100/100 | 0/100 | 稳定失败 | writer clean 不能替代 AIV1 reader 失效，淘汰。 |
+| `READER_DCCI` | 100/100 | 100/100 | 稳定通过 | AIV0→AIV1 的最小可靠序列。 |
+| `WRITER_AND_READER_DCCI` | 100/100 | 100/100 | 稳定通过 | 保守通过，但 writer DCCI 冗余。 |
+
+最终输出：
+
+```text
+[DEVICE] id=0 soc=Ascend950PR_958b topology=1AIC+2AIV
+[SUMMARY] mode=NO_DCCI                protocol=100/100 payload+golden=1/100
+[SUMMARY] mode=WRITER_DCCI            protocol=100/100 payload+golden=0/100
+[SUMMARY] mode=READER_DCCI            protocol=100/100 payload+golden=100/100
+[SUMMARY] mode=WRITER_AND_READER_DCCI protocol=100/100 payload+golden=100/100
+[CHARACTERIZATION] AIV0-builder -> AIV1-executor minimum=READER_DCCI;
+                   AIV-to-AIC remains unresolved
+[PASS] S1 mixed single-Vector runs=100 modes=4 reused_address=yes
+       golden_elements=16384
+```
+
+四模式中 AIV0 都精确 Build 一次、Claim/Vector 为 0；AIV1 都精确 Claim 一次、
+Build 为 0，仅在 payload 有效时执行一次 Vector；AIC 的 Build/Claim/Vector 均
+为 0。所有 control 最终为 `DONE`、fatal 为 0、guard 和输入未改写。候选模式
+payload 失败时 output 保持 sentinel，因此不会把“误用旧 descriptor 后碰巧算
+对”计为通过。
+
+### 4.7 阶段结论
+
+S1 已在同一次 1:2 mixed launch 内证明 AIV0 builder-only、AIV1
+executor-only 和真实 Vector task 完成边界。跨 AIV 的 DCache 行为与 S0 同 AIV
+一致：正式 GM 路径必须在 Claim winner 侧对 payload 执行 reader DCCI + DSB，
+writer DCCI 不是必要条件。这个结论仍不能替代 AIV→AIC 证据；S2 将用单 Cube
+task 和同一四模式矩阵独立验证。
+
+## 5. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | --- | --- | --- |
 | D0 文档与查证 | 完成 | `64e3d5d5`：范围、链接和空白检查通过。 |
-| S0 基础协议与 SIMT 自检 | 完成 | CPU 三套 PASS；A5 同 AIV 100×4 模式完成，reader DCCI 为最小可靠序列；随本次 S0 提交交付。 |
-| S1 单 Vector task | 未开始 | - |
+| S0 基础协议与 SIMT 自检 | 完成 | `399d5704`：CPU 三套 PASS；A5 同 AIV 100×4 模式完成，reader DCCI 为最小可靠序列。 |
+| S1 单 Vector task | 完成 | CPU 三套 PASS；1:2 mixed ELF 静态门槛 PASS；A5 跨 AIV 100×4 模式完成，reader DCCI 为最小可靠序列；随本次 S1 提交交付。 |
 | S2 单 Cube task | 未开始 | - |
 | S3 Vector + Cube | 未开始 | - |
 | S4 多 task、单 builder | 未开始 | - |

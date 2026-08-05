@@ -174,6 +174,14 @@ SIMT writer 做单行 DCCI、Claim winner 做 payload 单行 DCCI、两侧都做
 地址复用和两类跨核方向都稳定通过，则保留纯 thread-fence 路径；如果失败，
 就保留能闭合正确性的最小 writer/reader DCCI，不能为了减少指令而省略。
 
+截至 S1，已有两条各 100 轮、每轮四模式的 A5 证据：S0 的同 AIV 读取与
+S1 的 AIV0 builder 到 AIV1 executor 跨 AIV 读取都得到
+`NO_DCCI=1/100`、`WRITER_DCCI=0/100`、`READER_DCCI=100/100`、双侧
+DCCI `100/100`。因此 GM 路径在同 AIV和跨 AIV 方向均冻结为 Claim winner
+成功后对 payload 做 reader DCCI + DSB；writer DCCI 不是这两个方向的必要
+条件。AIV builder 到 AIC executor 仍未验证，必须由 S2 单 Cube task 独立
+取证后才能决定最终统一序列。
+
 ### 3.3 UBUF 构建路径
 
 UBUF 是每个 AIV 私有、不可跨核共享的暂存区。第一版只做单槽，之后扩展
