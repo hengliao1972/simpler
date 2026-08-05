@@ -768,15 +768,170 @@ S2 随本节所在提交独立交付；下一阶段 S3 将在同一次 mixed lau
 发布一个 Vector task 和一个 Cube task，验证 engine 路由、两个唯一 Claim、
 完成计数和 drain，而不直接跳到完整 PA。
 
-## 6. 阶段状态索引
+## 6. 2026-08-05：S3 Vector + Cube 双 task
+
+### 6.1 目标、拓扑与双 slot 合同
+
+S3 首次在同一次 mixed launch 中同时构建和执行两个不同 engine 的 task：
+
+| 参与者 | 构建 | 执行 | drain 前必须证明 |
+| ------ | ---- | ---- | ---------------- |
+| AIV0 / owner 32 | SIMT thread 0 构建 Vector，thread 1 构建 Cube。 | 0 个 task。 | 两个 SIMT report 均成功，随后发布 `builder_finished=1`。 |
+| AIV1 / owner 33 | 0 个 task。 | 只 Claim 并执行 Vector add。 | MTE3→S、Vector `DONE`、`done_count + 1`。 |
+| AIC / owner 0 | 0 个 task。 | 只 Claim 并执行 Cube matmul。 | FIX→S、Cube `DONE`、`done_count + 1`。 |
+
+Vector 和 Cube 各有独立的 64 B control 与 64 B payload。SIMT 两个 thread
+分别执行自己的 `EMPTY -> BUILDING -> BUILT`，不拼接同一个 descriptor；
+所以一个 slot 停在半包时，另一 slot 可以独立发布和执行。两个 executor
+使用 S0～S2 已冻结的 reader DCCI + DSB，不再重复运行已经淘汰的无 DCCI 和
+writer-only 模式。
+
+全局 drain 独占一条 64 B cacheline。AIV0 只有在 SIMT invoke 的 V→S wait
+完成并检查两份 report 后才能发布 `builder_finished=1`；每个 executor 只有
+在 workload 写回、task `DONE` 后才能原子增加 `done_count`。AIV0、AIV1、
+AIC 最终都必须观察到：
+
+```text
+builder_finished == 1 && done_count == 2
+```
+
+任一计数越界、状态错误、payload 错误或 timeout 都发布首错 fatal，不能靠
+放宽 drain 让错误路径伪装成通过。
+
+### 6.2 新增文件与入口
+
+- `gm/common/s3_dual_task.h`：两条 task 状态、双 descriptor、drain、角色、
+  六块 64 KiB 数据区、Vector/Cube 非对称 golden 和完整 GM ABI；
+- `gm/test/test_s3_dual_task.cpp`：CPU 半包交错、engine 路由、双执行、精确
+  drain、地址替换拒绝和双 golden；
+- `gm/cpu/build_s3.sh`：optimized、ASan/UBSan、TSan 三套 CPU 门槛；
+- `gm/ccec/s3_dual_task_kernel.cpp`：两 thread SIMT builder、AIV1 Vector、
+  AIC Cube、完成计数和 mixed entry；
+- `gm/ccec/s3_dual_task_host.cpp`：ACL loader、同地址重复运行、两份 report、
+  两个 descriptor、三角色、drain、guard、输入和双 golden oracle；
+- `gm/ccec/build_s3.sh`：双发布/完成顺序、双核型 bitcode、ELF、metadata、
+  AIV 本地内存预算和 host 构建门槛；
+- `run.sh`：增加 `build-s3`、`run-s3` 统一入口；
+- 两份中文文档：冻结 S3 合同并记录实际证据。
+
+所有文件仍位于 `simt_cross_core/`。S3 复用 `gm_probe_support.h` 的 control、
+fatal、SIMT report、role result、identity、计数和 checksum 基础函数，没有复制
+第三套公共诊断 ABI，也没有 include `cross_core` 或本机 `ops-nn` 源码。
+
+设备 `ProbeState` 为 394,624 B，包含六块 65,536 B 输入/输出 tile、七条
+64 B guard、两个 128 B task slot、两份 SIMT report、三份 role result 和
+一条 drain cacheline。host 每轮完整重置并复用同一 device 地址。
+
+### 6.3 CPU 命令与结果
+
+统一命令：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-s3
+```
+
+CPU 三套实际结果：
+
+```text
+[PASS] S3 CPU dual-task rounds=16: optimized
+[PASS] S3 CPU dual-task rounds=8:  ASan+UBSan
+[PASS] S3 CPU dual-task rounds=4:  TSan
+```
+
+受控交错先让 Vector builder 写完 4/8 word 后暂停，再完整发布 Cube。此时验证：
+
+1. Vector control 仍为 `BUILDING`，AIV1 对它的 Claim 失败且不读半包；
+2. Cube 已为 `BUILT`，AIC 可以独立 Claim、执行一次 matmul、发布 Cube
+   `DONE`，`done_count` 精确为 1；
+3. AIC 不能执行 Vector，AIV1 不能执行 Cube，错误 engine 不产生 Claim；
+4. 即使 Cube 已完成，`builder_finished=0` 时 drain 仍不能通过；
+5. 恢复 Vector 发布并设置 `builder_finished=1` 后，drain 仍等待第二个 task；
+6. AIV1 完成 Vector 并把 `done_count` 增至 2 后，drain 才通过；
+7. 两个 task 合计 Build 2/2、Claim 2/2、payload read 16 word、Vector/Cube
+   execute 各一次，两个 output 共 32,768 个元素逐项等于 golden；
+8. Vector、Cube 各自的 output 地址被替换并重新计算合法 checksum 时仍被
+   拒绝，证明 checksum 不能取代执行地址白名单。
+
+### 6.4 CCEC、bitcode 与 mixed ELF 门槛
+
+CCEC 分别以 `dav-c310-cube`、`dav-c310-vec` 编译同一内核源码。统一构建
+实际通过：
+
+```text
+[CHECK] S3 source closure and dual-task publication/drain order
+[CHECK] bitcode contains two-thread SIMT publication, Vector add,
+        Cube matmul and drain atomics
+[CHECK] ELF has two mixed entries, local SIMT/Vector/Cube functions
+        and 200/224 KiB AIV budget
+[BUILD] S3 CCEC complete
+```
+
+门槛具体锁定：
+
+- 两个 SIMT thread 各自写完 8-word payload、执行 thread fence 后才发布
+  对应 `BUILT`；SIMT invoke 的 V→S wait 先于 `builder_finished`；
+- Vector 的 `TLOAD < TADD < TSTORE < MTE3->S`，Cube 的
+  `TLOAD < TMOV < TMATMUL < TSTORE < FIX->S` 都先于各自 `CompleteTask`；
+- `CompleteTask` 内严格为 `CLAIMED -> DONE` CAS 在前、`done_count` 原子
+  加一在后；
+- AIV bitcode 同时包含 SIMT launch/TID、CAS/atomic-add、thread fence、
+  reader DCCI、Vector load/add/store 和 event intrinsic；
+- AIC bitcode 同时包含 CAS/atomic-add、reader DCCI、MTE2、ND2NZ、
+  L1→L0A/L0B、Cube MAD、FIX 写回和 event intrinsic；
+- 最终 ELF 只有两个非空 GLOBAL entry；SIMT builder、Vector add、Cube
+  matmul 都是非空 LOCAL function，无 undefined GLOBAL 和 relocation；
+- 两份 metadata 均为 `MIX_AIC_MAIN [1:2]`；AIV 为
+  `SIMD_SIMT_MIX_VF`，SIMT share 为 8 KiB，三块 Vector UB 加 share 仍为
+  200/224 KiB。
+
+### 6.5 真实 A5 结果
+
+本轮继续先执行仓库 A5 precheck；当前 shell 无 `npu-smi`、无
+`task-submit`，因此沿用用户明确授权的 device 0 未加锁路径。ACL 实际设备
+身份为 `Ascend950PR_958b`，host 同样拒绝非 `Ascend950*` SoC。命令：
+
+```bash
+timeout --foreground 300s \
+  tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-s3 --device 0 --runs 100
+```
+
+真实输出：
+
+```text
+[DEVICE] id=0 soc=Ascend950PR_958b topology=1AIC+2AIV
+         state_bytes=394624 tasks=2
+[SUMMARY] reader_dcci protocol+roles+drain+vector+cube=100/100
+[PASS] S3 mixed dual-task runs=100 reused_address=yes
+       vector_elements=16384 cube_elements=16384
+```
+
+100 次同地址复用中，每轮两份 SIMT report 都证明 thread 0/1 分别完成一个
+8-word descriptor；AIV0 Build 2/2 且 task execute 为 0；AIV1 和 AIC 各自
+Build 为 0、Claim 1/1、execute 一次。两个 control 分别精确为 Vector/Cube
+`DONE`，`builder_finished=1`、`done_count=2`、fatal=0，七条 guard、六块
+输入/输出和两份 checksum 全部通过。
+
+### 6.6 阶段结论
+
+S3 已证明同一个 AIV0 SIMT launch 可以用不同 thread 独立构建 Vector/Cube
+task，并让 AIV1/AIC 在同一次 mixed kernel launch 中按 engine 路由执行。
+全局 drain 依赖“builder 已完成发布”和“两个 task 已在真实写回边界后完成”
+两项独立事实，不会把单 task 重复完成或 workload 仅发射计作通过。
+
+本阶段没有测量性能，也没有生成泳道图；未加设备锁的墙钟不进入性能结论。
+S3 随本节所在提交独立交付。下一阶段 S4 扩展为多 task、单 builder，重点验证
+SIMT thread-stride task 扫描、executor token busy、无遗失和更大完成计数。
+
+## 7. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
 | D0 文档与查证 | 完成 | `64e3d5d5`：范围、链接和空白检查通过。 |
 | S0 基础协议与 SIMT 自检 | 完成 | `399d5704`：CPU 三套 PASS；A5 同 AIV 100×4 模式完成，reader DCCI 为最小可靠序列。 |
 | S1 单 Vector task | 完成 | `975da5ea`：CPU 三套 PASS；1:2 mixed ELF 静态门槛 PASS；A5 跨 AIV 100×4 模式完成，reader DCCI 为最小可靠序列。 |
-| S2 单 Cube task | 完成 | CPU 三套 PASS；1:2 mixed ELF/Cube intrinsic 门槛 PASS；A5 AIV→AIC 100×4 模式完成，reader DCCI 为最小可靠序列；随本次 S2 提交交付。 |
-| S3 Vector + Cube | 未开始 | - |
+| S2 单 Cube task | 完成 | `2e3034d7`：CPU 三套 PASS；1:2 mixed ELF/Cube intrinsic 门槛 PASS；A5 AIV→AIC 100×4 模式完成，reader DCCI 为最小可靠序列。 |
+| S3 Vector + Cube | 完成 | CPU 三套 PASS；双 task mixed ELF/Vector/Cube 门槛 PASS；A5 同地址复用 100/100，完成计数和 drain 精确闭合；随本次 S3 提交交付。 |
 | S4 多 task、单 builder | 未开始 | - |
 | G0 GM 完整 PA | 未开始 | - |
 | G1 双 builder GM | 未开始 | - |

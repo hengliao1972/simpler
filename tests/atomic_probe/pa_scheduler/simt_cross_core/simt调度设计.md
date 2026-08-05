@@ -222,6 +222,27 @@ binding、engine completion、vend、completion flag 和 DONE 语义，但在本
 任意超时或非法状态都发布首错 fatal，并让 host 得到可定位的 owner、task id
 和阶段；不得用无限轮询把协议错误变成设备超时。
 
+### 3.5 双 task 路由与 drain 合同
+
+S3 使用两个互不共享 control/payload cacheline 的 task slot。AIV0 的 SIMT
+thread 0 只构建 Vector slot，thread 1 只构建 Cube slot；一个 slot 仍处于
+`BUILDING` 时，另一个 slot 可以独立进入 `BUILT -> CLAIMED -> DONE`。AIV1
+只观察并领取 Vector slot，AIC 只观察并领取 Cube slot，不能通过遍历另一个
+engine 的 slot 形成隐式 Claim 竞争。
+
+SIMT invoke 完成且两个 report 都证明发布成功后，AIV0 才把
+`builder_finished` 从 0 原子发布为 1。每个 executor 必须先等本 engine 的
+MTE3/FIX 写回边界，再把自己的 control 从 `CLAIMED` 改为 `DONE`，最后对
+`done_count` 原子加一。三个角色只有同时观察到
+`builder_finished == 1 && done_count == 2` 才能通过全局 drain；因此
+`done_count == 2` 不能由“已发射两个 workload”或重复完成同一个 task 代替。
+
+S0～S2 已分别闭合同 AIV、跨 AIV 和 AIV→AIC 三种 GM descriptor 读取方向，
+S3 起不再重复四种已淘汰的 DCCI 模式。两个 Claim winner 都固定在 Claim
+成功后对自己的 payload line 执行 reader DCCI + DSB，再做普通 GM load。
+每个 stage 仍必须用同地址重复运行和完整 golden 证明这条冻结规则没有被新
+协议破坏。
+
 ## 4. 目录与分阶段实施
 
 ### 4.1 计划目录
