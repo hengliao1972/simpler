@@ -753,16 +753,16 @@ bool RunB256BuildTicketBudgetContractTest() {
 
 bool RunSharedBuildFatalPollCadenceTest() {
     // RunScheduler 在进入中央 ticket 循环前已经立即观察一次 fatal。
-    // 循环内只需锁定“每 8 个成功 Build 一次”的边界：0 不能重复读，
-    // 8/16 必须读，其余位置不读。这样远端错误传播最多多做 7 个 task。
+    // 循环内只需锁定“每 16 个成功 Build 一次”的边界：0 不能重复读，
+    // 16/32 必须读，其余位置不读。这样远端错误传播最多多做 15 个 task。
     bool exact = true;
-    for (uint64_t completed = 0; completed <= 24U; ++completed) {
+    for (uint64_t completed = 0; completed <= 48U; ++completed) {
         const bool expected =
-            completed == 8U || completed == 16U || completed == 24U;
+            completed == 16U || completed == 32U || completed == 48U;
         exact &= SharedBuildFatalPollDue(completed) == expected;
     }
     const bool ok =
-        exact && (kSharedBuildFatalPollPeriod - 1U) == 7U;
+        exact && (kSharedBuildFatalPollPeriod - 1U) == 15U;
     std::printf(
         "[ORDERED_SUBMIT] build_fatal_poll_cadence=%s "
         "period=%llu max_extra_tasks=%llu\n",

@@ -5881,7 +5881,7 @@ struct SharedBuildTicketResult {
     uint32_t task_id;
 };
 
-constexpr uint64_t kSharedBuildFatalPollPeriod = 8U;
+constexpr uint64_t kSharedBuildFatalPollPeriod = 16U;
 static_assert(
     (kSharedBuildFatalPollPeriod &
      (kSharedBuildFatalPollPeriod - 1U)) == 0U,
@@ -6041,8 +6041,8 @@ PA_DEVICE bool DispatchOneSharedBuildTask(
     // 进入 FinalDrain；strict-insert 等真正可能阻塞的慢路也保留自己的
     // fatal/watchdog。因此正常成功路径不需要在每张 ticket 前都让 96 核
     // 读取同一条 global-fatal cache line。启动后已经有一次立即观察，
-    // 此处每完成 8 个本地 Build 再观察一次，把远端错误传播的额外工作量
-    // 限制在每核最多 7 个 task，同时显著降低返回型 Atomic 竞争。
+    // 此处每完成 16 个本地 Build 再观察一次，把远端错误传播的额外工作量
+    // 限制在每核最多 15 个 task，同时继续降低返回型 Atomic 竞争。
     const uint64_t completed_builds = stats.result.claim_wins;
     if (SharedBuildFatalPollDue(completed_builds) &&
         IsFatal<Ops>(state, stats)) {
