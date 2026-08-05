@@ -1141,7 +1141,7 @@ PA 只是第一个算子，设计不得固化以下现状：
 当前边界固定为三层：
 
 | 层次 | 允许知道的信息 | 不允许知道的信息 |
-| ---- | ---------------- | -------------------- |
+| ---- | -------------- | ---------------- |
 | 公共调度协议 | task-id、是否需要 engine、engine class、Build/Execute owner、fanin、completion | `TaskKind`、batch 形状、UP/INOUT 数量 |
 | A5 后端策略 | 32 AIC + 64 AIV 物理拓扑、两条角色 Execute ticket、16 组完成归约 | Alloc/QK/SF/PV/UP 的业务含义 |
 | 算子适配层 | 随机访问构参、function 路由、payload shape、输出与 INOUT 规则 | 不得让公共 scanner 反向解析这些信息 |
@@ -1835,7 +1835,7 @@ Submit 起点和 FinalDrain 终点两个时钟，不新增结果字段、泳道�
 口径前的诊断版本，只用于解释工作从 FinalDrain 前移，不再是当前性能输出：
 
 | 指标 | 单 token | 双 token | 变化 |
-|---|---:|---:|---:|
+| ---- | -------: | -------: | ---: |
 | Submit 中位 | 1.871997 ms | 2.455617 ms | +31.18% |
 | 完整周期中位 | 9.345107 ms | 5.880792 ms | -37.07% |
 | EfDrain kernel 中位 | 208 | 432 | +224 |

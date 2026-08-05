@@ -1601,7 +1601,7 @@ descriptor 允许引用，builder 私有或 local descriptor 继续内联。host
 隔离 adapter 测试得到如下真实布局：
 
 | task | 旧 payload | 引用候选 | reference mask |
-|---|---:|---:|---:|
+| ---- | ---------: | -------: | -------------: |
 | QK | 592 B / 10 lines | 472 B / 8 lines | `0x8` |
 | SF | 604 B / 10 lines | 124 B / 2 lines | `0xf` |
 | PV | 596 B / 10 lines | 356 B / 6 lines | `0x9` |
@@ -1831,7 +1831,7 @@ real-compute `6,28,4,1` 运行 B256。1280 个 task、1024 个 kernel、payload�
 `+0.87%/+0.75%`，可作为同型解释：
 
 | 组成 | 时间 | 父区间占比 |
-|---|---:|---:|
+| ---- | ---: | ---------: |
 | Atomic | 304.410 us | 73.79% |
 | 两个 QK kernel | 83.864 us | 20.33% |
 | DCCI | 0.308 us | 0.07% |
@@ -1903,7 +1903,7 @@ ELF 和源码覆盖门槛均通过。
 相对 S6.23：
 
 | 指标 | S6.23 | S6.24 | 变化 |
-|---|---:|---:|---:|
+| ---- | ----: | ----: | ---: |
 | WinnerBuild 聚合 core-time | 60,335.301 us | 17,115.987 us | -71.63% |
 | WinnerBuild Atomic | 50,518.268 us | 8,529.341 us | -83.12% |
 | full-swimlane 生命周期 | 6.046633 ms | 5.123835 ms | -15.26% |
@@ -3322,7 +3322,7 @@ AIV baseline/new 149048   350e9fc0a2979b69cf2da118fd191b256d95aa96b1a9da99fb3031
 ### 当前保留机制逐项结论
 
 | 保留机制 | 所需不变量 | 归属与结论 |
-| ---- | ---- | ---- |
+| -------- | ---------- | ---------- |
 | 本核无工作快退 | token 和候选 cursor 仅由本核修改，plan 只读 | 公共调度优化；不依赖 PA task kind |
 | 中央唯一 Build ticket | task-id 稠密且 adapter 可按 task-id 随机访问构参 | 通用能力合同，不是所有 adapter 天然具备的默认能力 |
 | 不可变紧凑 plan | host 在 launch 前完整发布，device 只读 | 公共协议；PA batch/meta 只是当前 adapter 的 opaque identity |
@@ -3495,7 +3495,7 @@ S6.55 的 B256 full-swimlane 中仍能看到多处 `1 us` 以上空白。如果�
 `1.466841 ms` 的端到端泳道跨度直接相加减：
 
 | 父区间 | 父区间累计 | 已有精确证据 | 原先未解释的累计 | 主要结论 |
-| ---- | ----: | ---- | ----: | ---- |
+| ------ | ---------: | ------------ | ---------------: | -------- |
 | EfDrain | 34.347 ms | kernel 19.005 ms、direct atomic 2.910 ms、DCCI 0.045 ms | 12.387 ms | 主要是执行包 GM 搬运/校验、token/plan 扫描和 fanin 前缀推进 |
 | Materialize | 12.228 ms | direct atomic 3.226 ms、DCCI 0.631 ms | 8.371 ms | shared heap 原语之外是输出布局 Scalar 计算、GM descriptor 写入和 writer delta 构造 |
 | Fanin | 4.726 ms | direct atomic 1.346 ms、DCCI 0.046 ms | 3.334 ms | 参数引用扫描、writer-history GM 读取和本地 fanin 结果提交 |
@@ -3505,7 +3505,7 @@ S6.55 的 B256 full-swimlane 中仍能看到多处 `1 us` 以上空白。如果�
 新泳道中最主要的非原语区间为：
 
 | 离线业务区间 | 条数 | 累计 core-time | 单条均值 | 单条最大值 | 源码含义 |
-| ---- | ----: | ----: | ----: | ----: | ---- |
+| ------------ | ---: | -------------: | -------: | ---------: | -------- |
 | `winner_build.pack_execution_payload[GM+Scalar]` | 1,024 | 4.557 ms | 4.450 us | 8.018 us | 预取目标后，把 TensorDesc/scalar/fanin 打包写入 shared exec payload；末端 DCCI 单独显示 |
 | `execute.bind_payload_and_rebuild_args[GM+Scalar]` | 715 | 4.039 ms | 5.649 us | 12.533 us | payload invalidate 结束后，把 shared cell 搬到 owner token，校验 header/layout 并重建 dispatch args |
 | `materialize.write_descriptors_and_prepare_writer_delta[GM+Scalar]` | 1,280 | 2.787 ms | 2.178 us | 4.468 us | heap 原语结束后写 GM TaskPayload descriptor，并在 Scalar 上准备 writer delta |
@@ -3590,7 +3590,7 @@ terminal ticket upper bound=320+96=416
 execution drain 与全部后处理检查均 PASS，且无 trace drop。与 S6.55 同口径对比：
 
 | 指标 | S6.55 | S6.57 | 变化 |
-| ---- | ----: | ----: | ----: |
+| ---- | ----: | ----: | ---: |
 | direct `fatal_poll` | 1,472 | 207 | -1,265 / -85.938% |
 | direct `fatal_poll` 累计 core-time | 1,420.134 us | 178.039 us | -1,242.095 us |
 | physical Atomic records | 33,280 | 31,930 | -1,350 |
@@ -3653,7 +3653,7 @@ PollBatch，汇总 `12,827` 次 completion flag load；它们的显示区间与�
 core-time。补齐后的分布为：
 
 | 离线业务区间 | 条数 | 累计 core-time | 单条范围 | 解释 |
-| ---- | ----: | ----: | ----: | ---- |
+| ------------ | ---: | -------------: | -------: | ---- |
 | `wait_fanin_and_prepare_engine[AtomicPoll+GM+Scalar]` | 382 | 16.433 ms | 1.046–211.539 us | 等待 fanin completion，读取 owner token/payload，完成 ready 判断并准备 engine；不含随后单独显示的 kernel |
 | `defer_token_and_scan_candidates[AtomicPoll+GM+Scalar]` | 41 | 0.371 ms | 6.314–12.199 us | payload invalidate 后首次推进新 token；未 ready 时继续扫描候选 |
 | `recycle_token_and_scan_candidates[GM+Scalar]` | 133 | 0.331 ms | 1.001–4.994 us | completion 后复位 token，并读取 plan/control 寻找后续候选 |
@@ -3760,7 +3760,7 @@ candidate mean   改善 0.016833 ms / 1.186%
 与 S6.57 同类归因相比：
 
 | 指标 | S6.57 | S6.59 | 变化 |
-| ---- | ----: | ----: | ----: |
+| ---- | ----: | ----: | ---: |
 | `bind_payload_and_rebuild_args` 累计 core-time | 3989.984 us | 2692.903 us | -32.508% |
 | 同区间单条均值 | 5.660 us | 3.869 us | -31.636% |
 | Submit 全局区间 | 1032.361 us | 971.406 us | -5.904% |
@@ -4822,10 +4822,11 @@ B256 均通过完整语义、TensorMap、payload、执行次数和终态校验�
 代码膨胀。
 
 因此这组端到端样本只能判定“未量出稳定收益”，不能把约 1% 的表观差值
-归因为真实回退。后续 BUILT-ready 方案又使这两条 cursor 退出设备热路径，
-继续保留两个 128B 空槽已经没有性能意义。本地提交收敛时撤回该代码，只保留
-本段负结果和 A5 128B Atomic 冲突单元的基础结论；下一候选只处理严格
-Register 链中仍真实访问的 per-task completion 地址，不与本阶段混测。
+归因为真实回退。后续方案审视曾经让这两条 cursor 退出热路径；最终又撤回了
+该方案并恢复中央 cursor，但双 cursor 隔离本身仍没有稳定收益证据。本地提交
+收敛时不保留这两个 128B 空槽，只保留本段负结果和 A5 128B Atomic 冲突单元
+的基础结论；明确有效的地址优化只处理严格 Register 链中真实访问的 per-task
+completion，不把两个候选混成一项收益。
 
 ## 2026-08-04：S6.70-d 隔离每 task 插入完成字并验收
 
@@ -5076,3 +5077,65 @@ task 6 已发布后仍等待约 `33.1 us`，原因是 Execute owner 正在不可
 启动指令慢，也不是本阶段漏掉的后三张 Execute ticket。下一阶段应单独比较
 冷启动先 Build、Build owner 调度选择或严格 Register 交接结构；不能用本阶段
 的端到端收益宣称已经解决 AIC 首次执行滞后。
+
+## 2026-08-05：S6.73 收敛未推送优化，只保留三项独立收益
+
+### 最终保留范围
+
+本轮重新以远端 `cb939f59` 为基线重放本地修改。最终设备代码只保留三项已经
+做过单变量冻结 A/B、且不读取 PA task kind、batch 或固定 DAG 的优化：
+
+1. 每 task 的 TensorMap insert-completion 独占 128B Atomic 冲突单元；
+2. 每个 Scalar 的 owner-local Execute token 从三个扩为四个；
+3. 新领 Execute ticket 后首次观察 cell 尚未 BUILT，本调度边界停止继续领票，
+   后续边界仍可逐步填满四个 token。
+
+对应的原始单变量结果分别为：per-task completion 中位改善 `12.282%`、四 token
+中位改善 `3.713%`、未 BUILT 后停止连领中位改善 `3.481%`。这些比例描述各自
+冻结基线上的增量，不允许直接相加；移除其他本地候选后的最终绝对性能必须重新
+构建并复测。
+
+### 只留记录、不留代码的候选
+
+- 双中央 Execute cursor 的 128B 隔离（原 `e474baa4`）：受控 Atomic 探针证明
+  地址冲突单元存在，但该布局的 12 对端到端 A/B 置信区间跨零，没有证明收益；
+  最终恢复两个 64B cursor，不保留额外 192B 空槽。
+- BUILT-ready 位图与批量 bit-CAS（原 `a5702cb0`）：协议能够只发布已 Build
+  task，但生产期固定 `4 × active_words` 个 scanner 是工作负载敏感策略；首版
+  B256 又回退到 `1.834--1.924 ms`，相对当前未来 ticket 主线没有净收益。
+- builder 同角色 ready-word hint（原 `b494077d`）和 closure 后同调用重读
+  （原 `104e5a4d`）：前者修复 BUILT-ready 方案自己的扫描绕行，后者闭合该
+  方案的终止竞态；两者脱离 ready 位图没有独立含义。虽然各自在该分支内部
+  有收益或正确性价值，随父协议一并撤回。
+- 唯一 output publisher 不消费 FetchMax/Exchange 返回值（原 `20a9103b`）：
+  单变量中位约改善 `1.1%`，但当前只在 PA adapter 以模板布尔值启用，隐含
+  “cell 已可靠复位、无重试、无外部发布者”的合同。公共协议尚未显式表达这些
+  前提，因此本轮不保留代码，只保留该方向供以后用通用 publisher trait 重做。
+- 严格插入串行链离线细分（原 `38f70737`）：不影响设备性能，但当前 converter
+  假设每个 Register 最多一条 grouped symbol CAS，Atomic 地址拓扑也绑定当前
+  站点 ABI。它生成的实验归档仍保存在 `test_record/2026-8-5`；本轮不把这份
+  PA 形态诊断代码混入三项性能提交。
+
+上述撤回项不得在后续文档中写成现行合同。若重新启用，必须从新的公共接口、
+正确性门槛和独立 A/B 开始，不能直接恢复旧提交。NOP 循环不属于候选范围。
+
+### 三项组合的最终回归
+
+从远端 `cb939f59` 只重放上述三项后，重新执行了完整 CPU 协议回归，shared
+plan、随机构参、96-worker Build dispatch、四 token、严格插入、故障收敛和
+ordered Submit 门槛全部通过；CCEC perf-clock 与 full-swimlane 两类产物也都
+从源码重新构建通过。
+
+A5 B1 scalar-nop 烟测，以及 B256 real-compute `6,28,4,1` 的三次独立
+perf-clock 均通过全部业务、payload、1280 个 Build、1024 个 kernel、严格插入
+和 FinalDrain 断言。三次 startup 到 FinalDrain 结束的时间为：
+
+```text
+982.876 us
+997.605 us
+1023.453 us
+```
+
+中位数为 `997.605 us`，范围为 `982.876--1023.453 us`。这是移除其他候选后
+三项组合的绝对结果；它只用于确认最终组合没有依赖已撤回协议，不替代三项各自
+冻结基线上的单变量 A/B。
