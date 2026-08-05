@@ -31,6 +31,7 @@ constexpr uint64_t kDescriptorPoisonWord = 0xB4B4B4B4B4B4B4B4ULL;
 constexpr uint8_t kTailPoisonByte = 0xA5U;
 constexpr uint64_t kReportPoisonWord = 0xD3D3D3D3D3D3D3D3ULL;
 constexpr uint64_t kExecutionWitnessMagic = 0x5749544E45535330ULL;
+constexpr uint64_t kAllocBuildingMagic = 0x414C4C4F43425549ULL;
 constexpr uint32_t kInvalidBuilderThread = UINT32_MAX;
 constexpr uint32_t kBuildPreparedBit = 1U << 0U;
 constexpr uint32_t kBuildOutputsPublishedBit = 1U << 1U;
@@ -56,7 +57,9 @@ struct alignas(kCacheLineBytes) FullPaControl {
     uint32_t sf_repeats;
     uint32_t pv_repeats;
     uint32_t up_repeats;
-    uint64_t reserved[4];
+    uint32_t builder_count;
+    uint32_t reserved32;
+    uint64_t reserved[3];
 };
 
 struct alignas(kCacheLineBytes) FullPaGuard {
@@ -74,7 +77,7 @@ struct alignas(kCacheLineBytes) FullPaTaskPlan {
     uint32_t builder_warp;
     uint8_t encoded_meta;
     uint8_t exec_route;
-    uint16_t reserved16;
+    uint16_t builder_owner;
     uint64_t reserved_bytes;
     uint64_t launch_nonce;
     uint64_t reserved;
@@ -92,8 +95,8 @@ struct alignas(kCacheLineBytes) FullPaBuildReport {
     int64_t predecessor_observed;
     uint32_t prepare_count;
     uint32_t commit_count;
-    uint32_t main_scalar_build_count;
-    uint32_t main_scalar_commit_count;
+    uint32_t build_attempt_count;
+    uint32_t build_win_count;
     uint64_t launch_nonce;
 };
 
@@ -133,6 +136,7 @@ struct alignas(kCacheLineBytes) FullPaFatalControl {
 };
 
 struct alignas(kCacheLineBytes) FullPaDrainControl {
+    AtomicLine builder_started;
     AtomicLine builder_finished;
     AtomicLine done_count;
     AtomicLine alloc_done;
@@ -197,7 +201,7 @@ struct alignas(kCacheLineBytes) FullPaBuilderThreadReport {
     uint32_t prepare_count;
     uint32_t commit_count;
     uint32_t insert_wait_count;
-    uint32_t reserved0;
+    uint32_t claim_lost_count;
     uint64_t launch_nonce;
     uint64_t checksum;
 };
@@ -219,7 +223,7 @@ struct alignas(kCacheLineBytes) FullPaState {
     FullPaRoleResult roles[kOwnerCount];
     FullPaGuard guard_after_roles;
     FullPaGuard guard_before_builder_threads;
-    FullPaBuilderThreadReport builder_threads[kBuilderThreadCount];
+    FullPaBuilderThreadReport builder_threads[kMaxBuilderThreadCount];
     FullPaGuard guard_after_builder_threads;
 };
 
@@ -240,35 +244,57 @@ SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t ExpectedPayloadPoisonWord(uint64_t nonce,
     return kTailPoisonWord ^ nonce ^ (static_cast<uint64_t>(task_id) << 32U) ^ word;
 }
 
-SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t BuildingState(uint32_t task_id) {
-    return EncodeExecState(ExecPhase::Building, kBuilderOwner, kUnboundOwner, ExecEngineClass::None, 0U, task_id);
+SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t AllocBuildingState(uint64_t nonce, uint32_t task_id, uint32_t build_owner) {
+    uint64_t value = kAllocBuildingMagic ^ nonce ^ (static_cast<uint64_t>(task_id) << 19U) ^
+                     (static_cast<uint64_t>(build_owner) << 3U);
+    value ^= value >> 23U;
+    value *= 0xD6E8FEB86659FD93ULL;
+    value ^= value >> 31U;
+    value |= uint64_t{1} << 63U;
+    return value;
 }
 
-SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t BuiltState(uint32_t task_id) {
+SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t BuildingState(uint32_t task_id, uint32_t build_owner) {
+    return EncodeExecState(ExecPhase::Building, build_owner, kUnboundOwner, ExecEngineClass::None, 0U, task_id);
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t BuildingState(uint32_t task_id) { return BuildingState(task_id, kBuilderOwner); }
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t BuiltState(uint32_t task_id, uint32_t build_owner) {
     const TaskExecShape shape = TaskShape(TaskKindAt(task_id));
     ExecPayloadLayout layout{};
     (void)ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout);
     return EncodeExecState(
-        ExecPhase::Built, kBuilderOwner, kUnboundOwner, shape.engine_class, layout.payload_lines, task_id
+        ExecPhase::Built, build_owner, kUnboundOwner, shape.engine_class, layout.payload_lines, task_id
+    );
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t BuiltState(uint32_t task_id) { return BuiltState(task_id, kBuilderOwner); }
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t ClaimedState(uint32_t task_id, uint32_t build_owner, uint32_t execute_owner) {
+    const TaskExecShape shape = TaskShape(TaskKindAt(task_id));
+    ExecPayloadLayout layout{};
+    (void)ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout);
+    return EncodeExecState(
+        ExecPhase::Claimed, build_owner, execute_owner, shape.engine_class, layout.payload_lines, task_id
     );
 }
 
 SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t ClaimedState(uint32_t task_id, uint32_t execute_owner) {
+    return ClaimedState(task_id, kBuilderOwner, execute_owner);
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t DoneState(uint32_t task_id, uint32_t build_owner, uint32_t execute_owner) {
     const TaskExecShape shape = TaskShape(TaskKindAt(task_id));
     ExecPayloadLayout layout{};
     (void)ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout);
     return EncodeExecState(
-        ExecPhase::Claimed, kBuilderOwner, execute_owner, shape.engine_class, layout.payload_lines, task_id
+        ExecPhase::Done, build_owner, execute_owner, shape.engine_class, layout.payload_lines, task_id
     );
 }
 
 SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t DoneState(uint32_t task_id, uint32_t execute_owner) {
-    const TaskExecShape shape = TaskShape(TaskKindAt(task_id));
-    ExecPayloadLayout layout{};
-    (void)ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout);
-    return EncodeExecState(
-        ExecPhase::Done, kBuilderOwner, execute_owner, shape.engine_class, layout.payload_lines, task_id
-    );
+    return DoneState(task_id, kBuilderOwner, execute_owner);
 }
 
 SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t
@@ -363,9 +389,16 @@ ResolveExternalPayloadTensor(uint32_t batch_count, uint32_t task_id, uint32_t te
 SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t FullPaStateBytes() { return sizeof(FullPaState); }
 
 static_assert(sizeof(FullPaControl) == 128U, "G0 control must occupy two cache lines");
+static_assert(offsetof(FullPaControl, builder_count) == 96U, "G0/G1 builder-count ABI offset changed");
 static_assert(sizeof(FullPaGuard) == kCacheLineBytes, "G0 guard ABI changed");
 static_assert(sizeof(FullPaTaskPlan) == kCacheLineBytes, "G0 task plan ABI changed");
+static_assert(offsetof(FullPaTaskPlan, builder_owner) == 34U, "G0/G1 task-plan builder-owner ABI changed");
 static_assert(sizeof(FullPaBuildReport) == kCacheLineBytes, "G0 build report ABI changed");
+static_assert(
+    offsetof(FullPaBuildReport, build_attempt_count) == 48U &&
+        offsetof(FullPaBuildReport, build_win_count) == 52U,
+    "G0/G1 task build-attempt evidence ABI changed"
+);
 static_assert(sizeof(FullPaExecutionWitness) == kCacheLineBytes, "G0 execution witness ABI changed");
 static_assert(offsetof(FullPaExecutionWitness, fanin_ready_prefix) == 56U, "G0 execution fanin witness offset changed");
 static_assert(sizeof(FullPaTaskAllocationReport) == 128U, "G0 task allocation report ABI changed");

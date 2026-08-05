@@ -354,7 +354,8 @@ next_task             = current_task + 64
 B256/context8192 共 1280 个 task，因此 64 个有效 warp leader 各构建 20 个
 task。任意 `task[N]` 与 `task[N-1]` 都位于不同 warp，包含 `63 -> 64` 的
 回绕边界；所以严格插入等待只发生在不同 warp 之间。host 必须逐 task 核对
-实际 builder tid，并证明 1984 个 inactive lane 的访问和构建计数均为 0。
+实际 builder tid，并证明 1984 个 inactive lane 的整份诊断 report 仍为 host
+poison，即它们既不访问/构建 task，也不产生诊断 GM store。
 
 每个 warp leader 对自己的 task 完整执行以下流程：
 
@@ -384,6 +385,63 @@ SIMT thread report 求和，不能归因给 Main Scalar。executor
 仍使用 AIC/AIV 两条 immutable ticket 表和每 worker 四个 token，在 task
 尚未发布时停留于 `WaitingBuilt`，不能因一次观察到 `EMPTY/BUILDING` 就丢失
 该 task。
+
+### 3.9 G1 两个独立 VF 的全量竞争合同
+
+G1 不把 G0 的 64 个 leader 拆成两半，也不允许 Main Scalar 代替第二组
+builder。AIV0 和 AIV1 各自发射一份完整的 2048-thread VF；每份 VF 都有
+64 个 warp，仍只有每个 warp 的 lane0 有效。因此 G1 有 128 个有效 worker，
+但任一 warp 内始终只有一个 worker：
+
+```text
+AIV0: global_tid = local_tid,        owner = 32, global_warp = 0..63
+AIV1: global_tid = 2048 + local_tid, owner = 33, global_warp = 64..127
+active(local_tid) = (local_tid % 32 == 0)
+task scan          = local_warp + 64*k
+```
+
+两个 VF 扫描同一组 task，而不是静态分片。每个 VF 的 thread0 先对
+`builder_started` 各原子到达一次，所有 active leader 必须观察到
+`builder_started == builder_count` 后才能发起第一个 claim。这个闸门只能证明
+两份 VF 已经进入；逐 task 的参与尝试由独立设备证据验证：每个 leader 在
+claim 前对本 task 的 `build_attempt_count` 原子加一，唯一 CAS winner 再对
+`build_win_count` 原子加一。attempt/win 证明两个对应 leader 最终都尝试，
+不单独声称两次尝试的时间区间必然重叠。最终每个 task 必须精确满足：
+
+```text
+build_attempt_count == builder_count  # G0 为 1，G1 为 2
+build_win_count     == 1
+```
+
+可执行 task 竞争 `EMPTY -> BUILDING(actual_build_owner)`；Alloc 没有 execution
+control，复用其最终 completion flag 做临时 claim：
+`0 -> ALLOC_BUILDING(actual_build_owner) -> 1`。CAS loser 只允许观察另一合法
+builder 的临时/后续状态，不得预留 heap、写 descriptor/payload 或进入严格
+insert chain；同 owner 的重复 claim 和畸形状态必须报 fatal。winner 独立完成
+G0 的全部 Prepare/Commit，实际 build owner 必须同时保存在 plan、task report
+和 kernel task 的 BUILDING/BUILT/CLAIMED/DONE 状态中。Alloc 虽然终态 flag
+只有 1，也必须由 plan/report 保留 winner owner。
+
+两份 VF 的 4096 份 thread report 使用不相交下标。每个 active leader 的
+`attempt = win + loss`，所有 leader 汇总必须为：
+
+```text
+attempt = builder_count * task_count
+win     = task_count
+loss    = (builder_count - 1) * task_count
+```
+
+inactive lane 的整份 thread report 必须保持 host poison；G0 未发射的第二实例
+`[2048,4096)` 同样必须保持 host poison。两份 Main Scalar 仅允许
+`async_invoke -> V/S join -> drain`，其 role 的 build/commit/claim/execute/
+ticket 均为 0。AIV executor 因此从 owner34 开始，G1 总 executor 为
+32 AIC + 62 AIV = 94；16 个 drain group 仍各有 6 个物理参与者，owner32
+仍是唯一 root。
+
+task build report 只有一条 64 B cacheline，其中 word6 保存 attempt/win。
+为避免另一个 VF 的 atomic 与 winner 的普通 DCache store 同行竞争，整条 report
+禁止普通 SIMT store：word6 只用 atomic-add，其他 word 只允许从 host poison
+通过 atomic-CAS 发布。CPU 模型中的独立 `std::atomic` 不能替代这条设备规则。
 
 ## 4. 目录与分阶段实施
 

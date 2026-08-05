@@ -30,6 +30,7 @@ BUILD_MANIFEST="$BUILD_DIR/g0_build_manifest.sha256"
 AIC_ENTRY="simt_cross_core_g0_0_mix_aic"
 AIV_ENTRY="simt_cross_core_g0_0_mix_aiv"
 G0_BUILD_INPUTS=(
+    run.sh
     common/full_pa_exec_protocol.h
     common/full_pa_model.h
     gm/common/g0_full_pa.h
@@ -112,32 +113,86 @@ COMMON_DEVICE_FLAGS=(
     -I"$SIMT_ROOT/common"
 )
 
-echo "[CHECK] G0 source closure, 64-warp builder and publication order"
+echo "[CHECK] G0/G1 source closure, one/two 64-warp builders and publication order"
 if rg -n '#include.*(cross_core|ops-nn)' "$SIMT_ROOT" -g '*.h' -g '*.cpp'; then
     echo "G0 must not include cross_core or ops-nn source files." >&2
     exit 1
 fi
 if ! grep -Fq 'constexpr uint32_t kBuilderWarpCount = 64U;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kBuilderThreadCount = kBuilderWarpCount * kWarpSize;' "$MODEL_SOURCE" ||
+   ! grep -Fq 'constexpr uint32_t kMaxBuilderCount = 2U;' "$MODEL_SOURCE" ||
+   ! grep -Fq 'constexpr uint32_t kMaxBuilderThreadCount = kBuilderThreadCount * kMaxBuilderCount;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kBuilderTaskStride = kBuilderWarpCount;' "$MODEL_SOURCE" ||
-   ! grep -Fq 'static_assert(kBuilderThreadCount == 2048U && kBuilderLeaderCount == 64U' "$MODEL_SOURCE" ||
+   ! rg -q -U 'static_assert\(\s*kBuilderThreadCount == 2048U && kBuilderLeaderCount == 64U' "$MODEL_SOURCE" ||
    ! grep -Fq 'const bool active = lane == 0U && warp < kBuilderWarpCount;' "$KERNEL_SOURCE" ||
    ! grep -Fq 'task_id = warp; task_id < task_count; task_id += kBuilderTaskStride' "$KERNEL_SOURCE" ||
    ! grep -Fq 'cce::dim3{kBuilderThreadCount, 1U, 1U}' "$KERNEL_SOURCE"; then
-    echo "G0 must launch 2048 SIMT threads and let only lane 0 of each of 64 warps build tasks." >&2
+    echo "G0/G1 must launch 2048 SIMT threads per builder and let only lane 0 of each of 64 warps attempt tasks." >&2
+    exit 1
+fi
+if ! grep -Fq 'BuilderCountValid(state->control.builder_count)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'state->control.builder_thread_count == kBuilderThreadCount' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'const uint32_t global_thread = builder_instance * kBuilderThreadCount + thread;' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'const uint32_t global_warp = builder_instance * kBuilderWarpCount + warp;' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'if (aiv_id >= state->control.builder_count)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'state->control.builder_count, owner' "$KERNEL_SOURCE"; then
+    echo "G0/G1 must keep 2048 threads per VF while selecting one or two fixed builder AIVs at runtime." >&2
+    exit 1
+fi
+if ! grep -Fq 'if (thread == 0U)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'asc_atomic_add(builder_started, static_cast<uint64_t>(1U))' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'asc_atomic_add(builder_started, static_cast<uint64_t>(0U))' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'if (observed == builder_count)' "$KERNEL_SOURCE"; then
+    echo "G0/G1 each VF must contribute exactly one builder-start arrival before active leaders leave the gate." >&2
+    exit 1
+fi
+if ! grep -Fq 'const uint32_t aiv_id = block * subblock_dim + subblock;' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'subblock_dim != 2U' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'subblock >= subblock_dim' "$KERNEL_SOURCE"; then
+    echo "G0/G1 must derive dense AIV0/AIV1 owner ids from the checked 1:2 mixed topology." >&2
     exit 1
 fi
 
 vf_start_line="$(grep -nF 'void G0SimtBuildTasks(' "$KERNEL_SOURCE" | cut -d: -f1)"
 vf_end_line="$(grep -nF '#endif  // defined(__DAV_VEC__)' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
 builder_publish_line="$(grep -nF 'asc_atomic_cas(builder_finished' "$KERNEL_SOURCE" | cut -d: -f1)"
+builder_gate_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /const bool start_ready/ {print NR; exit}' "$KERNEL_SOURCE")"
+attempt_line="$(grep -nF 'asc_atomic_add(report + 6U, static_cast<uint64_t>(1U))' "$KERNEL_SOURCE" | cut -d: -f1)"
+claim_line="$(grep -nF 'SimtTryClaimTask(task_words, fatal, nonce, task_id, build_owner, builder_count)' "$KERNEL_SOURCE" | cut -d: -f1)"
+win_line="$(grep -nF 'asc_atomic_add(report + 6U, static_cast<uint64_t>(1U) << 32U)' "$KERNEL_SOURCE" | cut -d: -f1)"
+prepare_call_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /if \(!SimtPrepareTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
+commit_call_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /if \(!SimtCommitTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
 async_line="$(grep -nF 'cce::async_invoke<G0SimtBuildTasks>' "$KERNEL_SOURCE" | cut -d: -f1)"
 builder_wait_line="$(awk '/cce::async_invoke<G0SimtBuildTasks>/ {inside=1} inside && /wait_flag\(PIPE_V, PIPE_S, EVENT_ID0\)/ {print NR; exit}' "$KERNEL_SOURCE")"
-if [[ -z "$vf_start_line" || -z "$vf_end_line" || -z "$builder_publish_line" || -z "$async_line" ||
-      -z "$builder_wait_line" ]] ||
-   ! (( vf_start_line < builder_publish_line && builder_publish_line < vf_end_line &&
+leader_report_guard_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /^[[:space:]]*if \(active\) \{$/ {print NR; exit}' "$KERNEL_SOURCE")"
+thread_report_line="$(grep -nF 'thread_report_words + global_thread * kThreadReportStrideWords' "$KERNEL_SOURCE" | cut -d: -f1)"
+if [[ -z "$vf_start_line" || -z "$vf_end_line" || -z "$builder_publish_line" || -z "$builder_gate_line" ||
+      -z "$attempt_line" || -z "$claim_line" || -z "$win_line" || -z "$prepare_call_line" ||
+      -z "$commit_call_line" || -z "$async_line" || -z "$builder_wait_line" ||
+      -z "$leader_report_guard_line" || -z "$thread_report_line" ]] ||
+   ! (( vf_start_line < builder_gate_line && builder_gate_line < attempt_line && attempt_line < claim_line &&
+         claim_line < win_line && win_line < prepare_call_line && prepare_call_line < commit_call_line &&
+         commit_call_line < builder_publish_line && builder_publish_line < leader_report_guard_line &&
+         leader_report_guard_line < thread_report_line && thread_report_line < vf_end_line &&
          vf_end_line < async_line && async_line < builder_wait_line )); then
-    echo "G0 builder_finished must be published inside the SIMT VF; Main Scalar may only wait for VF completion." >&2
+    echo "G0/G1 must gate both VFs, record attempt/win, claim before task writes, and publish builder_finished in SIMT." >&2
+    exit 1
+fi
+if grep -Eq '^[[:space:]]*report\[[0-7](U)?\][[:space:]]*=' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'SimtPublishBuildReportWord(__gm__ uint64_t *address, uint64_t value)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'asc_atomic_cas(address, kReportPoisonWord, value)' "$KERNEL_SOURCE"; then
+    echo "G0/G1 task build-report cacheline must use atomics only; ordinary SIMT stores may race with word-6 evidence." >&2
+    exit 1
+fi
+if ! grep -Fq 'plan[4] = static_cast<uint64_t>(encoded_meta)' "$KERNEL_SOURCE" ||
+   ! grep -Fq '(static_cast<uint64_t>(build_owner) << 16U)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'thread_report_words + global_thread * kThreadReportStrideWords' "$KERNEL_SOURCE" ||
+   ! grep -Fq '(static_cast<uint64_t>(claim_losses) << 32U)' "$KERNEL_SOURCE"; then
+    echo "G0/G1 must preserve per-task builder owner and disjoint per-instance global thread/warp reports." >&2
+    exit 1
+fi
+if ! grep -Fq 'inactive-builder-lane-mutated' "$HOST_SOURCE"; then
+    echo "G0/G1 host must prove inactive SIMT lanes leave their diagnostic reports poisoned." >&2
     exit 1
 fi
 if grep -Fq 'ScalarCas(&state->drain.builder_finished' "$KERNEL_SOURCE"; then
@@ -146,7 +201,25 @@ if grep -Fq 'ScalarCas(&state->drain.builder_finished' "$KERNEL_SOURCE"; then
 fi
 if grep -Eq 'result(->|\.)build_count[[:space:]]*=[[:space:]]*state->control.task_count|result(->|\.)commit_count[[:space:]]*=[[:space:]]*state->control.task_count' \
     "$KERNEL_SOURCE"; then
-    echo "G0 Main Scalar role must not receive SIMT task build or commit attribution." >&2
+    echo "G0/G1 Main Scalar roles must not receive SIMT task build or commit attribution." >&2
+    exit 1
+fi
+if ! grep -Fq 'SimtAllocBuildingState(nonce, task_id, build_owner)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'asc_atomic_cas(task + kCompletionOffsetWords, static_cast<uint64_t>(0U), desired)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'asc_atomic_cas(task + kCompletionOffsetWords, alloc_building, 1U)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'SimtCompetingExecStateValid(observed, task_id, build_owner, builder_count)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'return kSimtClaimLost;' "$KERNEL_SOURCE"; then
+    echo "G0/G1 must give Alloc a special flag claim and treat only legal competing task states as a claim loss." >&2
+    exit 1
+fi
+if ! grep -Fq '(static_cast<uint64_t>(build_owner) << kStateBuildOwnerShift)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'token->control.build_owner = decoded.build_owner;' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'ClaimedState(task_id, token->control.build_owner, owner)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'DoneState(task_id, token->control.build_owner, owner)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'OwnerEngine(owner, state->control.builder_count)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'OwnerRoleAt(owner, builder_count)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'AivExecutorCount(state->control.builder_count)' "$KERNEL_SOURCE"; then
+    echo "G0/G1 must preserve the actual build owner through claim, token, DONE, roles and runtime drain counts." >&2
     exit 1
 fi
 
@@ -210,7 +283,7 @@ last_workload_line="$(grep -nE 'RunG0(VectorAdd|VectorMultiply|CubeMatmul)\(' "$
 witness_line="$(grep -nF 'if (!PublishExecutionWitness(' "$KERNEL_SOURCE" | cut -d: -f1)"
 vend_line="$(grep -nF 'token->control.completion_vend' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
 flag_line="$(grep -nF 'ScalarExchange(&task->completion.flag, 1U)' "$KERNEL_SOURCE" | cut -d: -f1)"
-done_line="$(grep -nF 'DoneState(task_id, owner)' "$KERNEL_SOURCE" | cut -d: -f1)"
+done_line="$(grep -nF 'DoneState(task_id, token->control.build_owner, owner)' "$KERNEL_SOURCE" | cut -d: -f1)"
 if [[ -z "$poison_store_line" || -z "$poison_dsb_line" || -z "$first_workload_line" ||
       -z "$last_workload_line" || -z "$witness_line" || -z "$vend_line" || -z "$flag_line" ||
       -z "$done_line" ]] ||
@@ -228,8 +301,9 @@ if ! grep -Fq 'StoreDev64(words + 7U, fanin_ready_prefix);' "$KERNEL_SOURCE" ||
 fi
 if ! grep -Fq 'constexpr uint32_t kDrainExpectedArrivals = 6U;' "$KERNEL_SOURCE" ||
    ! grep -Fq 'for (uint32_t group = 0U; group < kDrainGroupCount; ++group)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'ScalarAtomicLoad(&state->drain.builder_started.value) == state->control.builder_count' "$KERNEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kDrainGroupCount = 16U;' "$SIMT_ROOT/common/full_pa_exec_protocol.h"; then
-    echo "G0 final drain must preserve 16 groups with 6 arrivals per group." >&2
+    echo "G0/G1 final drain must preserve 16 groups with 6 arrivals and verify every configured builder started." >&2
     exit 1
 fi
 for workload in RunG0VectorAdd RunG0VectorMultiply RunG0CubeMatmul; do

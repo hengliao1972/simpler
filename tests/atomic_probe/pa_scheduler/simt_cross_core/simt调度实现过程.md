@@ -1426,7 +1426,8 @@ prepare 与严格 insert 被有意分开：
 分歧路径等待另一条路径。等待值只允许从 `N-2` 变为 `N-1`；观察到第三种值
 立即报告 `InsertProtocolFailed`，不能伪装成普通超时。构建报告逐 thread 保存
 tid/warp/lane、首尾 task、prepare/commit/等待次数、nonce 和 checksum，host
-逐项检查 64 个 active leader 与 1,984 个 inactive lane。
+逐项检查 64 个 active leader，并要求 1,984 个 inactive lane 的整份 report
+保持 host poison；因此同一 warp 除 lane0 外连诊断 GM store 也没有。
 
 ### 10.4 四 token 执行、真实 workload 与终态发布
 
@@ -1608,7 +1609,157 @@ warning。两条命令的原始汇总分别为：
 声称 64 个 warp 每周期同时 issue 或当前实现已经性能最优。阶段只做本地
 commit，不 push。
 
-## 11. 阶段状态索引
+## 11. G1：AIV0+AIV1 双 VF 全量竞争构建
+
+### 11.1 用户纠正与最终角色边界
+
+G1 最初讨论过“SIMT 只 Prepare、AIV0 Main Scalar 串行 Commit”的两段式方案，
+但这会把最关键的严格 insert chain 重新归因给 Scalar，也不能模拟两个 builder
+完整竞争。最终按用户纠正冻结为纯 SIMT：AIV0/AIV1 各发射 2048 thread，
+各 64 个 warp 只有 lane0 工作，共 128 个有效 leader。任一 task 只由 AIV0/AIV1
+中相同 local-warp 的两个 leader 竞争唯一 winner，不是 128 个 leader 同抢一个
+task。Main Scalar 只做 VF invoke/join 和最终 drain，不构造、提交或执行 task。
+
+A1 已经用真实 A5 区分了两种情况：同 warp 的 tid0/tid16 分歧路径 100 轮始终
+`T/S + disjoint`，不同 warp 的 tid0/tid32 100 轮始终 `S/S + overlap`。因此
+G1 没有在一个 warp 内安排两个有效 lane；AIV0/AIV1 的相同 local warp 也是
+两个独立 VF 的不同 global warp，不依赖同 warp 分歧取得 forward progress。
+
+### 11.2 参数化复用而不是复制 G0
+
+G0/G1 共用同一套 ABI、CPU 模型、kernel、ACL host 和构建入口，运行时只通过
+`builder_count=1|2` 选择拓扑。`builder_thread_count` 仍表示每份 VF 的 2048，
+总 report 容量单独扩为 4096，避免把 AIV1 误发射成 4096 thread。主要变化为：
+
+- 全局 thread/warp 分别为 `instance*2048+local_tid` 和
+  `instance*64+local_warp`，两实例写入互不重叠的 report；
+- AIV0/owner32、AIV1/owner33 为 builder，owner34..95 才是 AIV executor；
+- 每个 VF 的 thread0 对 `builder_started` 到达一次，所有 active leader 等齐
+  1/2 个实例后再 claim；
+- executable task 用实际 owner 竞争 `EMPTY -> BUILDING`，Alloc 用
+  `completion.flag: 0 -> ALLOC_BUILDING(owner) -> 1`，loser 不做任何 task 写入；
+- winner owner 贯穿 plan、build report、BUILT、token、CLAIMED 和 DONE；
+- 每 task 的 build report word6 用两个 32-bit 原子计数直接取证 attempt/win；
+  为避免同行的 DCache 普通回写与 atomic 竞争，winner 对其余 word 也只能从
+  host poison 用 atomic-CAS 发布，整个 64 B report 禁止普通 SIMT store；
+- thread report 的 `task_count/prepare/commit` 只统计 win，
+  `task_state_access_count` 统计 attempt，`claim_lost_count` 统计 loss；
+- AIV dispatch 尾 cursor 从 G0 的 `2*batches+63` 变为 G1 的
+  `2*batches+62`，AIC cursor 不变；
+- 两个 builder role 的 build/commit/claim/execute/ticket/exhausted 全为 0，
+  但都按物理拓扑各到达一次 drain；owner32 仍是唯一 root。
+
+ABI 版本升为 2。state 从 G0 阶段的 31,876,160 B 增至 32,007,296 B，精确
+增加 131,136 B：第二组 2048×64 B thread report 加一条 64 B
+`builder_started` cacheline；没有逐轮 raw trace 或按 poll 次数扩张的数组。
+
+### 11.3 CPU 并发模型和独立 host oracle
+
+CPU 模型同时运行 builder_count 1/2。每个实例的 64 个 leader 与全部 executor
+从同一 start gate 出发，两个 instance 的 thread0 另行完成 builder-start
+闸门。每个 task 都有独立 atomic attempt/win；Alloc 和 kernel task 分别走与
+设备一致的两种 claim，winner 才能 reserve/Prepare/Commit，loser 只记 loss。
+CPU 定向负例还逐项拒绝同 owner 重入、错误 task/engine/payload-lines、非法
+executor route、未知状态位，以及 Alloc 的错误 nonce/task/owner/magic，避免
+CPU oracle 比设备 loser 协议更宽松。
+
+materialize 和 host oracle 不预设 owner32 获胜，而是从每个 task 的实际
+plan/report 反推出 winner instance、global thread/warp，再逐线程重建
+win/first/last/wait/loss/checksum。固定总量为：
+
+| 配置 | task | attempt | win | loss | executor | AIC/AIV cursor |
+| ---- | ---: | ------: | --: | ---: | -------: | --------------: |
+| G0 B1 | 5 | 5 | 5 | 0 | 95 | 34 / 65 |
+| G0 B256 | 1280 | 1280 | 1280 | 0 | 95 | 544 / 575 |
+| G1 B1 | 5 | 10 | 5 | 5 | 94 | 34 / 64 |
+| G1 B256 | 1280 | 2560 | 1280 | 1280 | 94 | 544 / 574 |
+
+统一 CPU 入口最终重跑结果：
+
+```text
+[PASS] G0 CPU complete: builders=1/2, B1/B256, 64 leaders/builder,
+       unique build claim, 8-shard heap, exact DAG/payload, 4-token tickets,
+       fanin/completion/drain/tail, same-address reuse rounds=4
+[PASS] ... ASan+UBSan ... rounds=2
+[PASS] ... TSan ... rounds=2
+```
+
+三套测试都覆盖单/双 builder、B1/B256，并在同一个 `FullPaState` 地址连续
+materialize 两个 nonce。G0 的 `[2048,4096)` report 必须保持初始值；G1
+两组各只允许 64 个 lane0 leader 写 report，其余 lane 必须保持 host poison。
+host 还逐 task 检查 `attempt==builder_count && win==1`，
+所以“只启动 AIV1、实际所有 task 都没尝试”不能通过。
+
+### 11.4 CCEC、bitcode、ELF 与运行入口门槛
+
+设备实现没有新增第二份 kernel 源码。AIV entry 先严格检查
+`block<32 && subblock_dim==2 && subblock<2`，再用
+`block*subblock_dim+subblock` 得到 dense AIV id；不使用未经查证的 core-id
+映射。AIV id 小于 builder_count 才发射 VF，否则进入 executor。
+
+构建脚本新增了以下 fail-closed 检查：每 VF 必须是 2048 thread/64 warp/lane0；
+builder gate 必须早于 attempt/claim；claim 必须早于 Prepare，Prepare 早于
+Commit，`builder_finished` 只能在 VF 内发布；实际 owner 必须贯穿 state/token；
+task build-report 整条 cacheline 必须只使用 atomic-add/atomic-CAS，Main Scalar
+不得获得 task build/commit 归因；inactive lane 的 thread report 必须保持 poison。
+最终 CCEC AIC/AIV、optimized
+bitcode inventory、1:2 mixed ELF symbol/metadata/relocation 和 GCC15 host 均
+通过。成功清单同时覆盖 `run.sh`，因此 G0/G1 的固定 `--builders` 注入规则被
+修改后，旧产物会被拒绝。
+
+统一入口为：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-g1
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh run-g1 \
+  --device 0 --batches 1 --runs 10
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh run-g1 \
+  --device 0 --batches 256 --runs 10
+```
+
+`build-g1` 复用参数化的 G0/G1 构建；`run-g0` 强制注入 `--builders 1`，
+`run-g1` 强制注入 `--builders 2`。两者都拒绝用户覆盖 kernel/builders，执行
+A5 precheck、SHA-256 清单校验和 600 秒 timeout，并在 task-submit 内只接受
+`$TASK_DEVICE` 注入的 device。
+
+### 11.5 真实 A5 结果与结论边界
+
+本 shell 仍无 `npu-smi` 和 `task-submit`，故沿用本会话已明确授权的 device0
+unlocked 功能验证；每次均输出两条 warning，不把 host 墙钟作为性能数据。
+ACL 报告 `Ascend950PR_958b`。G1 先跑 B1，再跑 B256；随后用同一产物和
+builder_count=1 回归 G0。四组均首轮 fresh initialization，随后复用相同
+device state/workspace 地址并逐轮改变 nonce：
+
+```text
+[SUMMARY] G1 builders=2 B1   passes=10/10 fresh_initialization=yes same_address_reuse=validated
+[SUMMARY] G1 builders=2 B256 passes=10/10 fresh_initialization=yes same_address_reuse=validated
+[SUMMARY] G0 builders=1 B1   passes=10/10 fresh_initialization=yes same_address_reuse=validated
+[SUMMARY] G0 builders=1 B256 passes=10/10 fresh_initialization=yes same_address_reuse=validated
+```
+
+逐轮 winner 分布也由 host 在完整 oracle 通过后直接打印。G1 B1 的
+`AIV0/AIV1` 依次为
+`0/5, 2/3, 5/0, 2/3, 3/2, 4/1, 1/4, 0/5, 0/5, 5/0`；G1 B256
+十轮均为 `640/640`。B1 第 1 轮 owner32 没赢到 task，但该轮仍逐 task 验证
+owner32 的五次 attempt 和五次 loss。这正是区分“参与竞争”与“最终获胜”的
+原因，G1 不以两个 builder 都必须赢到 task 作为伪并发门槛。
+
+G1 的每轮 B1 都直接证明 10 次 attempt/5 个唯一 winner/5 次 loss；B256 证明
+2560 次 attempt/1280 个唯一 winner/1280 次 loss。所有 1024 个 kernel task
+仍各执行一次，两个 builder Main Scalar role 均为零 task，94 个 executor
+完整排空，16 组 drain 各 6 arrivals；descriptor、payload、history、last-writer、
+fanin、vend/flag、execution witness、DONE、workspace golden、guard、padding 和
+inactive tail 全部通过。
+
+本阶段没有生成泳道图，也没有测性能。结论限于：两个独立 VF 中相同
+local-warp 的两个 lane0 leader 最终都对其负责的每个 task 发起尝试，唯一 winner
+完成完整 Prepare/Commit，并能与 94 个 executor 在同一次 mixed kernel 中完成
+真实 PA DAG。start gate 与 attempt/win 不能单独证明两个对应 leader 对每个 task
+的尝试区间必然重叠；A1 证明的是不同 warp 具备独立推进和区间重叠能力，B256
+的实际 winner 分布是调度现象而非协议定理。这里不声称胜率均匀、每 task 必然
+时间重叠或每周期双发射。阶段只做本地 commit，不 push。
+
+## 12. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -1621,7 +1772,7 @@ commit，不 push。
 | S4 多 task、单 builder | 完成 | 初版 `a29fa08e` 完成 4-lane 基线；随后修正为 4-warp/128-thread 交错映射，CPU/CCEC/ELF PASS，A5 同地址复用 100/100，完成计数 `1/8/8/16` 精确闭合。 |
 | A1 warp 推进语义 | 完成 | CPU 三套和 CCEC/ELF 门槛 PASS；A5 同地址复用 100/100，SameWarp 始终 T/S+disjoint，CrossWarp 始终 S/S+overlap。 |
 | G0 GM 完整 PA | 完成 | 64-warp/lane0 纯 SIMT 构建；CPU 三套与 CCEC/ELF 门槛 PASS；A5 B1/B256 首轮 fresh 及同地址 10 轮全部 PASS。 |
-| G1 双 builder GM | 未开始 | - |
+| G1 双 builder GM | 完成 | 双 VF 各 2048-thread/64-warp/lane0 全量竞争；CPU 三套与 CCEC/ELF 门槛 PASS；A5 G1 B1/B256 及 G0 回归各同地址复用 10/10。 |
 | U0 UBUF 单槽 | 未开始 | - |
 | U1 UBUF 多槽/多 task | 未开始 | - |
 | U2 UBUF 完整 PA | 未开始 | - |

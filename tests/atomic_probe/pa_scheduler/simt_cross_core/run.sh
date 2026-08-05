@@ -41,6 +41,8 @@ Usage:
   ./run.sh run-s4 --device N [--runs N]
   ./run.sh build-g0
   ./run.sh run-g0 [--device N] [--batches 1|256] [--runs N]
+  ./run.sh build-g1
+  ./run.sh run-g1 [--device N] [--batches 1|256] [--runs N]
 
 build-s0 运行 CPU optimized/ASan/UBSan/TSan，并构建、静态检查 CCEC/ELF。
 run-s0 只运行已构建的真实 A5 探针；调用前仍需按仓库规则执行 A5 precheck。
@@ -59,8 +61,11 @@ run-s4 运行 AIV0 构建 16 task、AIV1/AIC 各以 busy depth 1 执行 8 task �
 build-g0 运行完整 PA 调度的 CPU 三套测试，并构建、静态检查 G0 CCEC/bitcode/mixed ELF/ACL host。
 run-g0 先做 A5 precheck、构建清单校验和 600 秒有界运行，再由 2048 SIMT thread/64 个 lane0 leader
 并发构建、AIC/AIV 执行完整 PA DAG；
+build-g1 复用同一份参数化源码，验证单/双 builder CPU 模型并重建完整 PA CCEC/ELF/ACL host。
+run-g1 执行 AIV0+AIV1 两个独立 VF：各 2048 SIMT thread/64 个 lane0 leader 对每个 task 竞争构建，
+其余 94 个 AIC/AIV owner 只执行完整 PA DAG；每个 warp 仍严格只有 lane0 一个有效 worker。
 环境提供 task-submit 时，必须先在锁外做 A5 precheck，再从其 --run 命令内调用；run-g0 会把
-$TASK_DEVICE 自动注入 host，锁内调用不得再传 --device。
+$TASK_DEVICE 自动注入 host，锁内调用不得再传 --device。run-g1 遵循同一规则。
 EOF
 }
 
@@ -191,23 +196,28 @@ case "$ACTION" in
         "$GM_BUILD/simt_cross_core_s4_host" \
             --kernel "$GM_BUILD/simt_cross_core_s4_kernel.o" "$@"
         ;;
-    build-g0)
+    build-g0|build-g1)
         if [[ $# -ne 0 ]]; then
-            echo "build-g0 does not accept additional arguments." >&2
+            echo "$ACTION does not accept additional arguments." >&2
             exit 1
         fi
         "$GM_ROOT/cpu/build_g0.sh"
         "$GM_ROOT/ccec/build_g0.sh"
         ;;
-    run-g0)
+    run-g0|run-g1)
+        full_pa_stage="${ACTION#run-}"
+        full_pa_builders=1
+        if [[ "$ACTION" == "run-g1" ]]; then
+            full_pa_builders=2
+        fi
         if [[ ! -x "$GM_BUILD/simt_cross_core_g0_host" ||
               ! -s "$GM_BUILD/simt_cross_core_g0_kernel.o" ||
               ! -s "$G0_BUILD_MANIFEST" ]]; then
-            echo "G0 artifacts are missing; run: $0 build-g0" >&2
+            echo "${full_pa_stage^^} artifacts are missing; run: $0 build-$full_pa_stage" >&2
             exit 1
         fi
         if ! (cd "$SCRIPT_DIR" && sha256sum --check --status "$G0_BUILD_MANIFEST"); then
-            echo "G0 sources and runtime artifacts do not match the successful-build manifest; run: $0 build-g0" >&2
+            echo "${full_pa_stage^^} sources and runtime artifacts do not match the successful-build manifest; run: $0 build-$full_pa_stage" >&2
             exit 1
         fi
         precheck_rc=0
@@ -218,11 +228,11 @@ case "$ACTION" in
         fi
         if (( precheck_rc != 0 )); then
             if (( precheck_rc != 1 )); then
-                echo "G0 A5 arch precheck rejected this silicon (exit=$precheck_rc); refusing hardware access." >&2
+                echo "${full_pa_stage^^} A5 arch precheck rejected this silicon (exit=$precheck_rc); refusing hardware access." >&2
                 exit "$precheck_rc"
             fi
             if [[ -n "${TASK_DEVICE:-}" ]] || command -v task-submit >/dev/null 2>&1; then
-                echo "G0 A5 arch precheck failed; refusing the submitted/managed hardware run." >&2
+                echo "${full_pa_stage^^} A5 arch precheck failed; refusing the submitted/managed hardware run." >&2
                 exit 1
             fi
             printf '%s\n' \
@@ -231,7 +241,7 @@ case "$ACTION" in
         fi
         if [[ -z "${TASK_DEVICE:-}" ]] && command -v task-submit >/dev/null 2>&1; then
             printf '%s\n' \
-                'run-g0 detected task-submit but is not running inside a submitted task; run the A5 precheck first, then wrap run-g0 with task-submit --device auto --device-num 1 --run "...".' \
+                "$ACTION detected task-submit but is not running inside a submitted task; run the A5 precheck first, then wrap $ACTION with task-submit --device auto --device-num 1 --run \"...\"." \
                 >&2
             exit 1
         fi
@@ -240,26 +250,31 @@ case "$ACTION" in
                 '[WARN] task-submit not found; running unlocked — results may be noisy if any other process is on this NPU' \
                 >&2
         fi
-        g0_device_args=()
+        full_pa_device_args=()
         for argument in "$@"; do
             case "$argument" in
                 --kernel|--kernel=*)
-                    echo "run-g0 uses the kernel covered by its successful-build manifest; do not override --kernel." >&2
+                    echo "$ACTION uses the kernel covered by its successful-build manifest; do not override --kernel." >&2
+                    exit 1
+                    ;;
+                --builders|--builders=*)
+                    echo "$ACTION fixes --builders=$full_pa_builders; do not override the stage topology." >&2
                     exit 1
                     ;;
                 --device|--device=*)
                     if [[ -n "${TASK_DEVICE:-}" ]]; then
-                        echo "run-g0 injects --device from TASK_DEVICE inside task-submit; do not pass --device explicitly." >&2
+                        echo "$ACTION injects --device from TASK_DEVICE inside task-submit; do not pass --device explicitly." >&2
                         exit 1
                     fi
                     ;;
             esac
         done
         if [[ -n "${TASK_DEVICE:-}" ]]; then
-            g0_device_args=(--device "$TASK_DEVICE")
+            full_pa_device_args=(--device "$TASK_DEVICE")
         fi
         timeout --foreground 600s "$GM_BUILD/simt_cross_core_g0_host" \
-            --kernel "$GM_BUILD/simt_cross_core_g0_kernel.o" "${g0_device_args[@]}" "$@"
+            --kernel "$GM_BUILD/simt_cross_core_g0_kernel.o" --builders "$full_pa_builders" \
+            "${full_pa_device_args[@]}" "$@"
         ;;
     *)
         usage >&2

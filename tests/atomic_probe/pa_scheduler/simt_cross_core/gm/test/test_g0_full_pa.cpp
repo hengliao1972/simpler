@@ -37,6 +37,8 @@ struct CpuTask {
     std::atomic<uint64_t> exec_state{0U};
     std::atomic<int64_t> completion_flag{0};
     std::atomic<uint64_t> completion_vend{0U};
+    std::atomic<uint32_t> build_attempt_count{0U};
+    std::atomic<uint32_t> build_win_count{0U};
     std::atomic<int64_t> insert_completion{0};
     std::atomic<uint64_t> task_base_plus_one{0U};
     std::atomic<uint64_t> completion_vend_plus_one{0U};
@@ -73,6 +75,12 @@ struct CpuOwner {
     std::array<uint32_t, kTokensPerOwner> last_ticket_tasks{};
     uint32_t busy_tokens = 0U;
     bool exhausted = false;
+};
+
+enum class BuildAttemptResult : uint32_t {
+    Won = 0,
+    Lost = 1,
+    Error = 2,
 };
 
 struct HeapInterval {
@@ -177,6 +185,50 @@ ExecPayloadHeader DecodeCpuHeader(const std::array<uint64_t, kMaxPayloadWords> &
     };
 }
 
+bool CompetingKernelClaimValid(
+    uint32_t task_id, uint32_t current_owner, uint32_t builder_count, uint64_t raw_state
+) {
+    const DecodedExecState decoded = DecodeExecState(static_cast<int64_t>(raw_state));
+    if (!decoded.valid || decoded.task_id != task_id || !TaskExecutable(TaskKindAt(task_id)) ||
+        !IsBuilderOwner(decoded.build_owner, builder_count) || decoded.build_owner == current_owner) {
+        return false;
+    }
+    if (decoded.phase == ExecPhase::Building) {
+        return decoded.execute_owner == kUnboundOwner && decoded.engine_class == ExecEngineClass::None &&
+               decoded.payload_lines == 0U;
+    }
+    const TaskKind kind = TaskKindAt(task_id);
+    const TaskExecShape shape = TaskShape(kind);
+    ExecPayloadLayout layout{};
+    if (!ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout) ||
+        decoded.engine_class != TaskEngine(kind) || decoded.payload_lines != layout.payload_lines) {
+        return false;
+    }
+    if (decoded.phase == ExecPhase::Built) {
+        return decoded.execute_owner == kUnboundOwner;
+    }
+    if (decoded.phase != ExecPhase::Claimed && decoded.phase != ExecPhase::Done) {
+        return false;
+    }
+    return OwnerCanExecute(decoded.execute_owner, decoded.engine_class, builder_count);
+}
+
+bool CompetingAllocClaimValid(
+    uint64_t nonce, uint32_t task_id, uint32_t current_owner, uint32_t builder_count, int64_t raw_state
+) {
+    if (raw_state == 1) {
+        return true;
+    }
+    for (uint32_t builder = 0U; builder < builder_count; ++builder) {
+        const uint32_t owner = BuilderOwnerForInstance(builder);
+        if (owner != current_owner &&
+            static_cast<uint64_t>(raw_state) == AllocBuildingState(nonce, task_id, owner)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void ResetExecutionTokenControl(ExecutionToken *token) {
     token->control.phase = ExecTokenPhase::Idle;
     token->control.task_id = UINT32_MAX;
@@ -207,10 +259,11 @@ TensorDesc LoadPayloadTensor(
 
 class CpuFullPaModel {
 public:
-    CpuFullPaModel(uint32_t batches, uint64_t nonce) :
+    CpuFullPaModel(uint32_t batches, uint64_t nonce, uint32_t builder_count) :
         batches_(batches),
         task_count_(TaskCount(batches)),
         kernel_task_count_(KernelTaskCount(batches)),
+        builder_count_(builder_count),
         nonce_(nonce),
         tasks_(std::make_unique<CpuTask[]>(task_count_)) {
         for (std::atomic<uint64_t> &cursor : heap_cursors_) {
@@ -218,6 +271,7 @@ public:
         }
         heap_vend_.store(0U, std::memory_order_relaxed);
         fatal_.store(0U, std::memory_order_relaxed);
+        builder_started_.store(0U, std::memory_order_relaxed);
         builder_finished_.store(0U, std::memory_order_relaxed);
         done_count_.store(0U, std::memory_order_relaxed);
         alloc_done_.store(0U, std::memory_order_relaxed);
@@ -242,8 +296,11 @@ public:
         for (uint32_t owner = 0U; owner < kOwnerCount; ++owner) {
             InitializeOwner(owner);
         }
-        for (uint32_t thread = 0U; thread < kBuilderThreadCount; ++thread) {
-            InitializeBuilderThreadReport(thread);
+        std::memset(builder_threads_.data(), 0xD3, sizeof(builder_threads_));
+        for (uint32_t thread = 0U; thread < BuilderThreadCount(builder_count_); ++thread) {
+            if (BuilderThreadActive(thread, builder_count_)) {
+                InitializeBuilderThreadReport(thread);
+            }
         }
         for (std::array<std::array<float, 2>, 2> &owner : owner_workload_) {
             for (std::array<float, 2> &values : owner) {
@@ -255,9 +312,12 @@ public:
     }
 
     bool RunConcurrent() {
-        constexpr uint32_t kParticipantCount = kBuilderLeaderCount + kExecutorCount;
-        StartGate start_gate(kParticipantCount);
-        std::array<std::atomic<bool>, kBuilderLeaderCount> builder_ok{};
+        if (!BuilderCountValid(builder_count_)) {
+            return false;
+        }
+        const uint32_t participant_count = BuilderLeaderCount(builder_count_) + ExecutorCount(builder_count_);
+        StartGate start_gate(participant_count);
+        std::array<std::atomic<bool>, kMaxBuilderLeaderCount> builder_ok{};
         std::array<std::atomic<bool>, kOwnerCount> executor_ok{};
         for (std::atomic<bool> &ok : builder_ok) {
             ok.store(false, std::memory_order_relaxed);
@@ -267,18 +327,24 @@ public:
         }
 
         std::vector<std::thread> leaders;
-        leaders.reserve(kBuilderLeaderCount);
-        for (uint32_t warp = 0U; warp < kBuilderWarpCount; ++warp) {
-            leaders.emplace_back([this, warp, &start_gate, &builder_ok] {
-                start_gate.ArriveAndWait();
-                builder_ok[warp].store(RunBuilderWarp(warp), std::memory_order_release);
-            });
+        leaders.reserve(BuilderLeaderCount(builder_count_));
+        for (uint32_t builder = 0U; builder < builder_count_; ++builder) {
+            for (uint32_t warp = 0U; warp < kBuilderWarpCount; ++warp) {
+                const uint32_t leader = builder * kBuilderLeaderCount + warp;
+                const uint32_t thread_id = BuilderThreadForTask(warp, builder);
+                leaders.emplace_back([this, leader, thread_id, &start_gate, &builder_ok] {
+                    start_gate.ArriveAndWait();
+                    builder_ok[leader].store(
+                        EnterBuilderGate(thread_id) && RunBuilderWarp(thread_id), std::memory_order_release
+                    );
+                });
+            }
         }
 
         std::vector<std::thread> executors;
-        executors.reserve(kExecutorCount);
+        executors.reserve(ExecutorCount(builder_count_));
         for (uint32_t owner = 0U; owner < kOwnerCount; ++owner) {
-            if (owner == kBuilderOwner) {
+            if (IsBuilderOwner(owner, builder_count_)) {
                 continue;
             }
             executors.emplace_back([this, owner, &start_gate, &executor_ok] {
@@ -294,15 +360,19 @@ public:
         for (std::thread &leader : leaders) {
             leader.join();
         }
-        const bool all_builders_ok = std::all_of(builder_ok.begin(), builder_ok.end(), [](const std::atomic<bool> &ok) {
-            return ok.load(std::memory_order_acquire);
-        });
-        bool builder_arrived = false;
+        bool all_builders_ok = true;
+        for (uint32_t leader = 0U; leader < BuilderLeaderCount(builder_count_); ++leader) {
+            all_builders_ok &= builder_ok[leader].load(std::memory_order_acquire);
+        }
+        all_builders_ok &= FinalizePerTaskBuildEvidence();
+        bool builders_arrived = false;
         bool drain_ok = false;
         if (all_builders_ok && fatal_.load(std::memory_order_acquire) == 0U) {
-            builder_finished_.store(1U, std::memory_order_release);
-            builder_arrived = ArriveDrain(kBuilderOwner);
-            if (builder_arrived && fatal_.load(std::memory_order_acquire) == 0U) {
+            builders_arrived = builder_finished_.load(std::memory_order_acquire) == 1U;
+            for (uint32_t builder = 0U; builder < builder_count_ && builders_arrived; ++builder) {
+                builders_arrived &= ArriveDrain(BuilderOwnerForInstance(builder));
+            }
+            if (builders_arrived && fatal_.load(std::memory_order_acquire) == 0U) {
                 drain_ok = WaitForDrainAndPublishRoot();
             }
         }
@@ -312,11 +382,11 @@ public:
         }
         bool all_executors_ok = true;
         for (uint32_t owner = 0U; owner < kOwnerCount; ++owner) {
-            if (owner != kBuilderOwner) {
+            if (!IsBuilderOwner(owner, builder_count_)) {
                 all_executors_ok &= executor_ok[owner].load(std::memory_order_acquire);
             }
         }
-        return all_builders_ok && all_executors_ok && builder_arrived && drain_ok &&
+        return all_builders_ok && all_executors_ok && builders_arrived && drain_ok &&
                fatal_.load(std::memory_order_acquire) == 0U;
     }
 
@@ -357,7 +427,7 @@ private:
         CpuOwner &worker = owners_[owner];
         std::memset(&worker.result, 0, sizeof(worker.result));
         worker.result.owner = owner;
-        worker.result.role = OwnerRoleAt(owner);
+        worker.result.role = OwnerRoleAt(owner, builder_count_);
         worker.result.physical_block = OwnerPhysicalBlock(owner);
         worker.result.drain_group = OwnerDrainGroup(owner);
         worker.result.launch_nonce = nonce_;
@@ -374,16 +444,18 @@ private:
         report.thread_id = thread_id;
         report.warp_id = thread_id / kWarpSize;
         report.lane_id = thread_id % kWarpSize;
-        report.active_leader = BuilderThreadActive(thread_id) ? 1U : 0U;
-        report.task_count = BuilderExpectedTaskCount(thread_id, task_count_);
-        report.first_task = report.task_count == 0U ? kNoTask : BuilderFirstTask(thread_id);
-        report.last_task = BuilderExpectedLastTask(thread_id, task_count_);
-        report.task_state_access_count = report.task_count;
-        report.prepare_count = report.task_count;
-        report.commit_count = report.task_count;
-        report.insert_wait_count = BuilderExpectedInsertWaitCount(thread_id, task_count_);
+        report.active_leader = BuilderThreadActive(thread_id, builder_count_) ? 1U : 0U;
+        report.task_count = 0U;
+        report.first_task = kNoTask;
+        report.last_task = kNoTask;
+        report.task_state_access_count = 0U;
+        report.prepare_count = 0U;
+        report.commit_count = 0U;
+        report.insert_wait_count = 0U;
+        report.claim_lost_count = 0U;
         report.launch_nonce = nonce_;
-        report.checksum = BuilderReportChecksum(nonce_, thread_id, task_count_);
+        report.checksum =
+            BuilderReportChecksum(nonce_, thread_id, task_count_, 0U, kNoTask, kNoTask, 0U, 0U, 0U, 0U, 0U);
     }
 
     template <typename Predicate>
@@ -427,13 +499,75 @@ private:
         SignalProgress();
     }
 
-    bool RunBuilderWarp(uint32_t warp) {
-        const uint32_t thread_id = warp * kWarpSize;
-        for (uint32_t task_id = warp; task_id < task_count_; task_id += kBuilderTaskStride) {
-            if (!BuildTask(task_id, thread_id)) {
-                PublishFatal(ExecFatalReason::BuildPackFailed, task_id, kBuilderOwner);
+    bool EnterBuilderGate(uint32_t thread_id) {
+        if (BuilderLocalThread(thread_id) == 0U) {
+            const uint64_t observed = builder_started_.fetch_add(1U, std::memory_order_acq_rel);
+            if (observed >= builder_count_) {
+                PublishFatal(ExecFatalReason::ControlPublishConflict, kNoTask, BuilderOwnerForThread(thread_id));
                 return false;
             }
+            SignalProgress();
+        }
+        uint32_t polls = 0U;
+        return WaitFor(
+            [this] {
+                return builder_started_.load(std::memory_order_acquire) == builder_count_;
+            },
+            &polls
+        );
+    }
+
+    bool ExistingKernelClaimValid(uint32_t task_id, uint32_t current_owner, uint64_t raw_state) const {
+        return CompetingKernelClaimValid(task_id, current_owner, builder_count_, raw_state);
+    }
+
+    bool ExistingAllocClaimValid(uint32_t task_id, uint32_t current_owner, int64_t raw_state) const {
+        return CompetingAllocClaimValid(nonce_, task_id, current_owner, builder_count_, raw_state);
+    }
+
+    bool RunBuilderWarp(uint32_t thread_id) {
+        FullPaBuilderThreadReport &report = builder_threads_[thread_id];
+        const uint32_t owner = BuilderOwnerForThread(thread_id);
+        const uint32_t first_attempt = BuilderFirstTask(thread_id, builder_count_);
+        for (uint32_t task_id = first_attempt; task_id < task_count_; task_id += kBuilderTaskStride) {
+            ++report.task_state_access_count;
+            const BuildAttemptResult result = BuildTask(task_id, thread_id);
+            if (result == BuildAttemptResult::Error) {
+                PublishFatal(ExecFatalReason::BuildPackFailed, task_id, owner);
+                return false;
+            }
+            if (result == BuildAttemptResult::Lost) {
+                ++report.claim_lost_count;
+                continue;
+            }
+            if (report.task_count == 0U) {
+                report.first_task = task_id;
+            }
+            ++report.task_count;
+            report.last_task = task_id;
+            ++report.prepare_count;
+            ++report.commit_count;
+            report.insert_wait_count += task_id == 0U ? 0U : 1U;
+        }
+        report.checksum = BuilderReportChecksum(
+            nonce_, thread_id, task_count_, report.task_count, report.first_task, report.last_task,
+            report.task_state_access_count, report.prepare_count, report.commit_count, report.insert_wait_count,
+            report.claim_lost_count
+        );
+        return true;
+    }
+
+    bool FinalizePerTaskBuildEvidence() {
+        for (uint32_t task_id = 0U; task_id < task_count_; ++task_id) {
+            CpuTask &task = tasks_[task_id];
+            const uint32_t attempts = task.build_attempt_count.load(std::memory_order_acquire);
+            const uint32_t wins = task.build_win_count.load(std::memory_order_acquire);
+            if (attempts != builder_count_ || wins != 1U) {
+                PublishFatal(ExecFatalReason::ControlPublishConflict, task_id, kBuilderOwner);
+                return false;
+            }
+            task.build_report.build_attempt_count = attempts;
+            task.build_report.build_win_count = wins;
         }
         return true;
     }
@@ -551,20 +685,36 @@ private:
         return destination == layout->written_words;
     }
 
-    bool BuildTask(uint32_t task_id, uint32_t thread_id) {
+    BuildAttemptResult BuildTask(uint32_t task_id, uint32_t thread_id) {
         CpuTask &task = tasks_[task_id];
         const TaskKind kind = TaskKindAt(task_id);
+        const uint32_t build_owner = BuilderOwnerForThread(thread_id);
+        task.build_attempt_count.fetch_add(1U, std::memory_order_acq_rel);
         uint64_t expected_state = 0U;
-        if (TaskExecutable(kind) &&
-            !task.exec_state.compare_exchange_strong(
-                expected_state, BuildingState(task_id), std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            return false;
+        int64_t alloc_claim = 0;
+        if (kind == TaskKind::Alloc) {
+            const int64_t desired = static_cast<int64_t>(AllocBuildingState(nonce_, task_id, build_owner));
+            if (!task.completion_flag.compare_exchange_strong(
+                    alloc_claim, desired, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                return ExistingAllocClaimValid(task_id, build_owner, alloc_claim) ? BuildAttemptResult::Lost :
+                                                                                    BuildAttemptResult::Error;
+            }
+            alloc_claim = desired;
+        } else if (!task.exec_state.compare_exchange_strong(
+                       expected_state, BuildingState(task_id, build_owner), std::memory_order_acq_rel,
+                       std::memory_order_acquire
+                   )) {
+            return ExistingKernelClaimValid(task_id, build_owner, expected_state) ? BuildAttemptResult::Lost :
+                                                                                    BuildAttemptResult::Error;
+        }
+        if (task.build_win_count.fetch_add(1U, std::memory_order_acq_rel) != 0U) {
+            return BuildAttemptResult::Error;
         }
         uint64_t task_base = 0U;
         uint64_t vend = 0U;
         if (!ReserveHeap(task_id, &task_base, &vend)) {
-            return false;
+            return BuildAttemptResult::Error;
         }
         const uint32_t output_count = TaskOutputCount(kind);
         for (uint32_t slot = 0U; slot < output_count; ++slot) {
@@ -574,7 +724,7 @@ private:
         }
         ExecPayloadLayout layout{};
         if (TaskExecutable(kind) && !PackPayload(task_id, vend, &layout)) {
-            return false;
+            return BuildAttemptResult::Error;
         }
         uint32_t insert_polls = 0U;
         int64_t predecessor_observed = -1;
@@ -586,7 +736,7 @@ private:
                     },
                     &insert_polls
                 )) {
-                return false;
+                return BuildAttemptResult::Error;
             }
             predecessor_observed = tasks_[task_id - 1U].insert_completion.load(std::memory_order_acquire);
         }
@@ -609,22 +759,27 @@ private:
         if (!committed_prefix_.compare_exchange_strong(
                 expected_prefix, task_id + 1U, std::memory_order_acq_rel, std::memory_order_acquire
             )) {
-            return false;
+            return BuildAttemptResult::Error;
         }
         const int64_t previous_insert = task.insert_completion.fetch_add(1, std::memory_order_acq_rel);
         if (previous_insert != InsertCompletionInitialValue(task_id)) {
-            return false;
+            return BuildAttemptResult::Error;
         }
         if (kind == TaskKind::Alloc) {
             task.completion_vend.store(vend, std::memory_order_relaxed);
-            task.completion_flag.store(1, std::memory_order_release);
+            if (!task.completion_flag.compare_exchange_strong(
+                    alloc_claim, 1, std::memory_order_release, std::memory_order_acquire
+                )) {
+                return BuildAttemptResult::Error;
+            }
             alloc_done_.fetch_add(1U, std::memory_order_acq_rel);
         } else {
-            expected_state = BuildingState(task_id);
+            expected_state = BuildingState(task_id, build_owner);
             if (!task.exec_state.compare_exchange_strong(
-                    expected_state, BuiltState(task_id), std::memory_order_release, std::memory_order_acquire
+                    expected_state, BuiltState(task_id, build_owner), std::memory_order_release,
+                    std::memory_order_acquire
                 )) {
-                return false;
+                return BuildAttemptResult::Error;
             }
         }
         task.plan = FullPaTaskPlan{
@@ -638,7 +793,7 @@ private:
             BuilderWarp(thread_id),
             EncodeTaskMeta(task_id, task_count_),
             EncodeTaskExecRoute(kind),
-            0U,
+            static_cast<uint16_t>(build_owner),
             AlignOutputBytes(TaskOutputBytes(kind)),
             nonce_,
             0U,
@@ -661,8 +816,16 @@ private:
             0U,
             nonce_,
         };
+        if (task_id + 1U == task_count_) {
+            uint64_t expected_finished = 0U;
+            if (!builder_finished_.compare_exchange_strong(
+                    expected_finished, 1U, std::memory_order_release, std::memory_order_acquire
+                )) {
+                return BuildAttemptResult::Error;
+            }
+        }
         SignalProgress();
-        return true;
+        return BuildAttemptResult::Won;
     }
 
     bool FillTokens(CpuOwner &worker) {
@@ -670,7 +833,7 @@ private:
             return false;
         }
         bool progress = false;
-        const ExecEngineClass engine = OwnerEngine(worker.result.owner);
+        const ExecEngineClass engine = OwnerEngine(worker.result.owner, builder_count_);
         const std::vector<uint32_t> &task_ids = engine == ExecEngineClass::Aic ? aic_task_ids_ : aiv_task_ids_;
         std::atomic<uint32_t> &cursor = engine == ExecEngineClass::Aic ? aic_cursor_ : aiv_cursor_;
         for (uint32_t slot = 0U; slot < kTokensPerOwner; ++slot) {
@@ -688,7 +851,7 @@ private:
             const uint32_t task_id = task_ids[ticket];
             token.control.phase = ExecTokenPhase::WaitingBuilt;
             token.control.task_id = task_id;
-            token.control.build_owner = kBuilderOwner;
+            token.control.build_owner = UINT32_MAX;
             token.control.execute_owner = worker.result.owner;
             token.control.engine_class = engine;
             token.control.payload_address = reinterpret_cast<uint64_t>(tasks_[task_id].payload.data());
@@ -803,17 +966,34 @@ private:
         const uint32_t task_id = token.control.task_id;
         CpuTask &task = tasks_[task_id];
         if (token.control.phase == ExecTokenPhase::WaitingBuilt) {
-            uint64_t expected = BuiltState(task_id);
-            if (!task.exec_state.compare_exchange_strong(
-                    expected, ClaimedState(task_id, worker.result.owner), std::memory_order_acq_rel,
-                    std::memory_order_acquire
-                )) {
-                if (expected == 0U || expected == BuildingState(task_id)) {
-                    return false;
-                }
+            uint64_t expected = task.exec_state.load(std::memory_order_acquire);
+            if (expected == 0U) {
+                return false;
+            }
+            const DecodedExecState decoded = DecodeExecState(static_cast<int64_t>(expected));
+            if (decoded.valid && decoded.phase == ExecPhase::Building && decoded.task_id == task_id &&
+                IsBuilderOwner(decoded.build_owner, builder_count_)) {
+                return false;
+            }
+            if (!decoded.valid || decoded.phase != ExecPhase::Built || decoded.task_id != task_id ||
+                !IsBuilderOwner(decoded.build_owner, builder_count_) ||
+                decoded.engine_class != TaskEngine(TaskKindAt(task_id))) {
                 PublishFatal(ExecFatalReason::ControlPublishConflict, task_id, worker.result.owner);
                 return false;
             }
+            const uint32_t build_owner = decoded.build_owner;
+            if (expected != BuiltState(task_id, build_owner)) {
+                PublishFatal(ExecFatalReason::ControlPublishConflict, task_id, worker.result.owner);
+                return false;
+            }
+            if (!task.exec_state.compare_exchange_strong(
+                    expected, ClaimedState(task_id, build_owner, worker.result.owner), std::memory_order_acq_rel,
+                    std::memory_order_acquire
+                )) {
+                PublishFatal(ExecFatalReason::ControlPublishConflict, task_id, worker.result.owner);
+                return false;
+            }
+            token.control.build_owner = build_owner;
             if (!PayloadValid(task_id)) {
                 PublishFatal(ExecFatalReason::ClaimedPayloadInvalid, task_id, worker.result.owner);
                 return false;
@@ -890,10 +1070,10 @@ private:
             PublishFatal(ExecFatalReason::CompletionPublishFailed, task_id, worker.result.owner);
             return false;
         }
-        uint64_t expected_state = ClaimedState(task_id, worker.result.owner);
+        uint64_t expected_state = ClaimedState(task_id, token.control.build_owner, worker.result.owner);
         if (!task.exec_state.compare_exchange_strong(
-                expected_state, DoneState(task_id, worker.result.owner), std::memory_order_release,
-                std::memory_order_acquire
+                expected_state, DoneState(task_id, token.control.build_owner, worker.result.owner),
+                std::memory_order_release, std::memory_order_acquire
             )) {
             PublishFatal(ExecFatalReason::CompletionStateConflict, task_id, worker.result.owner);
             return false;
@@ -1011,39 +1191,28 @@ private:
     }
 
     bool ValidateCounts() const {
-        if (fatal_.load(std::memory_order_acquire) != 0U || builder_finished_.load(std::memory_order_acquire) != 1U ||
+        if (fatal_.load(std::memory_order_acquire) != 0U ||
+            builder_started_.load(std::memory_order_acquire) != builder_count_ ||
+            builder_finished_.load(std::memory_order_acquire) != 1U ||
             done_count_.load(std::memory_order_acquire) != kernel_task_count_ ||
             alloc_done_.load(std::memory_order_acquire) != batches_ ||
             aic_done_.load(std::memory_order_acquire) != 2U * batches_ ||
             aiv_done_.load(std::memory_order_acquire) != 2U * batches_ ||
             committed_prefix_.load(std::memory_order_acquire) != task_count_ ||
             aic_cursor_.load(std::memory_order_acquire) != 2U * batches_ + kAicOwnerCount ||
-            aiv_cursor_.load(std::memory_order_acquire) != 2U * batches_ + kAivExecutorCount) {
+            aiv_cursor_.load(std::memory_order_acquire) != 2U * batches_ + AivExecutorCount(builder_count_)) {
             return false;
         }
         return aic_task_ids_.size() == 2U * batches_ && aiv_task_ids_.size() == 2U * batches_;
     }
 
     bool ValidateBuilderMapping() const {
-        for (uint32_t thread = 0U; thread < kBuilderThreadCount; ++thread) {
-            const FullPaBuilderThreadReport &report = builder_threads_[thread];
-            if (report.thread_id != thread || report.warp_id != thread / kWarpSize ||
-                report.lane_id != thread % kWarpSize ||
-                report.active_leader != (BuilderThreadActive(thread) ? 1U : 0U) ||
-                report.task_count != BuilderExpectedTaskCount(thread, task_count_) ||
-                report.first_task != (report.task_count == 0U ? kNoTask : BuilderFirstTask(thread)) ||
-                report.last_task != BuilderExpectedLastTask(thread, task_count_) ||
-                report.task_state_access_count != report.task_count || report.prepare_count != report.task_count ||
-                report.commit_count != report.task_count ||
-                report.insert_wait_count != BuilderExpectedInsertWaitCount(thread, task_count_) ||
-                report.reserved0 != 0U || report.launch_nonce != nonce_ ||
-                report.checksum != BuilderReportChecksum(nonce_, thread, task_count_)) {
-                return false;
-            }
-            if (!BuilderThreadActive(thread) && (report.task_state_access_count != 0U || report.task_count != 0U)) {
-                return false;
-            }
-        }
+        std::array<uint32_t, kMaxBuilderThreadCount> expected_wins{};
+        std::array<uint32_t, kMaxBuilderThreadCount> expected_first{};
+        std::array<uint32_t, kMaxBuilderThreadCount> expected_last{};
+        std::array<uint32_t, kMaxBuilderThreadCount> expected_waits{};
+        expected_first.fill(kNoTask);
+        expected_last.fill(kNoTask);
         for (uint32_t task_id = 0U; task_id < task_count_; ++task_id) {
             const CpuTask &task = tasks_[task_id];
             const TaskKind kind = TaskKindAt(task_id);
@@ -1056,21 +1225,42 @@ private:
             const uint32_t expected_phase_bits =
                 kBuildPreparedBit | kBuildOutputsPublishedBit | kBuildInsertCommittedBit |
                 (TaskExecutable(kind) ? kBuildExecPublishedBit : kBuildAllocCompletedBit);
+            const uint32_t builder_thread = task.plan.builder_thread;
+            if (builder_thread >= BuilderThreadCount(builder_count_) ||
+                !BuilderThreadActive(builder_thread, builder_count_)) {
+                return false;
+            }
+            const uint32_t builder_instance = BuilderInstance(builder_thread);
+            const uint32_t build_owner = BuilderOwnerForThread(builder_thread);
+            if (builder_thread != BuilderThreadForTask(task_id, builder_instance) ||
+                !IsBuilderOwner(build_owner, builder_count_)) {
+                return false;
+            }
+            if (TaskExecutable(kind)) {
+                const DecodedExecState decoded =
+                    DecodeExecState(static_cast<int64_t>(task.exec_state.load(std::memory_order_acquire)));
+                if (!decoded.valid || decoded.build_owner != build_owner || decoded.task_id != task_id) {
+                    return false;
+                }
+            } else if (task.completion_flag.load(std::memory_order_acquire) != 1) {
+                return false;
+            }
             if (!ConsecutiveTasksUseDifferentWarps(task_id) || task.plan.task_id != task_id ||
                 task.plan.batch != TaskBatch(task_id) || task.plan.kind != TaskKindAt(task_id) ||
                 task.plan.engine_class != TaskEngine(TaskKindAt(task_id)) ||
                 task.plan.output_count != TaskOutputCount(kind) || task.plan.payload_lines != layout.payload_lines ||
-                task.plan.builder_thread != BuilderThreadForTask(task_id) || task.plan.builder_warp != task_id % 64U ||
+                task.plan.builder_warp != BuilderWarp(builder_thread) ||
                 task.plan.encoded_meta != EncodeTaskMeta(task_id, task_count_) ||
-                task.plan.exec_route != EncodeTaskExecRoute(TaskKindAt(task_id)) || task.plan.reserved16 != 0U ||
+                task.plan.exec_route != EncodeTaskExecRoute(TaskKindAt(task_id)) ||
+                task.plan.builder_owner != build_owner ||
                 task.plan.reserved_bytes != AlignOutputBytes(TaskOutputBytes(kind)) ||
                 task.plan.launch_nonce != nonce_ || task.plan.reserved != 0U || task.build_report.task_id != task_id ||
-                task.build_report.builder_thread != BuilderThreadForTask(task_id) ||
-                task.build_report.builder_warp != task_id % kBuilderWarpCount || task.build_report.builder_lane != 0U ||
+                task.build_report.builder_thread != builder_thread ||
+                task.build_report.builder_warp != BuilderWarp(builder_thread) || task.build_report.builder_lane != 0U ||
                 task.build_report.phase_bits != expected_phase_bits ||
                 task.build_report.output_count != TaskOutputCount(kind) ||
                 task.build_report.payload_words != layout.written_words || task.build_report.launch_nonce != nonce_ ||
-                task.build_report.main_scalar_build_count != 0U || task.build_report.main_scalar_commit_count != 0U ||
+                task.build_report.build_attempt_count != builder_count_ || task.build_report.build_win_count != 1U ||
                 task.build_report.prepare_count != 1U || task.build_report.commit_count != 1U ||
                 task.insert_completion.load(std::memory_order_acquire) != static_cast<int64_t>(task_id)) {
                 return false;
@@ -1083,8 +1273,53 @@ private:
                        task.build_report.insert_poll_count == 0U) {
                 return false;
             }
+            ++expected_wins[builder_thread];
+            if (expected_first[builder_thread] == kNoTask) {
+                expected_first[builder_thread] = task_id;
+            }
+            expected_last[builder_thread] = task_id;
+            expected_waits[builder_thread] += task_id == 0U ? 0U : 1U;
         }
-        return true;
+
+        uint64_t total_attempts = 0U;
+        uint64_t total_wins = 0U;
+        uint64_t total_losses = 0U;
+        for (uint32_t thread = 0U; thread < BuilderThreadCount(builder_count_); ++thread) {
+            const FullPaBuilderThreadReport &report = builder_threads_[thread];
+            if (!BuilderThreadActive(thread, builder_count_)) {
+                FullPaBuilderThreadReport poison{};
+                std::memset(&poison, 0xD3, sizeof(poison));
+                if (std::memcmp(&report, &poison, sizeof(report)) != 0) {
+                    return false;
+                }
+                continue;
+            }
+            const uint32_t attempts = BuilderExpectedTaskCount(thread, task_count_, builder_count_);
+            const uint32_t wins = expected_wins[thread];
+            if (wins > attempts) {
+                return false;
+            }
+            const uint32_t losses = attempts - wins;
+            const uint64_t checksum = BuilderReportChecksum(
+                nonce_, thread, task_count_, wins, expected_first[thread], expected_last[thread], attempts, wins, wins,
+                expected_waits[thread], losses
+            );
+            if (report.thread_id != thread || report.warp_id != BuilderWarp(thread) ||
+                report.lane_id != thread % kWarpSize ||
+                report.active_leader != (BuilderThreadActive(thread, builder_count_) ? 1U : 0U) ||
+                report.task_count != wins || report.first_task != expected_first[thread] ||
+                report.last_task != expected_last[thread] || report.task_state_access_count != attempts ||
+                report.prepare_count != wins || report.commit_count != wins ||
+                report.insert_wait_count != expected_waits[thread] || report.claim_lost_count != losses ||
+                report.launch_nonce != nonce_ || report.checksum != checksum) {
+                return false;
+            }
+            total_attempts += attempts;
+            total_wins += wins;
+            total_losses += losses;
+        }
+        return total_attempts == static_cast<uint64_t>(builder_count_) * task_count_ && total_wins == task_count_ &&
+               total_losses == static_cast<uint64_t>(builder_count_ - 1U) * task_count_;
     }
 
     bool ValidateHeapAndOutputs() const {
@@ -1222,9 +1457,11 @@ private:
                     return false;
                 }
                 if (!decoded.valid || decoded.phase != ExecPhase::Done || decoded.task_id != task_id ||
-                    decoded.build_owner != kBuilderOwner || !OwnerCanExecute(decoded.execute_owner, TaskEngine(kind)) ||
+                    !IsBuilderOwner(decoded.build_owner, builder_count_) ||
+                    !OwnerCanExecute(decoded.execute_owner, TaskEngine(kind), builder_count_) ||
                     decoded.engine_class != TaskEngine(kind) || decoded.payload_lines != layout.payload_lines ||
-                    raw_state != DoneState(task_id, decoded.execute_owner) || !PayloadValid(task_id)) {
+                    raw_state != DoneState(task_id, decoded.build_owner, decoded.execute_owner) ||
+                    !PayloadValid(task_id)) {
                     return false;
                 }
             } else if (tasks_[task_id].exec_state.load(std::memory_order_acquire) != 0U) {
@@ -1305,7 +1542,7 @@ private:
         const TaskKind kind = TaskKindAt(task_id);
         const TaskExecShape shape = TaskShape(kind);
         ExecPayloadLayout layout{};
-        if (!TaskExecutable(kind) || TaskEngine(kind) != OwnerEngine(worker.result.owner) ||
+        if (!TaskExecutable(kind) || TaskEngine(kind) != OwnerEngine(worker.result.owner, builder_count_) ||
             task.witness_owner != worker.result.owner ||
             !ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout)) {
             return false;
@@ -1356,7 +1593,7 @@ private:
             if (!TaskExecutable(kind)) {
                 continue;
             }
-            if (task.witness_owner >= kOwnerCount || task.witness_owner == kBuilderOwner) {
+            if (task.witness_owner >= kOwnerCount || IsBuilderOwner(task.witness_owner, builder_count_)) {
                 return false;
             }
             ++witness_by_owner[task.witness_owner][static_cast<uint32_t>(kind)];
@@ -1364,7 +1601,7 @@ private:
         for (uint32_t owner = 0U; owner < kOwnerCount; ++owner) {
             const CpuOwner &worker = owners_[owner];
             const FullPaRoleResult &result = worker.result;
-            if (result.owner != owner || result.role != OwnerRoleAt(owner) ||
+            if (result.owner != owner || result.role != OwnerRoleAt(owner, builder_count_) ||
                 result.physical_block != OwnerPhysicalBlock(owner) || result.drain_group != OwnerDrainGroup(owner) ||
                 result.final_busy_tokens != 0U || result.drain_arrival_count != 1U || result.claim_lost_count != 0U ||
                 result.fatal_count != 0U || result.launch_nonce != nonce_ ||
@@ -1388,7 +1625,7 @@ private:
             if (used_tokens != std::min(result.ticket_count, kTokensPerOwner)) {
                 return false;
             }
-            if (owner == kBuilderOwner) {
+            if (IsBuilderOwner(owner, builder_count_)) {
                 if (result.build_count != 0U || result.commit_count != 0U || result.execute_count != 0U ||
                     result.ticket_count != 0U || result.exhausted_ticket_count != 0U || result.claim_count != 0U ||
                     result.max_busy_tokens != 0U) {
@@ -1404,8 +1641,8 @@ private:
             for (uint32_t kind_index = 0U; kind_index < static_cast<uint32_t>(TaskKind::Count); ++kind_index) {
                 const TaskKind kind = static_cast<TaskKind>(kind_index);
                 const uint32_t count = result.completed_by_kind[kind_index];
-                const bool legal =
-                    owner != kBuilderOwner && TaskExecutable(kind) && TaskEngine(kind) == OwnerEngine(owner);
+                const bool legal = !IsBuilderOwner(owner, builder_count_) && TaskExecutable(kind) &&
+                                   TaskEngine(kind) == OwnerEngine(owner, builder_count_);
                 if ((!legal && count != 0U) || count != witness_by_owner[owner][kind_index]) {
                     return false;
                 }
@@ -1421,7 +1658,7 @@ private:
                 return false;
             }
             expected_group_raw[OwnerDrainGroup(owner)] += contribution;
-            if (owner != kBuilderOwner) {
+            if (!IsBuilderOwner(owner, builder_count_)) {
                 const TaskKind kinds[2] = {
                     owner < kAicOwnerCount ? TaskKind::Qk : TaskKind::Sf,
                     owner < kAicOwnerCount ? TaskKind::Pv : TaskKind::Up,
@@ -1473,6 +1710,7 @@ private:
 
     void InitializeAbiState(FullPaState *state) const {
         std::memset(state, 0, sizeof(*state));
+        std::memset(state->builder_threads, 0xD3, sizeof(state->builder_threads));
         state->control.magic = kProbeMagic;
         state->control.version = kProbeVersion;
         state->control.launch_nonce = nonce_;
@@ -1489,6 +1727,7 @@ private:
         state->control.sf_repeats = 1U;
         state->control.pv_repeats = 1U;
         state->control.up_repeats = 1U;
+        state->control.builder_count = builder_count_;
         for (uint32_t task_id = 0U; task_id < kMaxTasks; ++task_id) {
             InitializeTaskAbi(&state->tasks[task_id], task_id);
         }
@@ -1555,6 +1794,7 @@ private:
 
     void MaterializeGlobalState(FullPaState *state) const {
         state->fatal.state = static_cast<int64_t>(fatal_.load(std::memory_order_acquire));
+        state->drain.builder_started.value = static_cast<int64_t>(builder_started_.load(std::memory_order_acquire));
         state->drain.builder_finished.value = static_cast<int64_t>(builder_finished_.load(std::memory_order_acquire));
         state->drain.done_count.value = static_cast<int64_t>(done_count_.load(std::memory_order_acquire));
         state->drain.alloc_done.value = static_cast<int64_t>(alloc_done_.load(std::memory_order_acquire));
@@ -1614,8 +1854,10 @@ private:
                     reinterpret_cast<uint64_t>(&destination.dispatch.global_context[0]);
             }
         }
-        for (uint32_t thread = 0U; thread < kBuilderThreadCount; ++thread) {
-            state->builder_threads[thread] = builder_threads_[thread];
+        for (uint32_t thread = 0U; thread < BuilderThreadCount(builder_count_); ++thread) {
+            if (BuilderThreadActive(thread, builder_count_)) {
+                state->builder_threads[thread] = builder_threads_[thread];
+            }
         }
     }
 
@@ -1728,7 +1970,7 @@ private:
         const TaskKind kind = TaskKindAt(task_id);
         const TaskExecShape shape = TaskShape(kind);
         ExecPayloadLayout layout{};
-        if (!TaskExecutable(kind) || TaskEngine(kind) != OwnerEngine(owner) ||
+        if (!TaskExecutable(kind) || TaskEngine(kind) != OwnerEngine(owner, builder_count_) ||
             task.execution_witness.execute_owner != owner ||
             !ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout)) {
             return false;
@@ -1770,6 +2012,8 @@ private:
 
     bool ValidateMaterializedGlobals(const FullPaState &state) const {
         if (state.fatal.state != static_cast<int64_t>(fatal_.load(std::memory_order_acquire)) ||
+            state.drain.builder_started.value !=
+                static_cast<int64_t>(builder_started_.load(std::memory_order_acquire)) ||
             state.drain.builder_finished.value !=
                 static_cast<int64_t>(builder_finished_.load(std::memory_order_acquire)) ||
             state.drain.done_count.value != static_cast<int64_t>(done_count_.load(std::memory_order_acquire)) ||
@@ -1810,10 +2054,13 @@ private:
                 }
             }
         }
-        for (uint32_t thread = 0U; thread < kBuilderThreadCount; ++thread) {
-            if (std::memcmp(
-                    &state.builder_threads[thread], &builder_threads_[thread], sizeof(state.builder_threads[thread])
-                ) != 0) {
+        FullPaBuilderThreadReport poison{};
+        std::memset(&poison, 0xD3, sizeof(poison));
+        for (uint32_t thread = 0U; thread < kMaxBuilderThreadCount; ++thread) {
+            const bool active =
+                thread < BuilderThreadCount(builder_count_) && BuilderThreadActive(thread, builder_count_);
+            const FullPaBuilderThreadReport &expected = active ? builder_threads_[thread] : poison;
+            if (std::memcmp(&state.builder_threads[thread], &expected, sizeof(expected)) != 0) {
                 return false;
             }
         }
@@ -1828,7 +2075,8 @@ private:
             state.control.heap_base != kSyntheticHeapBase || state.control.heap_bytes != kHeapBytes ||
             state.control.workspace_base != 0x800000000ULL || state.control.workspace_bytes != kWorkloadBytes ||
             state.control.qk_repeats != 1U || state.control.sf_repeats != 1U || state.control.pv_repeats != 1U ||
-            state.control.up_repeats != 1U || state.fatal.state != 0 || !GuardsValid(state) ||
+            state.control.up_repeats != 1U || state.control.builder_count != builder_count_ ||
+            state.control.reserved32 != 0U || state.fatal.state != 0 || !GuardsValid(state) ||
             state.ordinary_map.head.value != 0 || state.ordinary_map.tail.value != 0 ||
             state.ordinary_map.lookup_count.value != 0 || state.ordinary_map.append_count.value != 0) {
             return false;
@@ -1874,11 +2122,13 @@ private:
     uint32_t batches_;
     uint32_t task_count_;
     uint32_t kernel_task_count_;
+    uint32_t builder_count_;
     uint64_t nonce_;
     std::unique_ptr<CpuTask[]> tasks_;
     std::array<std::atomic<uint64_t>, kSharedHeapShards> heap_cursors_{};
     std::atomic<uint64_t> heap_vend_{0U};
     std::atomic<uint64_t> fatal_{0U};
+    std::atomic<uint64_t> builder_started_{0U};
     std::atomic<uint64_t> builder_finished_{0U};
     std::atomic<uint64_t> done_count_{0U};
     std::atomic<uint64_t> alloc_done_{0U};
@@ -1890,7 +2140,7 @@ private:
     std::vector<uint32_t> aic_task_ids_;
     std::vector<uint32_t> aiv_task_ids_;
     std::array<CpuOwner, kOwnerCount> owners_{};
-    std::array<FullPaBuilderThreadReport, kBuilderThreadCount> builder_threads_{};
+    std::array<FullPaBuilderThreadReport, kMaxBuilderThreadCount> builder_threads_{};
     std::array<float, kWorkloadTileColumns> workload_input_a_{};
     std::array<float, kWorkloadTileColumns> workload_input_b_{};
     std::array<std::array<std::array<float, 2>, 2>, kOwnerCount> owner_workload_{};
@@ -1926,6 +2176,93 @@ bool TestResetPreservesDispatch() {
            token.control.payload_address == 0U && token.control.completion_vend == 0U &&
            token.control.function_and_reference == 0U && token.control.shape_and_scalar_offset == 0U &&
            std::memcmp(&token.dispatch, &retained, sizeof(retained)) == 0;
+}
+
+bool TestCompetingBuilderClaimValidation() {
+    constexpr uint32_t kBuilderCount = 2U;
+    constexpr uint32_t kCurrentBuilder = kBuilderOwner;
+    constexpr uint32_t kOtherBuilder = kBuilderOwner + 1U;
+    constexpr uint32_t kQkTask = static_cast<uint32_t>(TaskKind::Qk);
+    constexpr uint32_t kUpTask = static_cast<uint32_t>(TaskKind::Up);
+    constexpr uint64_t kNonce = UINT64_C(0xA5000000B17D0001);
+
+    const TaskExecShape qk_shape = TaskShape(TaskKind::Qk);
+    const TaskExecShape up_shape = TaskShape(TaskKind::Up);
+    ExecPayloadLayout qk_layout{};
+    ExecPayloadLayout up_layout{};
+    if (!ComputeExecPayloadLayout(
+            qk_shape.tensor_count, qk_shape.scalar_count, qk_shape.fanin_count, qk_layout
+        ) ||
+        !ComputeExecPayloadLayout(up_shape.tensor_count, up_shape.scalar_count, up_shape.fanin_count, up_layout)) {
+        return false;
+    }
+
+    const bool legal_kernel_states =
+        CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, BuildingState(kQkTask, kOtherBuilder)) &&
+        CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, BuiltState(kQkTask, kOtherBuilder)) &&
+        CompetingKernelClaimValid(
+            kQkTask, kCurrentBuilder, kBuilderCount, ClaimedState(kQkTask, kOtherBuilder, 0U)
+        ) &&
+        CompetingKernelClaimValid(
+            kQkTask, kCurrentBuilder, kBuilderCount, DoneState(kQkTask, kOtherBuilder, 0U)
+        ) &&
+        CompetingKernelClaimValid(kUpTask, kCurrentBuilder, kBuilderCount, BuiltState(kUpTask, kOtherBuilder)) &&
+        CompetingKernelClaimValid(
+            kUpTask, kCurrentBuilder, kBuilderCount,
+            ClaimedState(kUpTask, kOtherBuilder, kBuilderOwner + kBuilderCount)
+        );
+
+    const uint64_t wrong_qk_engine = EncodeExecState(
+        ExecPhase::Built, kOtherBuilder, kUnboundOwner, ExecEngineClass::Aiv, qk_layout.payload_lines, kQkTask
+    );
+    const uint64_t wrong_qk_lines = EncodeExecState(
+        ExecPhase::Built, kOtherBuilder, kUnboundOwner, ExecEngineClass::Aic, qk_layout.payload_lines + 1U, kQkTask
+    );
+    const uint64_t bound_built = EncodeExecState(
+        ExecPhase::Built, kOtherBuilder, 0U, ExecEngineClass::Aic, qk_layout.payload_lines, kQkTask
+    );
+    const uint64_t wrong_qk_route = EncodeExecState(
+        ExecPhase::Claimed, kOtherBuilder, kBuilderOwner + kBuilderCount, ExecEngineClass::Aic,
+        qk_layout.payload_lines, kQkTask
+    );
+    const uint64_t wrong_up_route = EncodeExecState(
+        ExecPhase::Done, kOtherBuilder, 0U, ExecEngineClass::Aiv, up_layout.payload_lines, kUpTask
+    );
+    const uint64_t builder_as_executor = EncodeExecState(
+        ExecPhase::Claimed, kOtherBuilder, kOtherBuilder, ExecEngineClass::Aiv, up_layout.payload_lines, kUpTask
+    );
+    const bool illegal_kernel_states =
+        !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, 0U) &&
+        !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, BuildingState(kQkTask, kCurrentBuilder)) &&
+        !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, BuildingState(kQkTask + 5U, kOtherBuilder)) &&
+        !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, wrong_qk_engine) &&
+        !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, wrong_qk_lines) &&
+        !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, bound_built) &&
+        !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, wrong_qk_route) &&
+        !CompetingKernelClaimValid(kUpTask, kCurrentBuilder, kBuilderCount, wrong_up_route) &&
+        !CompetingKernelClaimValid(kUpTask, kCurrentBuilder, kBuilderCount, builder_as_executor) &&
+        !CompetingKernelClaimValid(
+            kQkTask, kCurrentBuilder, kBuilderCount, BuiltState(kQkTask, kOtherBuilder) | (uint64_t{1} << 63U)
+        );
+
+    const int64_t other_alloc = static_cast<int64_t>(AllocBuildingState(kNonce, 0U, kOtherBuilder));
+    const bool legal_alloc_states =
+        CompetingAllocClaimValid(kNonce, 0U, kCurrentBuilder, kBuilderCount, 1) &&
+        CompetingAllocClaimValid(kNonce, 0U, kCurrentBuilder, kBuilderCount, other_alloc);
+    const bool illegal_alloc_states =
+        !CompetingAllocClaimValid(
+            kNonce, 0U, kCurrentBuilder, kBuilderCount,
+            static_cast<int64_t>(AllocBuildingState(kNonce, 0U, kCurrentBuilder))
+        ) &&
+        !CompetingAllocClaimValid(kNonce + 1U, 0U, kCurrentBuilder, kBuilderCount, other_alloc) &&
+        !CompetingAllocClaimValid(kNonce, 5U, kCurrentBuilder, kBuilderCount, other_alloc) &&
+        !CompetingAllocClaimValid(
+            kNonce, 0U, kCurrentBuilder, kBuilderCount,
+            static_cast<int64_t>(AllocBuildingState(kNonce, 0U, kBuilderOwner + kBuilderCount))
+        ) &&
+        !CompetingAllocClaimValid(kNonce, 0U, kCurrentBuilder, kBuilderCount, 2);
+
+    return legal_kernel_states && illegal_kernel_states && legal_alloc_states && illegal_alloc_states;
 }
 
 bool TestHalfPacketAndUniqueClaim() {
@@ -2078,25 +2415,26 @@ bool TestBuildExecuteOverlap() {
            task2_state.load(std::memory_order_acquire) == BuiltState(2U);
 }
 
-bool RunCase(uint32_t batches, uint64_t nonce, FullPaState *state) {
-    CpuFullPaModel model(batches, nonce);
+bool RunCase(uint32_t batches, uint64_t nonce, uint32_t builder_count, FullPaState *state) {
+    CpuFullPaModel model(batches, nonce, builder_count);
     if (!model.RunConcurrent()) {
         std::fprintf(
-            stderr, "[FAIL] G0 CPU concurrent build/execute batches=%u nonce=%llu\n", batches,
-            static_cast<unsigned long long>(nonce)
+            stderr, "[FAIL] G0 CPU concurrent build/execute builders=%u batches=%u nonce=%llu\n", builder_count,
+            batches, static_cast<unsigned long long>(nonce)
         );
         return false;
     }
     if (!model.Validate() || !model.MaterializeAndValidate(state)) {
         std::fprintf(
-            stderr, "[FAIL] G0 CPU oracle batches=%u nonce=%llu\n", batches, static_cast<unsigned long long>(nonce)
+            stderr, "[FAIL] G0 CPU oracle builders=%u batches=%u nonce=%llu\n", builder_count, batches,
+            static_cast<unsigned long long>(nonce)
         );
         return false;
     }
     std::printf(
-        "[PASS] G0 CPU batches=%u tasks=%u kernels=%u nonce=%llu cursor=%u/%u\n", batches, model.TaskCountValue(),
-        KernelTaskCount(batches), static_cast<unsigned long long>(nonce), 2U * batches + kAicOwnerCount,
-        2U * batches + kAivExecutorCount
+        "[PASS] G0 CPU builders=%u batches=%u tasks=%u kernels=%u nonce=%llu cursor=%u/%u\n", builder_count, batches,
+        model.TaskCountValue(), KernelTaskCount(batches), static_cast<unsigned long long>(nonce),
+        2U * batches + kAicOwnerCount, 2U * batches + AivExecutorCount(builder_count)
     );
     return true;
 }
@@ -2123,25 +2461,32 @@ bool ParseRounds(int argc, char **argv, uint32_t *rounds) {
 
 int main(int argc, char **argv) {
     uint32_t rounds = 0U;
-    if (!ParseRounds(argc, argv, &rounds) || !TestResetPreservesDispatch() || !TestHalfPacketAndUniqueClaim() ||
+    if (!ParseRounds(argc, argv, &rounds) || !TestResetPreservesDispatch() ||
+        !TestCompetingBuilderClaimValidation() || !TestHalfPacketAndUniqueClaim() ||
         !TestFourTokenWaitingBuilt() || !TestBuildExecuteOverlap()) {
         std::fprintf(stderr, "[FAIL] G0 controlled interleaving\n");
         return EXIT_FAILURE;
     }
     auto state = std::make_unique<FullPaState>();
-    if (!RunCase(1U, 0xA500000000000001ULL, state.get())) {
-        return EXIT_FAILURE;
-    }
-    for (uint32_t round = 0U; round < rounds; ++round) {
-        const uint64_t nonce = 0xA500000000001000ULL + round;
-        if (!RunCase(kDefaultBatches, nonce, state.get()) ||
-            !RunCase(kDefaultBatches, nonce ^ 0x55AAULL, state.get())) {
+    for (uint32_t builder_count = kDefaultBuilderCount; builder_count <= kMaxBuilderCount; ++builder_count) {
+        if (!RunCase(
+                1U, 0xA500000000000000ULL | (static_cast<uint64_t>(builder_count) << 8U) | 1U, builder_count,
+                state.get()
+            )) {
             return EXIT_FAILURE;
+        }
+        for (uint32_t round = 0U; round < rounds; ++round) {
+            const uint64_t nonce = 0xA500000000001000ULL + (static_cast<uint64_t>(builder_count) << 32U) + round;
+            if (!RunCase(kDefaultBatches, nonce, builder_count, state.get()) ||
+                !RunCase(kDefaultBatches, nonce ^ 0x55AAULL, builder_count, state.get())) {
+                return EXIT_FAILURE;
+            }
         }
     }
     std::printf(
-        "[PASS] G0 CPU complete: B1/B256, 64 warp leaders, 8-shard heap, exact DAG/payload, 4-token tickets, "
-        "fanin/completion/drain/tail, same-address reuse rounds=%u\n",
+        "[PASS] G0 CPU complete: builders=1/2, B1/B256, 64 leaders/builder, unique build claim, "
+        "8-shard heap, exact DAG/payload, 4-token tickets, fanin/completion/drain/tail, "
+        "same-address reuse rounds=%u\n",
         rounds
     );
     return EXIT_SUCCESS;

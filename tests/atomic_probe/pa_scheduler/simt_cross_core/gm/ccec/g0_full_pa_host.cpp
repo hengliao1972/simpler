@@ -38,12 +38,14 @@ struct Options {
     int32_t device = 0;
     uint32_t batches = 256U;
     uint32_t runs = 2U;
+    uint32_t builder_count = g0::kDefaultBuilderCount;
 };
 
 constexpr uint32_t kHostTasksPerBatch = 5U;
 constexpr uint32_t kHostBuilderWarpCount = 64U;
 constexpr uint32_t kHostWarpThreads = 32U;
 constexpr uint32_t kHostBuilderThreadCount = kHostBuilderWarpCount * kHostWarpThreads;
+constexpr uint32_t kHostMaxBuilderThreadCount = kHostBuilderThreadCount * g0::kMaxBuilderCount;
 constexpr uint32_t kHostPayloadHeaderBytes = 64U;
 constexpr uint32_t kHostTensorDescBytes = 128U;
 constexpr uint32_t kHostTensorDims = 5U;
@@ -66,6 +68,10 @@ static_assert(g0::kTasksPerBatch == kHostTasksPerBatch, "host PA task plan disag
 static_assert(
     g0::kBuilderWarpCount == kHostBuilderWarpCount && g0::kWarpSize == kHostWarpThreads,
     "host SIMT mapping disagrees with the device ABI"
+);
+static_assert(
+    g0::kMaxBuilderThreadCount == kHostMaxBuilderThreadCount,
+    "host maximum SIMT report capacity disagrees with the device ABI"
 );
 static_assert(g0::kTensorDescBytes == kHostTensorDescBytes, "host TensorDesc size disagrees with the device ABI");
 static_assert(g0::kTokensPerOwner == 4U, "G0 must retain exactly four execution tokens per owner");
@@ -237,31 +243,23 @@ HostTaskOracle BuildHostTaskOracle(uint32_t task_id) {
     return task;
 }
 
-uint32_t ExpectedBuilderTaskCount(uint32_t thread_id, uint32_t task_count) {
-    if (thread_id >= kHostBuilderThreadCount || thread_id % kHostWarpThreads != 0U) {
-        return 0U;
-    }
-    const uint32_t warp = thread_id / kHostWarpThreads;
-    return warp < task_count ? 1U + (task_count - 1U - warp) / kHostBuilderWarpCount : 0U;
-}
-
-uint32_t ExpectedBuilderLastTask(uint32_t thread_id, uint32_t task_count) {
-    const uint32_t count = ExpectedBuilderTaskCount(thread_id, task_count);
-    return count == 0U ? UINT32_MAX : thread_id / kHostWarpThreads + (count - 1U) * kHostBuilderWarpCount;
-}
-
-uint32_t ExpectedBuilderWaitCount(uint32_t thread_id, uint32_t task_count) {
-    const uint32_t count = ExpectedBuilderTaskCount(thread_id, task_count);
-    return count - (count != 0U && thread_id == 0U ? 1U : 0U);
-}
-
-uint64_t ExpectedBuilderChecksum(uint64_t nonce, uint32_t thread_id, uint32_t task_count) {
-    uint64_t value =
-        nonce ^ (static_cast<uint64_t>(thread_id) << 32U) ^ ExpectedBuilderTaskCount(thread_id, task_count);
-    value ^= static_cast<uint64_t>(ExpectedBuilderLastTask(thread_id, task_count)) << 1U;
-    value ^= static_cast<uint64_t>(ExpectedBuilderWaitCount(thread_id, task_count)) << 48U;
+uint64_t ExpectedBuilderChecksum(
+    uint64_t nonce, uint32_t thread_id, uint32_t task_count, uint32_t wins, uint32_t first_task, uint32_t last_task,
+    uint32_t attempts, uint32_t prepares, uint32_t commits, uint32_t insert_waits, uint32_t claim_losses
+) {
+    uint64_t value = nonce ^ (static_cast<uint64_t>(thread_id) << 32U) ^ task_count;
+    value ^= static_cast<uint64_t>(wins) << 1U;
+    value ^= static_cast<uint64_t>(first_task) << 7U;
+    value ^= static_cast<uint64_t>(last_task) << 19U;
+    value ^= static_cast<uint64_t>(attempts) << 37U;
+    value ^= static_cast<uint64_t>(prepares) << 43U;
+    value ^= static_cast<uint64_t>(commits) << 49U;
+    value ^= static_cast<uint64_t>(insert_waits) << 55U;
+    value ^= static_cast<uint64_t>(claim_losses) << 25U;
     value *= UINT64_C(0x9E3779B97F4A7C15);
-    return value ^ (value >> 29U);
+    value ^= value >> 29U;
+    value *= UINT64_C(0xD6E8FEB86659FD93);
+    return value ^ (value >> 31U);
 }
 
 uint32_t ExpectedExecutionTaskId(HostEngine engine, uint32_t ticket_index) {
@@ -434,10 +432,12 @@ void InitializeToken(g0::ExecutionToken *token) {
     token->control.shape_and_scalar_offset = 0U;
 }
 
-void InitializeState(FullPaState *state, uint64_t nonce, uint32_t batches, uint64_t workspace_address) {
+void InitializeState(
+    FullPaState *state, uint64_t nonce, uint32_t batches, uint32_t builder_count, uint64_t workspace_address
+) {
     std::memset(state, 0xA5, sizeof(*state));
-    state->control.magic = UINT64_C(0x53494D5447304135);
-    state->control.version = 1U;
+    state->control.magic = g0::kProbeMagic;
+    state->control.version = g0::kProbeVersion;
     state->control.launch_nonce = nonce;
     state->control.timeout_ticks = UINT64_C(1000000000);
     state->control.batch_count = batches;
@@ -452,6 +452,11 @@ void InitializeState(FullPaState *state, uint64_t nonce, uint32_t batches, uint6
     state->control.sf_repeats = 1U;
     state->control.pv_repeats = 1U;
     state->control.up_repeats = 1U;
+    state->control.builder_count = builder_count;
+    state->control.reserved32 = 0U;
+    for (uint64_t &reserved : state->control.reserved) {
+        reserved = 0U;
+    }
 
     g0::FullPaGuard *guards[] = {
         &state->guard_before_tasks,           &state->guard_after_tasks,           &state->guard_before_tokens,
@@ -492,6 +497,10 @@ void InitializeState(FullPaState *state, uint64_t nonce, uint32_t batches, uint6
             task.exec.payload.words[word] = HostPayloadPoisonWord(nonce, task_id, word);
         }
         std::memset(&task.build_report, 0xD3, sizeof(task.build_report));
+        if (task_id < task_count) {
+            task.build_report.build_attempt_count = 0U;
+            task.build_report.build_win_count = 0U;
+        }
         std::memset(&task.execution_witness, 0xD3, sizeof(task.execution_witness));
         if (task_id < task_count && BuildHostTaskOracle(task_id).engine != HostEngine::None) {
             task.execution_witness.state = 0;
@@ -499,6 +508,7 @@ void InitializeState(FullPaState *state, uint64_t nonce, uint32_t batches, uint6
     }
 
     state->fatal.state = 0;
+    InitializeAtomic(&state->drain.builder_started, 0);
     InitializeAtomic(&state->drain.builder_finished, 0);
     InitializeAtomic(&state->drain.done_count, 0);
     InitializeAtomic(&state->drain.alloc_done, 0);
@@ -532,7 +542,7 @@ void InitializeState(FullPaState *state, uint64_t nonce, uint32_t batches, uint6
         }
         std::memset(&state->roles[owner], 0xD3, sizeof(state->roles[owner]));
     }
-    for (uint32_t thread = 0U; thread < g0::kBuilderThreadCount; ++thread) {
+    for (uint32_t thread = 0U; thread < g0::kMaxBuilderThreadCount; ++thread) {
         std::memset(&state->builder_threads[thread], 0xD3, sizeof(state->builder_threads[thread]));
     }
 }
@@ -886,7 +896,7 @@ bool ValidateHeapAndCollectBases(
 }
 
 bool ValidateTask(
-    const FullPaState &state, const FullPaState &initial, uint64_t nonce, uint32_t batches,
+    const FullPaState &state, const FullPaState &initial, uint64_t nonce, uint32_t batches, uint32_t builder_count,
     const std::vector<uint64_t> &task_bases, uint32_t task_id, ValidationFailure *failure
 ) {
     const HostTaskOracle expected = BuildHostTaskOracle(task_id);
@@ -899,6 +909,16 @@ bool ValidateTask(
     const uint8_t expected_route =
         expected.engine == HostEngine::None ? 1U : (expected.engine == HostEngine::Aic ? 7U : 11U);
     const g0::FullPaTaskPlan &plan = task.plan;
+    const uint32_t actual_builder_owner = plan.builder_owner;
+    if (!RecordCheck(
+            g0::IsBuilderOwner(actual_builder_owner, builder_count), failure, "task-plan-builder-owner", task_id,
+            actual_builder_owner, UINT32_MAX, g0::kBuilderOwner, actual_builder_owner
+        )) {
+        return false;
+    }
+    const uint32_t builder_instance = actual_builder_owner - g0::kBuilderOwner;
+    const uint32_t expected_builder_thread = g0::BuilderThreadForTask(task_id, builder_instance);
+    const uint32_t expected_builder_warp = expected_builder_thread / kHostWarpThreads;
     if (!RecordCheck(
             plan.task_id == task_id, failure, "task-plan-id", task_id, UINT32_MAX, UINT32_MAX, task_id, plan.task_id
         ) ||
@@ -924,12 +944,12 @@ bool ValidateTask(
             UINT32_MAX, expected.payload_lines, plan.payload_lines
         ) ||
         !RecordCheck(
-            plan.builder_thread == expected.builder_thread, failure, "task-plan-builder-thread", task_id, UINT32_MAX,
-            UINT32_MAX, expected.builder_thread, plan.builder_thread
+            plan.builder_thread == expected_builder_thread, failure, "task-plan-builder-thread", task_id,
+            actual_builder_owner, UINT32_MAX, expected_builder_thread, plan.builder_thread
         ) ||
         !RecordCheck(
-            plan.builder_warp == expected.builder_thread / kHostWarpThreads, failure, "task-plan-builder-warp", task_id,
-            UINT32_MAX, UINT32_MAX, expected.builder_thread / kHostWarpThreads, plan.builder_warp
+            plan.builder_warp == expected_builder_warp, failure, "task-plan-builder-warp", task_id,
+            actual_builder_owner, UINT32_MAX, expected_builder_warp, plan.builder_warp
         ) ||
         !RecordCheck(
             plan.encoded_meta == expected_meta, failure, "task-plan-encoded-meta", task_id, UINT32_MAX, UINT32_MAX,
@@ -938,9 +958,6 @@ bool ValidateTask(
         !RecordCheck(
             plan.exec_route == expected_route, failure, "task-plan-exec-route", task_id, UINT32_MAX, UINT32_MAX,
             expected_route, plan.exec_route
-        ) ||
-        !RecordCheck(
-            plan.reserved16 == 0U, failure, "task-plan-reserved16", task_id, UINT32_MAX, UINT32_MAX, 0U, plan.reserved16
         ) ||
         !RecordCheck(
             plan.reserved_bytes == expected.output_bytes, failure, "task-plan-reserved-bytes", task_id, UINT32_MAX,
@@ -1095,12 +1112,12 @@ bool ValidateTask(
             report.task_id
         ) ||
         !RecordCheck(
-            report.builder_thread == expected.builder_thread, failure, "build-report-thread", task_id, UINT32_MAX,
-            UINT32_MAX, expected.builder_thread, report.builder_thread
+            report.builder_thread == expected_builder_thread, failure, "build-report-thread", task_id,
+            actual_builder_owner, UINT32_MAX, expected_builder_thread, report.builder_thread
         ) ||
         !RecordCheck(
-            report.builder_warp == expected.builder_thread / kHostWarpThreads, failure, "build-report-warp", task_id,
-            UINT32_MAX, UINT32_MAX, expected.builder_thread / kHostWarpThreads, report.builder_warp
+            report.builder_warp == expected_builder_warp, failure, "build-report-warp", task_id, actual_builder_owner,
+            UINT32_MAX, expected_builder_warp, report.builder_warp
         ) ||
         !RecordCheck(
             report.builder_lane == 0U, failure, "build-report-lane", task_id, UINT32_MAX, UINT32_MAX, 0U,
@@ -1136,12 +1153,12 @@ bool ValidateTask(
             report.commit_count
         ) ||
         !RecordCheck(
-            report.main_scalar_build_count == 0U, failure, "main-scalar-built-task", task_id, UINT32_MAX, UINT32_MAX,
-            0U, report.main_scalar_build_count
+            report.build_attempt_count == builder_count, failure, "build-report-attempt-count", task_id,
+            actual_builder_owner, UINT32_MAX, builder_count, report.build_attempt_count
         ) ||
         !RecordCheck(
-            report.main_scalar_commit_count == 0U, failure, "main-scalar-committed-task", task_id, UINT32_MAX,
-            UINT32_MAX, 0U, report.main_scalar_commit_count
+            report.build_win_count == 1U, failure, "build-report-win-count", task_id, actual_builder_owner, UINT32_MAX,
+            1U, report.build_win_count
         ) ||
         !RecordCheck(
             report.launch_nonce == nonce, failure, "build-report-nonce", task_id, UINT32_MAX, UINT32_MAX, nonce,
@@ -1166,14 +1183,15 @@ bool ValidateTask(
 
     const HostDecodedExecState decoded = DecodeHostExecState(task.exec.control.state);
     if (!RecordCheck(
-            decoded.known_bits && decoded.phase == 4U && decoded.build_owner == 32U &&
+            decoded.known_bits && decoded.phase == 4U && decoded.build_owner == actual_builder_owner &&
                 decoded.engine == static_cast<uint32_t>(expected.engine) &&
                 decoded.payload_lines == expected.payload_lines && decoded.task_id == task_id,
             failure, "exec-done-control", task_id
         ) ||
         !RecordCheck(
             (expected.engine == HostEngine::Aic && decoded.execute_owner < 32U) ||
-                (expected.engine == HostEngine::Aiv && decoded.execute_owner >= 33U && decoded.execute_owner < 96U),
+                (expected.engine == HostEngine::Aiv && decoded.execute_owner >= g0::kBuilderOwner + builder_count &&
+                 decoded.execute_owner < 96U),
             failure, "exec-owner-route", task_id, decoded.execute_owner
         ) ||
         !RecordCheck(
@@ -1299,19 +1317,63 @@ bool ValidateTask(
            );
 }
 
-bool ValidateBuilderThreads(const FullPaState &state, uint64_t nonce, uint32_t task_count, ValidationFailure *failure) {
-    uint64_t task_sum = 0U;
+bool ValidateBuilderThreads(
+    const FullPaState &state, const FullPaState &initial, uint64_t nonce, uint32_t task_count, uint32_t builder_count,
+    ValidationFailure *failure
+) {
+    const uint32_t active_thread_count = g0::BuilderThreadCount(builder_count);
+    std::vector<uint32_t> expected_wins(active_thread_count, 0U);
+    std::vector<uint32_t> expected_first(active_thread_count, UINT32_MAX);
+    std::vector<uint32_t> expected_last(active_thread_count, UINT32_MAX);
+    std::vector<uint32_t> expected_waits(active_thread_count, 0U);
+    for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
+        const uint32_t thread_id = state.tasks[task_id].build_report.builder_thread;
+        if (!RecordCheck(
+                thread_id < active_thread_count && g0::BuilderThreadActive(thread_id, builder_count), failure,
+                "builder-winner-thread-range", task_id, UINT32_MAX, thread_id, active_thread_count - 1U, thread_id
+            )) {
+            return false;
+        }
+        ++expected_wins[thread_id];
+        if (expected_first[thread_id] == UINT32_MAX) {
+            expected_first[thread_id] = task_id;
+        }
+        expected_last[thread_id] = task_id;
+        expected_waits[thread_id] += task_id == 0U ? 0U : 1U;
+    }
+
+    uint64_t win_sum = 0U;
+    uint64_t attempt_sum = 0U;
     uint64_t prepare_sum = 0U;
     uint64_t commit_sum = 0U;
-    for (uint32_t thread_id = 0U; thread_id < kHostBuilderThreadCount; ++thread_id) {
+    uint64_t loss_sum = 0U;
+    for (uint32_t thread_id = 0U; thread_id < active_thread_count; ++thread_id) {
         const g0::FullPaBuilderThreadReport &report = state.builder_threads[thread_id];
         const uint32_t warp = thread_id / kHostWarpThreads;
         const uint32_t lane = thread_id % kHostWarpThreads;
         const bool leader = lane == 0U;
-        const uint32_t expected_count = ExpectedBuilderTaskCount(thread_id, task_count);
-        const uint32_t expected_first = expected_count == 0U ? UINT32_MAX : warp;
-        const uint32_t expected_last = ExpectedBuilderLastTask(thread_id, task_count);
-        const uint32_t expected_waits = ExpectedBuilderWaitCount(thread_id, task_count);
+        if (!leader) {
+            if (!RecordCheck(
+                    std::memcmp(&report, &initial.builder_threads[thread_id], sizeof(report)) == 0, failure,
+                    "inactive-builder-lane-mutated", UINT32_MAX, UINT32_MAX, thread_id
+                )) {
+                return false;
+            }
+            continue;
+        }
+        const uint32_t expected_attempts = g0::BuilderExpectedTaskCount(thread_id, task_count, builder_count);
+        const uint32_t wins = expected_wins[thread_id];
+        if (!RecordCheck(
+                wins <= expected_attempts, failure, "builder-thread-win-exceeds-attempts", UINT32_MAX, UINT32_MAX,
+                thread_id, expected_attempts, wins
+            )) {
+            return false;
+        }
+        const uint32_t claim_losses = expected_attempts - wins;
+        const uint64_t expected_checksum = ExpectedBuilderChecksum(
+            nonce, thread_id, task_count, wins, expected_first[thread_id], expected_last[thread_id], expected_attempts,
+            wins, wins, expected_waits[thread_id], claim_losses
+        );
         if (!RecordCheck(
                 report.thread_id == thread_id, failure, "builder-thread-id", UINT32_MAX, UINT32_MAX, thread_id,
                 thread_id, report.thread_id
@@ -1329,55 +1391,71 @@ bool ValidateBuilderThreads(const FullPaState &state, uint64_t nonce, uint32_t t
                 thread_id, leader ? 1U : 0U, report.active_leader
             ) ||
             !RecordCheck(
-                report.task_count == expected_count, failure, "builder-thread-task-count", UINT32_MAX, UINT32_MAX,
-                thread_id, expected_count, report.task_count
+                report.task_count == wins, failure, "builder-thread-task-count", UINT32_MAX, UINT32_MAX, thread_id,
+                wins, report.task_count
             ) ||
             !RecordCheck(
-                report.first_task == expected_first, failure, "builder-thread-first-task", UINT32_MAX, UINT32_MAX,
-                thread_id, expected_first, report.first_task
+                report.first_task == expected_first[thread_id], failure, "builder-thread-first-task", UINT32_MAX,
+                UINT32_MAX, thread_id, expected_first[thread_id], report.first_task
             ) ||
             !RecordCheck(
-                report.last_task == expected_last, failure, "builder-thread-last-task", UINT32_MAX, UINT32_MAX,
-                thread_id, expected_last, report.last_task
+                report.last_task == expected_last[thread_id], failure, "builder-thread-last-task", UINT32_MAX,
+                UINT32_MAX, thread_id, expected_last[thread_id], report.last_task
             ) ||
             !RecordCheck(
-                report.task_state_access_count == expected_count, failure, "builder-thread-state-access", UINT32_MAX,
-                UINT32_MAX, thread_id, expected_count, report.task_state_access_count
+                report.task_state_access_count == expected_attempts, failure, "builder-thread-state-access", UINT32_MAX,
+                UINT32_MAX, thread_id, expected_attempts, report.task_state_access_count
             ) ||
             !RecordCheck(
-                report.prepare_count == expected_count, failure, "builder-thread-prepare", UINT32_MAX, UINT32_MAX,
-                thread_id, expected_count, report.prepare_count
+                report.prepare_count == wins, failure, "builder-thread-prepare", UINT32_MAX, UINT32_MAX, thread_id,
+                wins, report.prepare_count
             ) ||
             !RecordCheck(
-                report.commit_count == expected_count, failure, "builder-thread-commit", UINT32_MAX, UINT32_MAX,
-                thread_id, expected_count, report.commit_count
+                report.commit_count == wins, failure, "builder-thread-commit", UINT32_MAX, UINT32_MAX, thread_id, wins,
+                report.commit_count
             ) ||
             !RecordCheck(
-                report.insert_wait_count == expected_waits, failure, "builder-thread-waits", UINT32_MAX, UINT32_MAX,
-                thread_id, expected_waits, report.insert_wait_count
+                report.insert_wait_count == expected_waits[thread_id], failure, "builder-thread-waits", UINT32_MAX,
+                UINT32_MAX, thread_id, expected_waits[thread_id], report.insert_wait_count
             ) ||
             !RecordCheck(
-                report.reserved0 == 0U, failure, "builder-thread-reserved", UINT32_MAX, UINT32_MAX, thread_id, 0U,
-                report.reserved0
+                report.claim_lost_count == claim_losses, failure, "builder-thread-claim-lost", UINT32_MAX, UINT32_MAX,
+                thread_id, claim_losses, report.claim_lost_count
             ) ||
             !RecordCheck(
                 report.launch_nonce == nonce, failure, "builder-thread-nonce", UINT32_MAX, UINT32_MAX, thread_id, nonce,
                 report.launch_nonce
             ) ||
             !RecordCheck(
-                report.checksum == ExpectedBuilderChecksum(nonce, thread_id, task_count), failure,
-                "builder-thread-checksum", UINT32_MAX, UINT32_MAX, thread_id,
-                ExpectedBuilderChecksum(nonce, thread_id, task_count), report.checksum
+                report.checksum == expected_checksum, failure, "builder-thread-checksum", UINT32_MAX, UINT32_MAX,
+                thread_id, expected_checksum, report.checksum
             )) {
             return false;
         }
-        task_sum += report.task_count;
+        win_sum += report.task_count;
+        attempt_sum += report.task_state_access_count;
         prepare_sum += report.prepare_count;
         commit_sum += report.commit_count;
+        loss_sum += report.claim_lost_count;
+    }
+    for (uint32_t thread_id = active_thread_count; thread_id < g0::kMaxBuilderThreadCount; ++thread_id) {
+        if (!RecordCheck(
+                std::memcmp(
+                    &state.builder_threads[thread_id], &initial.builder_threads[thread_id],
+                    sizeof(state.builder_threads[thread_id])
+                ) == 0,
+                failure, "inactive-builder-instance-mutated", UINT32_MAX, UINT32_MAX, thread_id
+            )) {
+            return false;
+        }
     }
     return RecordCheck(
-               task_sum == task_count, failure, "builder-thread-task-sum", UINT32_MAX, UINT32_MAX, UINT32_MAX,
-               task_count, task_sum
+               win_sum == task_count, failure, "builder-thread-win-sum", UINT32_MAX, UINT32_MAX, UINT32_MAX, task_count,
+               win_sum
+           ) &&
+           RecordCheck(
+               attempt_sum == static_cast<uint64_t>(builder_count) * task_count, failure, "builder-thread-attempt-sum",
+               UINT32_MAX, UINT32_MAX, UINT32_MAX, static_cast<uint64_t>(builder_count) * task_count, attempt_sum
            ) &&
            RecordCheck(
                prepare_sum == task_count, failure, "builder-thread-prepare-sum", UINT32_MAX, UINT32_MAX, UINT32_MAX,
@@ -1386,6 +1464,11 @@ bool ValidateBuilderThreads(const FullPaState &state, uint64_t nonce, uint32_t t
            RecordCheck(
                commit_sum == task_count, failure, "builder-thread-commit-sum", UINT32_MAX, UINT32_MAX, UINT32_MAX,
                task_count, commit_sum
+           ) &&
+           RecordCheck(
+               loss_sum == static_cast<uint64_t>(builder_count - 1U) * task_count, failure,
+               "builder-thread-claim-loss-sum", UINT32_MAX, UINT32_MAX, UINT32_MAX,
+               static_cast<uint64_t>(builder_count - 1U) * task_count, loss_sum
            );
 }
 
@@ -1445,7 +1528,8 @@ bool ValidateResetTokenControl(
 
 bool ValidateRetainedTokenDispatch(
     const FullPaState &state, const FullPaState &initial, uint64_t device_state_address, uint32_t batches,
-    uint32_t owner, uint32_t slot, std::vector<uint8_t> *retained_tasks, ValidationFailure *failure
+    uint32_t builder_count, uint32_t owner, uint32_t slot, std::vector<uint8_t> *retained_tasks,
+    ValidationFailure *failure
 ) {
     const g0::ExecutionToken &token = state.tokens[owner][slot];
     const g0::ExecutionToken &initial_token = initial.tokens[owner][slot];
@@ -1453,8 +1537,9 @@ bool ValidateRetainedTokenDispatch(
     if (slot >= used_tokens) {
         return RecordCheck(
             std::memcmp(&token.dispatch, &initial_token.dispatch, sizeof(token.dispatch)) == 0, failure,
-            owner == g0::kBuilderOwner ? "builder-token-dispatch-mutated" : "unused-token-dispatch-mutated", UINT32_MAX,
-            owner, slot
+            g0::IsBuilderOwner(owner, builder_count) ? "builder-token-dispatch-mutated" :
+                                                       "unused-token-dispatch-mutated",
+            UINT32_MAX, owner, slot
         );
     }
 
@@ -1566,11 +1651,11 @@ bool ValidateRetainedTokenDispatch(
 
 bool ValidateDispatchAndTokens(
     const FullPaState &state, const FullPaState &initial, uint64_t device_state_address, uint32_t batches,
-    ValidationFailure *failure
+    uint32_t builder_count, ValidationFailure *failure
 ) {
     const uint32_t engine_tasks = batches * 2U;
     const uint64_t expected_aic_next = static_cast<uint64_t>(engine_tasks) + 32U;
-    const uint64_t expected_aiv_next = static_cast<uint64_t>(engine_tasks) + 63U;
+    const uint64_t expected_aiv_next = static_cast<uint64_t>(engine_tasks) + g0::AivExecutorCount(builder_count);
     if (!RecordCheck(
             state.exec_dispatch.aic_next.value >= 0 &&
                 static_cast<uint64_t>(state.exec_dispatch.aic_next.value) == expected_aic_next,
@@ -1645,7 +1730,7 @@ bool ValidateDispatchAndTokens(
             const g0::ExecutionToken &token = state.tokens[owner][slot];
             if (!ValidateResetTokenControl(token.control, owner, slot, failure) ||
                 !ValidateRetainedTokenDispatch(
-                    state, initial, device_state_address, batches, owner, slot, &retained_tasks, failure
+                    state, initial, device_state_address, batches, builder_count, owner, slot, &retained_tasks, failure
                 )) {
                 return false;
             }
@@ -1655,7 +1740,8 @@ bool ValidateDispatchAndTokens(
 }
 
 bool ValidateRolesAndDrain(
-    const FullPaState &state, const FullPaState &initial, uint64_t nonce, uint32_t batches, ValidationFailure *failure
+    const FullPaState &state, const FullPaState &initial, uint64_t nonce, uint32_t batches, uint32_t builder_count,
+    ValidationFailure *failure
 ) {
     uint64_t task_kinds[5] = {};
     uint64_t total_execute = 0U;
@@ -1663,9 +1749,9 @@ bool ValidateRolesAndDrain(
     uint64_t total_exhausted = 0U;
     uint64_t group_completions[16] = {};
     uint32_t group_arrivers[16] = {};
-    for (uint32_t owner = 0U; owner < 96U; ++owner) {
+    for (uint32_t owner = 0U; owner < g0::kOwnerCount; ++owner) {
         const g0::FullPaRoleResult &role = state.roles[owner];
-        const uint32_t expected_role = owner < 32U ? 0U : (owner == 32U ? 1U : 2U);
+        const uint32_t expected_role = static_cast<uint32_t>(g0::OwnerRoleAt(owner, builder_count));
         const uint32_t expected_build_commit = 0U;
         const uint32_t physical = owner < 32U ? owner : (owner - 32U) / 2U;
         const uint32_t group = physical % 16U;
@@ -1673,7 +1759,9 @@ bool ValidateRolesAndDrain(
         for (uint32_t kind = 0U; kind < 5U; ++kind) {
             const uint32_t count = role.completed_by_kind[kind];
             const bool legal_kind =
-                owner < 32U ? (kind == 1U || kind == 3U) : (owner > 32U && (kind == 2U || kind == 4U));
+                owner < g0::kAicOwnerCount ?
+                    (kind == 1U || kind == 3U) :
+                    (g0::OwnerCanExecute(owner, g0::ExecEngineClass::Aiv, builder_count) && (kind == 2U || kind == 4U));
             if (!RecordCheck(
                     legal_kind || count == 0U, failure, "role-illegal-kind-count", UINT32_MAX, owner, kind, 0U, count
                 )) {
@@ -1715,8 +1803,9 @@ bool ValidateRolesAndDrain(
                 role.execute_count, role.ticket_count
             ) ||
             !RecordCheck(
-                role.exhausted_ticket_count == (owner == 32U ? 0U : 1U), failure, "role-exhausted-ticket-count",
-                UINT32_MAX, owner, UINT32_MAX, owner == 32U ? 0U : 1U, role.exhausted_ticket_count
+                role.exhausted_ticket_count == (g0::IsBuilderOwner(owner, builder_count) ? 0U : 1U), failure,
+                "role-exhausted-ticket-count", UINT32_MAX, owner, UINT32_MAX,
+                g0::IsBuilderOwner(owner, builder_count) ? 0U : 1U, role.exhausted_ticket_count
             ) ||
             !RecordCheck(
                 role.claim_count == role.execute_count, failure, "role-claim-count", UINT32_MAX, owner, UINT32_MAX,
@@ -1776,8 +1865,8 @@ bool ValidateRolesAndDrain(
             expected_kernel_tasks, total_tickets
         ) ||
         !RecordCheck(
-            total_exhausted == 95U, failure, "role-exhausted-total", UINT32_MAX, UINT32_MAX, UINT32_MAX, 95U,
-            total_exhausted
+            total_exhausted == g0::ExecutorCount(builder_count), failure, "role-exhausted-total", UINT32_MAX,
+            UINT32_MAX, UINT32_MAX, g0::ExecutorCount(builder_count), total_exhausted
         )) {
         return false;
     }
@@ -1786,6 +1875,11 @@ bool ValidateRolesAndDrain(
         return line.value;
     };
     if (!RecordCheck(
+            drain_value(state.drain.builder_started) == static_cast<int64_t>(builder_count), failure,
+            "drain-builder-started", UINT32_MAX, UINT32_MAX, UINT32_MAX, builder_count,
+            static_cast<uint64_t>(drain_value(state.drain.builder_started))
+        ) ||
+        !RecordCheck(
             drain_value(state.drain.builder_finished) == 1, failure, "drain-builder-finished", UINT32_MAX, UINT32_MAX,
             UINT32_MAX, 1U, static_cast<uint64_t>(drain_value(state.drain.builder_finished))
         ) ||
@@ -1813,14 +1907,16 @@ bool ValidateRolesAndDrain(
         return false;
     }
     const g0::AtomicLine *drain_lines[] = {
-        &state.drain.builder_finished, &state.drain.done_count, &state.drain.alloc_done,
-        &state.drain.aic_done,         &state.drain.aiv_done,   &state.drain.root_finished,
+        &state.drain.builder_started, &state.drain.builder_finished, &state.drain.done_count,
+        &state.drain.alloc_done,      &state.drain.aic_done,         &state.drain.aiv_done,
+        &state.drain.root_finished,
     };
     const g0::AtomicLine *initial_drain_lines[] = {
-        &initial.drain.builder_finished, &initial.drain.done_count, &initial.drain.alloc_done,
-        &initial.drain.aic_done,         &initial.drain.aiv_done,   &initial.drain.root_finished,
+        &initial.drain.builder_started, &initial.drain.builder_finished, &initial.drain.done_count,
+        &initial.drain.alloc_done,      &initial.drain.aic_done,         &initial.drain.aiv_done,
+        &initial.drain.root_finished,
     };
-    for (uint32_t line = 0U; line < 6U; ++line) {
+    for (uint32_t line = 0U; line < sizeof(drain_lines) / sizeof(drain_lines[0]); ++line) {
         if (!RecordCheck(
                 AtomicPaddingMatches(*drain_lines[line], *initial_drain_lines[line]), failure, "drain-padding-mutated",
                 UINT32_MAX, UINT32_MAX, line
@@ -1863,7 +1959,9 @@ void InitializeWorkspace(std::vector<float> *workspace) {
     std::fill_n(workspace->data() + kHostWorkloadTileElements, kHostWorkloadTileElements, kHostWorkloadInputB);
 }
 
-bool ValidateWorkspace(const FullPaState &state, const std::vector<float> &workspace, ValidationFailure *failure) {
+bool ValidateWorkspace(
+    const FullPaState &state, const std::vector<float> &workspace, uint32_t builder_count, ValidationFailure *failure
+) {
     if (!RecordCheck(
             workspace.size() == static_cast<size_t>(kHostWorkloadTiles) * kHostWorkloadTileElements, failure,
             "workspace-size", UINT32_MAX, UINT32_MAX, UINT32_MAX,
@@ -1900,7 +1998,7 @@ bool ValidateWorkspace(const FullPaState &state, const std::vector<float> &works
             if (state.roles[owner].completed_by_kind[static_cast<uint32_t>(HostTaskKind::Pv)] != 0U) {
                 expected_slot1 = 768.0F;
             }
-        } else if (owner > 32U) {
+        } else if (!g0::IsBuilderOwner(owner, builder_count)) {
             if (state.roles[owner].completed_by_kind[static_cast<uint32_t>(HostTaskKind::Sf)] != 0U) {
                 expected_slot0 = 5.0F;
             }
@@ -1919,7 +2017,7 @@ bool ValidateWorkspace(const FullPaState &state, const std::vector<float> &works
 
 bool ValidateRun(
     const FullPaState &state, const FullPaState &initial, const std::vector<float> &workspace,
-    uint64_t device_state_address, uint64_t nonce, uint32_t batches, ValidationFailure *failure
+    uint64_t device_state_address, uint64_t nonce, uint32_t batches, uint32_t builder_count, ValidationFailure *failure
 ) {
     if (!ValidateFixedRegions(state, initial, nonce, batches, failure)) {
         return false;
@@ -1930,14 +2028,14 @@ bool ValidateRun(
     }
     const uint32_t task_count = batches * kHostTasksPerBatch;
     for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
-        if (!ValidateTask(state, initial, nonce, batches, task_bases, task_id, failure)) {
+        if (!ValidateTask(state, initial, nonce, batches, builder_count, task_bases, task_id, failure)) {
             return false;
         }
     }
-    return ValidateBuilderThreads(state, nonce, task_count, failure) &&
-           ValidateDispatchAndTokens(state, initial, device_state_address, batches, failure) &&
-           ValidateRolesAndDrain(state, initial, nonce, batches, failure) &&
-           ValidateWorkspace(state, workspace, failure);
+    return ValidateBuilderThreads(state, initial, nonce, task_count, builder_count, failure) &&
+           ValidateDispatchAndTokens(state, initial, device_state_address, batches, builder_count, failure) &&
+           ValidateRolesAndDrain(state, initial, nonce, batches, builder_count, failure) &&
+           ValidateWorkspace(state, workspace, builder_count, failure);
 }
 
 bool ParseUnsigned(const char *raw, uint64_t maximum, uint64_t *value) {
@@ -1976,8 +2074,18 @@ bool ParseOptions(int argc, char **argv, Options *options) {
                 return false;
             }
             options->runs = static_cast<uint32_t>(value);
+        } else if (std::strcmp(argv[index], "--builders") == 0 && index + 1 < argc) {
+            uint64_t value = 0U;
+            if (!ParseUnsigned(argv[++index], g0::kMaxBuilderCount, &value) ||
+                !g0::BuilderCountValid(static_cast<uint32_t>(value))) {
+                std::fprintf(stderr, "invalid --builders value: %s (expected 1 or 2)\n", argv[index]);
+                return false;
+            }
+            options->builder_count = static_cast<uint32_t>(value);
         } else {
-            std::fprintf(stderr, "usage: %s --kernel FILE [--device N] [--batches 1|256] [--runs N]\n", argv[0]);
+            std::fprintf(
+                stderr, "usage: %s --kernel FILE [--device N] [--batches 1|256] [--runs N] [--builders 1|2]\n", argv[0]
+            );
             return false;
         }
     }
@@ -2159,9 +2267,11 @@ int main(int argc, char **argv) {
     }
 
     std::printf(
-        "[DEVICE] id=%d soc=%s topology=32*(1AIC+2AIV) simt_threads=%u warps=%u "
+        "[DEVICE] id=%d soc=%s topology=32*(1AIC+2AIV) builders=%u "
+        "simt_threads_per_builder=%u simt_threads_total=%u warps_per_builder=%u "
         "state_bytes=%zu state=0x%llx workspace_bytes=%llu workspace=0x%llx batches=%u runs=%u\n",
-        options.device, session.SocName().c_str(), kHostBuilderThreadCount, kHostBuilderWarpCount, sizeof(FullPaState),
+        options.device, session.SocName().c_str(), options.builder_count, kHostBuilderThreadCount,
+        g0::BuilderThreadCount(options.builder_count), kHostBuilderWarpCount, sizeof(FullPaState),
         static_cast<unsigned long long>(session.DeviceStateAddress()), static_cast<unsigned long long>(kWorkloadBytes),
         static_cast<unsigned long long>(session.DeviceWorkspaceAddress()), options.batches, options.runs
     );
@@ -2172,8 +2282,9 @@ int main(int argc, char **argv) {
     uint32_t passes = 0U;
     for (uint32_t run = 0U; run < options.runs; ++run) {
         const uint64_t nonce = UINT64_C(0xA550000000000000) ^ (static_cast<uint64_t>(options.batches) << 32U) ^
+                               (static_cast<uint64_t>(options.builder_count) << 24U) ^
                                (static_cast<uint64_t>(run) + 1U);
-        InitializeState(state.get(), nonce, options.batches, session.DeviceWorkspaceAddress());
+        InitializeState(state.get(), nonce, options.batches, options.builder_count, session.DeviceWorkspaceAddress());
         std::memcpy(initial.get(), state.get(), sizeof(*state));
         InitializeWorkspace(&workspace);
         if (!session.Run(state.get(), &workspace)) {
@@ -2184,7 +2295,10 @@ int main(int argc, char **argv) {
             break;
         }
         ValidationFailure failure{};
-        if (!ValidateRun(*state, *initial, workspace, session.DeviceStateAddress(), nonce, options.batches, &failure)) {
+        if (!ValidateRun(
+                *state, *initial, workspace, session.DeviceStateAddress(), nonce, options.batches,
+                options.builder_count, &failure
+            )) {
             std::fprintf(
                 stderr,
                 "[FAIL] run=%u nonce=0x%llx reason=%s task=%u owner=%u index=%u "
@@ -2233,16 +2347,27 @@ int main(int argc, char **argv) {
             continue;
         }
         ++passes;
+        std::array<uint32_t, g0::kMaxBuilderCount> builder_wins{};
+        for (uint32_t task_id = 0U; task_id < options.batches * kHostTasksPerBatch; ++task_id) {
+            const uint32_t builder = state->tasks[task_id].plan.builder_owner - g0::kBuilderOwner;
+            ++builder_wins[builder];
+        }
         std::printf(
             "[PASS] run=%u nonce=0x%llx active_tasks=%u kernel_tasks=%u heap_bytes=%llu "
-            "same_device_addresses=yes\n",
+            "builder_attempts_per_task=%u builder_wins=%u",
             run + 1U, static_cast<unsigned long long>(nonce), options.batches * kHostTasksPerBatch,
-            options.batches * 4U, static_cast<unsigned long long>(ExpectedHeapBytes(options.batches))
+            options.batches * 4U, static_cast<unsigned long long>(ExpectedHeapBytes(options.batches)),
+            options.builder_count, builder_wins[0]
         );
+        if (options.builder_count == g0::kMaxBuilderCount) {
+            std::printf("/%u", builder_wins[1]);
+        }
+        std::printf(" same_device_addresses=yes\n");
     }
     std::printf(
-        "[SUMMARY] G0 B%u passes=%u/%u fresh_initialization=yes same_address_reuse=%s\n", options.batches, passes,
-        options.runs, options.runs > 1U ? "validated" : "not-requested"
+        "[SUMMARY] G%u builders=%u B%u passes=%u/%u fresh_initialization=yes same_address_reuse=%s\n",
+        options.builder_count - 1U, options.builder_count, options.batches, passes, options.runs,
+        options.runs > 1U ? "validated" : "not-requested"
     );
     return passes == options.runs ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -9,9 +9,10 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-// G0 keeps the PA task ABI and task graph, but moves every Build/ordered-insert
-// operation into 64 independent SIMT warp leaders on AIV0. Main Scalar only
-// launches the VF and participates in the global drain.
+// G0/G1 keep the PA task ABI and task graph, but move every
+// Build/ordered-insert operation into 64 independent SIMT warp leaders on
+// each configured builder AIV. Main Scalar only launches the VF and
+// participates in the global drain.
 
 #include <pto/common/kernel_meta.hpp>
 #include <pto/pto-inst.hpp>
@@ -84,42 +85,48 @@ __aicore__ __attribute__((always_inline)) inline bool ConfigValid(__gm__ const F
            state->control.task_count == TaskCount(batches) &&
            state->control.kernel_task_count == KernelTaskCount(batches) &&
            state->control.builder_thread_count == kBuilderThreadCount &&
-           state->control.heap_base == kSyntheticHeapBase && state->control.heap_bytes == kHeapBytes &&
-           state->control.workspace_base != 0U && state->control.workspace_bytes == kWorkloadBytes &&
-           state->control.qk_repeats >= 1U && state->control.sf_repeats >= 1U && state->control.pv_repeats >= 1U &&
-           state->control.up_repeats >= 1U && state->exec_dispatch.aic_task_count == batches * 2U &&
-           state->exec_dispatch.aiv_task_count == batches * 2U;
+           BuilderCountValid(state->control.builder_count) && state->control.heap_base == kSyntheticHeapBase &&
+           state->control.heap_bytes == kHeapBytes && state->control.workspace_base != 0U &&
+           state->control.workspace_bytes == kWorkloadBytes && state->control.qk_repeats >= 1U &&
+           state->control.sf_repeats >= 1U && state->control.pv_repeats >= 1U && state->control.up_repeats >= 1U &&
+           state->exec_dispatch.aic_task_count == batches * 2U && state->exec_dispatch.aiv_task_count == batches * 2U;
 }
 
 #if defined(__DAV_VEC__)
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
-SimtFatalValue(ExecFatalReason reason, uint32_t task_id) {
-    return (static_cast<uint64_t>(reason) << kFatalReasonShift) |
-           (static_cast<uint64_t>(kBuilderOwner) << kFatalOwnerShift) |
+SimtFatalValue(ExecFatalReason reason, uint32_t owner, uint32_t task_id) {
+    return (static_cast<uint64_t>(reason) << kFatalReasonShift) | (static_cast<uint64_t>(owner) << kFatalOwnerShift) |
            (static_cast<uint64_t>(task_id) << kFatalTaskIdShift);
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline void
-SimtPublishFatal(__gm__ uint64_t *fatal, ExecFatalReason reason, uint32_t task_id) {
-    (void)asc_atomic_cas(fatal, static_cast<uint64_t>(0U), SimtFatalValue(reason, task_id));
+SimtPublishFatal(__gm__ uint64_t *fatal, ExecFatalReason reason, uint32_t owner, uint32_t task_id) {
+    (void)asc_atomic_cas(fatal, static_cast<uint64_t>(0U), SimtFatalValue(reason, owner, task_id));
 }
 
-__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
-SimtBuilderReportChecksum(uint64_t nonce, uint32_t thread_id, uint32_t task_count) {
-    const uint32_t lane = thread_id % kWarpSize;
-    const uint32_t first_task = lane == 0U ? thread_id / kWarpSize : UINT32_MAX;
-    const uint32_t expected_count = first_task == UINT32_MAX || first_task >= task_count ?
-                                        0U :
-                                        1U + (task_count - 1U - first_task) / kBuilderTaskStride;
-    const uint32_t last_task =
-        expected_count == 0U ? UINT32_MAX : first_task + (expected_count - 1U) * kBuilderTaskStride;
-    const uint32_t insert_wait_count = expected_count - (expected_count != 0U && first_task == 0U ? 1U : 0U);
-    uint64_t value = nonce ^ (static_cast<uint64_t>(thread_id) << 32U) ^ expected_count;
-    value ^= static_cast<uint64_t>(last_task) << 1U;
-    value ^= static_cast<uint64_t>(insert_wait_count) << 48U;
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t SimtBuilderReportChecksum(
+    uint64_t nonce, uint32_t thread_id, uint32_t task_count, uint32_t wins, uint32_t first_task, uint32_t last_task,
+    uint32_t attempts, uint32_t prepares, uint32_t commits, uint32_t insert_waits, uint32_t claim_losses
+) {
+    uint64_t value = nonce ^ (static_cast<uint64_t>(thread_id) << 32U) ^ task_count;
+    value ^= static_cast<uint64_t>(wins) << 1U;
+    value ^= static_cast<uint64_t>(first_task) << 7U;
+    value ^= static_cast<uint64_t>(last_task) << 19U;
+    value ^= static_cast<uint64_t>(attempts) << 37U;
+    value ^= static_cast<uint64_t>(prepares) << 43U;
+    value ^= static_cast<uint64_t>(commits) << 49U;
+    value ^= static_cast<uint64_t>(insert_waits) << 55U;
+    value ^= static_cast<uint64_t>(claim_losses) << 25U;
     value *= 0x9E3779B97F4A7C15ULL;
-    return value ^ (value >> 29U);
+    value ^= value >> 29U;
+    value *= 0xD6E8FEB86659FD93ULL;
+    return value ^ (value >> 31U);
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtPublishBuildReportWord(__gm__ uint64_t *address, uint64_t value) {
+    return asc_atomic_cas(address, kReportPoisonWord, value) == kReportPoisonWord;
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t SimtDescriptorWord(
@@ -242,9 +249,143 @@ SimtExternalDescriptorWord(uint32_t batch_count, uint32_t task_id, uint32_t tens
     );
 }
 
+constexpr uint32_t kSimtClaimFatal = 0U;
+constexpr uint32_t kSimtClaimWinner = 1U;
+constexpr uint32_t kSimtClaimLost = 2U;
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtBuilderOwnerValid(uint32_t owner, uint32_t builder_count) {
+    return builder_count >= 1U && builder_count <= kMaxBuilderCount && owner >= kBuilderOwner &&
+           owner < kBuilderOwner + builder_count;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
+SimtAllocBuildingState(uint64_t nonce, uint32_t task_id, uint32_t build_owner) {
+    uint64_t value = kAllocBuildingMagic ^ nonce ^ (static_cast<uint64_t>(task_id) << 19U) ^
+                     (static_cast<uint64_t>(build_owner) << 3U);
+    value ^= value >> 23U;
+    value *= 0xD6E8FEB86659FD93ULL;
+    value ^= value >> 31U;
+    value |= uint64_t{1} << 63U;
+    return value;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtCompetingExecStateValid(uint64_t raw, uint32_t task_id, uint32_t current_owner, uint32_t builder_count) {
+    if ((raw & ~kStateKnownMask) != 0U ||
+        static_cast<uint32_t>((raw >> kStateTaskIdShift) & kStateTaskIdMask) != task_id) {
+        return false;
+    }
+    const uint32_t phase = static_cast<uint32_t>((raw >> kStatePhaseShift) & kStatePhaseMask);
+    const uint32_t build_owner = static_cast<uint32_t>((raw >> kStateBuildOwnerShift) & kStateBuildOwnerMask);
+    const uint32_t execute_owner = static_cast<uint32_t>((raw >> kStateExecuteOwnerShift) & kStateExecuteOwnerMask);
+    const uint32_t engine = static_cast<uint32_t>((raw >> kStateEngineShift) & kStateEngineMask);
+    const uint32_t payload_lines = static_cast<uint32_t>((raw >> kStatePayloadLinesShift) & kStatePayloadLinesMask);
+    if (!SimtBuilderOwnerValid(build_owner, builder_count) || build_owner == current_owner) {
+        return false;
+    }
+    if (phase == static_cast<uint32_t>(ExecPhase::Building)) {
+        return execute_owner == kUnboundOwner && engine == static_cast<uint32_t>(ExecEngineClass::None) &&
+               payload_lines == 0U;
+    }
+    const uint32_t kind = task_id % kTasksPerBatch;
+    const uint32_t expected_engine =
+        kind == static_cast<uint32_t>(TaskKind::Qk) || kind == static_cast<uint32_t>(TaskKind::Pv) ?
+            static_cast<uint32_t>(ExecEngineClass::Aic) :
+            static_cast<uint32_t>(ExecEngineClass::Aiv);
+    const uint32_t expected_lines = kind == static_cast<uint32_t>(TaskKind::Up) ? 16U : 10U;
+    if (engine != expected_engine || payload_lines != expected_lines) {
+        return false;
+    }
+    if (phase == static_cast<uint32_t>(ExecPhase::Built)) {
+        return execute_owner == kUnboundOwner;
+    }
+    if (phase != static_cast<uint32_t>(ExecPhase::Claimed) && phase != static_cast<uint32_t>(ExecPhase::Done)) {
+        return false;
+    }
+    return expected_engine == static_cast<uint32_t>(ExecEngineClass::Aic) ?
+               execute_owner < kAicOwnerCount :
+               execute_owner >= kBuilderOwner + builder_count && execute_owner < kOwnerCount;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t SimtTryClaimTask(
+    __gm__ uint64_t *task_words, __gm__ uint64_t *fatal, uint64_t nonce, uint32_t task_id, uint32_t build_owner,
+    uint32_t builder_count
+) {
+    constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
+    constexpr uint32_t kCompletionOffsetWords = offsetof(FullPaTask, completion) / sizeof(uint64_t);
+    constexpr uint32_t kExecOffsetWords = offsetof(FullPaTask, exec) / sizeof(uint64_t);
+    __gm__ uint64_t *task = task_words + task_id * kTaskStrideWords;
+    if (task_id % kTasksPerBatch == static_cast<uint32_t>(TaskKind::Alloc)) {
+        const uint64_t desired = SimtAllocBuildingState(nonce, task_id, build_owner);
+        const uint64_t observed = asc_atomic_cas(task + kCompletionOffsetWords, static_cast<uint64_t>(0U), desired);
+        if (observed == 0U) {
+            return kSimtClaimWinner;
+        }
+        bool legal_loser = observed == 1U;
+        for (uint32_t builder = 0U; builder < builder_count; ++builder) {
+            const uint32_t competing_owner = kBuilderOwner + builder;
+            legal_loser = legal_loser || (competing_owner != build_owner &&
+                                          observed == SimtAllocBuildingState(nonce, task_id, competing_owner));
+        }
+        if (legal_loser) {
+            return kSimtClaimLost;
+        }
+    } else {
+        const uint64_t desired = (static_cast<uint64_t>(ExecPhase::Building) << kStatePhaseShift) |
+                                 (static_cast<uint64_t>(build_owner) << kStateBuildOwnerShift) |
+                                 (static_cast<uint64_t>(kUnboundOwner) << kStateExecuteOwnerShift) |
+                                 (static_cast<uint64_t>(task_id) << kStateTaskIdShift);
+        const uint64_t observed = asc_atomic_cas(task + kExecOffsetWords, static_cast<uint64_t>(0U), desired);
+        if (observed == 0U) {
+            return kSimtClaimWinner;
+        }
+        if (SimtCompetingExecStateValid(observed, task_id, build_owner, builder_count)) {
+            return kSimtClaimLost;
+        }
+    }
+    SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id);
+    return kSimtClaimFatal;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitBuilderStart(
+    __gm__ uint64_t *builder_started, __gm__ uint64_t *fatal, uint64_t timeout_ticks, uint32_t thread,
+    uint32_t build_owner, uint32_t builder_count, bool active
+) {
+    if (thread == 0U) {
+        const uint64_t observed = asc_atomic_add(builder_started, static_cast<uint64_t>(1U));
+        if (observed >= builder_count) {
+            SimtPublishFatal(fatal, ExecFatalReason::InvalidBuildInput, build_owner, UINT32_MAX);
+            return false;
+        }
+        asc_threadfence();
+    }
+    if (!active) {
+        return true;
+    }
+    const uint64_t begin = clock();
+    uint32_t polls = 0U;
+    while (clock() - begin <= timeout_ticks) {
+        const uint64_t observed = asc_atomic_add(builder_started, static_cast<uint64_t>(0U));
+        if (observed == builder_count) {
+            return true;
+        }
+        if (observed > builder_count) {
+            SimtPublishFatal(fatal, ExecFatalReason::InvalidBuildInput, build_owner, UINT32_MAX);
+            return false;
+        }
+        ++polls;
+        if ((polls & kWatchdogMask) == 0U && asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
+            return false;
+        }
+    }
+    SimtPublishFatal(fatal, ExecFatalReason::Timeout, build_owner, UINT32_MAX);
+    return false;
+}
+
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitAtomicValue(
     __gm__ uint64_t *address, uint64_t expected, __gm__ uint64_t *fatal, uint64_t timeout_ticks, uint32_t task_id,
-    uint32_t *poll_count
+    uint32_t build_owner, uint32_t *poll_count
 ) {
     const uint64_t begin = clock();
     uint32_t polls = 0U;
@@ -260,7 +401,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitAt
         // a slow predecessor, so report it immediately instead of timing out.
         if (observed != expected - 1U) {
             *poll_count += polls;
-            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, task_id);
+            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id);
             return false;
         }
         if ((polls & kWatchdogMask) == 0U && asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
@@ -274,7 +415,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitAt
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtLoadTaskBase(
     __gm__ uint64_t *task_words, uint32_t producer_task, __gm__ uint64_t *fatal, uint64_t timeout_ticks,
-    uint64_t *task_base, uint32_t *access_count
+    uint32_t build_owner, uint64_t *task_base, uint32_t *access_count
 ) {
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
     constexpr uint32_t kBaseReportOffsetWords =
@@ -344,7 +485,7 @@ SimtTensorOutputSlot(uint32_t task_id, uint32_t tensor_index) {
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepareTask(
     __gm__ uint64_t *task_words, __gm__ uint64_t *heap_words, __gm__ uint64_t *fatal, uint64_t nonce,
     uint64_t timeout_ticks, uint32_t batch_count, uint32_t task_count, uint32_t task_id, uint32_t builder_thread,
-    uint64_t *completion_vend, uint32_t *payload_words_written, uint32_t *state_access_count
+    uint32_t build_owner, uint64_t *completion_vend, uint32_t *payload_words_written, uint32_t *state_access_count
 ) {
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
     constexpr uint32_t kPlanOffsetWords = offsetof(FullPaTask, plan) / sizeof(uint64_t);
@@ -416,17 +557,6 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
         payload_lines = 16U;
     }
 
-    if (executable) {
-        const uint64_t building = (static_cast<uint64_t>(ExecPhase::Building) << kStatePhaseShift) |
-                                  (static_cast<uint64_t>(kBuilderOwner) << kStateBuildOwnerShift) |
-                                  (static_cast<uint64_t>(kUnboundOwner) << kStateExecuteOwnerShift) |
-                                  (static_cast<uint64_t>(task_id) << kStateTaskIdShift);
-        if (asc_atomic_cas(task + kExecOffsetWords, static_cast<uint64_t>(0U), building) != 0U) {
-            SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, task_id);
-            return false;
-        }
-    }
-
     const uint32_t shard = task_id & (kSharedHeapShards - 1U);
     uint64_t task_base = 0U;
     uint64_t vend = 0U;
@@ -434,7 +564,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
         const uint64_t cursor = asc_atomic_add(heap_words + shard * kHeapAtomicStrideWords, reserve);
         const uint64_t observed_vend = asc_atomic_add(heap_words + kAggregateVendOffsetWords, reserve);
         if (cursor > kHeapShardSpan - reserve || observed_vend > kHeapBytes - reserve) {
-            SimtPublishFatal(fatal, ExecFatalReason::HeapReservationFailed, task_id);
+            SimtPublishFatal(fatal, ExecFatalReason::HeapReservationFailed, build_owner, task_id);
             return false;
         }
         task_base = static_cast<uint64_t>(shard) * kHeapShardSpan + cursor;
@@ -444,7 +574,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
     }
     if (asc_atomic_cas(task + kBaseReportOffsetWords, 0U, task_base + 1U) != 0U ||
         asc_atomic_cas(task + kVendReportOffsetWords, 0U, vend + 1U) != 0U) {
-        SimtPublishFatal(fatal, ExecFatalReason::HeapReservationFailed, task_id);
+        SimtPublishFatal(fatal, ExecFatalReason::HeapReservationFailed, build_owner, task_id);
         return false;
     }
     *completion_vend = vend;
@@ -458,7 +588,8 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
         kDispatchMetaPresent | (task_id + 1U == task_count ? kDispatchMetaLastSubmit : 0U) | kind;
     const uint32_t exec_route =
         kExecRoutePresent | (executable ? kExecRouteExecutable : 0U) | (engine << kExecRouteEngineShift);
-    plan[4] = static_cast<uint64_t>(encoded_meta) | (static_cast<uint64_t>(exec_route) << 8U);
+    plan[4] = static_cast<uint64_t>(encoded_meta) | (static_cast<uint64_t>(exec_route) << 8U) |
+              (static_cast<uint64_t>(build_owner) << 16U);
     plan[5] = reserve;
     plan[6] = nonce;
     plan[7] = 0U;
@@ -479,7 +610,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
         __gm__ uint64_t *last_writer = task + kLastWriterOffsetWords + output * kAtomicStrideWords;
         if (asc_atomic_cas(published, UINT64_MAX, task_id) != UINT64_MAX ||
             asc_atomic_cas(last_writer, UINT64_MAX, task_id) != UINT64_MAX) {
-            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, task_id);
+            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id);
             return false;
         }
     }
@@ -504,9 +635,10 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
                 if (producer == task_id) {
                     producer_base = task_base;
                 } else if (!SimtLoadTaskBase(
-                               task_words, producer, fatal, timeout_ticks, &producer_base, state_access_count
+                               task_words, producer, fatal, timeout_ticks, build_owner, &producer_base,
+                               state_access_count
                            )) {
-                    SimtPublishFatal(fatal, ExecFatalReason::Timeout, task_id);
+                    SimtPublishFatal(fatal, ExecFatalReason::Timeout, build_owner, task_id);
                     return false;
                 }
             }
@@ -553,8 +685,9 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommitTask(
-    __gm__ uint64_t *task_words, __gm__ uint64_t *alloc_done, __gm__ uint64_t *fatal, uint64_t timeout_ticks,
-    uint32_t task_id, uint64_t completion_vend, uint32_t *insert_poll_count, int64_t *predecessor_observed
+    __gm__ uint64_t *task_words, __gm__ uint64_t *alloc_done, __gm__ uint64_t *fatal, uint64_t nonce,
+    uint64_t timeout_ticks, uint32_t task_id, uint32_t build_owner, uint64_t completion_vend,
+    uint32_t *insert_poll_count, int64_t *predecessor_observed
 ) {
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
     constexpr uint32_t kCompletionOffsetWords = offsetof(FullPaTask, completion) / sizeof(uint64_t);
@@ -571,10 +704,10 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
         __gm__ uint64_t *predecessor = task_words + (task_id - 1U) * kTaskStrideWords + kInsertOffsetWords;
         uint32_t polls = 0U;
         if (!SimtWaitAtomicValue(
-                predecessor, static_cast<uint64_t>(task_id - 1U), fatal, timeout_ticks, task_id, &polls
+                predecessor, static_cast<uint64_t>(task_id - 1U), fatal, timeout_ticks, task_id, build_owner, &polls
             )) {
             *insert_poll_count += polls;
-            SimtPublishFatal(fatal, ExecFatalReason::Timeout, task_id);
+            SimtPublishFatal(fatal, ExecFatalReason::Timeout, build_owner, task_id);
             return false;
         }
         *insert_poll_count += polls;
@@ -598,7 +731,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
         const uint32_t alloc = (task_id / kTasksPerBatch) * kTasksPerBatch;
         __gm__ uint64_t *alloc_last_writer = task_words + alloc * kTaskStrideWords + kLastWriterOffsetWords;
         if (asc_atomic_cas(alloc_last_writer, alloc, task_id) != alloc) {
-            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, task_id);
+            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id);
             return false;
         }
     }
@@ -606,14 +739,19 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
     const uint64_t expected_insert = task_id == 0U ? UINT64_MAX : static_cast<uint64_t>(task_id - 1U);
     const uint64_t insert_observed = asc_atomic_add(task + kInsertOffsetWords, static_cast<uint64_t>(1U));
     if (insert_observed != expected_insert) {
-        SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, task_id);
+        SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id);
         return false;
     }
 
     if (kind == static_cast<uint32_t>(TaskKind::Alloc)) {
-        if (asc_atomic_cas(task + kCompletionOffsetWords + 1U, 0U, completion_vend) != 0U ||
-            asc_atomic_cas(task + kCompletionOffsetWords, 0U, 1U) != 0U) {
-            SimtPublishFatal(fatal, ExecFatalReason::CompletionPublishFailed, task_id);
+        if (asc_atomic_cas(task + kCompletionOffsetWords + 1U, 0U, completion_vend) != 0U) {
+            SimtPublishFatal(fatal, ExecFatalReason::CompletionPublishFailed, build_owner, task_id);
+            return false;
+        }
+        asc_threadfence();
+        const uint64_t alloc_building = SimtAllocBuildingState(nonce, task_id, build_owner);
+        if (asc_atomic_cas(task + kCompletionOffsetWords, alloc_building, 1U) != alloc_building) {
+            SimtPublishFatal(fatal, ExecFatalReason::CompletionPublishFailed, build_owner, task_id);
             return false;
         }
         (void)asc_atomic_add(alloc_done, static_cast<uint64_t>(1U));
@@ -630,18 +768,18 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
                 static_cast<uint32_t>(ExecEngineClass::Aic) :
                 static_cast<uint32_t>(ExecEngineClass::Aiv);
         const uint64_t building = (static_cast<uint64_t>(ExecPhase::Building) << kStatePhaseShift) |
-                                  (static_cast<uint64_t>(kBuilderOwner) << kStateBuildOwnerShift) |
+                                  (static_cast<uint64_t>(build_owner) << kStateBuildOwnerShift) |
                                   (static_cast<uint64_t>(kUnboundOwner) << kStateExecuteOwnerShift) |
                                   (static_cast<uint64_t>(task_id) << kStateTaskIdShift);
         const uint64_t built = (static_cast<uint64_t>(ExecPhase::Built) << kStatePhaseShift) |
-                               (static_cast<uint64_t>(kBuilderOwner) << kStateBuildOwnerShift) |
+                               (static_cast<uint64_t>(build_owner) << kStateBuildOwnerShift) |
                                (static_cast<uint64_t>(kUnboundOwner) << kStateExecuteOwnerShift) |
                                (static_cast<uint64_t>(engine) << kStateEngineShift) |
                                (static_cast<uint64_t>(payload_lines) << kStatePayloadLinesShift) |
                                (static_cast<uint64_t>(task_id) << kStateTaskIdShift);
         asc_threadfence();
         if (asc_atomic_cas(task + kExecOffsetWords, building, built) != building) {
-            SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, task_id);
+            SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id);
             return false;
         }
     }
@@ -650,19 +788,23 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
 
 static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuildTasks(
     __gm__ uint64_t *task_words, __gm__ uint64_t *heap_words, __gm__ uint64_t *alloc_done,
-    __gm__ uint64_t *builder_finished, __gm__ uint64_t *fatal, __gm__ uint64_t *thread_report_words, uint64_t nonce,
-    uint64_t timeout_ticks, uint32_t batch_count, uint32_t task_count
+    __gm__ uint64_t *builder_started, __gm__ uint64_t *builder_finished, __gm__ uint64_t *fatal,
+    __gm__ uint64_t *thread_report_words, uint64_t nonce, uint64_t timeout_ticks, uint32_t batch_count,
+    uint32_t task_count, uint32_t builder_instance, uint32_t builder_count, uint32_t build_owner
 ) {
     const uint32_t thread = static_cast<uint32_t>(threadIdx.x);
     const uint32_t warp = thread / kWarpSize;
     const uint32_t lane = thread % kWarpSize;
     const bool active = lane == 0U && warp < kBuilderWarpCount;
+    const uint32_t global_thread = builder_instance * kBuilderThreadCount + thread;
+    const uint32_t global_warp = builder_instance * kBuilderWarpCount + warp;
     uint32_t tasks_built = 0U;
     uint32_t prepared = 0U;
     uint32_t committed = 0U;
-    uint32_t state_accesses = 0U;
+    uint32_t attempts = 0U;
     uint32_t producer_base_polls = 0U;
     uint32_t insert_waits = 0U;
+    uint32_t claim_losses = 0U;
     uint32_t first_task = UINT32_MAX;
     uint32_t last_task = UINT32_MAX;
     uint64_t checksum = 0U;
@@ -670,20 +812,30 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
     constexpr uint32_t kBuildReportOffsetWords = offsetof(FullPaTask, build_report) / sizeof(uint64_t);
     constexpr uint32_t kThreadReportStrideWords = sizeof(FullPaBuilderThreadReport) / sizeof(uint64_t);
-    if (active) {
+    const bool start_ready =
+        SimtWaitBuilderStart(builder_started, fatal, timeout_ticks, thread, build_owner, builder_count, active);
+    if (active && start_ready) {
         for (uint32_t task_id = warp; task_id < task_count; task_id += kBuilderTaskStride) {
-            if (tasks_built == 0U) {
-                first_task = task_id;
-            }
-            ++state_accesses;
             if (asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
                 break;
             }
+            ++attempts;
+            __gm__ uint64_t *report = task_words + task_id * kTaskStrideWords + kBuildReportOffsetWords;
+            (void)asc_atomic_add(report + 6U, static_cast<uint64_t>(1U));
+            const uint32_t claim = SimtTryClaimTask(task_words, fatal, nonce, task_id, build_owner, builder_count);
+            if (claim == kSimtClaimLost) {
+                ++claim_losses;
+                continue;
+            }
+            if (claim != kSimtClaimWinner) {
+                break;
+            }
+            (void)asc_atomic_add(report + 6U, static_cast<uint64_t>(1U) << 32U);
             uint64_t completion_vend = 0U;
             uint32_t payload_words = 0U;
             if (!SimtPrepareTask(
-                    task_words, heap_words, fatal, nonce, timeout_ticks, batch_count, task_count, task_id, thread,
-                    &completion_vend, &payload_words, &producer_base_polls
+                    task_words, heap_words, fatal, nonce, timeout_ticks, batch_count, task_count, task_id,
+                    global_thread, build_owner, &completion_vend, &payload_words, &producer_base_polls
                 )) {
                 break;
             }
@@ -691,14 +843,17 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             uint32_t task_insert_polls = 0U;
             int64_t predecessor_observed = -1;
             if (!SimtCommitTask(
-                    task_words, alloc_done, fatal, timeout_ticks, task_id, completion_vend, &task_insert_polls,
-                    &predecessor_observed
+                    task_words, alloc_done, fatal, nonce, timeout_ticks, task_id, build_owner, completion_vend,
+                    &task_insert_polls, &predecessor_observed
                 )) {
                 break;
             }
             insert_waits += task_id == 0U ? 0U : 1U;
             ++committed;
             ++tasks_built;
+            if (tasks_built == 1U) {
+                first_task = task_id;
+            }
             last_task = task_id;
 
             const uint32_t kind = task_id % kTasksPerBatch;
@@ -709,36 +864,51 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
                                                                                                                   0U);
             uint32_t phases = kBuildPreparedBit | kBuildOutputsPublishedBit | kBuildInsertCommittedBit;
             phases |= kind == static_cast<uint32_t>(TaskKind::Alloc) ? kBuildAllocCompletedBit : kBuildExecPublishedBit;
-            __gm__ uint64_t *report = task_words + task_id * kTaskStrideWords + kBuildReportOffsetWords;
-            report[0] = static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(thread) << 32U);
-            report[1] = static_cast<uint64_t>(warp);
-            report[2] = static_cast<uint64_t>(phases) | (static_cast<uint64_t>(output_count) << 32U);
-            report[3] = static_cast<uint64_t>(payload_words) | (static_cast<uint64_t>(task_insert_polls) << 32U);
-            report[4] = static_cast<uint64_t>(predecessor_observed);
-            report[5] = static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U);
-            report[6] = 0U;
-            report[7] = nonce;
+            if (!SimtPublishBuildReportWord(
+                    report, static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(global_thread) << 32U)
+                ) ||
+                !SimtPublishBuildReportWord(report + 1U, static_cast<uint64_t>(global_warp)) ||
+                !SimtPublishBuildReportWord(
+                    report + 2U, static_cast<uint64_t>(phases) | (static_cast<uint64_t>(output_count) << 32U)
+                ) ||
+                !SimtPublishBuildReportWord(
+                    report + 3U,
+                    static_cast<uint64_t>(payload_words) | (static_cast<uint64_t>(task_insert_polls) << 32U)
+                ) ||
+                !SimtPublishBuildReportWord(report + 4U, static_cast<uint64_t>(predecessor_observed)) ||
+                !SimtPublishBuildReportWord(
+                    report + 5U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U)
+                ) ||
+                !SimtPublishBuildReportWord(report + 7U, nonce)) {
+                SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id);
+                break;
+            }
             asc_threadfence();
             if (task_id + 1U == task_count) {
                 if (asc_atomic_cas(builder_finished, static_cast<uint64_t>(0U), static_cast<uint64_t>(1U)) != 0U) {
-                    SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, task_id);
+                    SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id);
                 }
             }
         }
     }
 
-    checksum = SimtBuilderReportChecksum(nonce, thread, task_count);
+    if (active) {
+        checksum = SimtBuilderReportChecksum(
+            nonce, global_thread, task_count, tasks_built, first_task, last_task, attempts, prepared, committed,
+            insert_waits, claim_losses
+        );
 
-    __gm__ uint64_t *thread_report = thread_report_words + thread * kThreadReportStrideWords;
-    thread_report[0] = static_cast<uint64_t>(thread) | (static_cast<uint64_t>(warp) << 32U);
-    thread_report[1] = static_cast<uint64_t>(lane) | (static_cast<uint64_t>(active ? 1U : 0U) << 32U);
-    thread_report[2] = static_cast<uint64_t>(tasks_built) | (static_cast<uint64_t>(first_task) << 32U);
-    thread_report[3] = static_cast<uint64_t>(last_task) | (static_cast<uint64_t>(state_accesses) << 32U);
-    thread_report[4] = static_cast<uint64_t>(prepared) | (static_cast<uint64_t>(committed) << 32U);
-    thread_report[5] = insert_waits;
-    thread_report[6] = nonce;
-    thread_report[7] = checksum;
-    asc_threadfence();
+        __gm__ uint64_t *thread_report = thread_report_words + global_thread * kThreadReportStrideWords;
+        thread_report[0] = static_cast<uint64_t>(global_thread) | (static_cast<uint64_t>(global_warp) << 32U);
+        thread_report[1] = static_cast<uint64_t>(lane) | (static_cast<uint64_t>(1U) << 32U);
+        thread_report[2] = static_cast<uint64_t>(tasks_built) | (static_cast<uint64_t>(first_task) << 32U);
+        thread_report[3] = static_cast<uint64_t>(last_task) | (static_cast<uint64_t>(attempts) << 32U);
+        thread_report[4] = static_cast<uint64_t>(prepared) | (static_cast<uint64_t>(committed) << 32U);
+        thread_report[5] = static_cast<uint64_t>(insert_waits) | (static_cast<uint64_t>(claim_losses) << 32U);
+        thread_report[6] = nonce;
+        thread_report[7] = checksum;
+        asc_threadfence();
+    }
 }
 
 #endif  // defined(__DAV_VEC__)
@@ -811,7 +981,9 @@ ValidatePayloadAndBind(__gm__ FullPaState *state, uint32_t owner, __gm__ Executi
     const TaskKind kind = TaskKindAt(task_id);
     const TaskExecShape shape = TaskShape(kind);
     ExecPayloadLayout layout{};
-    if (!ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout)) {
+    if (!IsBuilderOwner(token->control.build_owner, state->control.builder_count) ||
+        !OwnerCanExecute(owner, shape.engine_class, state->control.builder_count) ||
+        !ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout)) {
         return false;
     }
     InvalidatePayloadLines(task, layout.payload_lines);
@@ -986,8 +1158,9 @@ RunClaimedWorkload(__gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionTo
         PublishFatal(state, ExecFatalReason::CompletionPublishFailed, owner, task_id);
         return false;
     }
-    const uint64_t claimed = ClaimedState(task_id, owner);
-    if (ScalarCas(&task->exec.control.state, claimed, DoneState(task_id, owner)) != claimed) {
+    const uint64_t claimed = ClaimedState(task_id, token->control.build_owner, owner);
+    if (ScalarCas(&task->exec.control.state, claimed, DoneState(task_id, token->control.build_owner, owner)) !=
+        claimed) {
         PublishFatal(state, ExecFatalReason::CompletionStateConflict, owner, task_id);
         return false;
     }
@@ -1009,16 +1182,25 @@ AdvanceToken(__gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionToken *t
     __gm__ FullPaTask *task = &state->tasks[task_id];
     if (token->control.phase == ExecTokenPhase::WaitingBuilt) {
         const uint64_t observed = ScalarAtomicLoad(&task->exec.control.state);
-        if (observed == 0U || observed == BuildingState(task_id)) {
+        if (observed == 0U) {
             return false;
         }
-        const uint64_t built = BuiltState(task_id);
-        if (observed != built) {
+        const DecodedExecState decoded = DecodeExecState(static_cast<int64_t>(observed));
+        if (decoded.valid && decoded.phase == ExecPhase::Building && decoded.task_id == task_id &&
+            IsBuilderOwner(decoded.build_owner, state->control.builder_count) &&
+            observed == BuildingState(task_id, decoded.build_owner)) {
+            return false;
+        }
+        if (!decoded.valid || decoded.phase != ExecPhase::Built || decoded.task_id != task_id ||
+            !IsBuilderOwner(decoded.build_owner, state->control.builder_count) ||
+            observed != BuiltState(task_id, decoded.build_owner)) {
             ++result->claim_lost_count;
             PublishFatal(state, ExecFatalReason::InvalidBuiltControl, owner, task_id);
             return false;
         }
-        if (ScalarCas(&task->exec.control.state, built, ClaimedState(task_id, owner)) != built) {
+        token->control.build_owner = decoded.build_owner;
+        const uint64_t claimed = ClaimedState(task_id, decoded.build_owner, owner);
+        if (ScalarCas(&task->exec.control.state, observed, claimed) != observed) {
             ++result->claim_lost_count;
             PublishFatal(state, ExecFatalReason::ControlPublishConflict, owner, task_id);
             return false;
@@ -1060,7 +1242,7 @@ LoadDispatchTaskId(__gm__ const uint32_t *task_ids, uint32_t ticket) {
 
 __aicore__ __attribute__((always_inline)) inline void
 RunExecutor(__gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *result) {
-    const ExecEngineClass engine = OwnerEngine(owner);
+    const ExecEngineClass engine = OwnerEngine(owner, state->control.builder_count);
     __gm__ AtomicLine *cursor =
         engine == ExecEngineClass::Aic ? &state->exec_dispatch.aic_next : &state->exec_dispatch.aiv_next;
     __gm__ uint32_t *task_ids =
@@ -1085,7 +1267,7 @@ RunExecutor(__gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *result)
             const uint32_t task_id = LoadDispatchTaskId(task_ids, ticket);
             token->control.phase = ExecTokenPhase::WaitingBuilt;
             token->control.task_id = task_id;
-            token->control.build_owner = kBuilderOwner;
+            token->control.build_owner = UINT32_MAX;
             token->control.execute_owner = owner;
             token->control.engine_class = engine;
             token->control.payload_address = reinterpret_cast<uint64_t>(&state->tasks[task_id].exec.payload);
@@ -1173,9 +1355,9 @@ PublishRoleResult(__gm__ FullPaState *state, uint32_t owner, const FullPaRoleRes
 }
 
 __aicore__ __attribute__((always_inline)) inline void
-InitializeRoleResult(FullPaRoleResult *result, uint32_t owner, uint64_t nonce) {
+InitializeRoleResult(FullPaRoleResult *result, uint32_t owner, uint32_t builder_count, uint64_t nonce) {
     result->owner = owner;
-    result->role = OwnerRoleAt(owner);
+    result->role = OwnerRoleAt(owner, builder_count);
     result->physical_block = OwnerPhysicalBlock(owner);
     result->drain_group = OwnerDrainGroup(owner);
     result->build_count = 0U;
@@ -1234,6 +1416,7 @@ ArriveAndDrain(__gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *resu
     if (LoadFatal(state) == 0U) {
         const uint32_t batches = state->control.batch_count;
         const bool valid = completed == state->control.kernel_task_count &&
+                           ScalarAtomicLoad(&state->drain.builder_started.value) == state->control.builder_count &&
                            ScalarAtomicLoad(&state->drain.builder_finished.value) == 1U &&
                            ScalarAtomicLoad(&state->drain.done_count.value) == state->control.kernel_task_count &&
                            ScalarAtomicLoad(&state->drain.alloc_done.value) == batches &&
@@ -1242,7 +1425,7 @@ ArriveAndDrain(__gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *resu
                            ScalarAtomicLoad(&state->exec_dispatch.aic_next.value) ==
                                state->exec_dispatch.aic_task_count + kAicOwnerCount &&
                            ScalarAtomicLoad(&state->exec_dispatch.aiv_next.value) ==
-                               state->exec_dispatch.aiv_task_count + kAivExecutorCount;
+                               state->exec_dispatch.aiv_task_count + AivExecutorCount(state->control.builder_count);
         if (!valid) {
             PublishFatal(state, ExecFatalReason::DrainMismatch, owner, UINT32_MAX);
         }
@@ -1270,16 +1453,23 @@ simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
         kSingleCacheLine
     );
     dsb(DSB_ALL);
-    const uint32_t aiv_id = static_cast<uint32_t>(get_block_idx() * get_subblockdim() + get_subblockid());
+    const uint32_t block = static_cast<uint32_t>(get_block_idx());
+    const uint32_t subblock_dim = static_cast<uint32_t>(get_subblockdim());
+    const uint32_t subblock = static_cast<uint32_t>(get_subblockid());
+    if (block >= kAicOwnerCount || subblock_dim != 2U || subblock >= subblock_dim) {
+        PublishFatal(state, ExecFatalReason::InvalidBuildInput, kBuilderOwner, 0U);
+        return;
+    }
+    const uint32_t aiv_id = block * subblock_dim + subblock;
     const uint32_t owner = kBuilderOwner + aiv_id;
     FullPaRoleResult result;
-    InitializeRoleResult(&result, owner, state->control.launch_nonce);
+    InitializeRoleResult(&result, owner, state->control.builder_count, state->control.launch_nonce);
     if (!ConfigValid(state)) {
         PublishFatal(state, ExecFatalReason::InvalidBuildInput, owner, 0U);
         ArriveAndDrain(state, owner, &result);
         return;
     }
-    if (aiv_id != 0U) {
+    if (aiv_id >= state->control.builder_count) {
         RunExecutor(state, owner, &result);
         ArriveAndDrain(state, owner, &result);
         return;
@@ -1288,10 +1478,12 @@ simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
         cce::dim3{kBuilderThreadCount, 1U, 1U}, reinterpret_cast<__gm__ uint64_t *>(&state->tasks[0]),
         reinterpret_cast<__gm__ uint64_t *>(&state->heap),
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->drain.alloc_done.value)),
+        reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->drain.builder_started.value)),
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->drain.builder_finished.value)),
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->fatal.state)),
         reinterpret_cast<__gm__ uint64_t *>(&state->builder_threads[0]), state->control.launch_nonce,
-        state->control.timeout_ticks, state->control.batch_count, state->control.task_count
+        state->control.timeout_ticks, state->control.batch_count, state->control.task_count, aiv_id,
+        state->control.builder_count, owner
     );
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
@@ -1316,7 +1508,7 @@ simt_cross_core_g0_0_mix_aic(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
     dsb(DSB_ALL);
     const uint32_t owner = static_cast<uint32_t>(get_block_idx());
     FullPaRoleResult result;
-    InitializeRoleResult(&result, owner, state->control.launch_nonce);
+    InitializeRoleResult(&result, owner, state->control.builder_count, state->control.launch_nonce);
     if (!ConfigValid(state)) {
         PublishFatal(state, ExecFatalReason::InvalidBuildInput, owner, 0U);
     } else {

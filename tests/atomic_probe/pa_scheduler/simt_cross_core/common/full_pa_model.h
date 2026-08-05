@@ -26,7 +26,7 @@ namespace pa_scheduler::simt_cross_core::g0 {
 #endif
 
 constexpr uint64_t kProbeMagic = 0x53494D5447304135ULL;
-constexpr uint64_t kProbeVersion = 1U;
+constexpr uint64_t kProbeVersion = 2U;
 constexpr uint32_t kDefaultBatches = 256U;
 constexpr uint32_t kTasksPerBatch = 5U;
 constexpr uint32_t kKernelsPerBatch = 4U;
@@ -39,6 +39,8 @@ constexpr uint32_t kAicOwnerCount = 32U;
 constexpr uint32_t kAivOwnerCount = 64U;
 constexpr uint32_t kOwnerCount = kAicOwnerCount + kAivOwnerCount;
 constexpr uint32_t kBuilderOwner = 32U;
+constexpr uint32_t kDefaultBuilderCount = 1U;
+constexpr uint32_t kMaxBuilderCount = 2U;
 constexpr uint32_t kFirstAivExecutorOwner = kBuilderOwner + 1U;
 constexpr uint32_t kAivExecutorCount = kAivOwnerCount - 1U;
 constexpr uint32_t kExecutorCount = kAicOwnerCount + kAivExecutorCount;
@@ -46,6 +48,8 @@ constexpr uint32_t kWarpSize = 32U;
 constexpr uint32_t kBuilderWarpCount = 64U;
 constexpr uint32_t kBuilderThreadCount = kBuilderWarpCount * kWarpSize;
 constexpr uint32_t kBuilderLeaderCount = kBuilderWarpCount;
+constexpr uint32_t kMaxBuilderThreadCount = kBuilderThreadCount * kMaxBuilderCount;
+constexpr uint32_t kMaxBuilderLeaderCount = kBuilderLeaderCount * kMaxBuilderCount;
 constexpr uint32_t kBuilderTaskStride = kBuilderWarpCount;
 constexpr uint32_t kBuilderTasksPerLeaderMain = kMainTaskCount / kBuilderLeaderCount;
 constexpr uint32_t kSharedHeapShards = 8U;
@@ -269,65 +273,135 @@ SIMT_CROSS_CORE_G0_MODEL_INLINE int64_t InsertCompletionInitialValue(uint32_t ta
     return static_cast<int64_t>(task_id) - 1;
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE bool BuilderThreadActive(uint32_t thread_id) {
-    return thread_id < kBuilderThreadCount && (thread_id % kWarpSize) == 0U;
+SIMT_CROSS_CORE_G0_MODEL_INLINE bool BuilderCountValid(uint32_t builder_count) {
+    return builder_count >= kDefaultBuilderCount && builder_count <= kMaxBuilderCount;
 }
 
 SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderWarp(uint32_t thread_id) { return thread_id / kWarpSize; }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderFirstTask(uint32_t thread_id) {
-    return BuilderThreadActive(thread_id) ? BuilderWarp(thread_id) : UINT32_MAX;
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderInstance(uint32_t thread_id) { return thread_id / kBuilderThreadCount; }
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderLocalThread(uint32_t thread_id) {
+    return thread_id % kBuilderThreadCount;
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderThreadForTask(uint32_t task_id) {
-    return (task_id % kBuilderWarpCount) * kWarpSize;
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderLocalWarp(uint32_t thread_id) {
+    return BuilderLocalThread(thread_id) / kWarpSize;
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderExpectedTaskCount(uint32_t thread_id, uint32_t task_count) {
-    const uint32_t first = BuilderFirstTask(thread_id);
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderOwnerForInstance(uint32_t builder_instance) {
+    return kBuilderOwner + builder_instance;
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderOwnerForThread(uint32_t thread_id) {
+    return BuilderOwnerForInstance(BuilderInstance(thread_id));
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderThreadCount(uint32_t builder_count) {
+    return builder_count * kBuilderThreadCount;
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderLeaderCount(uint32_t builder_count) {
+    return builder_count * kBuilderLeaderCount;
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE bool
+BuilderThreadActive(uint32_t thread_id, uint32_t builder_count = kDefaultBuilderCount) {
+    return BuilderCountValid(builder_count) && thread_id < BuilderThreadCount(builder_count) &&
+           (thread_id % kWarpSize) == 0U;
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
+BuilderFirstTask(uint32_t thread_id, uint32_t builder_count = kDefaultBuilderCount) {
+    return BuilderThreadActive(thread_id, builder_count) ? BuilderLocalWarp(thread_id) : UINT32_MAX;
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderThreadForTask(uint32_t task_id, uint32_t builder_instance = 0U) {
+    return builder_instance * kBuilderThreadCount + (task_id % kBuilderWarpCount) * kWarpSize;
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
+BuilderExpectedTaskCount(uint32_t thread_id, uint32_t task_count, uint32_t builder_count = kDefaultBuilderCount) {
+    const uint32_t first = BuilderFirstTask(thread_id, builder_count);
     return first == UINT32_MAX || first >= task_count ? 0U : 1U + (task_count - 1U - first) / kBuilderTaskStride;
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderExpectedLastTask(uint32_t thread_id, uint32_t task_count) {
-    const uint32_t count = BuilderExpectedTaskCount(thread_id, task_count);
-    return count == 0U ? UINT32_MAX : BuilderFirstTask(thread_id) + (count - 1U) * kBuilderTaskStride;
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
+BuilderExpectedLastTask(uint32_t thread_id, uint32_t task_count, uint32_t builder_count = kDefaultBuilderCount) {
+    const uint32_t count = BuilderExpectedTaskCount(thread_id, task_count, builder_count);
+    return count == 0U ? UINT32_MAX : BuilderFirstTask(thread_id, builder_count) + (count - 1U) * kBuilderTaskStride;
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderExpectedInsertWaitCount(uint32_t thread_id, uint32_t task_count) {
-    const uint32_t count = BuilderExpectedTaskCount(thread_id, task_count);
-    return count - (count != 0U && BuilderFirstTask(thread_id) == 0U ? 1U : 0U);
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
+BuilderExpectedInsertWaitCount(uint32_t thread_id, uint32_t task_count, uint32_t builder_count = kDefaultBuilderCount) {
+    const uint32_t count = BuilderExpectedTaskCount(thread_id, task_count, builder_count);
+    return count - (count != 0U && BuilderFirstTask(thread_id, builder_count) == 0U ? 1U : 0U);
 }
 
 SIMT_CROSS_CORE_G0_MODEL_INLINE uint64_t BuilderReportChecksum(
-    uint64_t nonce, uint32_t thread_id, uint32_t task_count
+    uint64_t nonce, uint32_t thread_id, uint32_t task_count, uint32_t wins, uint32_t first_task, uint32_t last_task,
+    uint32_t attempts, uint32_t prepares, uint32_t commits, uint32_t insert_waits, uint32_t claim_losses
 ) {
-    uint64_t value = nonce ^ (static_cast<uint64_t>(thread_id) << 32U) ^
-                     BuilderExpectedTaskCount(thread_id, task_count);
-    value ^= static_cast<uint64_t>(BuilderExpectedLastTask(thread_id, task_count)) << 1U;
-    value ^= static_cast<uint64_t>(BuilderExpectedInsertWaitCount(thread_id, task_count)) << 48U;
+    uint64_t value = nonce ^ (static_cast<uint64_t>(thread_id) << 32U) ^ task_count;
+    value ^= static_cast<uint64_t>(wins) << 1U;
+    value ^= static_cast<uint64_t>(first_task) << 7U;
+    value ^= static_cast<uint64_t>(last_task) << 19U;
+    value ^= static_cast<uint64_t>(attempts) << 37U;
+    value ^= static_cast<uint64_t>(prepares) << 43U;
+    value ^= static_cast<uint64_t>(commits) << 49U;
+    value ^= static_cast<uint64_t>(insert_waits) << 55U;
+    value ^= static_cast<uint64_t>(claim_losses) << 25U;
     value *= 0x9E3779B97F4A7C15ULL;
-    return value ^ (value >> 29U);
+    value ^= value >> 29U;
+    value *= 0xD6E8FEB86659FD93ULL;
+    return value ^ (value >> 31U);
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint64_t
+BuilderReportChecksum(uint64_t nonce, uint32_t thread_id, uint32_t task_count) {
+    const uint32_t wins = BuilderExpectedTaskCount(thread_id, task_count);
+    return BuilderReportChecksum(
+        nonce, thread_id, task_count, wins, wins == 0U ? UINT32_MAX : BuilderFirstTask(thread_id),
+        BuilderExpectedLastTask(thread_id, task_count), wins, wins, wins,
+        BuilderExpectedInsertWaitCount(thread_id, task_count), 0U
+    );
 }
 
 SIMT_CROSS_CORE_G0_MODEL_INLINE bool ConsecutiveTasksUseDifferentWarps(uint32_t task_id) {
-    return task_id == 0U || BuilderWarp(BuilderThreadForTask(task_id)) !=
-                                BuilderWarp(BuilderThreadForTask(task_id - 1U));
+    return task_id == 0U ||
+           BuilderLocalWarp(BuilderThreadForTask(task_id)) != BuilderLocalWarp(BuilderThreadForTask(task_id - 1U));
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE OwnerRole OwnerRoleAt(uint32_t owner) {
-    return owner < kAicOwnerCount
-               ? OwnerRole::AicExecutor
-               : (owner == kBuilderOwner ? OwnerRole::AivBuilder : OwnerRole::AivExecutor);
+SIMT_CROSS_CORE_G0_MODEL_INLINE bool IsBuilderOwner(uint32_t owner, uint32_t builder_count = kDefaultBuilderCount) {
+    return BuilderCountValid(builder_count) && owner >= kBuilderOwner && owner < kBuilderOwner + builder_count;
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE ExecEngineClass OwnerEngine(uint32_t owner) {
-    return owner < kAicOwnerCount
-               ? ExecEngineClass::Aic
-               : (owner > kBuilderOwner && owner < kOwnerCount ? ExecEngineClass::Aiv : ExecEngineClass::None);
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t AivExecutorCount(uint32_t builder_count = kDefaultBuilderCount) {
+    return BuilderCountValid(builder_count) ? kAivOwnerCount - builder_count : 0U;
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE bool OwnerCanExecute(uint32_t owner, ExecEngineClass engine_class) {
-    return owner != kBuilderOwner && owner < kOwnerCount && OwnerEngine(owner) == engine_class;
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t ExecutorCount(uint32_t builder_count = kDefaultBuilderCount) {
+    return kAicOwnerCount + AivExecutorCount(builder_count);
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE OwnerRole OwnerRoleAt(uint32_t owner, uint32_t builder_count = kDefaultBuilderCount) {
+    return owner < kAicOwnerCount ?
+               OwnerRole::AicExecutor :
+               (IsBuilderOwner(owner, builder_count) ? OwnerRole::AivBuilder : OwnerRole::AivExecutor);
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE ExecEngineClass
+OwnerEngine(uint32_t owner, uint32_t builder_count = kDefaultBuilderCount) {
+    return owner < kAicOwnerCount ?
+               ExecEngineClass::Aic :
+               (owner < kOwnerCount && !IsBuilderOwner(owner, builder_count) ? ExecEngineClass::Aiv :
+                                                                               ExecEngineClass::None);
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE bool
+OwnerCanExecute(uint32_t owner, ExecEngineClass engine_class, uint32_t builder_count = kDefaultBuilderCount) {
+    return owner < kOwnerCount && !IsBuilderOwner(owner, builder_count) &&
+           OwnerEngine(owner, builder_count) == engine_class;
 }
 
 SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t OwnerPhysicalBlock(uint32_t owner) {
@@ -508,9 +582,18 @@ SIMT_CROSS_CORE_G0_MODEL_INLINE uint64_t ExpectedWorkloadOutputPair(TaskKind kin
 }
 
 static_assert(kMainTaskCount == 1280U && kMainKernelTaskCount == 1024U, "main PA task counts changed");
-static_assert(kBuilderThreadCount == 2048U && kBuilderLeaderCount == 64U && kBuilderTasksPerLeaderMain == 20U,
-              "G0 builder must use 64 warp leaders from a 2048-thread launch");
-static_assert(kOwnerCount == 96U && kExecutorCount == 95U, "mixed owner topology changed");
+static_assert(
+    kBuilderThreadCount == 2048U && kBuilderLeaderCount == 64U && kBuilderTasksPerLeaderMain == 20U,
+    "G0 builder must use 64 warp leaders from a 2048-thread launch"
+);
+static_assert(
+    kMaxBuilderThreadCount == 4096U && kMaxBuilderLeaderCount == 128U,
+    "G1 must retain two independent 64-warp builder instances"
+);
+static_assert(
+    kOwnerCount == 96U && kExecutorCount == 95U && kAicOwnerCount + kAivOwnerCount - kMaxBuilderCount == 94U,
+    "mixed owner topology changed"
+);
 static_assert(kWorkloadTileBytes == 65536U && kWorkloadBytes == 12713984U, "workload layout changed");
 static_assert(sizeof(TensorDesc) == kTensorDescBytes, "TensorDesc ABI changed");
 static_assert(offsetof(TensorDesc, shapes) == 44U && offsetof(TensorDesc, extent_elem_cache) == 64U &&
