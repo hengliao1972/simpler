@@ -6673,3 +6673,31 @@ CPU 全量和远端错误收敛测试、CCEC 两类构建及 A5 B256 完整终�
 重读及三项重复范围判断，但 12 对交错的基线/候选中位仅为
 `1007.850/1005.596 us`，配对差中位 `+0.016 us`，只有 `6/12` 对更快。
 不能用源码上确定少一次读取代替端到端收益证据。
+
+### 15.58 否决 TensorDesc 64-bit 宽拷贝候选
+
+cross-core 的 `CopyGmTensor()` 原来按 byte volatile 搬运完整 128B descriptor。
+本轮依据仓内现有 64-bit descriptor 读取方式，把它单变量改为 16 个 64-bit
+word 搬运，不调整 DCCI、barrier、atomic 或发布顺序。
+
+CPU/CCEC 与 A5 完整终态均通过，但冻结基线的 6 对正反交错中，逐 byte/64-bit
+候选中位为 `1003.285/1011.602 us`，候选减基线的配对差中位为
+`+5.944 us`，仅 `2/6` 对候选更快。该结果足以否决保留，不把“窄指令数量
+减少”误写成设备收益；代码已恢复逐 byte 实现。
+
+### 15.59 将 writer register-mask 校验并入 delta 构造
+
+`PrepareSharedTaskWriterDelta()` 原有一轮独立 tensor-tag 扫描只用于重建
+`expected_register_mask`，紧接着的 delta 构造又扫描相同参数。本轮在后者中
+同步累计 expected mask，并继续逐位比较 `context.register_mask`；所有引用、
+producer、唯一性、region 和 writer-shape 检查不变，也不依赖 PA task kind。
+
+CPU 全套、CCEC 两类构建和 A5 B256 终态均通过。冻结 `db70ee6a` 的 12 对正反
+交错中，基线/候选中位为 `1017.082/1001.396 us`，改善
+`15.686 us（1.542%）`；均值改善 `0.858%`，配对差中位
+`-11.897 us`，候选 `10/12` 对更快。
+
+full-swimlane 的 1280 Build、1024 kernel、2048 fresh output、768 symbol
+commit 和 6528 次 DCCI 全部闭合；Materialize 的 output publish 前累计
+core-work 从 `7,309,547` 降至 `7,164,158 cycles`，与删除一次参数扫描的代码
+位置一致。该通用、小范围候选正式保留。

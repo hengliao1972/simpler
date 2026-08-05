@@ -5220,3 +5220,72 @@ CPU 通过；CCEC AIC 等价 finish 出口从 4 合并为 3，临时精确锁定
 完成 12 对交错。基线/候选中位为 `1007.850/1005.596 us`，但配对差中位仅
 `+0.016 us`，恰好 `6/12` 对更快。固定少一次 GM byte 重读没有转化为稳定
 端到端收益，候选与临时门槛完整撤回。
+
+## 2026-08-05：S6.75 否决 TensorDesc 64-bit 宽拷贝候选
+
+`CopyGmTensor()` 搬运一个 128B `TensorDesc` 时原本执行逐 byte volatile
+load/store。仓内 execution payload 已有按 `uint64_t` 读取同一 descriptor 的
+CCEC 先例，因此本轮只把该 helper 改成 16 个 64-bit word 搬运；搬运总字节数、
+DCCI、StoreBarrier、published atomic 和调用点均不变。
+
+CPU 全套与 CCEC perf-clock 构建通过，A5 B256 单次业务、payload、严格插入、
+1024 kernel 和 FinalDrain 终态全部 PASS。随后用冻结的 `db70ee6a` 周期 16
+产物做 6 对 B-C/C-B 反转交错：
+
+```text
+逐 byte 基线中位数 = 1003.285 us
+64-bit 候选中位数 = 1011.602 us
+候选减基线配对差中位数 = +5.944 us
+候选获胜 = 2 / 6 对
+```
+
+候选没有性能保留依据。减少源码循环迭代不能证明 A5 的 GM 事务更少；访问宽度、
+代码生成和 Scalar load/store 流水的组合反而可能抵消收益。该修改已完整撤回，
+后续不得仅凭“128 次变 16 次”恢复它。
+
+## 2026-08-05：S6.76 将 writer register-mask 校验并入 delta 构造
+
+`PrepareSharedTaskWriterDelta()` 原来先完整扫描一次全部 tensor tag，单独构造
+`expected_register_mask`；随后立即再次按相同索引扫描 tag、引用和
+`context.register_mask` 来构造 writer delta。前一轮没有产生后续可复用的
+引用信息。
+
+本轮删除独立 tag 扫描，在既有 delta 循环中同步累计
+`expected_register_mask`，循环结束后仍要求它与 `context.register_mask`
+逐位相等。`InspectSharedWriterIntent()`、`ValidateSharedWriterIntentSet()`、
+空指针、symbol 唯一性、ordinary region、producer 范围以及 PA writer shape
+校验均保持；实现不读取 task kind、batch 或固定 DAG，适用于通用 shared
+writer-intent 参数。
+
+CPU 全套和 CCEC perf-clock/full-swimlane 构建通过。冻结 `db70ee6a` 基线与
+候选按 B-C/C-B 反转顺序交错 12 对，统一统计 Startup 开始到 FinalDrain
+结束：
+
+```text
+基线: min / median / max / mean
+      977.117 / 1017.082 / 1028.739 / 1011.584 us
+候选: min / median / max / mean
+      976.067 / 1001.396 / 1035.339 / 1002.900 us
+
+独立中位数改善 = 15.686 us / 1.542%
+独立均值改善   = 8.684 us / 0.858%
+配对差中位数   = -11.897 us
+候选获胜       = 10 / 12 对
+```
+
+候选 full-swimlane 位于：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260805_063700_2192398/
+```
+
+其 lifecycle 为 `1120.551 us`，Submit 为 `1013.464 us`；1280 Build、1024
+kernel、2048 fresh output、768 symbol commit 和 6528 次 DCCI 全部闭合。
+与 S6.74 的 period16 full-swimlane 对照，Materialize 中 output publish 之前的
+累计 core-work 从 `7,309,547` 降到 `7,164,158` cycles，减少
+`145,389 cycles（1.989%）`；完整 Materialize 从 `12,313,656` 降到
+`12,238,519` cycles。同期 Register 等严格插入等待会随 owner 到达顺序波动，
+不能用单份泳道的总 Submit 差替代冻结 perf-clock A/B。
+
+该项以完全相同的逐位校验结果替代重复遍历，没有新增共享状态、atomic、DCCI
+或错误传播窗口，正式保留。

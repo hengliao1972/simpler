@@ -64,28 +64,22 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
          !ValidateSharedWriterIntentSet(args, task_id))) {
         return false;
     }
+    // delta 构造本来就按全部参数顺序扫描；在同一轮累计 writer tag mask，
+    // 保留 context.register_mask 的完整一致性证明，避免此前紧邻的第二轮
+    // 纯 tag 扫描。该合并不信任 PA kind，也不放宽任一引用检查。
     uint32_t expected_register_mask = 0;
-    for (int32_t index = 0;
-         index < args.tensor_count; ++index) {
-        if (IsSharedWriterIntentTag(
-                TaskTag(args, static_cast<uint32_t>(index))
-            )) {
-            expected_register_mask |=
-                1U << static_cast<uint32_t>(index);
-        }
-    }
-    if (context.register_mask != expected_register_mask) {
-        return false;
-    }
     uint32_t register_mask = context.register_mask;
     for (int32_t index = 0; index < args.tensor_count; ++index) {
         const uint32_t bit =
             1U << static_cast<uint32_t>(index);
+        const TensorArgType tag =
+            TaskTag(args, static_cast<uint32_t>(index));
+        if (IsSharedWriterIntentTag(tag)) {
+            expected_register_mask |= bit;
+        }
         if ((register_mask & bit) == 0) {
             continue;
         }
-        const TensorArgType tag =
-            TaskTag(args, static_cast<uint32_t>(index));
         if (!IsSharedWriterIntentTag(tag)) {
             return false;
         }
@@ -182,7 +176,8 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
         }
         register_mask &= ~bit;
     }
-    if (register_mask != 0) {
+    if (register_mask != 0 ||
+        context.register_mask != expected_register_mask) {
         return false;
     }
     // Inspect/Validate 与 delta 构造都只读取同一个 const TaskArgs；两者对
