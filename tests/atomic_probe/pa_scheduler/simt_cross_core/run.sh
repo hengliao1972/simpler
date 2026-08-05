@@ -13,6 +13,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 S0_ROOT="$SCRIPT_DIR/protocol_probe"
 S0_BUILD="$S0_ROOT/build/ccec"
+ATOMIC_ROOT="$S0_ROOT/simt_atomic"
+ATOMIC_BUILD="$ATOMIC_ROOT/build/ccec"
 GM_ROOT="$SCRIPT_DIR/gm"
 GM_BUILD="$GM_ROOT/build/ccec"
 
@@ -21,6 +23,8 @@ usage() {
 Usage:
   ./run.sh build-s0
   ./run.sh run-s0 --device N [--runs N]
+  ./run.sh build-atomic
+  ./run.sh run-atomic --device N [--runs N]
   ./run.sh build-s1
   ./run.sh run-s1 --device N [--runs N]
   ./run.sh build-s2
@@ -30,6 +34,8 @@ Usage:
 
 build-s0 运行 CPU optimized/ASan/UBSan/TSan，并构建、静态检查 CCEC/ELF。
 run-s0 只运行已构建的真实 A5 探针；调用前仍需按仓库规则执行 A5 precheck。
+build-atomic 运行 SIMT atomic CPU 三套测试，并构建、静态检查 CCEC/ELF。
+run-atomic 在真实 A5 上验证 32/64/1024/2048 线程的 GM uint64 CAS/add 同地址竞争。
 build-s1 运行单 Vector 的 CPU 三套测试，并构建、静态检查 1:2 mixed CCEC/ELF。
 run-s1 运行 AIV0 SIMT builder -> AIV1 Vector executor 的真实 A5 四模式探针。
 build-s2 运行单 Cube 的 CPU 三套测试，并构建、静态检查 1:2 mixed CCEC/ELF。
@@ -63,6 +69,23 @@ case "$ACTION" in
         fi
         "$S0_BUILD/simt_cross_core_s0_host" \
             --kernel "$S0_BUILD/simt_cross_core_s0_kernel.o" "$@"
+        ;;
+    build-atomic)
+        if [[ $# -ne 0 ]]; then
+            echo "build-atomic does not accept additional arguments." >&2
+            exit 1
+        fi
+        "$ATOMIC_ROOT/cpu/build.sh"
+        "$ATOMIC_ROOT/ccec/build.sh"
+        ;;
+    run-atomic)
+        if [[ ! -x "$ATOMIC_BUILD/simt_cross_core_atomic_host" ||
+              ! -s "$ATOMIC_BUILD/simt_cross_core_atomic_kernel.o" ]]; then
+            echo "SIMT atomic artifacts are missing; run: $0 build-atomic" >&2
+            exit 1
+        fi
+        "$ATOMIC_BUILD/simt_cross_core_atomic_host" \
+            --kernel "$ATOMIC_BUILD/simt_cross_core_atomic_kernel.o" "$@"
         ;;
     build-s1)
         if [[ $# -ne 0 ]]; then

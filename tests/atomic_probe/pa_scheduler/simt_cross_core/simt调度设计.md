@@ -183,6 +183,14 @@ winner 成功后对 payload 做 reader DCCI + DSB；writer DCCI 不是必要条�
 这个结论只覆盖 A5、当前普通 GM payload、同地址重复复用和现有 compiler
 DCCI 配置，不能外推为所有 GM 访问都使用相同 cache 协议。
 
+这组数据能支持的一致性口径是“SIMT/V 侧普通 GM 写”与“Main
+Scalar/S 侧普通 GM 读”不能按单一自动一致 DCache 使用，不是对未公开的
+物理 cache 层次做推测。`asc_threadfence()` 只建立 SIMT 普通 store 与后续
+atomic 发布的顺序；Scalar reader 仍需对 payload line 执行 DCCI + DSB。
+atomic-only control line 依赖原子访问的同地址顺序，不能把这个性质外推到旁边的
+普通 payload line。`ld_dev` 仅在探针诊断路径中用于绕开 Scalar 普通
+DCache 读取，不代替正式 executor 的 reader DCCI 合同。
+
 ### 3.3 UBUF 构建路径
 
 UBUF 是每个 AIV 私有、不可跨核共享的暂存区。第一版只做单槽，之后扩展
@@ -243,6 +251,29 @@ S3 起不再重复四种已淘汰的 DCCI 模式。两个 Claim winner 都固定
 每个 stage 仍必须用同地址重复运行和完整 golden 证明这条冻结规则没有被新
 协议破坏。
 
+### 3.6 SIMT atomic 同地址竞争合同
+
+S0 只由 SIMT thread 0 执行 CAS，证明了指令可编译且单线程路径可用，
+但没有覆盖多 warp 对同一 GM 地址竞争。A0 独立探针只验证当前调度会
+用到的 GM `uint64_t asc_atomic_cas` 和 `asc_atomic_add`，不扩展到 UBUF、
+其他数据类型或其他 atomic 操作。
+
+本机 CANN dav_3510 头文件定义 warp size 为 32、SIMT 最大线程数为
+2048；本机 `ops-nn` 同时存在 1024-thread 常用算子和 2048-thread
+`sparse_tensor_dense_mat_mul` 实现。因此 A0 固定验证 32/64/1024/2048
+四档，分别覆盖 1/2/32/64 warp。每档必须同时满足：
+
+- 同地址 CAS 恰好一个 winner，winner 返回 64-bit initial value；
+- 其余 CAS loser 全部返回 winner 写入的最终 64-bit desired value；
+- 同地址 atomic-add 最终值精确增加 thread count，返回 ticket 是
+  `[initial, initial + thread_count)` 的不重不漏排列；
+- active thread marker 全部匹配，inactive tail 保持 sentinel，所有 guard 不变；
+- 同一 device allocation 重复使用，每轮改变 nonce 且验证 64-bit 高位。
+
+Main Scalar 在 V→S completion 之后用 `ld_dev` 建立设备侧诊断摘要，host
+对所有逐线程返回值再做一次精确 oracle。这里故意不使用 Scalar 普通
+GM load，避免把 SIMT/Scalar 普通 DCache 可见性与 atomic 返回值语义混在一起。
+
 ## 4. 目录与分阶段实施
 
 ### 4.1 计划目录
@@ -256,6 +287,7 @@ simt_cross_core/
     cpu/                  # 协议语义和受控交错
     ccec/                 # 最小 mixed A5 探针
     test/
+    simt_atomic/          # GM uint64 CAS/add 多 warp 同地址独立探针
   gm/
     common/
     cpu/
@@ -283,6 +315,7 @@ simt_cross_core/
 | S1 | 单 Vector task | AIV0 构建，AIV executor 唯一领取并通过 golden。 |
 | S2 | 单 Cube task | AIV0 构建，AIC executor 唯一领取并通过 golden。 |
 | S3 | Vector + Cube | 两个 task 同时发布，engine 路由、完成和 drain 正确。 |
+| A0 | SIMT atomic 竞争 | 32/64/1024/2048 thread 的 GM uint64 CAS/add 返回值与终值精确。 |
 | S4 | 多 task、单 builder | task-id 扫描、fanin、token busy 和无遗失。 |
 | G0 | GM 完整 PA | shared TensorMap 主 Case 的五类 task、DAG 和 golden 闭合。 |
 | G1 | AIV0+AIV1 GM | 两 builder 竞争构建；两者仍零 task execute。 |

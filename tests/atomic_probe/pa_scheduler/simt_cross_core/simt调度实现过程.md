@@ -923,7 +923,162 @@ task，并让 AIV1/AIC 在同一次 mixed kernel launch 中按 engine 路由执�
 S3 随本节所在提交独立交付。下一阶段 S4 扩展为多 task、单 builder，重点验证
 SIMT thread-stride task 扫描、executor token busy、无遗失和更大完成计数。
 
-## 7. 阶段状态索引
+## 7. 2026-08-05：A0 SIMT atomic 同地址竞争探针
+
+### 7.1 为什么需要独立验证
+
+S0～S3 已经使用 SIMT `asc_atomic_cas`，S3 还使用了 atomic-add，但那些
+用例的目标是调度协议：S0 的 CAS 只由 thread 0 执行，S3 的构建线程数也只有
+2。它们能证明指令在当前组合路径中可用，但不能单独回答以下问题：
+
+1. 多个 warp 同时 CAS 同一 GM `uint64_t` 时是否恰好一个 winner；
+2. winner 和 loser 返回的 old value 是否保留完整 64 bit；
+3. 同地址 atomic-add 的返回 ticket 是否不重不漏；
+4. 语义能否从单 warp 一直保持到工具链声明的最大线程数。
+
+因此在 S4 之前增加 A0 独立项，只验证调度会用到的 GM `uint64_t`
+CAS/add，不把结论外推到 UBUF、其他数据类型或其他 atomic 操作。
+
+### 7.2 接口、warp 与线程上限查证
+
+本阶段先查本机 CANN 9.1.0 weekly 20260708，没有臆想接口：
+
+- `simt_api/device_atomic_functions.h` 明确声明 GM
+  `uint64_t asc_atomic_cas(...)` 和 `asc_atomic_add(...)`；
+- `device_atomic_functions_impl.h` 分别下降到 `atomicCAS` 与 `atomicAdd`；
+- dav_3510 `kernel_simt_warp_level_impl.h` 的 `WARP_SIZE` 为 32；
+- dav_3510 `kernel_simt_constant.h` 的 `SIMT_MAX_THREAD_NUM` 为 2048；
+- 本机 `ops-nn` 存在多个 1024-thread 实现，也有
+  `sparse_tensor_dense_mat_mul` 以 2048 作为 `LAUNCH_BOUND` 和实际
+  `dim3` 线程数。
+
+因此没有继续沿用 S0 的 64-thread 最小配置，而是固定四档：
+
+| 线程数 | warp 数 | 覆盖目的 |
+| -----: | ------: | -------- |
+| 32 | 1 | 单 warp 基本语义。 |
+| 64 | 2 | 最小跨 warp 竞争。 |
+| 1024 | 32 | 本机算子常用的大并发配置。 |
+| 2048 | 64 | 当前 dav_3510 头文件声明上限。 |
+
+### 7.3 探针 ABI 和精确 oracle
+
+`protocol_probe/simt_atomic/` 是独立子目录，但复用本目录已有的
+`common/shared_protocol.h` cacheline 对齐定义：
+
+- `common/atomic_probe.h`：固定 32/64/1024/2048 配置、完整
+  64-bit initial/desired/ticket/marker 生成规则与 49,856 B host/device ABI；
+- `test/test_simt_atomic.cpp`：用 C++ atomic 建立与设备 oracle 一致的
+  portable 语义模型；
+- `cpu/build.sh`：optimized、ASan/UBSan、TSan 三套门槛；
+- `ccec/kernel.cpp`：AIV Main Scalar 发射最多 2048 个 SIMT thread，
+  所有 active thread 对同一 CAS cell 和同一 add cell 执行原子指令；
+- `ccec/host.cpp`：单次分配 device state，四档与多轮全部复用同一地址，
+  逐线程核对 CAS old value、add ticket、marker、inactive tail 和 guard；
+- `ccec/build.sh`：锁定源码顺序、CCEC bitcode intrinsic、ELF symbol、
+  relocation 和 `MIX_AIV_MAIN [0:1]` metadata；
+- `run.sh`：增加 `build-atomic` 与 `run-atomic` 统一入口。
+
+每个 SIMT thread 按以下顺序执行：
+
+```text
+same-address uint64 CAS
+  -> same-address uint64 atomic-add
+  -> 写本 thread 的 CAS old value / add ticket / marker
+  -> asc_threadfence
+```
+
+CAS initial 与每个 thread 的 desired 有不同的固定高位，且低 12 bit 唯一编码
+thread id。因此 host 不只统计 winner 数，还可以验证“返回 initial 的线程”
+与“最终 desired 的 owner”必须是同一个 thread。add 结果在 host 排序后必须
+精确等于 `[initial, initial + thread_count)`，不允许只用 final count 推断。
+
+Main Scalar 在 V→S wait 后用 `ld_dev` 读取 atomic cell 和逐线程诊断数据，
+不使用 Scalar 普通 GM load。这一选择是为了隔离 atomic 语义与 S0～S2
+已证实存在差异的 SIMT/Scalar 普通 DCache 可见性，不表示正式 executor
+可以省略 payload reader DCCI。
+
+### 7.4 CPU 与 CCEC 结果
+
+统一构建命令：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-atomic
+```
+
+CPU 模型不用 OS thread 数伪装硬件上限，只对 32/64/128 actor 验证相同语义。
+为避免 sanitizer 无意义地反复创建大量 OS thread，最终统一入口轮数为：
+
+```text
+[PASS] SIMT atomic CPU rounds=16 thread_configs=32/64/128: optimized
+[PASS] SIMT atomic CPU rounds=8  thread_configs=32/64/128: ASan+UBSan
+[PASS] SIMT atomic CPU rounds=4  thread_configs=32/64/128: TSan
+```
+
+CCEC 和静态门槛实际通过：
+
+```text
+[CHECK] SIMT atomic source closure and full-contention sequence
+[CHECK] bitcode contains 2048-thread SIMT launch, GM uint64 CAS/add,
+        return stores, fence and V/S wait
+[CHECK] ELF exports only AIV Main entry; SIMT atomic entry is local;
+        metadata is MIX_AIV_MAIN [0:1]
+[BUILD] SIMT atomic CCEC complete
+```
+
+optimized bitcode 中同时存在 `llvm.hivm.atom.CAS.G.u64` 和
+`llvm.hivm.atom.ADD.G.u64`，以及 TID、SIMT info、workitem fence、V/S event、
+`LD.DEV.u64.GM` 和 `ST.DEV.u64`。最终 ELF 只导出一个非空 AIV Main
+entry，并保留一个非空 LOCAL SIMT entry，无 undefined GLOBAL 和 relocation。
+
+### 7.5 真实 A5 结果
+
+当前 shell 仍无 `npu-smi`、无 `task-submit`，因此按用户已授权的 device 0
+未加锁路径运行。ACL 报告 `Ascend950PR_958b`，本轮不记录性能。命令：
+
+```bash
+timeout --foreground 300s \
+  tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-atomic --device 0 --runs 100
+```
+
+真实输出：
+
+```text
+[DEVICE] id=0 soc=Ascend950PR_958b state_bytes=49856
+         max_threads=2048 warp_size=32
+[SUMMARY] threads=  32 warps= 1 CAS+add+returns+guards=100/100
+[SUMMARY] threads=  64 warps= 2 CAS+add+returns+guards=100/100
+[SUMMARY] threads=1024 warps=32 CAS+add+returns+guards=100/100
+[SUMMARY] threads=2048 warps=64 CAS+add+returns+guards=100/100
+[PASS] A5 SIMT GM uint64 atomic runs=100
+       configs=32/64/1024/2048 reused_address=yes
+```
+
+| 线程 | warp | 同地址 CAS | 同地址 add ticket | marker/inactive/guard | 结果 |
+| ---: | ---: | ---------: | ----------------: | --------------------: | ---: |
+| 32 | 1 | 100/100 | 100/100 | 100/100 | PASS |
+| 64 | 2 | 100/100 | 100/100 | 100/100 | PASS |
+| 1024 | 32 | 100/100 | 100/100 | 100/100 | PASS |
+| 2048 | 64 | 100/100 | 100/100 | 100/100 | PASS |
+
+四档都是同一个 device allocation 上重复地址运行；每轮都检查恰好一个 CAS
+winner、全部 loser 的 old value、最终 CAS owner、完整 add ticket 排列、最终
+add count、active marker、inactive tail、6 条 guard 和 64-bit 高位。
+
+### 7.6 阶段结论与边界
+
+A0 证明在当前 `Ascend950PR_958b` 和 CANN 20260708 组合上，SIMT
+thread 可继续使用 GM `uint64_t asc_atomic_cas/add`，且同地址语义在
+1、2、32、64 warp 下均精确。当前工具链和真实 A5 都接受 2048-thread，
+因此 1024 是常用规模，不是本环境的已证实硬上限。
+
+这个结论不包含 UBUF atomic、非 `uint64_t` 类型、CAS/add 之外的指令、
+多 AIV 同时对同一 atomic 地址竞争，也不改变普通 payload 的 reader DCCI
+规则。本阶段没有测量性能，没有生成泳道图。A0 随本节所在提交独立交付，
+然后继续 S4。
+
+## 8. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -931,7 +1086,8 @@ SIMT thread-stride task 扫描、executor token busy、无遗失和更大完成�
 | S0 基础协议与 SIMT 自检 | 完成 | `399d5704`：CPU 三套 PASS；A5 同 AIV 100×4 模式完成，reader DCCI 为最小可靠序列。 |
 | S1 单 Vector task | 完成 | `975da5ea`：CPU 三套 PASS；1:2 mixed ELF 静态门槛 PASS；A5 跨 AIV 100×4 模式完成，reader DCCI 为最小可靠序列。 |
 | S2 单 Cube task | 完成 | `2e3034d7`：CPU 三套 PASS；1:2 mixed ELF/Cube intrinsic 门槛 PASS；A5 AIV→AIC 100×4 模式完成，reader DCCI 为最小可靠序列。 |
-| S3 Vector + Cube | 完成 | CPU 三套 PASS；双 task mixed ELF/Vector/Cube 门槛 PASS；A5 同地址复用 100/100，完成计数和 drain 精确闭合；随本次 S3 提交交付。 |
+| S3 Vector + Cube | 完成 | `5dff1124`；CPU 三套 PASS；双 task mixed ELF/Vector/Cube 门槛 PASS；A5 同地址复用 100/100，完成计数和 drain 精确闭合。 |
+| A0 SIMT atomic 竞争 | 完成 | CPU 三套 PASS；CCEC/ELF 门槛 PASS；A5 32/64/1024/2048 线程各 100/100；随本次 A0 提交交付。 |
 | S4 多 task、单 builder | 未开始 | - |
 | G0 GM 完整 PA | 未开始 | - |
 | G1 双 builder GM | 未开始 | - |
