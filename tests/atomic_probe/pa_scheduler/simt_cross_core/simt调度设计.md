@@ -274,6 +274,37 @@ Main Scalar 在 V→S completion 之后用 `ld_dev` 建立设备侧诊断摘要�
 对所有逐线程返回值再做一次精确 oracle。这里故意不使用 Scalar 普通
 GM load，避免把 SIMT/Scalar 普通 DCache 可见性与 atomic 返回值语义混在一起。
 
+### 3.6.1 同 warp 串行与跨 warp 独立推进合同
+
+A1 不用“发射了 64 个 thread”推断两个 warp 一定并行，而是把 forward
+progress 和墙钟区间分别做成可证伪的设备 oracle。公开 SIMT `clock()` 在
+当前 CANN 9.1 实现中落到 `__cce_simt_get_CLOCK64()`；warp id 没有独立 API，
+固定由 `threadIdx.x / 32` 推导，lane 由 `threadIdx.x % 32` 推导。
+
+四种模式复用同一 A/B 工作代码和同一份 GM 状态：
+
+- `A-only`、`B-only` 分别记录两条不同代码路径的 CLOCK64 区间与 checksum；
+- `same-warp` 只让 warp0 的 lanes 0..15 和 lanes 16..31 进入互斥外层
+  分支，只有 leader tid0/tid16 执行握手和 A/B work；
+- `cross-warp` 把 A/B 外层分支分别放在 warp0/warp1，同样只有 leader
+  tid0/tid32 执行握手和 work；
+- A/B leader 先 CAS 发布自己的 ready，再用 `atomic-add(0)` 有界读取对方
+  ready，所有等待同时受最大 poll 数和 CLOCK64 deadline 限制。
+
+每份 CLOCK64 区间从对应 `RunA/RunB` 入口开始，包含握手、poll 和 work。
+同 warp 的一条分歧路径在另一条路径尚未执行时无法完成双向握手，因此先执行
+的一方必须 timeout，后一方只能单向观察到前者；两份总区间必须不重叠。
+跨 warp 只有双方都在对方的 bounded poll 窗口内取得过 forward progress，
+才可能同时成功；对应总区间必须重叠。这里的“跨 warp 独立推进”不等价于两条
+指令每周期同时 issue：warp 仍共享执行管线，所以 A1 不把设备总耗时强行断言为
+`max(A,B)`。CPU 的 step oracle 另行验证理想调度关系
+`same=A+B`、`cross=max(A,B)`，设备结论以握手因果和 CLOCK64 区间为准。
+
+每轮四种模式使用不同 nonce，但复用同一 device allocation；host 必须核对
+active/inactive report、精确 tid/warp/lane、A/B checksum、ready、guard 和
+Main Scalar 的 `ld_dev` 摘要。A1 是调度语义探针，不生成泳道图，也不作为
+完整 PA 的性能数字。
+
 ### 3.7 多 task 扫描、busy token 与 fan-in 合同
 
 S4 使用 16 个交错编号的 task：偶数 task 为 Vector，奇数 task 为
@@ -314,6 +345,7 @@ simt_cross_core/
     ccec/                 # 最小 mixed A5 探针
     test/
     simt_atomic/          # GM uint64 CAS/add 多 warp 同地址独立探针
+    warp_concurrency/     # 同 warp 分歧串行与跨 warp 独立推进探针
   gm/
     common/
     cpu/
@@ -342,6 +374,7 @@ simt_cross_core/
 | S2 | 单 Cube task | AIV0 构建，AIC executor 唯一领取并通过 golden。 |
 | S3 | Vector + Cube | 两个 task 同时发布，engine 路由、完成和 drain 正确。 |
 | A0 | SIMT atomic 竞争 | 32/64/1024/2048 thread 的 GM uint64 CAS/add 返回值与终值精确。 |
+| A1 | warp 推进语义 | 同 warp 握手不能双向完成且区间串行；跨 warp 双向完成且区间重叠。 |
 | S4 | 多 task、单 builder | task-id 扫描、fanin、token busy 和无遗失。 |
 | G0 | GM 完整 PA | shared TensorMap 主 Case 的五类 task、DAG 和 golden 闭合。 |
 | G1 | AIV0+AIV1 GM | 两 builder 竞争构建；两者仍零 task execute。 |

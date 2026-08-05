@@ -1244,7 +1244,119 @@ S4 已证明一个固定 AIV0 可以用 4 个 SIMT warp 构建多份独立 task�
 本阶段没有测性能、没有生成泳道图；未加锁设备墙钟不作性能结论。S4 随本次
 阶段提交交付，不 push。下一阶段 G0 才把这一能力接入 GM 版完整 PA DAG。
 
-## 9. 阶段状态索引
+## 9. A1：同 warp 串行与跨 warp 独立推进
+
+### 9.1 验证问题与接口查证
+
+S4 修正为 4 warp 后，`tid` 分布只能证明任务确实落在不同 warp，仍不能直接
+回答“同 warp 的不同分支是否串行、不同 warp 的不同代码能否独立推进”。A1
+因此建立独立的 `protocol_probe/warp_concurrency/`，不改 S4 协议，也不把
+thread 数量当作并行证据。
+
+先查当前 CANN 9.1 安装和本机 `ops-nn/control/sleep` 实现，确认：
+
+- `simt_api/asc_simt.h` 提供的 SIMT `clock()` 实际使用
+  `__cce_simt_get_CLOCK64()`；
+- thread id 使用 `threadIdx.x`，warp/lane 分别按 `/32` 和 `%32` 推导；
+- GM `uint64_t` 没有单独 atomic-load API，本探针复用已经由 A0 证明的
+  `asc_atomic_cas` 发布和 `asc_atomic_add(address, 0)` 读取；
+- CCEC optimized bitcode 中对应符号必须包含
+  `llvm.hivm.get.CLOCK64`、`llvm.hivm.atom.CAS.G.u64` 和
+  `llvm.hivm.atom.ADD.G.u64`。
+
+### 9.2 CPU 与设备 oracle
+
+CPU 模型显式区分 outer-branch mask 和真正执行 actor 的 leader mask，并保存
+warp id、leader lane 和 cooperative dispatch epoch。同 warp 使用 warp0 的
+`0x0000ffff/0xffff0000` 两个互斥外层 mask，executing mask 分别只有
+lane0/lane16。模型同时覆盖 A-first 和 B-first：先执行的路径发布后有界等待
+4 次并 timeout，之后另一条路径才能开始并观察前者。跨 warp 使用 warp0/warp1
+两个 outer actor 每 epoch 各推进一次，executing mask 都只有 lane0，双方在
+第二个 epoch 都观察到对方。non-leader mailbox 访问次数必须为 0。
+
+另设不依赖 host wall time的 step oracle，覆盖多组正常值和零边界：
+
+| A steps | B steps | A-only | B-only | same warp | cross warp |
+| ------- | ------- | ------ | ------ | --------- | ---------- |
+| 7 | 11 | 7 | 11 | 18 | 11 |
+
+所有用例都要求 `same=A+B`、`cross=max(A,B)`。这只是理想 cooperative
+调度模型，不拿它替代 A5 指令管线事实。
+
+设备统一发射 64 thread，四种模式复用相同 A/B 工作函数：
+
+- `AOnly`：tid0；
+- `BOnly`：tid16；
+- `SameWarp`：仅 warp0，A/B 分支 leader 为 tid0/tid16；
+- `CrossWarp`：A/B 分别位于 warp0/warp1，leader 为 tid0/tid32。
+
+实现检查中曾发现 `SameWarp` 首版只判断 lane，导致 64-thread launch 的
+warp1 也会重复写 ready/report；在设备运行前已修为先限定 `warp==0`，host
+仍逐字段要求精确 tid0/tid16，不能容忍重复 writer。A/B 都先 CAS 发布 ready，
+再进行最多 200000 次、同时受 CLOCK64 deadline 约束的 atomic poll。Main
+Scalar 等 V→S completion 后只用 `ld_dev` 汇总报告，host 再核对全部 control、
+ready、report、checksum、inactive sentinel、atomic padding 和五条 guard。
+
+### 9.3 构建与静态证据
+
+统一入口：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-warp
+```
+
+结果：
+
+- CPU optimized、ASan+UBSan、TSan 全部 PASS；
+- dav-c310-vec CCEC object 和 optimized bitcode 构建通过；
+- bitcode 同时包含 64-thread SIMT launch/TID、CLOCK64、GM uint64 CAS/add、
+  workitem fence、V/S flag 和 Scalar `ld_dev/st_dev`；
+- 最终 ELF 只导出一个 AIV Main global entry，SIMT entry 为 local，metadata
+  为 `MIX_AIV_MAIN [0:1]`，无 undefined global 和 relocation；
+- GCC 15 ACL host 在 `-Wall -Wextra -Werror` 下通过。
+
+### 9.4 真实 A5 结果
+
+本轮再次执行仓库 A5 precheck；当前 shell 没有 `npu-smi` 和 `task-submit`，
+但 `/dev/davinci0` 存在，因此沿用用户已经明确授权的 device 0 未加锁功能验证
+路径。ACL 实际报告 `Ascend950PR_958b`。先 smoke 1 轮，再以同一个 896-byte
+device allocation 连续复用 100 轮：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-warp --device 0 --runs 100
+```
+
+100 轮全部 PASS。CLOCK64 是原始 tick，不换算 ns；下表为 100 轮摘要：
+
+| 模式 | PASS | span 平均 | A 区间平均 | B 区间平均 | poll | handshake | 区间关系 |
+| ---- | ---- | --------: | ---------: | ---------: | ---- | --------- | -------- |
+| AOnly | 100/100 | 1,060,021.5 | 1,060,021.5 | - | 0/- | N/- | single |
+| BOnly | 100/100 | 1,120,029.0 | - | 1,120,029.0 | -/0 | -/N | single |
+| SameWarp | 100/100 | 97,630,251.2 | 96,508,663.3 | 1,121,012.6 | 200000/1 | T/S | disjoint |
+| CrossWarp | 100/100 | 1,121,257.7 | 1,062,052.3 | 1,121,125.8 | 1/1 | S/S | overlap |
+
+`SameWarp` 的 A 区间故意包含 200000 次超时 poll，所以不能拿它当作纯 A
+workload 性能；它的用途是制造因果判据。A timeout 后 B 才开始，100 轮始终
+是 `T/S`，span 与本轮 A/B 两段区间之和只差约 575 tick（0.000589%），符合
+分歧路径串行执行。
+
+`CrossWarp` 100 轮始终是 `S/S`：双方都在对方 bounded poll 尚未结束时发布
+ready，形成双向 forward-progress 证据，而且包含握手、poll 和 work 的
+`RunA/RunB` 总区间始终重叠。其平均 span 只比较慢的 B-only 高 0.1097%；
+cross A/B 自身相对单独运行分别只高 0.1916%/0.0979%。结合 `poll=1/1`、
+span 接近较慢单分支和两段总区间重叠，可以推断本例 work 阶段获得了有效的
+并发推进；不能仅凭区间字段宣称纯 work 的起止点完全重叠。本次真实设备数据
+因此同时区分了：
+
+1. 同 warp 的互斥分支不能在等待期间推进另一分支；
+2. 不同 warp 能独立取得 forward progress，并且本例两条工作区间实际重叠；
+3. “区间重叠”不外推为任意两条 SIMT 指令都能同周期 issue，执行管线仍可能共享。
+
+A1 不生成泳道图，不把未加锁 host 墙钟写成性能结论。本阶段只做本地阶段性
+commit，不 push。
+
+## 10. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -1255,6 +1367,7 @@ S4 已证明一个固定 AIV0 可以用 4 个 SIMT warp 构建多份独立 task�
 | S3 Vector + Cube | 完成 | `5dff1124`；CPU 三套 PASS；双 task mixed ELF/Vector/Cube 门槛 PASS；A5 同地址复用 100/100，完成计数和 drain 精确闭合。 |
 | A0 SIMT atomic 竞争 | 完成 | `dc61c014`：CPU 三套 PASS；CCEC/ELF 门槛 PASS；A5 32/64/1024/2048 线程各 100/100。 |
 | S4 多 task、单 builder | 完成 | 初版 `a29fa08e` 完成 4-lane 基线；随后修正为 4-warp/128-thread 交错映射，CPU/CCEC/ELF PASS，A5 同地址复用 100/100，完成计数 `1/8/8/16` 精确闭合。 |
+| A1 warp 推进语义 | 完成 | CPU 三套和 CCEC/ELF 门槛 PASS；A5 同地址复用 100/100，SameWarp 始终 T/S+disjoint，CrossWarp 始终 S/S+overlap。 |
 | G0 GM 完整 PA | 未开始 | - |
 | G1 双 builder GM | 未开始 | - |
 | U0 UBUF 单槽 | 未开始 | - |
