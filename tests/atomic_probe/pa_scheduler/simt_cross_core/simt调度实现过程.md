@@ -1982,7 +1982,246 @@ U0 已证明：在一份 2048-thread VF 中，64 个不同 warp 的 lane0
 门槛验证，不夸大成已经在真机动态注入。阶段只做本地
 commit，不 push。
 
-## 13. 阶段状态索引
+## 13. U1：纯 SIMT 四槽与 generation 复用
+
+### 13.1 容量与接口查证
+
+U1 开工前先重新核对了“四个最大 U0 槽”的容量。U0 每槽
+4480 B，两槽就会超过当前 ELF 的 TLV7 8192 B，不能直接把 offset
+倍增后就宣称合法。本机 ACL 头文件确实存在
+`ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE`，`aclrtLaunchKernelWithHostArgs`
+也接受 launch cfg；本机 `ops-nn` 还有 12 KiB dynamic local-memory 的
+AscendC 实例。但这些证据尚未回答 standalone mixed ELF 中的真机
+参数、对齐和 DCache 分区，所以 U1 不将 dynamic UB 当作未验证前提。
+
+真实 G0 PA shape 继续提供了更小、可直接验证的边界：QK/SF/PV
+分别是 592/604/596 B，均向上取整为 10 条 cacheline；UP 是
+988 B，取整为 16 条。数值同时由 `full_pa_model.h` 的 shape、
+`full_pa_exec_protocol.h` 的 layout 公式和设备 executor 的同一公式
+锁定。这是当前 PA Case 的上限，不是通用协议 68 行容量的替代。
+
+因此 U1 固定四槽，每槽为 `64 B guard + 16*64 B payload +
+64 B guard = 1152 B`，合计 4608 B，在 TLV7 8192 B 内剩余 3584 B。
+U0 继续保留 68 行单槽边界，U1 只验证与 U2 当前 PA Case 直接
+衔接的 `1/4/10/16` 行四槽路径。TLV7 容量检查只是静态门槛：
+公开接口没有完整说明裸 offset 与 VF stack 的内部分区，而 U1 会
+比 U0 多触及 `4480..4607`。所以四槽 guard 的真机自检是必须
+的最终地址边界证据，不能被 metadata 算术代替。
+
+### 13.2 冻结协议
+
+U1 不引入 PA descriptor 或严格 insert chain，这些属于 U2。本阶段用
+128 个互相独立、可全量校验的 payload task 隔离多槽生命周期问题。
+2048 thread/64 warp 仍然只有 lane0 有效，每个 leader 精确处理
+`warp` 和 `warp+64`两个 task。slot 与 payload 映射为：
+
+```text
+slot_id(task)       = task_id % 4
+payload_class(task) = ((task_id / 4) + 3) % 4
+payload_lines       = {1, 4, 10, 16}[payload_class]
+```
+
+每槽因此都经历 32 次复用，且四种长度各 8 次。task0..3 是
+16-line anchor：四个 leader 各自取得一个不同槽，完整写入并检查
+guard 后，各自用 CAS 只置 `anchor_staged_mask` 中与 task0..3 对应的
+bit，在保持所有权的情况下同时等到
+`anchor_staged_count=4 && anchor_staged_mask=0xf`。
+其他 60 个 leader 在此之前不能 acquire，使真机必须形成
+`max_busy_depth=4`。
+
+每槽的 atomic state 用高 32 位保存 generation，低 32 位保存
+`task_id+1`，0 表示 free。只允许 `FREE(g)->BUSY(g,task)` 和
+`BUSY(g,task)->FREE(g+1)` 两种 CAS。host 必须对每槽验证 report 中
+generation 集合恰好为 `0..31`、无重复，终态恰好为 `FREE(32)`。
+异常如果发生在 acquire 之后，必须用原 BUSY 值精确释放且推进
+generation，未发布 task 再尝试恢复 `EMPTY`，然后通过 fatal 让全部
+角色有界退出。release 固定先有界减 global busy，再 exact-CAS 槽状态；
+后者失败必须恢复 global busy。
+
+AIV0 `__aicore__` entry 壳仍只做 VF invoke/join/drain，所有 build
+claim（`EMPTY->BUILDING`）、UBUF 写读、GM store、fence、`BUILT` 和槽释放
+都在 SIMT leader 内。AIV1 owner33 延续 U0 的独立 executor，只负责
+execute claim（`BUILT->CLAIMED`）/DCCI/校验/DONE，不参与构建。本阶段要
+动态证明四个不同 anchor 的完整
+staging payload 曾同时驻留，不声称 64 个 leader 的时间区间全部重叠，
+也不记录性能收益。
+
+### 13.3 实现与审查修正
+
+U1 新增了以下实现：
+
+- `ubuf/common/u1_multi_slot.h`：128 task、四槽布局、generation 状态、
+  task/build/exec/thread/role report 和统一 fatal ABI；
+- `ubuf/common/u1_multi_slot_cpu_model.h` 与
+  `ubuf/test/test_u1_multi_slot.cpp`：受控交错、故障注入和 64-warp
+  压力模型；
+- `ubuf/ccec/u1_multi_slot_kernel.cpp`：AIV0 的 2048-thread VF、四槽
+  UBUF 直接 GM transport、AIV1 executor 和 AIC observer；
+- `ubuf/ccec/u1_multi_slot_host.cpp`：真机逐 task、逐 generation、逐
+  inactive lane 和 guard oracle；
+- CPU/CCEC 的 `build_u1.sh` 及统一 `run.sh build-u1/run-u1` 入口。
+
+首轮审查发现，若用 `task_id/4` 预先推导 generation，就隐含了
+同槽 task 按 id 串行的错误前提。真实并发下，generation 只能由
+`FREE(g)->BUSY(g,task)` 成功的实际 CAS 次序产生。最终删除了
+task-id-to-generation helper，build report 记录实际 `g`，host 只验证每槽
+generation 集合精确为 `0..31`。
+
+第二轮审查发现，仅有 `anchor_staged_count=4` 不能独立排除
+某一 anchor 重复到达。因此新增了身份位图：task0..3 只能用
+CAS 各自置 bit0..3，门槛同时要求 `count=4 && mask=0xf`。另外将
+所有持槽的 pre-publish 错误收口统一为：有界减 busy、exact-CAS
+推进 generation、必要时回滚 busy、尝试 `BUILDING->EMPTY`，最后
+才发布本地 fatal。另一线程已发布 fatal 时，当前 holder 也走同一
+cleanup epilogue。
+
+最终只读审查又封住了三个边界。第一，mask 与 count 位于不同 GM
+atomic cacheline，设备端不能把 `count=4/mask!=0xf` 的瞬态可见性偏差
+直接判成永久错误；现在所有范围内不一致都继续有界轮询，CPU 增加
+确定性偏差用例，证明它以 timeout 而非 invariant 收口。第二，在 GM
+copy/fence 之后、发布 `BUILT` 之前增加紧邻 fatal 检查；CPU 的受控交错
+改为断言 holder 精确释放、恢复 EMPTY、保留外部首错且绝不发布。
+第三，设备 `busy_depth` 递减由无限 CAS 改成最多 4096 次尝试，cleanup
+本身不再可能永久自旋；anchor 身份位图 CAS 同样复用该上限。
+
+原先用于保留 SIMD/SIMT mixed metadata 的 anchor 位于 config 校验之前，
+畸形 version 理论上可触达 UBUF。现在它只在完整 `ConfigValid` 成功后，
+由保留的诊断 nonce `UINT64_MAX` 触发；该单 word 写发生在 SIMT launch
+之前，并会被 slot0 guard 初始化覆盖。正常 probe 路径不执行它。role
+report 中的 `main_scalar_build_action_count=0` 只作为运行时 telemetry，
+不再声称能够自证“没有 Scalar 构建代码”；构建脚本另行截取
+`RunBuilder` 的完整作用域并拒绝 task CAS/state/payload/report 写入模式，
+与 host telemetry 形成两条独立门槛。
+
+后续 executor 复审发现，原循环会先尝试 `BUILT->CLAIMED`，仅在 CAS
+失败的等待分支检查 fatal；如果首错已经存在而后续 task 已是 BUILT，
+owner33 仍可能继续执行。现在每次 claim 前先查 fatal，claim 成功后、
+payload 前以及 DONE 前各复查一次；后两个窗口观察到首错时用精确 CAS
+恢复 `CLAIMED->BUILT`，不再推进 DONE。CPU 新增两份预置 BUILT task，
+先由畸形第三 task 发布 foreign fatal，再断言两者保持 BUILT 且
+claim/done 都为 0，首错也未被覆盖。
+
+### 13.4 CPU 验证
+
+统一命令：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-u1
+```
+
+三套最终结果全部 PASS：
+
+| 构建 | 压力轮数 | 结果 |
+| ---- | -------: | ---- |
+| optimized | 8 | PASS |
+| ASan + UBSan | 2 | PASS |
+| TSan | 2 | PASS |
+
+CPU 用例动态覆盖了：四个 anchor 同时持有四个完整 16-line
+payload、发布前不可见、同槽不提前复用、长短 payload 交替不写
+GM tail、异常/guard/timeout 精确释放、旧 generation 不能释放新 owner、
+畸形 control fail-closed、executor 逐 word 校验和 seeded 64-warp 竞争。
+还有一组确定性交错专门让 anchor0 持有 slot0 等 gate，再由 AIV1
+畸形 control 路径发布首个 fatal；anchor0 最终精确收口到
+`FREE(1)`、task 恢复 `EMPTY`、global busy 回到 0，且不覆盖首错。
+
+### 13.5 CCEC、bitcode 与 ELF 门槛
+
+`build-u1` 后半段的结果如下：
+
+- dav-c310-cube AIC observer 和 dav-c310-vec AIV builder/executor 都通过
+  CCEC `-O3`；
+- optimized AIV bitcode 保留 AS6 volatile UBUF load/store、GM uint64 CAS/add、
+  workitem fence、Scalar reader DCCI/DSB，且 builder transport 中没有
+  MTE3/UBTOOUT；
+- 最终 ELF 只有 AIC/AIV 两个 global entry，内部 SIMT entry 为 local，
+  无 undefined global 和 relocation；
+- metadata 为两个 `MIX_AIC_MAIN [1:2]`，AIV VF 类型为
+  `SIMD_SIMT_MIX_VF=4`，TLV7 为 `0x2000`/8192 B；
+- 4608 B 四槽区域通过静态预算，kernel ELF 为 273952 B，
+  GCC 15 ACL host 为 30968 B；successful-build manifest 也已生成并校验。
+
+静态容量仍只是入场条件，它本身不证明 UBUF `4480..4607` 可用；
+这一部分由下一节真机 guard 结果闭合。
+
+### 13.6 真实 A5 结果
+
+本轮仍先执行仓库 A5 precheck。当前 shell 没有 `npu-smi` 和
+`task-submit`，但 `/dev/davinci0` 存在，因此沿用用户已授权的
+device 0 unlocked 单卡功能验证，不记录 host 墙钟性能。ACL 实际报告
+`Ascend950PR_958b`，device state 为 288640 B，地址
+`0x120000019000`。
+
+先执行 1 轮 smoke，再对同一 device allocation 连续复用 100 轮：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-u1 --device 0 --runs 1
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-u1 --device 0 --runs 100
+```
+
+| 项目 | 1 轮 smoke | 100 轮同地址复用 |
+| ---- | ---------: | ---------------: |
+| PASS | 1/1 | 100/100 |
+| task BUILT/DONE | 128/128 | 每轮 128/128 |
+| 每槽 acquire/release | 32/32 | 每轮 32/32 |
+| 每槽终态 | `FREE(32)` | 每轮 `FREE(32)` |
+| anchor count/mask | `4/0xf` | 每轮 `4/0xf` |
+| global max busy | 4 | 每轮 4 |
+| UBUF guard check | 128 | 每轮 128 |
+| inactive lane | 1984 份 poison | 每轮 1984 份 poison |
+| builder Main Scalar build telemetry | 0 | 每轮 0 |
+| builder transport MTE3 | 0 | 每轮 0 |
+
+四个 anchor 的 slot/generation report 还分别为 `0/0`、`1/0`、`2/0`、
+`3/0`，同时 `mask=0xf` 和 `max_busy=4`，所以这里的四槽同驻留
+不是仅从一个累加计数推测。每个 task 的 build report 亦证明每槽
+generation 集合精确为 `0..31`。后 guard 位于过去 U0 未触及的
+`4480..4607`；100 轮全部 guard 和 GM 邻接区域校验通过，所以
+当前 A5 上的 4608 B 裸 UBUF 边界已经获得动态证据。
+
+### 13.7 U0 与 G0/G1 回归
+
+由于统一 `run.sh` 加入了 U1 入口，U0 和 G0/G1 的 successful-build
+manifest 都必须重建，不能继续使用旧产物。本轮重新执行：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-u0
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-g1
+```
+
+U0 CPU optimized 8 轮、ASan+UBSan 2 轮、TSan 2 轮全部 PASS，
+CCEC/bitcode/mixed ELF/host 和新 manifest 通过。G0/G1 参数化 CPU 模型
+optimized 4 轮、ASan+UBSan 2 轮、TSan 2 轮全部 PASS，完整 PA
+CCEC/bitcode/mixed ELF/host 和新 manifest 也通过。随后执行真机功能
+回归：
+
+| 路径 | 配置 | A5 结果 | 关键终态 |
+| ---- | ---- | ------- | -------- |
+| U0 | 64 task/单槽 | 1/1 PASS | acquire/release `64/64`，BUILT/DONE `64/64`，mte3=0 |
+| G0 | B1/1 builder | 1/1 PASS | 5 task/4 kernel task，attempt=1 |
+| G0 | B256/1 builder | 1/1 PASS | 1280 task/1024 kernel task，attempt=1 |
+| G1 | B1/2 builders | 1/1 PASS | 每 task attempt=2，唯一 winner |
+| G1 | B256/2 builders | 1/1 PASS | 1280 task 的 winner 为 `640/640` |
+
+回归仍是用户授权的 unlocked device 0 功能运行，不作性能取样。
+
+### 13.8 本阶段结论与边界
+
+U1 已证明：一份 2048-thread VF 中 64 个独立 warp 的 lane0 可以
+以纯 SIMT 语义竞争和复用四个 AIV0 私有 UBUF slot，并将 128 份
+`1/4/10/16` 行 payload 逐有效 word 直接写入 GM，再由独立 AIV1
+executor 收口。该结论同时覆盖实际 generation、无提前复用、四槽
+同驻留、异常可收口和 100 轮同地址复用。
+
+U1 仍然是独立 payload 诊断 task，没有 PA descriptor、shared TensorMap
+history/last-writer 或严格 insert chain；这些属于 U2。本阶段也没有
+SIMT-native MTE3，transport 仍是 UBUF volatile load 后的普通 GM word store。
+`max_busy=4` 只证明四个 anchor staging 区间曾同时存在，不声称
+64 个 warp 的所有指令都同周期并行，也不把 unlocked 运行写成性能数据。
+
+## 14. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -1997,5 +2236,5 @@ commit，不 push。
 | G0 GM 完整 PA | 完成 | 64-warp/lane0 纯 SIMT 构建；CPU 三套与 CCEC/ELF 门槛 PASS；A5 B1/B256 首轮 fresh 及同地址 10 轮全部 PASS。 |
 | G1 双 builder GM | 完成 | 双 VF 各 2048-thread/64-warp/lane0 全量竞争；CPU 三套与 CCEC/ELF 门槛 PASS；A5 G1 B1/B256 及 G0 回归各同地址复用 10/10。 |
 | U0 UBUF 单槽 | 完成 | 64-warp/lane0 纯 SIMT 单槽；CPU 三套、CCEC/ELF 门槛和 A5 同地址 100/100 全部 PASS；G0/G1 四组真机回归 PASS。 |
-| U1 UBUF 多槽/多 task | 未开始 | - |
+| U1 UBUF 多槽/多 task | 完成 | 本提交；CPU 三套、CCEC/bitcode/mixed ELF 门槛全部 PASS；A5 smoke 1/1 与同地址复用 100/100，四槽 `maxbusy=4`、每槽 generation `0..31`精确闭合。 |
 | U2 UBUF 完整 PA | 未开始 | - |

@@ -24,6 +24,8 @@ G0_BUILD_MANIFEST="$GM_BUILD/g0_build_manifest.sha256"
 UBUF_ROOT="$SCRIPT_DIR/ubuf"
 U0_BUILD="$UBUF_ROOT/build/ccec"
 U0_BUILD_MANIFEST="$U0_BUILD/u0_build_manifest.sha256"
+U1_BUILD="$UBUF_ROOT/build/ccec"
+U1_BUILD_MANIFEST="$U1_BUILD/u1_build_manifest.sha256"
 
 usage() {
     cat <<'EOF'
@@ -48,6 +50,8 @@ Usage:
   ./run.sh run-g1 [--device N] [--batches 1|256] [--runs N]
   ./run.sh build-u0
   ./run.sh run-u0 [--device N] [--runs N]
+  ./run.sh build-u1
+  ./run.sh run-u1 [--device N] [--runs N]
 
 build-s0 运行 CPU optimized/ASan/UBSan/TSan，并构建、静态检查 CCEC/ELF。
 run-s0 只运行已构建的真实 A5 探针；调用前仍需按仓库规则执行 A5 precheck。
@@ -72,8 +76,10 @@ run-g1 执行 AIV0+AIV1 两个独立 VF：各 2048 SIMT thread/64 个 lane0 lead
 build-u0 运行 UBUF 单槽 CPU 三套测试，并构建、静态检查 U0 CCEC/bitcode/mixed ELF/ACL host。
 run-u0 在真实 A5 上验证 AIV0 的 64 个 lane0 leader 竞争单个 UBUF slot，由同一
 SIMT leader 读回 UBUF 并直接写 GM；AIV1 Scalar 只执行，mte3_count 必须为 0。
+build-u1 运行 UBUF 四槽/128 task CPU 三套测试，并构建、静态检查 U1 CCEC/bitcode/mixed ELF/ACL host。
+run-u1 在真实 A5 上验证 4×1152 B UBUF slot 的并发驻留、generation 复用和 128 task 全量收口。
 环境提供 task-submit 时，必须先在锁外做 A5 precheck，再从其 --run 命令内调用；run-g0 会把
-$TASK_DEVICE 自动注入 host，锁内调用不得再传 --device。run-g1/run-u0 遵循同一规则。
+$TASK_DEVICE 自动注入 host，锁内调用不得再传 --device。run-g1/run-u0/run-u1 遵循同一规则。
 EOF
 }
 
@@ -254,6 +260,14 @@ case "$ACTION" in
         "$UBUF_ROOT/cpu/build_u0.sh"
         "$UBUF_ROOT/ccec/build_u0.sh"
         ;;
+    build-u1)
+        if [[ $# -ne 0 ]]; then
+            echo "build-u1 does not accept additional arguments." >&2
+            exit 1
+        fi
+        "$UBUF_ROOT/cpu/build_u1.sh"
+        "$UBUF_ROOT/ccec/build_u1.sh"
+        ;;
     run-g0|run-g1)
         full_pa_stage="${ACTION#run-}"
         full_pa_builders=1
@@ -297,38 +311,44 @@ case "$ACTION" in
             --kernel "$GM_BUILD/simt_cross_core_g0_kernel.o" --builders "$full_pa_builders" \
             "${full_pa_device_args[@]}" "$@"
         ;;
-    run-u0)
-        if [[ ! -x "$U0_BUILD/simt_cross_core_u0_host" ||
-              ! -s "$U0_BUILD/simt_cross_core_u0_kernel.o" ||
-              ! -s "$U0_BUILD_MANIFEST" ]]; then
-            echo "U0 artifacts are missing; run: $0 build-u0" >&2
+    run-u0|run-u1)
+        ubuf_stage="${ACTION#run-}"
+        ubuf_build="$U0_BUILD"
+        ubuf_manifest="$U0_BUILD_MANIFEST"
+        if [[ "$ACTION" == "run-u1" ]]; then
+            ubuf_build="$U1_BUILD"
+            ubuf_manifest="$U1_BUILD_MANIFEST"
+        fi
+        ubuf_host="$ubuf_build/simt_cross_core_${ubuf_stage}_host"
+        ubuf_kernel="$ubuf_build/simt_cross_core_${ubuf_stage}_kernel.o"
+        if [[ ! -x "$ubuf_host" || ! -s "$ubuf_kernel" || ! -s "$ubuf_manifest" ]]; then
+            echo "${ubuf_stage^^} artifacts are missing; run: $0 build-$ubuf_stage" >&2
             exit 1
         fi
-        if ! (cd "$SCRIPT_DIR" && sha256sum --check --status "$U0_BUILD_MANIFEST"); then
-            echo "U0 sources and runtime artifacts do not match the successful-build manifest; run: $0 build-u0" >&2
+        if ! (cd "$SCRIPT_DIR" && sha256sum --check --status "$ubuf_manifest"); then
+            echo "${ubuf_stage^^} sources and runtime artifacts do not match the successful-build manifest; run: $0 build-$ubuf_stage" >&2
             exit 1
         fi
-        require_a5_access "U0"
-        u0_device_args=()
+        require_a5_access "${ubuf_stage^^}"
+        ubuf_device_args=()
         for argument in "$@"; do
             case "$argument" in
                 --kernel|--kernel=*)
-                    echo "run-u0 uses the kernel covered by its successful-build manifest; do not override --kernel." >&2
+                    echo "$ACTION uses the kernel covered by its successful-build manifest; do not override --kernel." >&2
                     exit 1
                     ;;
                 --device|--device=*)
                     if [[ -n "${TASK_DEVICE:-}" ]]; then
-                        echo "run-u0 injects --device from TASK_DEVICE inside task-submit; do not pass --device explicitly." >&2
+                        echo "$ACTION injects --device from TASK_DEVICE inside task-submit; do not pass --device explicitly." >&2
                         exit 1
                     fi
                     ;;
             esac
         done
         if [[ -n "${TASK_DEVICE:-}" ]]; then
-            u0_device_args=(--device "$TASK_DEVICE")
+            ubuf_device_args=(--device "$TASK_DEVICE")
         fi
-        timeout --foreground 300s "$U0_BUILD/simt_cross_core_u0_host" \
-            --kernel "$U0_BUILD/simt_cross_core_u0_kernel.o" "${u0_device_args[@]}" "$@"
+        timeout --foreground 300s "$ubuf_host" --kernel "$ubuf_kernel" "${ubuf_device_args[@]}" "$@"
         ;;
     *)
         usage >&2

@@ -475,6 +475,82 @@ task build report 只有一条 64 B cacheline，其中 word6 保存 attempt/win�
 禁止普通 SIMT store：word6 只用 atomic-add，其他 word 只允许从 host poison
 通过 atomic-CAS 发布。CPU 模型中的独立 `std::atomic` 不能替代这条设备规则。
 
+### 3.10 U1 四槽、128 task 与 generation 合同
+
+U1 不为了强行保留 U0 的 68-line 边界而臆测动态 UB 接口。
+G0 的真实 PA payload 中 QK/SF/PV 都是 10 行，UP 是 16 行，因此
+U1 将每槽最大 payload 固定为 16 行。每槽布局为前 guard 1 行、
+payload 16 行、后 guard 1 行，即 1152 B；四槽合计 4608 B，低于
+已由 U0 产物证明的 TLV7 8192 B 静态 share 预算，不需要新的
+launch attribute，并继续保留至少 32 KiB SIMT DCache。但公开
+文档没有完整说明裸 UBUF offset 与 VF stack 在 TLV7 内的物理分区；
+U0 真机只触达 `0..4479`，U1 会首次触达 `4480..4607`。因此
+4608 B 只是静态容量入场条件，四槽前后 guard 和真实 A5 结果仍是
+必须通过的地址边界门槛。U0 仍独立覆盖 68 行
+单槽边界；U1 只声称四槽的 `1/4/10/16` 行。
+
+U1 仍发射 2048 thread/64 warp，只允许每个 warp 的 lane0 工作。
+任务数增为 128，每个 leader 精确构建 `warp` 和 `warp+64`
+两个 task。槽与长度映射固定为：
+
+```text
+slot_id(task)       = task_id % 4
+payload_class(task) = ((task_id / 4) + 3) % 4
+payload_lines       = {1, 4, 10, 16}[payload_class]
+```
+
+这样 task0..3 都是 16 行 anchor，而每个物理槽在 32 次复用中都
+精确经历八次 `1/4/10/16`，不会把槽号与 payload 长度永久绑定。
+
+槽状态为独占 64 B 的 GM atomic-only cacheline。低 32 位为
+`task_id+1`，0 表示 free；高 32 位为 generation。acquire 只能将
+`FREE(g)` CAS 为 `BUSY(g, task)`，release 只能将原值 CAS 为
+`FREE(g+1)`。build report 必须记录 slot id 和取得时的 generation；
+host 对每槽独立验证 generation 恰好是 `0..31` 且无重复，终态为
+`FREE(32)`。这是防止提前释放和 ABA 复用的主要协议证据。
+
+四个 anchor leader 先各自取得不同槽，完整写入 16 行并检查
+前后 guard，然后各自用 CAS 在 `anchor_staged_mask` 中只置自己的
+task bit，再累加 `anchor_staged_count`。重复 bit 必须报 fatal；四者在
+保持槽所有权的状态下同时等到 `count=4 && mask=0xf`。其他
+60 个 leader 在此之前不能 acquire。因此真机终态必须观察到
+`anchor_staged_count=4`、`anchor_staged_mask=0xf` 和 global
+`max_busy_depth=4`，证明四个不同 anchor 的完整
+staging payload 曾同时驻留；这仍不外推为所有 64 个 leader 的
+指令区间全部重叠。
+
+count 与 mask 是两条不同的 GM atomic cacheline。发布顺序虽然固定为
+先置身份 bit、再加 count，但没有把跨地址可见顺序当成未经验证的硬件
+前提：reader 只有同时读到精确的 `4/0xf` 才开门；所有取值范围合法但
+暂时不匹配的组合都继续有界轮询。只有 count 越界、mask 出现非法 bit、
+重复置同一身份 bit，或最终 watchdog 超时才报错；身份位图自身的 CAS
+竞争也有固定尝试上限。
+
+slot CAS 成功取得 `BUSY` 后必须立即增加 global busy depth，然后
+才能开始 staging。释放时先用有界 CAS 将 global busy depth 减一，
+再执行精确的 `BUSY(g,task)->FREE(g+1)`；若第二步失败，必须
+先回滚 busy depth 再报 fatal。这避免新 owner 在旧 owner 减计数前
+已重新 acquire 同一槽，从而把 `max_busy_depth` 伪增到 5。
+
+每个 winner 的正常顺序继续是纯 SIMT：取得 task、取得槽、只写
+有效 UBUF word、检查 guard、同 leader 读 UBUF 后直接写 GM、fence、
+发布 `BUILT`、推进 generation 并释放槽。AIV0 `__aicore__` entry 壳
+仍只能 invoke/join/drain；AIV1 作为与 U0 一致的独立 executor 进行
+Claim/DCCI/校验/DONE，不参与 task 构建。任何 pre-publish 异常都
+必须先用精确 BUSY 值释放所属槽、推进 generation，尚未发布
+的 task 再尝试 `BUILDING->EMPTY`，最后让全局 fatal 使其他角色有界
+收口。持槽 leader 在等待中观察到别的线程已发 fatal 时也必须走
+同一 cleanup epilogue；不得留下 busy 槽或伪造已发布 task。
+GM copy 与 fence 之后、`BUILDING->BUILT` 紧邻之前还必须再读一次
+global fatal，封住 copy 期间由其他角色发布首错的窗口。busy decrement
+最多尝试固定次数；超过上限保留当前可解释的 BUSY/busy-depth 状态并
+发布或保留首个 fatal，不能在 cleanup 内无限自旋。
+
+AIV1 executor 同样必须在每次 `BUILT->CLAIMED` 之前检查 fatal，并在
+claim 成功后、读取 payload 前再次检查。第二个窗口若观察到首错，owner33
+必须用精确 CAS 将自己的 `CLAIMED` 恢复为 `BUILT`，不得增加 claim/done
+计数；payload 校验完成到 `DONE` 之前再做一次同样的 fatal 边界检查。
+
 ## 4. 目录与分阶段实施
 
 ### 4.1 计划目录
