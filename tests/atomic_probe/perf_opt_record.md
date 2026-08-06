@@ -6884,3 +6884,20 @@ perf-clock `.text` 增加 `768 B`。冻结 S6.93 做 12 对反转顺序 A/B：�
 `0.077%`，配对差中位为慢 `3.083 us`，且只赢 `5/12` 对。Atomic 计数下降没有
 转化为可靠端到端收益，生产代码与专项测试完整撤回；详细证据见实现过程
 S6.94。
+
+### 15.70 否决三项 Execute 动态批次
+
+候选把四 token 窗口中的 Execute 动态领取批宽由 `2` 提高到
+`kExecTokensPerWorker - 1 = 3`。它仍保留同角色所有 Scalar 对中央 cursor 的
+动态 work stealing，每个 task 的 token、route、Claim、Execute 和 completion
+均独立，且不读取 PA task kind、固定 DAG、batch、核数或 tensor shape；因此
+泛化边界合格。CPU/CCEC、A5 B1 full-swimlane 和 B256 perf-clock 正确性全部
+闭合，Execute ticket 从 `606` 降到 `436`，最终 `.text` 也减少 `2304 B`。
+
+但是四对冻结 startup→FinalDrain A/B 中，基线/候选中位为
+`848.290/995.609 us`，候选回退 `17.367%`，四对全部失败。同口径单轮
+`fanin_loads` 从 `9074` 增到 `30027`，落入 FinalDrain 的 kernel 从 `119`
+增到 `356`。三项批次过早占住未 Build/未 ready token，只留一个空槽，造成
+反复 fanin 轮询和更长执行尾部；这些成本远大于少掉的返回型 Atomic。
+生产代码和测试已完整恢复到 S6.93。详细协议、原始数据与否决依据见实现过程
+S6.95。

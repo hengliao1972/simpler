@@ -6834,3 +6834,74 @@ S6.93 基线              829.328     842.812     863.576     843.515 us
 收益；不能用 `606 -> 512` 的 Atomic 调用数下降替代端到端裁决。因此生产代码
 和专项测试完整恢复到 S6.93，只保留本节结论。后续若消减尾部越界领取，必须
 继续保留动态 work stealing，且协议不能依赖某个算子的任务代价恰好均匀。
+
+## S6.95 否决三项 Execute 动态批次
+
+### 候选动机与泛化边界
+
+S6.93 的每次 Execute ticket 用一个返回型 `FetchAdd(+2)` 动态取得两个
+ordinal，B256 共执行 `606` 次。四个 owner-local token 始终至少留有两个空槽。
+本轮隔离验证把批宽改为 `kExecTokensPerWorker - 1`，即一次动态取得三项、仍
+保留一个空槽；预计物理 ticket 数为：
+
+```text
+AIC: ceil(512 / 3) + 32 - 1 = 202
+AIV: ceil(512 / 3) + 64 - 1 = 234
+合计                              436
+```
+
+该候选没有静态分配 worker 配额，AIC/AIV 角色内的动态 work stealing 仍在；
+每个 task 仍独立绑定 token、独立校验 route、独立 Claim/Execute/Done，严格
+TensorMap metadata writer 插入链、Build ticket、payload、DCCI、fanin 和
+completion 合同均未修改。批宽只由通用 token 容量决定，不读取 PA
+`TaskKind`、固定 DAG、batch、核数、输出数量或 tensor shape，因此候选本身
+通过算子泛化审查。
+
+### 正确性和机器码
+
+CPU 门槛扩展到三项不可整除尾批、同角色动态接力、未 Build 批次保留一个空槽、
+fanin 等待和重复消费 fail-closed。完整 CPU 回归全部 PASS；10 轮 96-thread
+模型均精确完成 `1280` Build、`1024` Execute、`256` metadata writer，Execute
+ticket 从 `606` 降到 `436`。CCEC perf-clock/full-swimlane 的 AIC/AIV generic
+probe、split Finish、mixed ELF、manifest 和零 relocation 门槛通过；A5 B1
+full-swimlane 与 B256 perf-clock 的业务、严格插入、payload、DCCI、kernel
+exactly-once 和全部终态断言均 PASS。
+
+最终 perf-clock device `.text` 从 S6.93 的 `0x3d038` 降到 `0x3c738`，减少
+`0x900 = 2304 B`。因此候选确实改变了设备指令和 Atomic 人口，不是源码等价
+改写。
+
+### 回退证据与根因
+
+首次 B256 候选完整周期为 `997.825 us`。随后冻结 S6.93 与候选，按 B-C/C-B
+顺序运行四对独立进程：
+
+```text
+                         min       median      max        mean
+S6.93 双项基线          839.254    848.290    856.208    848.010 us
+三项动态批次候选        983.813    995.609   1004.864    994.974 us
+
+独立中位回退：147.319 us / 17.367%
+逐对差中位：  +147.878 us
+候选获胜：    0/4
+```
+
+同口径单轮计数揭示回退方向：
+
+```text
+                              S6.93 双项       三项候选
+Execute ticket                        606             436
+fanin_loads                         9,074          30,027
+kernel 落入 FinalDrain               119             356
+完整周期                         846.370 us      997.825 us
+```
+
+三项批次少了 `170` 次返回型 ticket Atomic，但更早占住了三个尚未 Build/未
+ready 的 token。每核只剩一个空槽后不能继续动态取得一批，已占 token 又在后续
+边界重复做 fanin 检查；结果 fanin poll 增至约 `3.31` 倍，更多 kernel 被推迟到
+FinalDrain，远大于 ticket 消减收益。这个结论不依赖 PA task 类型：只要其他
+算子的 Build/ready 时机存在离散，三项长前视同样有风险。
+
+候选生产代码和测试已完整恢复到 S6.93。后续不得仅凭 Atomic 调用数下降重做
+三项领取；任何更大批次必须先证明不会扩大未就绪 token 驻留和 FinalDrain
+尾部，并继续满足算子泛化门槛。
