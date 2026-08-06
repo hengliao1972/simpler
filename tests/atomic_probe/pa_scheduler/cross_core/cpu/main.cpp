@@ -638,8 +638,13 @@ int main(int argc, char **argv) {
             : pa_scheduler::host::Median(lifecycle_spans);
     std::printf(
         "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s "
-        "median_submit_span_us=%.3f median_startup_barrier_us=%.3f "
-        "median_dispatch_exit_spread_us=%.3f median_final_drain_us=%.3f median_lifecycle_us=%.3f "
+        "median_submit_span_us=%.3f "
+#if PTO_FDWIC_SHARED_MAP
+        "median_startup_arrival_spread_us=%.3f median_dispatch_exit_spread_us=%.3f "
+#else
+        "median_startup_barrier_us=%.3f median_final_barrier_us=%.3f "
+#endif
+        "median_final_drain_us=%.3f median_lifecycle_us=%.3f "
         "semantic_status=%s postprocess_status=%s\n",
         options.runs, spans.size(),
         pa_scheduler::host::ActiveFinalBarrierName(

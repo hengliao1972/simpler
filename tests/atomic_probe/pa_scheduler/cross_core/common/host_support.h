@@ -6175,7 +6175,11 @@ inline Metrics Validate(
 #endif
     Expect(
         state.started_count.value == static_cast<int64_t>(kWorkers),
+#if PTO_FDWIC_SHARED_MAP
+        "all configured workers publish one startup arrival", &metrics
+#else
         "startup barrier remains flat and reaches all workers", &metrics
+#endif
     );
     Expect(
         submits == expected_submits,
@@ -7022,9 +7026,9 @@ inline Metrics Validate(
     const Uint64Distribution post_release_drain = SummarizeUint64(post_release_drain_ticks);
 #if PTO_FDWIC_SHARED_MAP
     std::printf(
-        "[LIFECYCLE] run=%u final_shape=%s startup_span_us=%.3f dispatch_exit_spread_us=%.3f "
+        "[LIFECYCLE] run=%u final_shape=%s startup_arrival_spread_us=%.3f dispatch_exit_spread_us=%.3f "
         "final_drain_span_us=%.3f lifecycle_span_us=%.3f "
-        "worker_startup_wait_median_us=%.3f worker_startup_wait_p95_us=%.3f "
+        "worker_startup_publish_median_us=%.3f worker_startup_publish_p95_us=%.3f "
         "worker_final_drain_median_us=%.3f worker_final_drain_p95_us=%.3f\n",
         run, ActiveFinalBarrierName(final_barrier_shape), metrics.startup_barrier_span_us,
         metrics.final_barrier_span_us, metrics.final_drain_span_us, metrics.lifecycle_span_us,

@@ -6901,3 +6901,26 @@ S6.94。
 反复 fanin 轮询和更长执行尾部；这些成本远大于少掉的返回型 Atomic。
 生产代码和测试已完整恢复到 S6.93。详细协议、原始数据与否决依据见实现过程
 S6.95。
+
+### 15.71 启动偏斜期间用 Build 代替原地等待
+
+shared cross-core 的调度正确性由三项通用合同闭合：中央 Build/Execute ticket
+保证 task 恰好一次领取，metadata writer completion 保证 TensorMap side
+effect 严格按 task id 插入，FinalDrain 保证全部配置 worker 和 execution task
+最终收口。原启动 FetchAdd 后的全员轮询只对齐起跑时刻，不承担上述任一正确性
+职责。
+
+候选保留每 worker 一次 `started_count` 增量及 host 精确参与者断言，但 shared
+路径不再在入口等待计数达到全员：早到 worker 可以先领取 Build，Execute
+ticket 在机会式读取确认全员到达后才开放；private 路径不变。公共代码不读取 PA
+`TaskKind`、固定 DAG、batch、核数、输出数量或 tensor shape。A5 B256 完整泳道
+精确记录 96 次启动增量、122 次 Execute admission 读取；严格 writer 链、1,280 Build、1,024
+kernel、6,528 DCCI 和全部终态保持。CPU 全回归、CCEC 两类构建、A5 B1/B256
+均通过，perf-clock `.text` 增加 768B。
+
+冻结 S6.93 与候选，以 6 对正序加 6 对反序组成平衡 A/B：基线/候选中位为
+`843.900/835.266 us`，改善 `8.635 us / 1.023%`；均值改善 `1.013%`，配对
+改善中位 `8.626 us`，候选胜 `10/12`。完全取消 Execute 门控的版本虽改善
+`3.129%`，却连续三次破坏 CPU independent-overlap 门槛，因泛化风险撤回。
+最终保留项不改变算子语义和 TensorMap
+顺序，按“通用协议消冗且端到端收益已证明”保留；完整依据见实现过程 S6.96。

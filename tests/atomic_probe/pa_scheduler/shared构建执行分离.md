@@ -7,13 +7,13 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 Build ticket 恰好一次 Build；host 按通用 `(engine class, function id, task id)` 生成 function-striped Execute 计划，32 AIC 与 64 AIV 分别通过各自中央 cursor 动态领取同角色 task；一次返回型 FetchAdd 取得最多两个连续 ordinal 并绑定两个 owner-local token，任一新 token 尚未 `BUILT` 时停止本边界继续领取；Build/Execute owner 独立且允许同核 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.93 已形成三条独立发放流：一条全 96 Scalar Build ticket、两条 AIC/AIV Execute cursor；Execute 计划按 function id 轮转，固定两项 ticket 批次在四 token 窗口内一次绑定两个 task；task-indexed immutable payload、跨核 DCCI publish/acquire 和 16 组 FinalDrain 收口均保持；TensorMap 严格链只串行 host/operator 声明且 device delta 再确认的真实 metadata writer，完成字仍按 task 隔离到独占 128B atomic 冲突单元；fresh output descriptor 在预留 writer 后直接构造到最终 `shared_outputs`，consumer 与 metadata writer 分别直接等待实际使用的 output `published` |
+| 正式实现 | S0–S6.96 已形成三条独立发放流：一条全 Scalar Build ticket、两条按 engine class 划分的 Execute cursor；Execute 计划按 function id 轮转，固定两项 ticket 批次在四 token 窗口内一次绑定两个 task；task-indexed immutable payload、跨核 DCCI publish/acquire 和分组 FinalDrain 收口均保持；TensorMap 严格链只串行 host/operator 声明且 device delta 再确认的真实 metadata writer；shared 模式保留每 worker 一次启动到达发布，早到 worker 不原地等待、可先领取 Build，Execute ticket 在全员到达后才开放 |
 | CPU 正确性用例 | 任意 function-id/engine 输入的轮转计划、重复 task/非法 engine 拒绝、双项 ticket 唯一 ordinal、奇数尾批与空 engine 计划 exhaustion、同核/跨核 owner、双项 `WAITING_BUILT` 与四 token 背压、稀疏 metadata writer 严格插入与乱序 Build、direct-output 发布证明、1024 kernel exactly-once 和 FinalDrain 完整回归均已通过 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束。S6.93 相对冻结 S6.92 基线的 12 对交错 A/B 中，中位从 `941.054 us` 降至 `842.926 us`，改善 `98.128 us / 10.427%`，候选胜 `12/12` 对；配对差中位 `-103.762 us`；B1/B256、完整泳道和终态全部 PASS |
+| A5 PA 功能/性能 | 唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束。S6.96 相对冻结 S6.93 基线的 6 对正序＋6 对反序 A/B 中，中位从 `843.900 us` 降至 `835.266 us`，改善 `8.635 us / 1.023%`，候选胜 `10/12` 对；配对改善中位 `8.626 us`；CPU、CCEC、A5 B1/B256、完整泳道和终态全部 PASS |
 | 历史 S4 Execute election | K2 首版曾通过 CPU B1/B256 和 A5 B1/B256，现已被 S6.68-b 的角色中央 ticket 替代，仅作为历史证据保留 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前验证缺口 | 稀疏 writer 链、direct-output 证明、四 token、function-striped 双项 Execute ticket 和原位 SharedOutput descriptor 的 CPU、CCEC、A5 B1/B256、完整泳道与冻结 A/B 均已完成；当前权威中位距 `0.8 ms` 目标仍约 `42.9 us`。后续候选仍需保持真实 metadata writer 的严格 task-id 顺序，并经独立门槛和冻结 A/B 后才能保留 |
+| 当前验证缺口 | 稀疏 writer 链、direct-output 证明、四 token、function-striped 双项 Execute ticket、原位 SharedOutput descriptor 和 shared Build 启动重叠的 CPU、CCEC、A5 B1/B256、完整泳道与冻结 A/B 均已完成；当前权威中位距 `0.8 ms` 目标仍约 `35.3 us`。后续候选仍需保持真实 metadata writer 的严格 task-id 顺序，并经独立门槛和冻结 A/B 后才能保留 |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -1482,8 +1482,8 @@ FinalDrain 轮询记录耗尽通用 trace 容量，因此不用它代替 A5 的
 
 ### S6：性能评估与容量/复用优化
 
-- 量化终点为 B256、real-compute、96 Scalar、严格插入链与跨核执行
-  保持不变时，`startup_to_final_drain <= 0.6 ms`；不得用缩减候选人口或
+- 量化终点为 B256、real-compute、全部配置 Scalar、严格插入链与跨核执行
+  保持不变时，`startup_to_final_drain <= 0.8 ms`；不得用缩减候选人口或
   kernel/Scalar overlap 换取该数字；
 - 使用贯穿 S0–S5 累积的三条证据链，对 publication、
   handoff、election 和 Build 负载转移做同口径收益审计；
@@ -2013,12 +2013,12 @@ AIC 实际 service 总量 / 32 核                         595.487 us/core
 ```
 
 因此新的 Execute queue、owner 迁移或扫描策略，理论收益上限只有当前样本中的
-约 `59.655 us`，不足以单独把约 `0.99 ms` 收到 `0.6 ms`。现阶段不再新增
+约 `59.655 us`，不足以单独把约 `0.99 ms` 收到 `0.8 ms`。现阶段不再新增
 BUILT-only 或伪 ready 队列；优先缩短严格 Register 完成传播和随后的 Build
 发布，让 Build 工作尽可能被 AIC kernel 覆盖。只有 Build 释放显著前移后，
 才重新评估 Execute 端的次级尾部。
 
-`0.6 ms` 同时已接近当前 real-compute 的 AIC 算术 service 下界。后续方案
+当前 `0.8 ms` 目标仍受 real-compute 的 AIC 算术 service 下界约束。后续方案
 不能靠删减 kernel、截断 FinalDrain 或改变任务数达标；仍以 startup 起点到
 FinalDrain 结束的完整周期裁决。离线工具及逐 task 分解见
 `cross_core/analyze_pa_exec_release_bound.py` 和过程记录 S6.82。
@@ -2132,3 +2132,57 @@ TensorMap 未来若需要更细的 reader 并行度，应增加 ordinary-writer 
 S6.85 的 A5 证据为 site 19 physical/logical `1275/5870 -> 255/979`，site 20
 仍为 256；12 对 trace-free B256 中位 `952.797 -> 945.690 us`。这只说明通用
 reader 快路径有效，不授权继续加入 PA task-kind 特例。
+
+### 2026-08-06：启动偏斜期间允许 Build，Execute 全员到达后开放
+
+每个 worker 仍通过一次 `started_count` 原子增量发布真实参与状态，host 也仍
+要求计数精确等于配置的 worker 数；shared cross-core 路径不再在入口原地轮询
+全员到齐。早到 worker 可以立即领取中央 Build ticket，晚到 worker 随后加入
+动态 work stealing；Execute ticket 只有在机会式读取确认全员到达后才开放。
+
+这一变更成立依赖的是 shared 调度协议，而不是 PA 拓扑：
+
+1. Build task 由全局唯一 ticket 恰好一次领取，不依赖各 worker 同时起跑；
+2. Execute task 由 engine-class cursor 唯一领取；全员到达前禁止发放新的
+   owner-local token，避免少数早到核囤积尚未 BUILT 的执行所有权；
+3. TensorMap metadata side effect 仍由 writer bitset 与 previous-writer completion
+   严格按 task id 排序，启动先后不能越过插入链；
+4. FinalDrain 仍等待全部配置 worker 到达并关闭所有 execution task，因此早到
+   worker 不会让 kernel 在参与者缺失时提前退出；
+5. fatal、payload、DCCI、fanin 和 completion 合同均未放宽。
+
+公共热路不读取 `TaskKind`、固定 DAG、batch、worker 数、输出数量或 tensor
+shape。private replay 仍保留原 flat startup barrier；只有满足上述中央票据和
+最终 execution drain 合同的 shared cross-core 模式允许 Build 与启动到达重叠。
+观测字段为保持记录 ABI 继续沿用内部 `startup_barrier_*` 名称，但 shared host
+输出明确解释为 `startup_arrival_spread` 与每 worker 的 publish 开销，不能再
+把它解读为等待时间。
+
+第一版曾让 Build/Execute 都立即开放。它在 6 对正序＋6 对反序样本中把中位从
+`851.030 us` 降到 `824.401 us`，但 CPU `independent_kernel_overlap` 定向门槛
+连续三次失败：少数早到 worker 可以先占住尚未 BUILT 的 Execute token，随后
+又停在另一项 Build 的插入后区间，使独立 task 暂时失去可领取的执行 owner。
+业务最终仍能收口，但这种启动不均衡会对更复杂算子放大，因此该版本即使更快
+也不保留。
+
+最终版本只允许 Build 先行，Execute 仍等待全员到达。冻结 S6.93 与候选后，
+按 6 对基线→候选、6 对候选→基线组成平衡样本。B256 real-compute 完整周期
+结果为：
+
+```text
+                         min        median       max        mean
+S6.93 基线              836.852     843.900     854.963    844.373 us
+S6.96 候选              823.210     835.266     852.739    835.822 us
+
+独立中位改善：8.635 us / 1.023%
+独立均值改善：8.552 us / 1.013%
+配对改善中位：8.626 us
+候选获胜：10/12
+```
+
+perf-clock 最终 `.text` 从 `0x3d038` 增至 `0x3d338`，增加 `768 B`。完整
+B256 泳道中启动原子为 96 次 `startup_increment` 和 122 次机会式
+`startup_poll`；旧 flat barrier 的同类逻辑读取约为 120 次，因此收益不是减少
+Atomic，而是让原先的等待时间承载 Build 工作。1,280 Build、1,024 kernel、
+256 metadata writer、6,528 DCCI、严格 writer history 和 FinalDrain 全部闭合，
+raw 无丢记录。该收益不来自减少参与核、改变任务计划或放宽 TensorMap 顺序。

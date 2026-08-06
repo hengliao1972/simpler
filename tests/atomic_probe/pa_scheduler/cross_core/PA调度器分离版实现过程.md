@@ -6905,3 +6905,70 @@ FinalDrain，远大于 ticket 消减收益。这个结论不依赖 PA task 类�
 候选生产代码和测试已完整恢复到 S6.93。后续不得仅凭 Atomic 调用数下降重做
 三项领取；任何更大批次必须先证明不会扩大未就绪 token 驻留和 FinalDrain
 尾部，并继续满足算子泛化门槛。
+
+## S6.96 启动偏斜期间允许 Build，Execute 全员到达后开放
+
+### 理论合同与泛化边界
+
+S6.93 的每个 worker 在调度入口先对 `started_count` 做一次 FetchAdd，随后原地
+轮询到全部 worker 到齐。该等待主要用于压低启动偏斜，但 shared cross-core 的
+正确性并不依赖所有 Scalar 同时起跑：
+
+- Build 由中央 ticket 恰好一次发放；
+- AIC/AIV Execute 分别由 engine-class cursor 恰好一次发放；
+- TensorMap metadata side effect 仍由 previous-writer completion 严格排序；
+- FinalDrain 仍等待全部配置 worker 到达并关闭全部 execution task。
+
+因此候选保留每 worker 一次 `started_count` 增量，host 继续断言最终参与者数
+精确；shared 路径不再在入口原地等待，早到 worker 可以先领取 Build ticket。
+Execute ticket 通过调度边界上的机会式读取，在全员到达后才开放。private 路径
+保持原 flat startup barrier。公共热路不读取 PA
+`TaskKind`、固定 DAG、batch、worker 数、输出数量或 tensor shape；这一优化
+适用于满足中央唯一票据、严格 writer 链和最终 execution drain 合同的任意
+shared cross-core 算子，不是 PA adapter 特例。
+
+观测输出同步修正语义：内部 ABI 字段仍沿用 `startup_barrier_*`，shared host
+对外报告 `startup_arrival_spread` 和 `worker_startup_publish`，不再把原子发布
+区间误称为等待时间。构建脚本继续按真实机器码逐角色锁定 split Finish
+relocation；perf-clock AIC/AIV 精确为 `2/4`，full-swimlane 为 `3/3`，没有
+放宽门槛。
+
+### 正确性、机器码和完整泳道
+
+CPU 全回归通过；10 轮 96-thread 动态模型每轮均闭合 1,280 Build、1,024
+Execute、256 metadata writer 和 FinalDrain。CCEC perf-clock/full-swimlane 的
+AIC/AIV generic probe、split Finish、mixed ELF、manifest 和零 relocation
+门槛通过。A5 B1 full-swimlane、B256 perf-clock 和 B256 full-swimlane 的
+payload、fanin、DCCI、严格 writer history、kernel exactly-once、fatal 与全部
+终态断言均 PASS。
+
+B256 full-swimlane 精确记录 96 次 `startup_increment` 和 122 次机会式
+`startup_poll`；1,280 Build、1,024 kernel、256 metadata writer、2,048
+published output、6,528 DCCI 均保持，raw 无丢记录。perf-clock 最终 `.text`
+从 `0x3d038` 增至 `0x3d338`，增加 `768 B`。
+
+### 平衡冻结 A/B 与结论
+
+完全取消 Execute 启动门控的第一版曾在平衡 12 对中改善 `3.129%`，但 CPU
+`independent_kernel_overlap` 连续三次失败。原因是少数早到 worker 会先占住
+未 BUILT Execute token，再在另一项 Build 内停顿；它对 PA 当前 A5 样本有利，
+却会放大其他算子的 Build 时延不均，因此完整否决。最终候选只让 Build 与启动
+偏斜重叠，Execute 仍在全员到达后开放。
+
+冻结 S6.93 和最终候选，先执行 6 对基线→候选，再执行 6 对候选→基线，避免固定
+进程顺序冒充收益。唯一口径为最早 startup 起点到最后 FinalDrain 结束：
+
+```text
+                         min        median       max        mean
+S6.93 基线              836.852     843.900     854.963    844.373 us
+S6.96 候选              823.210     835.266     852.739    835.822 us
+
+独立中位改善：8.635 us / 1.023%
+独立均值改善：8.552 us / 1.013%
+配对改善中位：8.626 us
+候选获胜：10/12
+```
+
+候选正确性、真实后端、端到端收益和算子泛化边界均闭合，正式保留。当前权威
+中位距 `0.8 ms` 目标仍约 `35.3 us`；后续继续优化公共调度协议，不得通过
+减少参与者、识别 PA task kind 或放宽 TensorMap 严格插入达标。

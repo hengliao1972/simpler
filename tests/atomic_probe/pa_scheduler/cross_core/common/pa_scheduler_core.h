@@ -6213,7 +6213,8 @@ PA_DEVICE bool DispatchOneSharedBuildTask(
     CoreRole role, uint32_t task_count,
     PaOrchestrationState &orch, TaskArgs &args,
     SubmitContext &context, LocalStats &stats,
-    PmuContext &pmu_context, bool &exhausted
+    PmuContext &pmu_context, bool execute_admission_open,
+    bool &exhausted
 ) {
     exhausted = false;
 #if PA_BUILD_PERF_CLOCK || PA_BUILD_SUBMIT_PMU
@@ -6225,7 +6226,8 @@ PA_DEVICE bool DispatchOneSharedBuildTask(
     BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
     const uint32_t worker_id =
         static_cast<uint32_t>(worker.core_idx);
-    if (CrossCoreExecHasLocalProgressWork(
+    if (execute_admission_open &&
+        CrossCoreExecHasLocalProgressWork(
             state, worker_id, role, task_count, stats
         )) {
         (void)ProgressCrossCoreExec<Ops, true>(
@@ -6606,9 +6608,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     (void)startup_dcci_end;
 #endif
 
-    // startup 严格保持生产 flat 语义；本实验只改变 replay 尾部的 final 汇合。
-    // 96 个参与者全部完成本地状态初始化后再进入 task 0，主要用于压低启动偏斜对
-    // winner 分布和 Submit 时序的干扰；atomicMax 的唯一 winner 正确性本身不依赖该屏障。
+    // 每个 worker 都先发布一次启动到达标记。private replay 继续等待全员到齐；
+    // shared cross-core 依靠唯一 Build/Execute ticket、严格 metadata writer 插入链
+    // 和最终 execution drain 闭合，不把启动对齐当成调度正确性的前置条件。
 #if PA_BUILD_PERF_CLOCK
     // perf-clock 的第一次权威读数从 startup increment 前开始，
     // 与 FinalDrain 后的第二次读数组成完整端到端边界。复用
@@ -6623,6 +6625,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         stats.trace, stats.result, -1, AtomicSite::StartupIncrement,
         &state->started_count.value, 1
     );
+#if !PTO_FDWIC_SHARED_MAP
     const uint64_t start_wait = Ops::Now();
     uint32_t start_polls = 0;
     const uint32_t startup_poll_region = AtomicPollRegionBegin<Ops>(
@@ -6640,6 +6643,14 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         }
     }
     AtomicPollRegionEnd<Ops>(stats.trace, stats.result, startup_poll_region);
+#else
+    // shared cross-core 的 Build/Execute 均由全局唯一 ticket 动态发放，
+    // metadata side effect 又由严格 writer 插入链排序；最终 execution drain
+    // 仍要求全部配置 worker 到达。因此 started_count 继续记录真实参与者，
+    // 早到 worker 不必原地等待，可先领取 Build；Execute ticket 会在后面的
+    // 调度循环确认全员到达后开放，避免少数早到核囤积执行所有权。
+    // 这里不读取任何算子 task kind、DAG、batch 或 tensor shape。
+#endif
 #if PA_BUILD_PERF_CLOCK
     stats.result.startup_barrier_end = 0;
 #else
@@ -6685,6 +6696,12 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #endif
     uint64_t orchestration_begin = 0;
     uint64_t orchestration_end = 0;
+#if PTO_FDWIC_SHARED_MAP
+    // 启动偏斜期间允许中央 Build ticket 立即推进，但在全部配置 worker
+    // 发布到达前不发放 owner-local Execute token，避免少数早到核囤积
+    // 尚未 BUILT 的执行所有权。该门控只依赖通用参与者合同。
+    bool execute_admission_open = false;
+#endif
     if (!IsFatal<Ops>(state, stats)) {
         // private 每批固定回放 Alloc/QK/SF/PV/UP；shared 直接消费 host
         // 按 context_len 发布的 1+4N immutable plan，由中央 ticket 选择
@@ -6714,10 +6731,18 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #endif
         bool dispatch_exhausted = false;
         while (!dispatch_exhausted) {
+            if (!execute_admission_open) {
+                execute_admission_open =
+                    LoadLine<Ops>(
+                        state->started_count, stats,
+                        AtomicSite::StartupPoll
+                    ) >= static_cast<int64_t>(state->config.workers);
+            }
             if (!DispatchOneSharedBuildTask<Ops, Profile>(
                     state, worker, role, task_count,
                     orchestration, args, context, stats,
-                    pmu_context, dispatch_exhausted
+                    pmu_context, execute_admission_open,
+                    dispatch_exhausted
                 )) {
                 break;
             }
@@ -6831,6 +6856,13 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     uint32_t final_watchdog_polls = 0;
     const uint64_t final_watchdog_begin = Ops::Now();
     while (true) {
+        if (!execute_admission_open) {
+            execute_admission_open =
+                LoadLine<Ops>(
+                    state->started_count, stats,
+                    AtomicSite::StartupPoll
+                ) >= static_cast<int64_t>(state->config.workers);
+        }
         // 错误只需最终可见，不为成功路径的每次 progress 付出同地址返回型
         // Atomic。第 0 轮立即检查，随后每 256 轮检查一次；命中后本核 token
         // 进入 Faulted 并结束。正常成功路径由执行排空到达证明完整性。
@@ -6841,7 +6873,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             )) {
             cross_core_exec_ok = false;
         }
-        const uint32_t freed = cross_core_exec_ok
+        const uint32_t freed =
+            cross_core_exec_ok && execute_admission_open
             ? ProgressCrossCoreExec<Ops, true>(
                   state, worker, task_count,
                   /*production_closed=*/false,
@@ -6853,7 +6886,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         // EMPTY/BUILDING 候选会保留 scanner 队头；对应 builder 自己也要
         // 完成越界 ticket 后才能到达。只有 scanner/token 全部排空的核
         // 才能发布一次携带 owner-local completion 数的到达。
-        if (cross_core_exec_ok &&
+        if (cross_core_exec_ok && execute_admission_open &&
             CrossCoreExecWorkerDrained<true>(
                 state, worker, task_count, stats
             )) {
