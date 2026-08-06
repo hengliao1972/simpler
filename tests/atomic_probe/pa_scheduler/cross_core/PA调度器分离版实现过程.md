@@ -5709,3 +5709,83 @@ ready。
 配置。后续优化应直接减少依赖解除到 Execute 领取之间的延迟，并避免重新引入
 S6.80 已证伪的全局 queue-head 热点；不能再以“让 AIC 少 Build”替代真正的
 ready 传播。
+
+## 2026-08-06：S6.82 用实际泳道推导 Build 释放上界，主矛盾转向严格发布链
+
+### 为什么需要重新判定优化对象
+
+S6.80 与 S6.81 分别否决了 BUILT-only 全局队列和 AIC Execute-only 角色隔离。
+两次反例都说明“更早尝试 Execute”不等于“任务更早 ready”，但仅凭端到端结果
+仍无法回答：如果 Execute 发现完全理想，当前还能回收多少时间。
+
+本阶段新增只读工具：
+
+```text
+cross_core/analyze_pa_exec_release_bound.py
+```
+
+它只解析既有 `merged_swimlane.json`，不修改设备代码、不增加 raw 字段，也不把
+泳道观察构建与 trace-free 绝对时间相减。工具按当前 standalone PA 的固定
+`Alloc/QK/SF/PV/UP` task-id 合同重建 `QK -> SF -> PV` 与
+`QK/SF/PV -> UP` 依赖，并明确区分两个完成边界：
+
+- completion flag 结束：后继依赖可见；
+- DONE CAS 结束：本 engine 的这份工作真正释放。
+
+然后计算两组不同的理想调度：
+
+1. 保留每个 task 的真实 BUILT 发布时间，只假设 ready task 可被同角色空闲
+   engine 零开销取得；
+2. 再把所有 BUILT 发布时间理想化为 0，只保留泳道测得的 kernel、completion
+   flag 与 DONE 工作量。
+
+复现命令：
+
+```bash
+.venv/bin/python \
+  tests/atomic_probe/pa_scheduler/cross_core/analyze_pa_exec_release_bound.py \
+  tests/atomic_probe/pa_scheduler/outputs/\
+pa_scheduler_cross_core_shared_swimlane_20260806_005546_3225536/\
+ccec/merged_swimlane.json
+```
+
+### B256 取证结果
+
+```text
+实际泳道：
+  first kernel                         86.480 us
+  last BUILT                          923.450 us
+  last completion                   1,102.950 us
+
+保留真实 BUILT 释放的理想 Execute：
+  first kernel                         70.382 us
+  last completion                   1,043.295 us
+  1024 task 的理想 engine queue delay       0 us
+
+把 BUILT 释放理想化为 0：
+  last completion                     616.061 us
+
+按实际 service 总量/核数得到的算术下界：
+  AIC                                595.487 us/core
+  AIV                                242.189 us/core
+```
+
+真实 BUILT 释放不变时，即使 Execute 发现与领取完全理想，尾部也只缩短
+`59.655 us`。理想模拟里 engine queue delay 全为 0，不是说当前实现没有领取
+延迟，而是说明它不是约 `0.4 ms` 差距的主因：任务真正 ready 的速度已经慢于
+同角色 engine 的消费能力。
+
+反过来，把 Build 释放理想化后才到 `616.061 us`；AIC 实际 kernel 加完成发布
+工作量本身已达 `595.487 us/core`。因此 `0.6 ms` 已贴近当前 real-compute
+负载的算术极限，要求 Register/Build 大部分 Scalar 工作与 AIC 计算重叠，且
+剩余启动、完成和调度开销必须非常小。这个结果不是降低目标，而是约束后续候选：
+
+- 暂不再实现新的 BUILT/ready 全局队列；它至多争取约 60 us，却很容易新增
+  返回型 Atomic、DCCI 和 fanin 空轮询；
+- 下一主攻点是 `last BUILT = 923.450 us` 背后的严格 Register 完成传播与
+  Build 发布链；
+- 候选必须先减少该链的实际工作或返回型等待，再看 Execute 尾部是否同步前移；
+- 最终保留仍以 startup 起点到 FinalDrain 结束的 trace-free 交错 A/B 裁决，
+  理想模拟只用于筛方向，不能替代上板结果。
+
+本阶段仅新增离线分析工具与结论，device code **未修改**。

@@ -1979,3 +1979,25 @@ Build 内增加 Register-wait 或 Register-after 两类 Execute 检查点。只�
 重新打开这一设计空间。完整数据和泳道见
 [Build Phase-Aware Execute Opportunity](cross_core/PA_Build_Phase_Aware_Execute_Opportunity_Proposal.md)
 及 `test_record/2026-8-6/build_phase_opportunity_rejected/`。
+
+### 2026-08-06：用释放上界约束后续优化顺序
+
+对当前 S6.79 B256 full-swimlane 做离线依赖重建后，现行设计增加一条方向门槛：
+
+```text
+实际 last BUILT / last completion       923.450 / 1102.950 us
+保留真实 BUILT 的理想 Execute 尾部                1043.295 us
+全部 BUILT 在 0 时刻可用的理想尾部                  616.061 us
+AIC 实际 service 总量 / 32 核                         595.487 us/core
+```
+
+因此新的 Execute queue、owner 迁移或扫描策略，理论收益上限只有当前样本中的
+约 `59.655 us`，不足以单独把约 `0.99 ms` 收到 `0.6 ms`。现阶段不再新增
+BUILT-only 或伪 ready 队列；优先缩短严格 Register 完成传播和随后的 Build
+发布，让 Build 工作尽可能被 AIC kernel 覆盖。只有 Build 释放显著前移后，
+才重新评估 Execute 端的次级尾部。
+
+`0.6 ms` 同时已接近当前 real-compute 的 AIC 算术 service 下界。后续方案
+不能靠删减 kernel、截断 FinalDrain 或改变任务数达标；仍以 startup 起点到
+FinalDrain 结束的完整周期裁决。离线工具及逐 task 分解见
+`cross_core/analyze_pa_exec_release_bound.py` 和过程记录 S6.82。
