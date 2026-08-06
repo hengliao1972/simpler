@@ -6740,3 +6740,25 @@ Materialize 发布前累计 core-work 从 `8592643` 降至 `8101114 cycles`，�
 `0.090%` 且只在 `4/12` 对获胜，因此不得宣称端到端收益。该项按通用非 atomic
 消冗保留，结论限定为“局部工作量明确下降、端到端持平”。完整数据和正确性
 门槛见实现过程 S6.86。
+
+### 15.62 将不可变 writer 摘要校验降为每 worker 一次
+
+`build_dispatch` 的 writer 分类计数由 host/operator 在 launch 前发布，device
+运行期不修改；旧代码却在 1280 个 task 的 Finish 中重复校验同一计划头。本轮
+把校验移到中央 Build 循环之前，每个 worker 各执行一次，共从 1280 次降为
+96 次。逐 task writer bit、previous writer、真实 delta 交叉校验以及严格
+TensorMap writer 链全部保留；公共代码不读取 PA task kind、固定 DAG、batch
+或输出形状。
+
+新增故障测试证明畸形摘要会在首张 Build ticket 前置 fatal：ticket cursor、
+completed Submit 均保持 0，96 个 worker 全部返回。Python `168` 项、CPU 全
+协议、CCEC 两类构建和 A5 B256 完整终态均通过。perf-clock AIC finish 出口因
+尾合并由 4 变 3，构建仍按实际 AIC/AIV `3/3` 精确校验；full-swimlane 保持
+`4/3`。最终 kernel `.text` 缩小 256B。
+
+冻结 12 对端到端 A/B 的基线/候选中位为 `935.241/938.195 us`，候选慢
+`0.316%` 且只在 `5/12` 对获胜，不能宣称端到端收益；均值则轻微改善
+`0.118%`，同样属于波动区。定向 full-swimlane 中，原校验所在的
+`Claim->Materialize` 累计 core-work 从 `2697808` 降到 `2481234 cycles`，
+减少 `216574 cycles / 8.03%`。该项按通用非 atomic 局部消冗保留，结论限定
+为“局部有效、端到端未证明改善”；完整证据见实现过程 S6.87。

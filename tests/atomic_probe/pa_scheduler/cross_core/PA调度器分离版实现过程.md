@@ -6213,3 +6213,110 @@ outputs/pa_scheduler_cross_core_shared_swimlane_20260806_075121_19286/
 不能把 `raw Submit` 差值当作权威端到端收益。最终保留依据是：通用非 atomic
 工作量明确下降、device 代码缩小、严格 writer 与完整业务不变；性能结论必须
 继续写成“局部有效、端到端未证明改善”。
+
+## 2026-08-06：S6.87 将不可变 writer 摘要校验移出逐 task Finish
+
+### 重复工作的来源与泛化边界
+
+`SharedBuildDispatchState` 的第一条 cache line 只有 `next_task` 会被 device
+修改；第二条 cache line 中的 `task_count`、三类 metadata writer 计数及后续
+plan 都由 host/operator 在 launch 前一次发布，device 运行期只读。S6.86 后，
+`FinishSharedWinnerSubmitBody()` 仍为每个 Build task 调用一次
+`ValidateSharedMetadataWriterSummary()`，重复读取并检查同一份计划头：
+
+```text
+B256 旧调用次数：1280 次
+新调用次数：      96 次（每个 worker 在领取首张 Build ticket 前一次）
+减少：            1184 次
+```
+
+该校验验证的是通用计划不变量：总 writer、ordinary writer、symbol writer
+均不得超过 task 数，union writer 数必须处于两个分类计数的最大值与和之间。
+它不读取 PA `TaskKind`、固定五 task 形状、batch、固定核拓扑、输出数量或 PA
+依赖图；其他算子只要发布同一 `SharedBuildDispatchState` 合同，就走完全相同的
+路径。
+
+最终实现把摘要校验并入 `RunSchedulerImpl()` 已有的 immutable dispatch header
+检查，并保留每个 worker 各自校验一次。没有改成“只让 worker 0 校验再跨核
+广播”，因为后者会新增同步 atomic 和 A5 非一致 DCache 发布协议。逐 task
+Finish 继续解码本 task 的 writer bit 与 previous writer，并用真实 writer
+delta 交叉验证计划；严格 TensorMap writer-to-writer 顺序没有放宽。
+
+### 失败时序与构建结构门槛
+
+新增 CPU 故障测试在 host 初始化后把 union writer 数改为 `task_count+1`，再让
+96 个 worker 进入正式 `RunScheduler()`。结果为：
+
+```text
+fatal                         1
+build_dispatch.next_task      0
+completed Submit              0
+96 个 worker                  全部返回
+```
+
+这证明非法摘要在第一张 Build ticket 之前失败，不会留下 Materialize、Register
+或执行包副作用；相较旧的“首个 task 已被发放后才在 Finish 发现”路径，错误
+收敛更早。
+
+perf-clock AIC caller 因热体缩短发生合法尾合并，finish relocation 从 4 个变为
+3 个；AIV 保持 3 个，full-swimlane 仍为 AIC/AIV `4/3`。构建门槛继续精确锁定
+每种 ELF 的实际形状，并仍检查唯一 role finish 符号、外部 block-local state、
+mixed ELF 与零残留 relocation；没有把检查放宽成范围。五类 PA task 与任意
+Scalar Build owner 的覆盖由 CPU 动态协议及 A5 的 1280 次精确 Build 终态证明，
+不由 relocation 数量臆测。
+
+### 正确性与性能证据
+
+候选通过以下门槛：
+
+- pa_scheduler 加工链 Python `168` 项；
+- cross-core atomic/DCCI source coverage；
+- CPU perf-clock 全构建，包括故障摘要、96-thread Build、writer intent、
+  ordinary ring、严格 writer 链和 execution drain；
+- CCEC perf-clock/full-swimlane 的 AIC/AIV generic probe、split Finish、mixed
+  ELF、relocation 与 manifest；
+- A5 B256 real-compute `6,28,4,1` 的 1280 Build、1024 kernel、256 个严格
+  metadata writer、payload、fanin、DCCI、FinalDrain 与全部 host 终态。
+
+机器码的定向变化为：
+
+```text
+callback finish AIC .text    40088 -> 39872 B   (-216 B)
+callback finish AIV .text    40584 -> 40360 B   (-224 B)
+最终 kernel .text           304440 -> 304184 B  (-256 B)
+```
+
+冻结 S6.86 产物与候选，按 B-C/C-B 交错运行 12 对 B256 完整周期：
+
+```text
+                         min        median       max         mean
+S6.86 基线              919.940     935.241     960.528     937.724 us
+摘要一次校验候选        908.805     938.195     965.304     936.613 us
+
+独立中位变化：候选慢 2.954 us / 0.316%
+独立均值变化：候选快 1.111 us / 0.118%
+候选获胜：5/12
+```
+
+端到端只能判定持平，不能宣称收益。为观察确定的非 atomic 代码位置，又各取一份
+full-swimlane；旧校验恰好位于 `Claim.end -> Materialize.begin`，结果为：
+
+```text
+                                      S6.86       摘要一次校验      变化
+Claim->Materialize aggregate cycles   2697808       2481234       -216574 (-8.03%)
+其中 AIC                               336564        336357          -207
+其中 AIV                              2361244       2144877       -216367
+raw Submit makespan                    743.046 us     746.841 us    +3.795 us
+```
+
+候选泳道位于（测试产物不提交）：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260806_081402_73408/
+```
+
+局部下降与被删除的 1184 次只读摘要校验精确同边界，且 atomic、DCCI、writer、
+kernel 与 TensorMap side effect 数量均未减少；raw 墙钟和 12 对端到端仍受
+其他调度及 atomic 波动影响。因此本阶段按“通用非 atomic 局部消冗”保留，
+性能结论限定为“局部有效、端到端未证明改善”。当前约 `0.935~0.938 ms` 的
+独立中位仍距 `0.8 ms` 目标约 `135~138 us`，后续不得用 PA 特例扩大数字。

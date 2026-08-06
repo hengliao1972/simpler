@@ -782,6 +782,65 @@ bool RunSharedBuildFatalPollCadenceTest() {
     return ok;
 }
 
+bool RunInvalidMetadataWriterSummaryRejectedBeforeBuildTest() {
+    SchedulerState *state = MapSchedulerState();
+    if (state == nullptr) {
+        return false;
+    }
+    pa_scheduler::host::Options options;
+    options.batches = 1;
+    options.runs = 1;
+    options.trace_enabled = false;
+    options.shared_context_lens = {8192};
+    options.final_barrier_shape = FinalBarrierShape::TwoLevel16;
+    pa_scheduler::host::InitializeState(state, options);
+    pa_scheduler::host::ConfigureTrace(state, options, nullptr);
+
+    // build_dispatch header 是 host 在 launch 前发布、device 只读的算子
+    // 通用计划。破坏 union writer 数后，所有 worker 都必须在领取第一张
+    // Build ticket 前终止，避免错误计划产生任何 Materialize/Register 副作用。
+    state->build_dispatch.metadata_writer_count =
+        state->build_dispatch.task_count + 1U;
+
+    std::vector<std::thread> workers;
+    workers.reserve(kWorkers);
+    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
+        const CoreRole role =
+            worker_id < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
+        workers.emplace_back([state, worker_id, role]() {
+            RunScheduler<OrderedSubmitTestOps>(state, worker_id, role);
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+
+    uint64_t completed_submits = 0;
+    bool all_workers_returned = true;
+    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
+        completed_submits += state->results[worker_id].submits;
+        all_workers_returned &=
+            state->results[worker_id].worker_id == worker_id &&
+            state->results[worker_id].finish_cycle != 0;
+    }
+    const bool ok =
+        state->fatal.value == 1 &&
+        state->build_dispatch.next_task.value == 0 &&
+        completed_submits == 0 && all_workers_returned;
+    std::printf(
+        "[ORDERED_SUBMIT] invalid_metadata_summary_pre_dispatch=%s "
+        "cursor=%lld submits=%llu all_workers_returned=%u\n",
+        ok ? "PASS" : "FAIL",
+        static_cast<long long>(
+            state->build_dispatch.next_task.value
+        ),
+        static_cast<unsigned long long>(completed_submits),
+        all_workers_returned ? 1U : 0U
+    );
+    (void)munmap(state, sizeof(SchedulerState));
+    return ok;
+}
+
 bool RunLocalClaimAttemptAccountingTest() {
     LocalStats zero_attempts{};
     FinalizeSharedClaimAttempts(zero_attempts, 0);
@@ -1951,6 +2010,8 @@ int main() {
         RunB256BuildTicketBudgetContractTest();
     const bool build_fatal_poll_cadence_ok =
         RunSharedBuildFatalPollCadenceTest();
+    const bool invalid_metadata_summary_ok =
+        RunInvalidMetadataWriterSummaryRejectedBeforeBuildTest();
     const bool task_id_prefix_ok =
         RunSplitReplayTaskIdPrefixTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
@@ -1969,6 +2030,7 @@ int main() {
         RunRemoteFatalCadenceClosureTest();
     if (!claim_accounting_ok || !build_ticket_budget_ok ||
         !build_fatal_poll_cadence_ok ||
+        !invalid_metadata_summary_ok ||
         !task_id_prefix_ok || !loser_ok ||
         !output_prepare_ok ||
         !fanin_compaction_ok || !efdrain_skip_ok ||

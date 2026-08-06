@@ -852,10 +852,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         static_cast<int32_t>(ticket.function_id);
     bool publishes_metadata = false;
     int32_t previous_metadata_writer = -1;
-    if (!ValidateSharedMetadataWriterSummary(
-            state->build_dispatch
-        ) ||
-        !DecodeSharedMetadataWriterPlan(
+    if (!DecodeSharedMetadataWriterPlan(
             state->build_dispatch, task_id,
             publishes_metadata, previous_metadata_writer
         )) {
