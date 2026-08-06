@@ -6775,3 +6775,14 @@ joint 字段的重复写入收敛为每 worker 一次初始化。该改动不依
 从 `2481234` 增到 `2526758 cycles`（`+1.835%`）：AIC 减少 `4.858%`，占主要
 人口的 AIV 增加 `2.884%`；raw Submit 也增加 `7.973 us`。因此源码消冗没有
 形成跨核型一致收益，本轮完整撤回。详细数据见实现过程 S6.88。
+
+### 15.64 否决 execution payload 重复 layout 校验消减
+
+候选让公共 Build 路径复用已经验证的 payload layout，避免
+`BuildAndPublishExecPayload()` 与 `PackExecPayload()` 从源码看重复计算。它不
+依赖任何 PA 任务类型、固定 DAG、核数或形状，CPU、CCEC 和 A5 B256 正确性均
+闭合。
+
+最终 kernel `.text` 大小仍为 `0x4a438`，且基线/候选 `.text` 的逐字节 SHA256
+完全相同。CCEC 已自动消除该源码重复；设备指令没有变化，多轮 A/B 没有统计
+意义。因此生产代码完整撤回，详细取证见实现过程 S6.89。

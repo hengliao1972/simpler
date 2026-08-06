@@ -6388,3 +6388,39 @@ outputs/pa_scheduler_cross_core_shared_swimlane_20260806_083859_162230/
 store 引起的取指/布局变化已经抵消逻辑消减。结合端到端仅 `7/12` 获胜，本轮
 判定为“协议上通用、性能上不稳”，生产代码完整恢复到 `d13d46c0`。后续不得
 重复该候选，也不得把单次 0.945% 中位改善写成有效收益。
+
+## 2026-08-06：S6.89 否决 execution payload 重复 layout 校验消减
+
+### 候选与泛化边界
+
+公共 `BuildAndPublishExecPayload()` 在预留 cell 前先调用
+`ValidateExecPayloadSpec()` 得到 `checked_layout`，随后
+`PackExecPayload()` 又对同一份不可变 spec 执行一次校验和 layout 计算。候选
+曾把打包主体拆成“消费已验证 layout”的内部入口，使正式 Build 路径只校验
+一次，而保留原有公共 `PackExecPayload()` 的完整校验。
+
+该改动只依赖 portable execution payload 协议，不读取 PA `TaskKind`、固定 DAG、
+batch、核数、输出形状或算子参数，泛化边界本身成立；cell reserve、payload
+写入、DCCI、BUILT CAS 和全部错误返回顺序也没有改变。
+
+### 构建和机器码取证
+
+候选通过 CPU perf-clock 全构建：atomic/DCCI 覆盖、随机参数、ordinary
+TensorMap ring、稀疏 metadata writer 严格链、96-worker Build、execution
+payload/scan/drain 和 ordered Submit 均通过。CCEC AIC/AIV generic probe、
+perf-clock、split Finish、mixed ELF、relocation 与 manifest 也全部通过；A5 B256
+单次完整周期保持 1,280 Build、1,024 kernel、256 metadata writer、2,048
+published output、6,528 DCCI 及全部终态断言。
+
+但是，冻结基线与候选最终 `pa_scheduler_kernel.o` 的 `.text` 大小均为
+`0x4a438`，逐字节 SHA256 也完全相同：
+
+```text
+0301fc51feb5d2bff7b09fa43cc16b61f760722ee1ce98e111bdccba3e3fc3bc
+```
+
+候选对象文件只因源码/调试信息不同而文件大小略变，设备实际执行指令没有任何
+变化。这证明 CCEC 已在内联后消除重复 layout 计算和比较；继续跑端到端 A/B
+只会比较同一份机器码的硬件波动，不能产生候选证据。因此本轮不做多轮性能
+统计，生产源码完整恢复，仅保留该静态反例。后续若优化 execution payload，
+必须先证明最终 `.text` 或明确的 GM/atomic/DCCI 动作发生变化。
