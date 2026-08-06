@@ -5573,3 +5573,139 @@ AIC/AIV 比例；所有算子的 fresh output 都能复用同一合同。它删�
 `0.989 ms`，仍未达到 `0.6 ms`；下一阶段若要动严格 Register 链，必须先以
 独立 compact-delta 探针量出 prepare/publish/invalidate/commit 的净成本，不能
 仅凭经典算法的渐进复杂度直接改生产协议。
+
+## 2026-08-06：S6.80 否决 BUILT-only 全局执行队列
+
+### 要验证的问题与协议
+
+旧 Execute 中央 ticket 在 task Build 前就唯一绑定 Execute owner。为了消除
+“未来 owner 暂停，已经 BUILT 的 task 却不能被其他同角色 Scalar 执行”的延迟，
+本阶段实现了两条按 AIC/AIV 分离的 BUILT-only MPMC 链式队列：
+
+```text
+Build owner 完整发布 cell=BUILT
+-> Exchange(queue.tail, task_id)
+-> Exchange(predecessor.next, task_id)
+-> 同角色 Scalar 通过 head/next/CAS 取得唯一 Execute owner
+```
+
+每个控制字和 task-indexed `next` 都独占 128B atomic 冲突单元；节点单轮不复用，
+因此没有 ABA。第 96 个 Build 终止 ticket 关闭两条队列，消费者只有在
+`closed && head == tail && head.next == -1` 时判定永久排空；`head != tail` 且
+`next == -1` 被识别为生产者 tail/link 之间的发布空洞。新增确定性 CPU 门槛覆盖：
+
+- 乱序 producer link 与关闭时发布空洞；
+- consumer CAS 竞争且每 task 恰好消费一次；
+- 重复 link、错误 role、越界和环路 fail-closed；
+- 8 producer × 8 consumer、1024 task 并发恰好一次；
+- task 6 已 BUILT 时可绕过仍为 EMPTY 的 task 1/3，修复旧 owner 预绑定的
+  确定性活性反例。
+
+完整 CPU B8、CCEC AIC/AIV perf-clock/full-swimlane 构建和 A5 B256 的 1280 task、
+1024 kernel、payload、fanin、角色路由、严格 TensorMap 插入与最终队列闭合均
+通过。也就是说该候选在协议正确性上成立，否决原因完全来自 A5 性能。
+
+### A5 结果与否决原因
+
+无观测 B256 单轮完整周期为：
+
+```text
+S6.79 冻结基线：12 对候选中位约 989.253 us
+BUILT-only 队列：                         4964.305 us
+```
+
+full-swimlane 证据位于：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260806_025118_3387499/
+```
+
+与 S6.79 泳道逐项对比：
+
+```text
+                                        S6.79        BUILT-only queue
+完整泳道 lifecycle                    1105.275 us       4898.483 us
+FinalDrain                              约尾部闭合        3913.405 us
+fanin atomic load                        约 65K            157,926
+其中 fanin_not_ready                         -             156,646
+atomic logical calls                     95,261            251,356
+DCCI calls                                6,528              6,528
+DCCI cache lines                        107,257            117,620
+AIC 首个 kernel                           86.480 us          80.236 us
+AIC 每核首个 kernel 中位                 149.484 us         142.405 us
+AIC 每核首个 kernel 最晚                 274.703 us         378.032 us
+AIC 最后 kernel 结束                    1098.046 us        4889.958 us
+```
+
+候选只把全局首个 AIC 提前 `6.244 us`、每核首个中位提前约 `7.080 us`，却把
+AIC 最晚启动和整体尾部显著拉长。根因是 `BUILT` 只说明 payload 可消费，不等于
+fanin 已 ready：Build 完成顺序跨 batch/阶段高度乱序，四个 owner-local token
+会取得任意后序 BUILT task，再反复轮询尚未完成的 fanin。队列将原来的执行顺序
+约束丢掉后，产生 `156,646` 次无效 ready load；同时所有核继续竞争两条共享
+head，新增 enqueue/dequeue 返回型 atomic。它不是“真正 ready queue”，仅把
+未来 Build 等待改造成更昂贵的依赖等待。
+
+因此该生产代码完整回撤，不进入有效优化提交。后续若再次使用完成队列，至少要
+由依赖解除事件发布“真正 ready”的 task，或提供不会让 fanin-blocked token
+长期占槽的有界顺序窗口；不能再把所有 BUILT task 无差别送入全局 MPMC 队列。
+
+## 2026-08-06：S6.81 否决 AIC Execute-only 角色隔离
+
+### 要验证的问题
+
+S6.79 的 full-swimlane 显示，32 个 AIC Scalar 除执行 Cube kernel 外仍参与全局
+Build ticket，并承担 Materialize、Register、Fanin 和 WinnerBuild。为了区分
+“AIC 没有足够 Scalar 时间执行”与“Cube task 的依赖尚未就绪”，本阶段增加了
+一个仅用于受控取证的编译期角色参数：
+
+```text
+对照：32 AIC + 64 AIV 均可 Build，AIC 同时执行 Cube task
+候选：64 AIV 独占 Build，32 AIC 只执行 Cube task
+```
+
+该参数只按 AIC/AIV 后端角色划分，不读取 PA task kind、batch 或固定 DAG。
+Execute owner 规则、严格 TensorMap 插入链、fanin、TaskCell、DCCI 和 kernel
+负载均未改变。候选只让 AIC 不读取 Build cursor；因此终止越界 ticket 从 96
+次降到 64 次。
+
+CPU B8 的 40 task/32 kernel、payload、fanin、严格插入和 completion 全部通过；
+CCEC AIC/AIV perf-clock 构建及最终 ELF relocation 门槛通过。A5 B256 候选也完成
+1280 task、1024 kernel，所有语义与协议断言均为 PASS。
+
+### 同源 A5 对照结果
+
+两种配置均从同一份候选源码分别重编译，随后各运行 6 个独立 B256 进程；统一
+统计 startup 起点到最后 FinalDrain 结束：
+
+```text
+64 AIV 独占 Build：
+  977.363, 1013.222, 977.727, 1010.168, 1002.666, 989.027 us
+  min / median / max = 977.363 / 995.847 / 1013.222 us
+
+96 Scalar 均可 Build：
+  986.542, 969.940, 984.936, 1045.900, 1000.333, 1025.158 us
+  min / median / max = 969.940 / 993.438 / 1045.900 us
+
+候选相对对照中位：+2.409 us / +0.242%
+```
+
+工作分布同时发生了确定性迁移：
+
+```text
+                           64 AIV 独占 Build      96 Scalar 均可 Build
+Build ticket atomic               1344                    1376
+fanin load 范围              13896--15378             10054--11721
+EfDrain 执行 task              416--432                 880--902
+FinalDrain 执行 task           592--608                 122--144
+```
+
+候选虽然少了 32 次终止 ticket atomic，却使 Build 吞吐降低，并让更多可执行工作
+推迟到 FinalDrain；额外 fanin 轮询也抵消了 AIC 不参与 Build 所节省的 Scalar
+工作。端到端没有收益，说明当前主要限制不是 AIC 被 Build 代码简单占满，而是
+producer Build/执行/依赖解除的到达时间。仅隔离角色不能让 Cube fanin 更早
+ready。
+
+因此参数、host oracle、manifest 和 Build 脚本改动均已完整撤回，不保留中间
+配置。后续优化应直接减少依赖解除到 Execute 领取之间的延迟，并避免重新引入
+S6.80 已证伪的全局 queue-head 热点；不能再以“让 AIC 少 Build”替代真正的
+ready 传播。
