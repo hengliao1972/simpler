@@ -7,13 +7,13 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 Build ticket 恰好一次 Build；32 AIC 与 64 AIV 分别通过各自中央 Execute ticket 动态领取同角色 task；每核四个 token 可在 payload 尚未发布时保存 `WAITING_BUILT`，但单次调度边界遇到首个未 `BUILT` 的新 token 后不再连续预领；Build/Execute owner 独立且允许同核 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.72 已形成三条独立发放流：一条全 96 Scalar Build ticket、两条 AIC/AIV Execute ticket；严格 TensorMap 插入链、task-indexed immutable payload、跨核 DCCI publish/acquire、四个 owner-local token 和 16 组 FinalDrain 收口均保持；严格插入完成字已按 task 隔离到独占 128B atomic 冲突单元；新领 token 未 `BUILT` 时结束本次边界的继续预领 |
-| CPU 正确性用例 | 双角色 Execute ticket、同核/跨核 owner、单边界只保留一个新 `WAITING_BUILT`、跨多个边界仍可逐步用满四 token、严格插入与乱序 Build、1024 kernel exactly-once 和 FinalDrain 完整回归均已通过 |
+| 正式实现 | S0–S6.79 已形成三条独立发放流：一条全 96 Scalar Build ticket、两条 AIC/AIV Execute ticket；严格 TensorMap 插入链、task-indexed immutable payload、跨核 DCCI publish/acquire、四个 owner-local token 和 16 组 FinalDrain 收口均保持；严格插入完成字已按 task 隔离到独占 128B atomic 冲突单元；新领 token 未 `BUILT` 时结束本次边界的继续预领；fresh output descriptor 在预留 writer 后直接构造到最终 `shared_outputs`，不再经 worker payload 二次搬运 |
+| CPU 正确性用例 | 双角色 Execute ticket、同核/跨核 owner、单边界只保留一个新 `WAITING_BUILT`、跨多个边界仍可逐步用满四 token、严格插入与乱序 Build、原位 SharedOutput 发布/重复预留拒绝、1024 kernel exactly-once 和 FinalDrain 完整回归均已通过 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束。S6.72 相对 S6.71 四 token 冻结基线的 12 对 A/B 中，中位从 `1.047032 ms` 降至 `1.010589 ms`，改善 `3.481%`，11/12 对候选更快；B1/B256 功能与终态全部 PASS |
+| A5 PA 功能/性能 | 唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束。S6.79 相对冻结旧 ELF 的 12 对交错 A/B 中，中位从 `1.000814 ms` 降至 `0.989253 ms`，改善 `1.155%`，候选胜 `8/12` 对；B1/B256、完整泳道和终态全部 PASS |
 | 历史 S4 Execute election | K2 首版曾通过 CPU B1/B256 和 A5 B1/B256，现已被 S6.68-b 的角色中央 ticket 替代，仅作为历史证据保留 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前验证缺口 | 四 token、per-task 128B 插入完成字和单边界停止无效预领的 CPU、CCEC、A5 B1/B256、完整泳道和冻结 A/B 均已完成；当前中位距 `0.6 ms` 目标仍约 `0.411 ms`，下一阶段优先处理严格 Register 链和 Execute owner 被长 Build 占用的问题，不机械扩容 token |
+| 当前验证缺口 | 四 token、per-task 128B 插入完成字、单边界停止无效预领和原位 SharedOutput descriptor 的 CPU、CCEC、A5 B1/B256、完整泳道与冻结 A/B 均已完成；当前中位距 `0.6 ms` 目标仍约 `0.389 ms`。严格 Register 链的经典替代都需要新增有序提交 payload/DCCI，未经独立探针和冻结 A/B 不进入生产路径 |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -90,7 +90,7 @@ owner 与 Execute owner 是合法且无需绕开的结果。
 
 `same_core` 只表示“Build 和 Execute 由同一个 worker 完成”，不表示它的整套内存模型都是本核私有的。现有 shared TensorMap 路径已经有三类真实跨核发布：
 
-1. Materialize 把 fresh output `TensorDesc` 发布到 task-indexed `shared_outputs`；
+1. Materialize 先预留 output writer，再把 fresh output `TensorDesc` 直接构造并发布到 task-indexed `shared_outputs`；不再先写 worker payload 后做第二次 128B 搬运；
 2. Register 通过 `task[N-1].deps_prepared -> metadata(N) -> task[N].deps_prepared` 严格保序插入 TensorMap；
 3. Execute/Complete 通过 task `vend/flag` 向其他核发布 kernel 完成，fanin reader 跨核读取。
 
@@ -102,7 +102,7 @@ owner 与 Execute owner 是合法且无需绕开的结果。
 | --------- | --------------------- | ----------------- |
 | Build owner | 现有中央 Build ticket 保证每个 task 唯一 Build owner | 原样保留；96 个 Scalar 都可领取 Build task |
 | output 内存 | shared heap 为 task 保留 GM 区域；`TensorDesc` 指向该共享内存 | executor 直接写该 GM 地址，不再发明一套 output “转移所有权”协议 |
-| SharedOutput 发布 | descriptor 普通写 -> `FlushRegion()` -> atomic `published` | 原样保留；`published` 仍只表示 descriptor 可读，不表示 kernel 完成 |
+| SharedOutput 发布 | writer reserve -> descriptor 在最终 cell 原位构造 -> `FlushRegion()` -> atomic `published` | 发布顺序与 Atomic/DCCI 数量不变；`published` 仍只表示 descriptor 可读，不表示 kernel 完成 |
 | TensorMap 有序插入 | 等 `deps_prepared[N-1]`，发布 N 的 metadata/history，再 CAS 发布 `deps_prepared[N]` | 原样保留；跨核 Execute 不参与该串行链 |
 | fanin lookup | Build 阶段只接受 `producer < N`，再把 fanin 保存到执行包 | 过滤边界和 TensorMap 语义不变 |
 | fanin ready | consumer 以 task completion `flag` 的返回型 atomic load 判断 producer 完成 | 原样保留，只是读取它的 worker 可能换了 |
@@ -446,7 +446,7 @@ Build owner:
   -> atomic BUILT
 
 Execute owner:
-  先确认本核三个 execution token 中至少一个为 IDLE
+  先确认本核四个 execution token 中至少一个为 IDLE
   -> 只 poll/CAS atomic control
   -> 取得 CLAIMED 后对完整 payload 调用一次 InvalidateRegion
   -> 在 token 中保存 immutable payload 地址并重建 executor-local binding
@@ -454,6 +454,24 @@ Execute owner:
   -> fanin ready 前缀、phase、context/dispatch 只在 owner token 中修改
   -> 发布 DONE 后才把对应 execution token 恢复为 IDLE
 ```
+
+fresh SharedOutput descriptor 与 execution payload 是两种不同的普通 GM
+payload，但必须遵守相同的“唯一最终地址、只写一次”原则。S6.79 的正式路径为：
+
+```text
+返回型 FetchMax 预留本 task 的全部 output writer 控制字
+-> Materialize 直接在 shared_outputs[task].tensors[output] 构造 TensorDesc
+-> SubmitContext::result 保存该最终地址
+-> 对最终 descriptor 连续区域执行原有 FlushRegion
+-> atomic published
+-> portable execution payload 从 result 指向的最终 descriptor 构造
+```
+
+因此不再在 `WorkerState::payload` 生成一份中间 descriptor，也不再执行
+`worker payload -> shared_outputs` 的第二次 128B 搬运。writer reserve、descriptor
+DCCI、StoreBarrier、published Exchange 的次数和顺序均未减少；异常预留、
+Materialize 或发布失败仍回滚 writer 控制字并清除半成品。这个合同按 output
+ordinal 和有效 count 工作，不读取 PA task kind，零 output task 是自然空操作。
 
 这里的“一次 DCCI”指一次**批量发布 helper**：多 line payload 在硬件上仍需要每条 line 一条 DCCI，但中间不夹杂业务读写，末尾只一次 DSB。禁止把 `FlushRegion()` 放入 tensor/scalar/fanin 的字段循环，也禁止“先写 header -> flush -> 再补 count -> 再 flush”。
 
@@ -545,7 +563,8 @@ Execute owner:
 ```text
 1. 从全 96 Scalar 共用的中央 Build cursor 取得唯一 task ordinal，确认本核是 Build owner
 2. 对 task-indexed cell 执行返回型 CAS：EMPTY -> BUILDING
-3. Materialize，并按现有协议发布 fresh SharedOutput descriptor
+3. 预留 SharedOutput writer；Materialize 把 fresh descriptor 直接构造到最终
+   task-indexed cell，完成原有 DCCI 与 `published` 发布，不产生 worker 中间副本
 4. 严格按 task id Register metadata，发布 deps_prepared[N]
 5. Fanin lookup，过滤 producer >= current task
 6. 冻结 completion-vend，在寄存器/本地状态中计算并校验 payload_lines
@@ -1892,3 +1911,71 @@ CPU、CCEC、A5 B256 full-swimlane 和 trace-free 十轮已全部通过；完整
 逐阶段代码、泳道与性能数字继续记录在
 [PA调度器分离版实现过程](cross_core/PA调度器分离版实现过程.md)，本文只保存
 采用后的架构合同和仍待验证的设计边界。
+
+### 2026-08-05：已否决的 Register 等待 Execute 检查点
+
+当前 Build/Execute 分离仍有一个调度空洞：Execute owner 已持有
+`WAITING_BUILT` token 后可能进入另一个 Build；这个 Build 在严格 Register
+链上等待前序 task 时只连续读取 insert-completion，期间即使原 token 已经
+`BUILT` 也不会重新观察。task 6 的实测反例中，这造成约 `33.119 us` 的
+`BUILT -> owner reobserve` 延迟。
+
+本阶段允许在这一处**纯等待**中加入有界执行检查点，合同如下：
+
+1. 每轮必须先读取 predecessor completion；已经 ready 时直接进入 Register；
+2. 只有确认值仍为合法 pending 后，累计到固定轮询间隔才触发检查；
+3. 一次只检查一个 owner-local token，不领取 Execute/Build 新 ticket，不扫描
+   全局 cell，也不批量 drain 四个 token；
+4. `WAITING_BUILT` 最多做一次 cell-state 观察和 CLAIM；`WAITING_FANIN` 最多
+   做一次 ready-prefix 观察，未 ready 立即返回当前 Register 轮询；
+5. fanin ready 后，kernel 与 completion 是不可拆分同步工作单元；kernel
+   内不让出 Scalar；
+6. 当前 Build 的 `TaskArgs`、`SubmitContext` 和 writer delta 继续保存在同一
+   调用栈，返回后完成原 Register/Fanin/Build，不发布 GM continuation；
+7. 检查点位于 metadata commit 之前，不能扩散到 Materialize 或 Fanin
+   preparation 等实际计算段。
+
+现有 B256 raw 中 1,279 次前序等待的 load 数量中位为 `20`、p75 为 `32`、
+p90 为 `90`；达到 16 次的长等待占事件数 `64.0%`，覆盖全部轮询 load 的
+`93.6%`。第一版因此使用 `K=16`，四个 token 以 owner-local 游标轮转，一次
+只碰一个 slot。这个参数必须经 A5 冻结 A/B 裁决，不能因为首个 AIC 提前就
+直接固化。
+
+这项改动不改变 TensorMap 严格插入、payload publication、`BUILT -> CLAIMED`
+exactly-once、fanin 或 FinalDrain 合同。它会形成同步的
+`Build(Register wait) -> Execute -> resume Build` 调用栈，因此 CCEC 还必须
+验证 split finish 对同角色 dispatcher 的唯一依赖、32 KiB stack、AIC/AIV
+代码体积和完整 B256 终态。泳道上 Register 父区间可以包含这次 Execute，
+但不能把嵌套 kernel 时间解释成 predecessor Atomic 延迟。
+
+随后按上述合同完成 CPU、CCEC 和 A5 B256 验证。正确性全部通过，首个 AIC
+kernel 也从旧证据约 `113.609 us` 提前到 `56.909 us`；但 826 个 kernel
+进入 Register 后，前序等待中位从约 `5.647 us` 放大到 `178.413 us`，
+trace-free 端到端从同窗 `996.663 us` 回退到 `2985.751 us`。同步 kernel
+阻塞当前 task 的 insert-completion，并把延迟沿严格 metadata 链传播。
+
+因此这一节只保留为已验证反例，不是现行架构合同。生产实现、专用 placement
+和 split finish dispatcher 依赖均撤回；完整证据见
+`test_record/2026-8-6/register_wait_exec_k16_rejected.json` 与
+[Register Wait Execute Checkpoint 方案](cross_core/PA_Register_Wait_Execute_Checkpoint_Design_Proposal.md)。
+
+### 2026-08-06：已否决的 Register 后 Execute Opportunity
+
+为避免上一候选把 kernel 串进严格插入链，又验证了更窄的边界：task N 完成
+Register 并发布 insert completion 后，在 N 的 Fanin/BUILT 前只推进一个已有
+owner-local Execute token。该位置不阻塞 N+1 的 TensorMap 插入，正确性、
+CCEC split TU 和 A5 B256 全部闭合。
+
+但 6 对冻结反转 A/B 中，端到端中位由 `1011.904 us` 回退到 `1035.376 us`，
+候选 `0/6` 获胜。泳道显示它把 208 个 kernel 从 EfDrain 搬到新机会点，
+FinalDrain 仍为 122；与此同时，全部 1280 个 Build 都增加第二次 split Finish、
+continuation 校验和四 token 扫描。机会点还会在同步执行旧 task 时延后当前 N
+的 Fanin/BUILT，因而没有增加 Scalar/engine overlap，只是重新排列串行工作并
+叠加控制成本。
+
+因此现行架构仍保持 **完整 Build 后回到外层 Execute-first 调度边界**，不在
+Build 内增加 Register-wait 或 Register-after 两类 Execute 检查点。只有未来
+出现能明确减少 FinalDrain、或能避免“每 Build 固定付费”的新触发证据时，才
+重新打开这一设计空间。完整数据和泳道见
+[Build Phase-Aware Execute Opportunity](cross_core/PA_Build_Phase_Aware_Execute_Opportunity_Proposal.md)
+及 `test_record/2026-8-6/build_phase_opportunity_rejected/`。

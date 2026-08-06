@@ -5289,3 +5289,287 @@ kernel、2048 fresh output、768 symbol commit 和 6528 次 DCCI 全部闭合。
 
 该项以完全相同的逐位校验结果替代重复遍历，没有新增共享状态、atomic、DCCI
 或错误传播窗口，正式保留。
+
+## 2026-08-06：S6.77 否决严格 Register 等待内的同步 Execute 检查点
+
+### 动机与边界
+
+旧泳道中 task 6 已 `BUILT` 后仍约 `33.119 us` 才被 Execute owner 重观察；
+反例 owner 正在另一个 Build 的严格 Register 前序等待中。本阶段只在确认
+predecessor completion 仍为合法 pending 后，每 16 次 load 轮转检查一个
+owner-local token；不领新 Execute/Build ticket、不扫全局 cell、不批量 drain，
+fanin 未 ready 只观察一次，kernel 开始后同步执行到底。
+
+`K=16` 来自已有 1,279 次等待分布：load 数中位 20、p75 32，达到 16 次的
+等待覆盖全部轮询 load 的 93.6%。CPU 新增的确定性交错临时证明了：ready
+首读不检查、第 16 次 pending 才执行、单次只推进一槽、fanin 未 ready 立即
+返回且中央 Execute cursor 不前进。
+
+### CCEC 代码形态
+
+初版 inline 展开使 callback/dispatched 两个 Finish 各复制一份执行器，AIC
+finish object 从约 641 KiB 增到 894 KiB，并产生两个 dispatcher relocation。
+改为唯一 noinline helper 后，AIC/AIV finish 分别约 788/783 KiB，两个对象
+各只保留一个同核型 dispatcher relocation；最终 ELF 无残留 relocation，
+32 KiB stack 编译通过。最终设备 ELF 仍从冻结基线约 2.41 MiB 增至
+2.56 MiB，约增加 6.2%，本身也是需要裁决的 I-cache 代价。
+
+### A5 结果
+
+B1 与 B256 的 Build/Execute exactly-once、TensorMap 严格插入、payload、
+fanin、DCCI、completion 和 FinalDrain 全部 PASS。B256 结果为：
+
+```text
+修改前 trace-free 单次       996.663 us
+K=16 trace-free 候选         2985.751 us
+K=16 full-swimlane lifecycle 3292.715 us
+K=16 full-swimlane Submit    3087.272 us
+
+placement: EfDrain=101, RegisterCheckpoint=826, FinalDrain=97
+首个 AIC kernel: 约 113.609 us -> 56.909 us
+Register wait median: 约 5.647 us -> 178.413 us
+Register wait p95:    约 30.056 us -> 344.486 us
+Register wait max:    约 54.675 us -> 432.575 us
+```
+
+候选确实解决局部首发延迟，但 QK/SF/PV 同步 kernel 约 28--54 us，通常长于
+触发检查点之后剩余的前序等待。kernel 期间 predecessor 即使已经发布，当前
+Build 仍不能继续 Register；延迟随后沿 task-id 严格插入链传播，最终把
+Register wait 中位放大到约 178 us。
+
+这不是通过调大 K 能修复的问题：固定阈值不知道当前等待还剩多久；K 越大只会
+减少触发并退化成旧路径。方案因此正式否决，生产代码、专用 placement、CCEC
+split finish 依赖和临时 CPU 用例全部撤回。过程泳道保留在：
+
+```text
+test_record/2026-8-6/register_wait_exec_k16_rejected.json
+```
+
+当前排他 analyzer 拒绝候选中的 Register 内 Kernel，这是它对现行生产结构的
+正确约束；既然候选已否决，不为过程态扩张 analyzer 兼容分支。
+
+### 回撤复验
+
+生产代码、临时 CPU 用例和 split-finish dispatcher 依赖撤回后，CPU 全套协议
+测试通过；CCEC perf-clock 重新编译也重新满足 finish 不引用 dispatcher、最终
+ELF 无 relocation 的约束。A5 B256、real-compute `6,28,4,1` 复验结果为：
+
+```text
+startup_to_final_drain_us=979.943
+placement: EfDrain=902, RingBp=0, FinalDrain=122
+execution_status=PASS, semantic_status=PASS
+```
+
+该结果回到同窗约 1 ms 基线，证明约 3 ms 回退来自本轮检查点结构，而非设备
+状态或随机波动。8 月 6 日目录只保留被否决候选的泳道证据与说明，不保留候选
+生产代码。
+
+## 2026-08-06：S6.78 否决 Register 后的 Build Phase-Aware Execute Opportunity
+
+### 目标与实现
+
+S6.77 的根因是把同步 kernel 放进严格 Register 前序等待，阻塞会沿 task-id
+插入链传播。本阶段把机会点移到 task N 已发布 insert completion 之后、Fanin
+和 BUILT 之前：严格插入链已经释放，caller 只推进一个已有 owner-local token，
+不领取新 Execute ticket、不 fanin spin、不批量 drain。
+
+为保持 CCEC finish object 不依赖 dispatcher，Build finish 被临时切成两段：
+
+```text
+Stage A: Materialize -> Register -> insert completion -> Registered
+caller : 固定四 token 中选择最老 task，最多推进一个
+Stage B: Fanin -> BUILT/Alloc complete -> close Submit
+```
+
+continuation 复用 `CompeteFirstSplitRuntimeState::reserved`，没有新增 SchedulerState
+字段、atomic、DCCI 或 raw record。CPU 先红后绿：定向门槛证明 Stage A 已释放
+插入链但尚未发布当前 BUILT、机会点不移动中央 Execute cursor、一次只推进一个
+既有 token、Stage B 必须消费同 task continuation。完整 CPU 96-worker、严格
+插入、payload、fatal 和 FinalDrain 协议全部通过。
+
+初版 inline 实现把最终 ELF 从约 `2.407 MiB` 放大到 `3.021 MiB`。将正常 drain
+与单次机会统一为一个 noinline helper 后，最终 perf-clock ELF 为
+`2,195,712 B`，反而比冻结基线 `2,407,192 B` 小 `8.785%`；AIC/AIV caller
+object 分别缩小 `14.922%/13.253%`，Finish object 约增加 `2.8%`，没有最终
+relocation。因此最终性能裁决针对的是调度机制本身，而不是保留一版明显膨胀
+的中间产物。
+
+### A5 正确性与冻结 A/B
+
+B1 为 `204.528 us`。B256 的 Build/Execute exactly-once、TensorMap 严格
+插入、payload、fanin、DCCI、completion、1024 kernel 和 FinalDrain 全部
+PASS。冻结修改前产物后做 6 对 B-C/C-B 反转交错：
+
+```text
+基线中位数 = 1011.904 us
+候选中位数 = 1035.376 us
+候选回退   = 23.473 us / 2.320%
+候选获胜   = 0 / 6 对
+配对差中位 = +24.178 us
+```
+
+这组结果在全部六对中同向，达到明确否决标准。
+
+### 为什么变慢
+
+保留的 B256 泳道为：
+
+```text
+lifecycle=1104.222 us, Submit=1011.970 us
+EfDrain=694, BuildOpportunity=208, FinalDrain=122
+```
+
+对照撤回后典型的 `EfDrain=902, RingBp=0, FinalDrain=122`，候选没有减少任何
+FinalDrain 工作，只把 208 个原本由常规 EfDrain 推进的 kernel 提前到新机会点。
+这 208 个完成仅覆盖 `208/1280=16.25%` 的 Build 机会；但全部 1280 个 Build
+都支付第二次 split Finish、continuation 交接和四 token 扫描。
+
+此外机会点仍位于当前 N 的 Fanin/BUILT 之前。同步执行旧 task M 时，Scalar
+不能继续生成 N 的 payload，于是 M 提前、N 的 ready 供给变晚。Build 与 Execute
+在同一 Scalar 上仍是串行工作，尾部又未减少，最终只发生时间位置搬运并叠加
+固定控制成本。这解释了“局部确实提前、端到端却稳定回退”，也说明不能用
+placement 改善或 ELF 缩小替代完整周期裁决。
+
+### 泳道归档与回撤
+
+候选 raw 和 Perfetto 合并泳道保留在：
+
+```text
+test_record/2026-8-6/build_phase_opportunity_rejected/
+```
+
+正式 sparse validator 不允许 Register 与 Fanin/AllocComplete 之间出现 Kernel。
+本次只用未进入设备代码的临时 exporter 放宽相邻端点检查以保存过程 raw；全部
+设备语义断言和 dropped-record 门槛已通过，正式 exclusive analyzer 没有为了
+已否决结构扩张兼容逻辑。
+
+候选生产代码、placement 别名、split continuation 和临时 CPU 门槛已完整撤回。
+按用户要求，回撤后不再重复上板；本阶段直接采用已经完成的冻结 A/B 作为性能
+结论。完整设计与原因分析见
+`PA_Build_Phase_Aware_Execute_Opportunity_Proposal.md`。
+
+## 2026-08-06：S6.79 原位构造 SharedOutput descriptor
+
+### 经典协议检索与当前结构的对应关系
+
+本阶段先按用户要求查证经典并发协议，不先把一个熟悉的锁名套到 A5 上：
+
+- Mellor-Crummey/Scott queue lock 和 Anderson array queue lock 的核心都是让
+  waiter 在独立或局部位置上自旋，避免所有核持续冲击同一共享字。当前
+  `deps_prepared[N]` 已按 task 独占 128B，且只有 task N+1 的 Build owner
+  轮询 task N；从等待地址拓扑看，它已经属于这种 distributed waiting，
+  换成 MCS/array-lock 名字不会删除严格顺序链上的返回型观察。
+- Flat Combining 和 Remote Core Locking 把临界区交给一个 combiner/server，
+  oneTBB `serial_in_order` pipeline 与 Disruptor 的 claim/publish/sequence 则给出
+  更一般的 `parallel prepare -> ordered commit -> parallel consume` 结构。它们
+  确实是严格 TensorMap 插入的架构候选，但不是低成本替换：A5 Scalar 间没有
+  cache coherence，Build owner 必须新增 writer delta 普通 GM 发布、逐行 DCCI、
+  ready Atomic；committer 还要 invalidate、校验、按序提交并通知原 owner。
+  当前固定 `SharedTaskWriterDelta` 的通用最坏形状约 1264B，即使改成实际前缀，
+  PA 的空 ordinary writer 也不能代表其他算子。现阶段没有证据证明这些新增
+  GM/DCCI 小于现有每 task 一读一写交接，因此不把 grouped drainer/combiner
+  直接接入生产代码。
+
+查证来源：
+
+- MCS queue lock：<https://homepages.inf.ed.ac.uk/mic/PPLS/mellor-crummey.pdf>
+- Anderson array queue lock：<https://homes.cs.washington.edu/~tom/pubs/spinlock.html>
+- Flat Combining：<https://doi.org/10.1145/1810479.1810540>
+- Remote Core Locking：<https://www.usenix.org/system/files/conference/atc12/atc12-final237.pdf>
+- oneTBB `parallel_pipeline`：<https://uxlfoundation.github.io/oneTBB/main/specification/source/algorithms/functions/parallel_pipeline_func.html>
+- Disruptor sequence/publish：<https://lmax-exchange.github.io/disruptor/disruptor.html>
+
+本轮也没有恢复已经明确排除的 NOP/backoff 微调，没有实现 grouped drainer。
+经典协议检索带来的直接结论是：当前等待地址已经充分分散，下一项低风险工作
+应先消除严格链外围的重复 ordinary GM 数据移动。
+
+### 候选：预留后直接写最终 descriptor cell
+
+B256 有 `2048` 个 fresh output，每个 `TensorDesc` 为 128B。旧路径为：
+
+```text
+Materialize 写 worker payload descriptor
+-> output writer FetchMax reserve
+-> 再复制 128B 到 shared_outputs[task].tensors[output]
+-> descriptor DCCI
+-> published Exchange
+```
+
+因此一轮会额外搬运 `2048 * 128B = 256 KiB` descriptor。候选保持 output
+writer、DCCI 和 published 协议不变，只调整唯一普通 payload 地址：
+
+```text
+先用原返回型 FetchMax 预留全部 output writer
+-> Materialize 直接在最终 task-indexed shared output cell 构造 descriptor
+-> SubmitContext::result 指向最终 descriptor
+-> 原有 descriptor DCCI + StoreBarrier + published Exchange
+-> execution payload 从 result 的最终地址构造
+```
+
+默认 Materialize/adapter 实例保持旧接口；只有 cross-core 生产实例显式启用
+direct contract，避免测试兼容入口被隐式改义。新增 CPU 门槛分别证明：
+
+- direct Materialize 的 result 指针精确等于最终 shared cell，descriptor 地址、
+  大小和 owner 正确，worker payload 未生成中间副本；
+- writer 可在构造前预留，原位发布不修改 descriptor，published/last_writer
+  达到精确 task id；重复预留在覆盖 descriptor 前失败；
+- 默认 execution adapter 仍从旧 payload 取值，生产 direct 实例才从 result
+  取最终地址。
+
+Materialize、writer-delta 或预留失败会走既有 rollback；published Exchange
+异常仍由 publish helper 完整 rollback。若内部 descriptor/result 合同校验
+失败，则整轮立即进入 terminal fatal，cell 不再继续调度或复用，保留控制字
+作为错误证据。曾尝试在外层 fatal 分支再复制一遍完整 rollback：device ELF
+由 `2,412,976B` 增至 `2,417,472B`，6 对 A/B 只胜 2 对，独立中位从同期旧版
+`992.529 us` 回退到 `997.471 us`，因此撤回该冷路径膨胀。最终 `.text` 与下面
+12 对取证使用的候选逐字节一致。
+
+### 正确性、泳道归因与性能裁决
+
+完整 CPU build、shared-output/Materialize/adapter/ordered Submit 门槛全部通过；
+CCEC perf-clock 和 full-swimlane 的 AIC/AIV 构建、最终 ELF 无 relocation 门槛
+通过。A5 B1/B256 完成 1280 task、1024 kernel、严格 TensorMap 插入、payload、
+descriptor、fanin、completion、heap 与 FinalDrain 全部 PASS。
+
+冻结修改前 host/kernel，与候选按 B-C/C-B 反转顺序交错运行 12 对独立 B256
+trace-free 进程，统一统计 startup 起点到最后 FinalDrain 结束：
+
+```text
+冻结旧版: min / median / max / mean
+          984.903 / 1000.814 / 1025.604 / 1003.398 us
+原位候选: min / median / max / mean
+          974.389 /  989.253 / 1021.602 /  992.809 us
+
+独立中位数改善 = 11.561 us / 1.155%
+独立均值改善   = 10.589 us / 1.055%
+配对收益中位数 = 8.468 us
+候选获胜       = 8 / 12 对
+```
+
+候选 B256 full-swimlane 位于：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260806_005546_3225536/
+```
+
+与 S6.76 旧泳道对比，归因与代码改动一致：
+
+```text
+                         旧版 cycles    候选 cycles       变化
+Materialize 聚合          12,238,519     10,197,389   -2,041,130 / -16.68%
+descriptor 二次 copy       2,203,052          2,038   -2,201,014 / -99.91%
+output writer reserve 次数      2,048          2,048   不变
+output published 次数           2,048          2,048   不变
+descriptor DCCI 次数            1,024          1,024   不变
+```
+
+copy 的 `2,038 cycles` 只是为保持 raw 子区闭合而读取的时间戳边界，不再包含
+descriptor 搬运。完整泳道 lifecycle 为 `1105.275 us`、Submit 为
+`1043.084 us`，只用于归因，不与 trace-free 中位直接相减。
+
+该修改按 output ordinal/count 工作，不读取 PA task kind、batch、固定 DAG 或
+AIC/AIV 比例；所有算子的 fresh output 都能复用同一合同。它删除 ordinary GM
+冗余而不削弱 Atomic/DCCI，因此正式保留。当前可信 trace-free 中位约
+`0.989 ms`，仍未达到 `0.6 ms`；下一阶段若要动严格 Register 链，必须先以
+独立 compact-delta 探针量出 prepare/publish/invalidate/commit 的净成本，不能
+仅凭经典算法的渐进复杂度直接改生产协议。
