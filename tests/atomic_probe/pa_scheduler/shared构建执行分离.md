@@ -2217,3 +2217,34 @@ full-swimlane 的全部终态通过。B256 泳道中 FinalDrain 的
 1,280 Build、1,024 kernel、256 metadata writer 和 6,528 次 DCCI。冻结 12 对
 startup 到 FinalDrain 交错 A/B 中，基线/候选中位为
 `835.004/825.133 us`，改善 `9.870 us / 1.182%`；候选胜 `9/12` 对。
+
+### 2026-08-06：Execute admission 首次观察延后到首个 Build dispatch 边界
+
+S6.97 中每个 worker 发布 `started_count` 后，仍会在领取第一张 Build ticket
+之前立即返回型读取同一地址。最新泳道记录 110 次 `startup_poll`，聚合
+`1374.078 us` core-time、平均 `12.492 us`；这使“启动偏斜期间先做 Build”的
+收益又被一次同步同址读取部分抵消。
+
+当前 shared cross-core 合同改为：本核先经过一次 Build dispatch 边界，随后才
+首次检查 Execute admission。取得有效 ticket 时，实际 Build 时延自然打散读取；
+取得终端 ticket 时直接进入 FinalDrain 并沿用既有观察路径。只有观察到
+`started_count == workers` 才能领取 Execute ticket，因此小任务、零本地 Build
+份额和任意 worker/task 数量组合仍能闭合。
+
+实现不能消费 `StartupIncrement` 的 FetchAdd 返回值来判断“最后到达者”，否则
+会把原本返回值未使用的 source-issue Atomic 改成 return-ready 热路径。候选也
+没有按 task kind 选择延迟：唯一条件是 owner-local 已经过一次通用 dispatch
+边界，不借用 PA/观测统计字段参与控制。
+
+第一版测试暴露了一个必须修正的终止边界：若不可变计划在入口已判错，延后的
+FinalDrain fatal 相位之前不能推进 Execute cursor。实现现在复用入口已有的
+`IsFatal` 结果初始化 `cross_core_exec_ok`；已知错误本核不发任何 Execute ticket，
+远端后发错误仍由 S6.97 的有界错相观察收敛。两条非法摘要用例继续要求 Build、
+Execute cursor 和 Submit 全部为零。
+
+该方案不读取 PA `TaskKind`、固定 DAG、batch、核数、输出数量或 tensor shape；
+中央 ticket、严格 metadata writer completion 链、payload/DCCI、fanin、kernel
+completion 和 FinalDrain 汇合均不变。B256 泳道中 `startup_poll` 从
+`110 / 1374.078 us` 降为 `96 / 28.465 us`，96 次 startup increment 保持不变。
+冻结 12 对 startup 到 FinalDrain A/B 中，S6.97/候选中位为
+`831.300/815.937 us`，改善 `15.363 us / 1.848%`；候选胜 `11/12` 对。

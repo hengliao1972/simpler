@@ -6702,7 +6702,10 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // 尚未 BUILT 的执行所有权。该门控只依赖通用参与者合同。
     bool execute_admission_open = false;
 #endif
-    if (!IsFatal<Ops>(state, stats)) {
+    // 复用入口已有的 terminal 读取结果。若本核已经发现不可变计划或启动
+    // 协议错误，FinalDrain 不得在错相 fatal 观察到来前发放 Execute ticket。
+    const bool scheduler_entry_ok = !IsFatal<Ops>(state, stats);
+    if (scheduler_entry_ok) {
         // private 每批固定回放 Alloc/QK/SF/PV/UP；shared 直接消费 host
         // 按 context_len 发布的 1+4N immutable plan，由中央 ticket 选择
         // Build owner；Execute owner 由独立的 AIC/AIV 角色 ticket 决定。
@@ -6730,22 +6733,30 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         stats.result.submit_begin = orchestration_begin;
 #endif
         bool dispatch_exhausted = false;
+        bool crossed_first_build_dispatch = false;
         while (!dispatch_exhausted) {
-            if (!execute_admission_open) {
+            // 不在所有 worker 刚完成 startup increment 后立刻同址读取
+            // started_count。先经过一次通用 Build dispatch 边界，再借实际
+            // dispatch 时延自然打散首次观察；Execute 仍只有在确证全员到达
+            // 后才开放。这里不借用 PA/观测统计字段，终端 ticket 也构成边界。
+            if (!execute_admission_open && crossed_first_build_dispatch) {
                 execute_admission_open =
                     LoadLine<Ops>(
                         state->started_count, stats,
                         AtomicSite::StartupPoll
                     ) >= static_cast<int64_t>(state->config.workers);
             }
-            if (!DispatchOneSharedBuildTask<Ops, Profile>(
+            const bool dispatch_ok =
+                DispatchOneSharedBuildTask<Ops, Profile>(
                     state, worker, role, task_count,
                     orchestration, args, context, stats,
                     pmu_context, execute_admission_open,
                     dispatch_exhausted
-                )) {
+                );
+            if (!dispatch_ok) {
                 break;
             }
+            crossed_first_build_dispatch = true;
         }
 #if PA_BUILD_PERF_CLOCK
         // 唯一性能终点在 FinalDrain 排空后读取；不保留 Submit-only
@@ -6849,7 +6860,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 AtomicSite::SharedExecDrainArrivalPoll
             )
     );
-    bool cross_core_exec_ok = true;
+    bool cross_core_exec_ok = scheduler_entry_ok;
     bool cross_core_drain_arrived = false;
     bool cross_core_drain_closed = false;
     // 各 worker 使用不同的轮询相位，避免正常路径进入 FinalDrain 时同时

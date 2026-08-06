@@ -6947,3 +6947,29 @@ history。perf-clock `.text` 从 `0x3d338` 降至 `0x3ca38`，减少 `2304 B`。
 `835.004/825.133 us`，改善 `9.870 us / 1.182%`；均值改善 `0.873%`，配对
 改善中位 `11.262 us`，候选胜 `9/12`。正确性、泛化边界、直接因果和端到端
 收益均闭合，正式保留；详细证据见实现过程 S6.97。
+
+### 15.73 首个 Build dispatch 边界后再观察 Execute admission
+
+S6.97 的 worker 在 startup increment 后、首个 Build 前立即返回型读取
+`started_count`。B256 泳道为 110 次 `startup_poll`、聚合
+`1374.078 us` core-time，平均 `12.492 us`；这不是 TensorMap 或 execution
+顺序边界，而是 96 核近同时访问同一地址的调度代价。
+
+候选保留每 worker 一次、返回值未使用的 startup FetchAdd；先经过一次中央
+Build dispatch 边界，再首次观察 Execute admission。有效 ticket 的真实 Build
+时延打散读取；终端 ticket 直接进入 FinalDrain 并继续观察。Execute 仍必须确证
+全员到达才开放。实现只依赖 owner-local dispatch 状态，不借用 PA/观测统计
+字段，也不读取 task kind、固定 DAG、batch、核数或 tensor shape。
+
+CPU 首轮还发现：入口已知 invalid plan 时，FinalDrain 在错相 fatal 观察前可能
+推进 Execute cursor。最终复用入口已有 `IsFatal` 结果初始化本核执行状态，保证
+已知错误下 Build/Execute cursor 与 Submit 全为零；远端后发错误仍按有界错相
+协议收敛。完整 CPU 回归、CCEC 两类构建和 A5 B1/B256 全部门槛通过。
+
+B256 full-swimlane 中 `startup_poll` 从 `110 / 1374.078 us` 降到
+`96 / 28.465 us`，平均从 `12.492 us` 降至 `0.297 us`；96 次
+startup increment 及 1,280 Build、1,024 kernel、256 metadata writer、6,528
+DCCI 均不变。冻结 12 对 startup→FinalDrain A/B 中，S6.97/候选中位为
+`831.300/815.937 us`，改善 `15.363 us / 1.848%`；均值改善 `1.599%`，
+配对改善中位 `12.578 us`，候选胜 `11/12`。最终 `.text` 增加 512 B，但直接
+归因与端到端同向，正式保留；详细证据见实现过程 S6.98。

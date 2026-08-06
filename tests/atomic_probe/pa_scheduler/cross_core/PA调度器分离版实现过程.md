@@ -7045,3 +7045,105 @@ S6.97 候选              819.636     825.133     842.307    827.799 us
 候选同时通过算子泛化、错误收敛、真实 CCEC、严格插入与端到端收益门槛，正式
 保留。当前权威中位距 `0.8 ms` 目标约 `25.1 us`；下一阶段继续审视公共协议，
 不得用 PA task 形状或减少参与 worker 来达标。
+
+## S6.98 首个 Build dispatch 边界后再观察 Execute admission
+
+### 直接瓶颈与方案边界
+
+S6.97 的 B256 full-swimlane 中，每个 worker 在 startup increment 后、首个
+Build 前立刻读取 `started_count`；启动偏斜导致部分 worker 重读，共形成 110 次
+`atomic.return_ready.startup_poll.load#-1`，聚合 `1374.078 us` core-time，
+平均 `12.492 us`、最大 `19.368 us`。这些返回型读取集中在同一地址和同一时段，
+并不构成 TensorMap 或 execution 的顺序边界。
+
+候选保持每 worker 一次返回值未使用的 startup FetchAdd，不把它改成更重的
+return-ready 路径。shared Build 仍可立即领取；本核经过一次 Build dispatch
+边界后才首次读取 `started_count`：有效 ticket 利用真实 Build 时延打散读取，
+终端 ticket 则直接进入 FinalDrain 并继续检查。读到全员之前 Execute admission
+始终关闭。最终实现只使用 owner-local dispatch 状态，不借用 `claim_wins` 等
+PA/观测统计字段，也不依赖 task kind、固定 DAG、batch、核数、输出数量或
+tensor shape。
+
+### CPU 首轮发现与正确性修正
+
+首轮 CPU 回归中，两条 invalid immutable-plan 摘要用例失败：Build cursor 和
+Submit 都保持零，但 FinalDrain 在错相 fatal 观察前推进了 Execute cursor。根因
+是入口已经读取到 fatal，却没有把该本核结论带入 FinalDrain；原立即 startup
+观察的调度时序掩盖了这个问题。
+
+最终实现复用入口既有 `IsFatal` 结果形成 `scheduler_entry_ok`，并以它初始化
+`cross_core_exec_ok`。因此：
+
+- 本核入口已知计划/启动错误时，Build、Execute cursor 和 Submit 都保持零；
+- 运行中其他核后发 fatal 时，仍由 S6.97 的最多 255 轮错相观察收敛；
+- 没有新增 Atomic、DCCI 或共享字段，也没有把异常即时退出重新放回成功热路。
+
+修正后完整 CPU perf-clock 回归通过，包括两类 invalid summary 首票拒绝、
+independent kernel overlap、remote fatal closure、随机计划、ordinary ring、
+payload、严格 writer 插入和 96-thread B256。
+
+### CCEC、A5 与泳道证据
+
+CCEC perf-clock/full-swimlane 的 generic probe、AIC/AIV、split Finish、mixed
+ELF、manifest 与零 relocation 门槛通过；两类构建的 AIC/AIV Finish relocation
+均精确为 `3/3`。A5 B1 scalar-nop 和 B256 real-compute `6,28,4,1` 继续闭合
+1,280 Build、1,024 kernel、256 metadata writer、2,048 output、6,528 DCCI、
+严格 TensorMap writer history 和全部终态。
+
+最新 B256 full-swimlane 位于：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260806_141420_875979/ccec/
+```
+
+与 S6.97 对照：
+
+```text
+                                      S6.97       S6.98
+startup_poll 调用                         110           96
+startup_poll 聚合 core-time          1374.078       28.465 us
+startup_poll 平均                       12.492        0.297 us
+startup_increment 调用                      96           96
+Build / kernel / metadata writer    1280/1024/256 1280/1024/256
+published output / DCCI                2048/6528    2048/6528
+raw trace drops                               0            0
+```
+
+`startup_poll` 调用只减少 14 次，但聚合时长下降 `97.518%`，说明主要收益是
+把 96 核同相位争用改成 Build 边界后的分散读取，而不是机械删除业务工作。
+full-swimlane 的不同 ELF 只用于归因，不能与 perf-clock 绝对时间相减。
+
+### 冻结交错 A/B 与结论
+
+冻结 S6.97 和最终候选，先执行 6 对基线→候选，再执行 6 对候选→基线；统一
+统计最早 startup 到最后 FinalDrain 结束：
+
+```text
+                         min        median       max        mean
+S6.97 基线              816.397     831.300     839.369    830.718 us
+S6.98 候选              805.355     815.937     832.282    817.436 us
+
+独立中位改善：15.363 us / 1.848%
+独立均值改善：13.282 us / 1.599%
+配对改善中位：12.578 us
+候选获胜：11/12
+```
+
+最终 perf-clock ELF `.text` 从 `0x3ca38` 增至 `0x3cc38`，增加 `0x200 =
+512 B`；端到端和直接泳道证据仍一致支持收益。候选通过正确性、真实后端、
+泛化与性能门槛，正式保留。当前权威中位距 `0.8 ms` 目标约 `15.9 us`。
+
+### 泛化复核
+
+首版候选曾用 `stats.result.claim_wins` 判断本核是否已经完成过 Build。该字段是
+观测统计，不是调度协议状态；小任务或零本地 Build 份额下也不成立，因此该版
+运行时代码不保留。最终代码只保存 owner-local
+`crossed_first_build_dispatch`：有效 ticket 在真实 Build dispatch 结束后置位，
+终端 ticket 直接进入 FinalDrain。控制流不读取 PA TaskKind、固定五任务 DAG、
+batch、context length、输出槽或统计结果。
+
+本轮其余 PA 固定信息只存在于适配与验证层：host 将 UP 的真实 writer 语义映射
+为通用 metadata-writer 位，B256 的 1,280/1,024/256 计数用于 PA 终态门槛，
+CCEC Finish relocation 数用于锁定当前测试产物形状。它们都不参与公共调度
+决策，不能复制成其他算子的运行时特判；其他算子只需发布自己的 immutable
+task、engine/function 和 metadata-writer 计划。
