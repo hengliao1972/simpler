@@ -6589,3 +6589,50 @@ EfDrain 类别       基线样本/候选样本    基线非 atomic 中位    候
 
 本轮按“通用性合格、性能证据不合格”否决，生产源码已完整恢复到
 `d1503fa6`。后续不得用 `.text` 缩小替代直接区间证据。
+
+## 2026-08-06：S6.92 否决 payload route 重复解析消减
+
+### 候选边界与两版机器码筛选
+
+`PublishCrossCoreExecTask()` 原先先解析一次 function/engine route 来校验
+Build owner，随后 `MakePaExecPayloadSpec()` 又解析同一份不可变 route。
+该重复与具体 PA task、固定 DAG、batch、核数和 tensor 形状无关；其他算子
+adapter 也会面对“先决定 engine placement、再构造 portable payload”的同类
+边界。
+
+首版直接把 owner 校验移到 spec 构造之后。虽然源码少一次解析，但改变了
+spec 的活跃区间，CCEC 生成的 AIC/AIV 发布函数反而分别增加约
+`168/140 B`，最终 kernel `.text` 从 `0x4a038` 增为 `0x4a138`。该版没有
+上板，立即撤回。
+
+第二版保持原验证顺序：先以 `ResolvePaExecRoute()` 完成 route 和 owner
+校验，再把已验证 route 传入 spec 构造；shape、layout、cell reserve、payload
+写入、DCCI、BUILT 发布和所有错误收敛均不变。两个设备实例各缩短 `32 B`，
+但新增 switch table 抵消了这部分缩减，最终 kernel `.text` 仍为
+`0x4a038`；设备哈希发生变化，因而继续进入动态筛选，而不是把它误判为同一
+机器码。
+
+### 正确性与端到端裁决
+
+CPU 全协议构建通过，CCEC perf-clock 构建、split Finish、1:2 ELF、manifest
+及零 relocation 门槛通过。A5 B256 单次继续闭合 `1280` Build、`1024`
+kernel、`256` metadata writer、`2048` published output、`6528` DCCI 和全部
+FinalDrain/host 终态。
+
+冻结 `d1503fa6` 基线与第二版候选，按 B-C/C-B 反转顺序交错运行 12 对完整
+周期：
+
+```text
+                         min        median       max         mean
+d1503fa6 基线            917.782     945.650     1009.000    947.143 us
+route 复用候选           903.429     946.756      982.401    946.813 us
+
+独立中位变化：候选慢 1.106 us / 0.117%
+独立均值变化：候选快 0.330 us / 0.035%
+逐对差中位：+12.560 us；候选获胜 5/12
+```
+
+候选没有达到保留门槛；函数局部缩短既没有缩小最终 `.text`，也没有形成端到端
+收益。生产源码已完整恢复，后续不得仅凭“少一次 route 解析”恢复本候选；若要
+重做，必须先让 portable adapter 合同本身输出一次性验证对象，并以独立机器码
+和设备证据重新开始。
