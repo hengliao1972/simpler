@@ -6791,3 +6791,46 @@ S6.93 候选              832.802     842.926     858.253     843.566 us
 该候选同时通过泛化边界、正确性、真实 CCEC 与冻结性能裁决，正式保留。当前
 权威中位距 `0.8 ms` 目标仍有约 `42.9 us`；后续继续从通用调度协议寻找收益，
 不得新增 PA kind、固定 DAG、固定 batch/核数或输出形状分支。
+
+## S6.94 否决按 worker 静态均分 Execute 双项批次
+
+S6.93 的 `606` 次 Execute ticket 由两部分组成：AIC/AIV 各有 `256` 个有效
+双项批次，另有 `31+63=94` 次非尾 worker 的越界 `FetchAdd(+2)`。本轮尝试
+让每个角色按 `batch_count / worker_count` 和余数确定每核配额；配额总和严格
+等于有效批次数，worker 完成本地配额后即可证明 exhausted，不再触碰共享
+cursor。候选只使用角色、任务数、worker 数和 worker 序号，不读取 PA
+`TaskKind`、固定 DAG、固定 batch/核数或 tensor 形状。
+
+泛化边界用例额外覆盖了 `13` 个 task、`7` 个双项批次在 `4` 个 worker 上
+按 `2/2/2/1` 分配，证明不可整除时也不丢任务、不重复领取；奇数尾批、空
+engine 计划、四 token 前视、重复消费和 FinalDrain 门槛也全部通过。CPU 十轮
+96-thread 模型均完成 `1280` Build、`1024` kernel、`256` metadata writer，
+Execute ticket 从 `606` 精确降为 `512`。CCEC full-swimlane/perf-clock 的
+AIC/AIV、split Finish、mixed ELF、manifest 和零 relocation 门槛通过；A5 B1
+scalar-nop 与 B256 real-compute `6,28,4,1` 保持严格 TensorMap 插入、payload、
+fanin、DCCI、kernel exactly-once 和终态全部正确。
+
+但是静态配额把角色内动态 work stealing 改成了固定每核份额。即使 PA 当前
+计划的 function 数量较均衡，不同 task 的 ready 时机和真实执行代价仍不同；
+对其他算子，这种差异只会更大。候选 perf-clock 最终 `.text` 也从
+`0x3d038` 增至 `0x3d338`，增加 `768 B`，说明 quota 除法、余数和本地计数并非
+无成本。
+
+冻结 S6.93 与候选，预热后按 B-C/C-B 反转顺序运行 12 对独立 A5 B256；口径
+均为最早 startup 起点到最后 FinalDrain 结束：
+
+```text
+                         min        median       max         mean
+S6.93 基线              829.328     842.812     863.576     843.515 us
+静态 quota 候选         836.149     841.682     857.606     844.164 us
+
+独立中位变化：-1.130 us / -0.134%
+独立均值变化：+0.649 us / +0.077%
+配对差中位：  +3.083 us
+候选获胜：    5/12
+```
+
+独立中位的 `0.134%` 表面改善落在波动区，配对中位、均值和胜负数均不支持
+收益；不能用 `606 -> 512` 的 Atomic 调用数下降替代端到端裁决。因此生产代码
+和专项测试完整恢复到 S6.93，只保留本节结论。后续若消减尾部越界领取，必须
+继续保留动态 work stealing，且协议不能依赖某个算子的任务代价恰好均匀。
