@@ -183,6 +183,14 @@ if ! grep -Fq 'const uint64_t metadata_insert_contract = task[kPlanOffsetWords +
     echo "U2 must consume the generic sparse writer-intent contract; operator-specific TaskKind branches are forbidden." >&2
     exit 1
 fi
+if ! grep -Fq 'SimtPreviousMetadataWriterForSymbol(task_id, producer, output_slot)' "$KERNEL_SOURCE" ||
+   ! grep -Fq '(static_cast<uint64_t>(previous) << 32U)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'if (predecessor_task == producer)' "$KERNEL_SOURCE" ||
+   ! grep -Fq '++*predecessor_wait_count;' "$KERNEL_SOURCE" ||
+   grep -Fq 'AtomicSite::SimtMetadataLastWriterLoad' "$KERNEL_SOURCE"; then
+    echo "U2 metadata writers must share the exact per-symbol predecessor protocol and avoid last-writer atomic loads." >&2
+    exit 1
+fi
 
 ubuf_store_line="$(grep -nF 'staging_payload[destination++] =' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
 ubuf_complete_line="$(grep -nF 'bool guards_valid = true;' "$KERNEL_SOURCE" | cut -d: -f1)"

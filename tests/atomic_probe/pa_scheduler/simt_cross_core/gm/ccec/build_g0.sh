@@ -162,14 +162,14 @@ COMMON_DEVICE_FLAGS=(
     -I"$SIMT_ROOT/common"
 )
 
-echo "[CHECK] GM source closure, 1..8 independent builders, warps/builder=$BUILDER_WARP_COUNT and publication order (variant=$G0_VARIANT)"
+echo "[CHECK] GM source closure, 1..16 independent builders, warps/builder=$BUILDER_WARP_COUNT and publication order (variant=$G0_VARIANT)"
 if rg -n '#include.*(cross_core|ops-nn)' "$SIMT_ROOT" -g '*.h' -g '*.cpp'; then
     echo "G0 must not include cross_core or ops-nn source files." >&2
     exit 1
 fi
 if ! grep -Fq 'constexpr uint32_t kBuilderWarpCount = SIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kBuilderThreadCount = kBuilderWarpCount * kWarpSize;' "$MODEL_SOURCE" ||
-   ! grep -Fq 'constexpr uint32_t kMaxBuilderCount = 8U;' "$MODEL_SOURCE" ||
+   ! grep -Fq 'constexpr uint32_t kMaxBuilderCount = 16U;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kMaxBuilderThreadCount = kBuilderThreadCount * kMaxBuilderCount;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kBuilderTaskStride = kBuilderWarpCount;' "$MODEL_SOURCE" ||
    ! rg -q -U 'static_assert\(\s*kBuilderWarpCount >= 1U && kBuilderWarpCount <= 64U' "$MODEL_SOURCE" ||
@@ -187,7 +187,7 @@ if ! grep -Fq 'BuilderCountValid(state->control.builder_count)' "$KERNEL_SOURCE"
    ! grep -Fq 'const uint32_t global_warp = builder_instance * kBuilderWarpCount + warp;' "$KERNEL_SOURCE" ||
    ! grep -Fq 'if (aiv_id >= state->control.builder_count)' "$KERNEL_SOURCE" ||
    ! grep -Fq 'state->control.builder_count, owner' "$KERNEL_SOURCE"; then
-    echo "GM must keep the configured threads per VF while selecting 1..8 fixed builder AIVs at runtime." >&2
+    echo "GM must keep the configured threads per VF while selecting 1..16 fixed builder AIVs at runtime." >&2
     exit 1
 fi
 if ! grep -Fq 'if (thread == 0U)' "$KERNEL_SOURCE" ||
@@ -313,6 +313,14 @@ if ! grep -Fq 'const uint64_t metadata_insert_contract = task[kPlanOffsetWords +
        END {exit found ? 0 : 1}
    ' "$KERNEL_SOURCE"; then
     echo "G0 metadata commit must consume the generic writer-intent contract; operator-specific TaskKind branches are forbidden." >&2
+    exit 1
+fi
+if ! grep -Fq 'SimtPreviousMetadataWriterForSymbol(task_id, producer, output_slot)' "$KERNEL_SOURCE" ||
+   ! grep -Fq '(static_cast<uint64_t>(previous) << 32U)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'if (predecessor_task == producer)' "$KERNEL_SOURCE" ||
+   ! grep -Fq '++*predecessor_wait_count;' "$KERNEL_SOURCE" ||
+   grep -Fq 'AtomicSite::SimtMetadataLastWriterLoad' "$KERNEL_SOURCE"; then
+    echo "G0 metadata writers must prepare exact per-symbol predecessors once, wait only real predecessors and CAS without a last-writer atomic load." >&2
     exit 1
 fi
 

@@ -290,31 +290,6 @@ bool HostMetadataWriterIntentAt(uint32_t task_id, uint32_t writer, HostSharedWri
     return true;
 }
 
-uint32_t HostPreviousMetadataWriterTask(uint32_t task_id) {
-    if (HostMetadataWriterIntentCount(task_id) == 0U) {
-        return UINT32_MAX;
-    }
-    while (task_id != 0U) {
-        --task_id;
-        if (HostMetadataWriterIntentCount(task_id) != 0U) {
-            return task_id;
-        }
-    }
-    return UINT32_MAX;
-}
-
-uint64_t HostMetadataInsertContract(uint32_t task_id) {
-    constexpr uint64_t kPresent = uint64_t{1} << 63U;
-    constexpr uint32_t kPredecessorShift = 8U;
-    const uint32_t writer_count = HostMetadataWriterIntentCount(task_id);
-    if (writer_count == 0U) {
-        return 0U;
-    }
-    const uint32_t predecessor = HostPreviousMetadataWriterTask(task_id);
-    const uint64_t predecessor_code = predecessor == UINT32_MAX ? 0U : static_cast<uint64_t>(predecessor) + 1U;
-    return kPresent | writer_count | (predecessor_code << kPredecessorShift);
-}
-
 int32_t HostLatestMetadataWriterBefore(
     uint32_t task_limit, uint32_t producer_task, uint32_t output_slot
 ) {
@@ -330,6 +305,59 @@ int32_t HostLatestMetadataWriterBefore(
         }
     }
     return latest;
+}
+
+uint32_t HostMetadataWriterPredecessorCount(uint32_t task_id) {
+    const uint32_t writer_count = HostMetadataWriterIntentCount(task_id);
+    uint32_t predecessor_count = 0U;
+    for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+        HostSharedWriterIntent intent{};
+        if (!HostMetadataWriterIntentAt(task_id, writer, &intent)) {
+            return 0U;
+        }
+        const uint32_t predecessor =
+            static_cast<uint32_t>(HostLatestMetadataWriterBefore(task_id, intent.producer_task, intent.output_slot));
+        if (predecessor == intent.producer_task) {
+            continue;
+        }
+        bool duplicate = false;
+        for (uint32_t earlier = 0U; earlier < writer; ++earlier) {
+            HostSharedWriterIntent earlier_intent{};
+            if (!HostMetadataWriterIntentAt(task_id, earlier, &earlier_intent)) {
+                return 0U;
+            }
+            const uint32_t earlier_predecessor = static_cast<uint32_t>(
+                HostLatestMetadataWriterBefore(task_id, earlier_intent.producer_task, earlier_intent.output_slot)
+            );
+            duplicate = duplicate ||
+                        (earlier_predecessor != earlier_intent.producer_task && earlier_predecessor == predecessor);
+        }
+        predecessor_count += duplicate ? 0U : 1U;
+    }
+    return predecessor_count;
+}
+
+uint32_t HostLatestMetadataPredecessorTask(uint32_t task_id) {
+    const uint32_t writer_count = HostMetadataWriterIntentCount(task_id);
+    uint32_t latest = UINT32_MAX;
+    for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+        HostSharedWriterIntent intent{};
+        if (!HostMetadataWriterIntentAt(task_id, writer, &intent)) {
+            return UINT32_MAX;
+        }
+        const uint32_t predecessor =
+            static_cast<uint32_t>(HostLatestMetadataWriterBefore(task_id, intent.producer_task, intent.output_slot));
+        if (predecessor != intent.producer_task && (latest == UINT32_MAX || predecessor > latest)) {
+            latest = predecessor;
+        }
+    }
+    return latest;
+}
+
+uint64_t HostMetadataInsertContract(uint32_t task_id) {
+    constexpr uint64_t kPresent = uint64_t{1} << 63U;
+    const uint32_t writer_count = HostMetadataWriterIntentCount(task_id);
+    return writer_count == 0U ? 0U : kPresent | writer_count;
 }
 
 uint64_t ExpectedBuilderChecksum(
@@ -1473,7 +1501,7 @@ bool ValidateTask(
     }
 
     const g0::FullPaBuildReport &report = task.build_report;
-    const uint32_t metadata_predecessor = HostPreviousMetadataWriterTask(task_id);
+    const uint32_t metadata_predecessor = HostLatestMetadataPredecessorTask(task_id);
     const uint32_t expected_phase_bits = expected.engine == HostEngine::None ? 0x17U : 0x0FU;
     if (!RecordCheck(
             report.task_id == task_id, failure, "build-report-task", task_id, UINT32_MAX, UINT32_MAX, task_id,
@@ -1711,7 +1739,7 @@ bool ValidateBuilderThreads(
             expected_first[thread_id] = task_id;
         }
         expected_last[thread_id] = task_id;
-        expected_waits[thread_id] += HostPreviousMetadataWriterTask(task_id) == UINT32_MAX ? 0U : 1U;
+        expected_waits[thread_id] += HostMetadataWriterPredecessorCount(task_id);
     }
 
     uint64_t win_sum = 0U;

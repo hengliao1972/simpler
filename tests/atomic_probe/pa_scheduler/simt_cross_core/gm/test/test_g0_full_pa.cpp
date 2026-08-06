@@ -224,24 +224,6 @@ bool TensorEqual(const TensorDesc &lhs, const TensorDesc &rhs) {
     return std::memcmp(&lhs, &rhs, sizeof(TensorDesc)) == 0;
 }
 
-int32_t LatestMetadataWriterBefore(
-    uint32_t task_limit, uint32_t producer_task, uint32_t output_slot
-) {
-    int32_t latest = static_cast<int32_t>(producer_task);
-    for (uint32_t task_id = producer_task + 1U; task_id < task_limit; ++task_id) {
-        const uint32_t writer_count = MetadataWriterIntentCount(task_id);
-        for (uint32_t writer = 0U; writer < writer_count; ++writer) {
-            uint32_t candidate_producer = 0U;
-            uint32_t candidate_slot = 0U;
-            if (MetadataWriterIntentAt(task_id, writer, candidate_producer, candidate_slot) &&
-                candidate_producer == producer_task && candidate_slot == output_slot) {
-                latest = static_cast<int32_t>(task_id);
-            }
-        }
-    }
-    return latest;
-}
-
 uint64_t PackOutputPair(const std::array<float, 2> &values) {
     std::array<uint32_t, 2> bits{};
     std::memcpy(bits.data(), values.data(), sizeof(bits));
@@ -362,7 +344,7 @@ public:
         aiv_done_.store(0U, std::memory_order_relaxed);
         aic_cursor_.store(0U, std::memory_order_relaxed);
         aiv_cursor_.store(0U, std::memory_order_relaxed);
-        committed_prefix_.store(0U, std::memory_order_relaxed);
+        committed_writer_count_.store(0U, std::memory_order_relaxed);
         for (std::atomic<int64_t> &arrival : drain_arrivals_) {
             arrival.store(0, std::memory_order_relaxed);
         }
@@ -968,7 +950,7 @@ private:
             report.last_task = task_id;
             ++report.prepare_count;
             ++report.commit_count;
-            report.insert_wait_count += PreviousMetadataWriterTask(task_id) == UINT32_MAX ? 0U : 1U;
+            report.insert_wait_count += MetadataWriterPredecessorCount(task_id);
         }
         report.checksum = BuilderReportChecksum(
             nonce_, thread_id, task_count_, report.task_count, report.first_task, report.last_task,
@@ -1169,7 +1151,6 @@ private:
         int64_t predecessor_observed = -1;
         const uint64_t metadata_insert_contract = MetadataInsertContractForTask(task_id);
         const uint32_t writer_count = MetadataInsertWriterCount(metadata_insert_contract);
-        const uint32_t predecessor_task = MetadataInsertPredecessorTask(metadata_insert_contract);
         for (uint32_t writer = 0U; writer < writer_count; ++writer) {
             uint32_t producer = 0U;
             uint32_t output_slot = 0U;
@@ -1193,7 +1174,43 @@ private:
                 return BuildAttemptResult::Error;
             }
         }
-        if (predecessor_task != UINT32_MAX) {
+        for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+            uint32_t producer = 0U;
+            uint32_t output_slot = 0U;
+            if (!MetadataWriterIntentAt(task_id, writer, producer, output_slot)) {
+#if defined(SIMT_CROSS_CORE_U2)
+                (void)abort_u2_payload();
+#endif
+                return BuildAttemptResult::Error;
+            }
+            const uint32_t predecessor_task = PreviousMetadataWriterForSymbol(task_id, producer, output_slot);
+            if (predecessor_task == UINT32_MAX) {
+#if defined(SIMT_CROSS_CORE_U2)
+                (void)abort_u2_payload();
+#endif
+                return BuildAttemptResult::Error;
+            }
+            if (predecessor_task == producer) {
+                continue;
+            }
+            bool duplicate_predecessor = false;
+            for (uint32_t earlier = 0U; earlier < writer; ++earlier) {
+                uint32_t earlier_producer = 0U;
+                uint32_t earlier_slot = 0U;
+                if (!MetadataWriterIntentAt(task_id, earlier, earlier_producer, earlier_slot)) {
+#if defined(SIMT_CROSS_CORE_U2)
+                    (void)abort_u2_payload();
+#endif
+                    return BuildAttemptResult::Error;
+                }
+                const uint32_t earlier_predecessor =
+                    PreviousMetadataWriterForSymbol(task_id, earlier_producer, earlier_slot);
+                duplicate_predecessor = duplicate_predecessor || (earlier_predecessor != earlier_producer &&
+                                                                  earlier_predecessor == predecessor_task);
+            }
+            if (duplicate_predecessor) {
+                continue;
+            }
             if (!WaitFor(
                     [this, predecessor_task] {
                         return tasks_[predecessor_task].insert_completion.load(std::memory_order_acquire) ==
@@ -1206,7 +1223,9 @@ private:
 #endif
                 return BuildAttemptResult::Error;
             }
-            predecessor_observed = tasks_[predecessor_task].insert_completion.load(std::memory_order_acquire);
+            predecessor_observed = std::max(
+                predecessor_observed, tasks_[predecessor_task].insert_completion.load(std::memory_order_acquire)
+            );
         }
 #if defined(SIMT_CROSS_CORE_U2)
         if (TaskExecutable(kind) && fatal_.load(std::memory_order_acquire) != 0U) {
@@ -1229,13 +1248,21 @@ private:
                     return BuildAttemptResult::Error;
                 }
                 const int64_t previous_writer =
-                    tasks_[producer].last_writer[output_slot].load(std::memory_order_acquire);
+                    static_cast<int64_t>(PreviousMetadataWriterForSymbol(task_id, producer, output_slot));
                 if (previous_writer < static_cast<int64_t>(producer) ||
                     previous_writer >= static_cast<int64_t>(task_id)) {
 #if defined(SIMT_CROSS_CORE_U2)
                     (void)abort_u2_payload();
 #endif
                     return BuildAttemptResult::Error;
+                }
+                for (uint32_t earlier = 0U; earlier < writer; ++earlier) {
+                    if (task.history.entries[earlier].symbol_key == SharedSymbolKey(producer, output_slot)) {
+#if defined(SIMT_CROSS_CORE_U2)
+                        (void)abort_u2_payload();
+#endif
+                        return BuildAttemptResult::Error;
+                    }
                 }
                 task.history.entries[writer] = WriterHistoryRecord{
                     SharedSymbolKey(producer, output_slot),
@@ -1269,16 +1296,7 @@ private:
             }
         }
         if (MetadataInsertContractPresent(metadata_insert_contract)) {
-            uint32_t expected_prefix = MetadataWriterOrdinal(task_id);
-            if (!committed_prefix_.compare_exchange_strong(
-                    expected_prefix, expected_prefix + 1U, std::memory_order_acq_rel,
-                    std::memory_order_acquire
-                )) {
-#if defined(SIMT_CROSS_CORE_U2)
-                (void)abort_u2_payload();
-#endif
-                return BuildAttemptResult::Error;
-            }
+            committed_writer_count_.fetch_add(1U, std::memory_order_acq_rel);
         }
         if (MetadataInsertContractPresent(metadata_insert_contract)) {
             const int64_t previous_insert = task.insert_completion.fetch_add(1, std::memory_order_acq_rel);
@@ -1738,7 +1756,7 @@ private:
             alloc_done_.load(std::memory_order_acquire) != batches_ ||
             aic_done_.load(std::memory_order_acquire) != 2U * batches_ ||
             aiv_done_.load(std::memory_order_acquire) != 2U * batches_ ||
-            committed_prefix_.load(std::memory_order_acquire) != MetadataWriterTaskCount(task_count_) ||
+            committed_writer_count_.load(std::memory_order_acquire) != MetadataWriterTaskCount(task_count_) ||
             aic_cursor_.load(std::memory_order_acquire) != 2U * batches_ + kAicOwnerCount ||
             aiv_cursor_.load(std::memory_order_acquire) != 2U * batches_ + AivExecutorCount(builder_count_)) {
             return false;
@@ -1808,7 +1826,7 @@ private:
                                                                InsertCompletionInitialValue(task_id))) {
                 return false;
             }
-            const uint32_t predecessor_task = PreviousMetadataWriterTask(task_id);
+            const uint32_t predecessor_task = LatestMetadataWriterPredecessorTask(task_id);
             if (predecessor_task != UINT32_MAX) {
                 if (task.build_report.predecessor_observed != static_cast<int64_t>(predecessor_task) ||
                     task.build_report.insert_poll_count == 0U) {
@@ -1822,7 +1840,7 @@ private:
                 expected_first[builder_thread] = task_id;
             }
             expected_last[builder_thread] = task_id;
-            expected_waits[builder_thread] += predecessor_task == UINT32_MAX ? 0U : 1U;
+            expected_waits[builder_thread] += MetadataWriterPredecessorCount(task_id);
         }
 
         uint64_t total_attempts = 0U;
@@ -1902,7 +1920,8 @@ private:
             const uint32_t output_count = TaskOutputCount(kind);
             for (uint32_t slot = 0U; slot < kOutputsPerTask; ++slot) {
                 if (slot < output_count) {
-                    const int64_t expected_writer = LatestMetadataWriterBefore(task_count_, task_id, slot);
+                    const int64_t expected_writer =
+                        static_cast<int64_t>(PreviousMetadataWriterForSymbol(task_count_, task_id, slot));
                     if (task.published[slot].load(std::memory_order_acquire) != static_cast<int64_t>(task_id) ||
                         task.last_writer[slot].load(std::memory_order_acquire) != expected_writer ||
                         !TensorEqual(task.outputs[slot], MakeTaskOutputDescriptor(task_id, slot, task_base))) {
@@ -1931,7 +1950,7 @@ private:
                     }
                     expected.entries[writer] = WriterHistoryRecord{
                         SharedSymbolKey(producer, output_slot),
-                        LatestMetadataWriterBefore(task_id, producer, output_slot),
+                        static_cast<int32_t>(PreviousMetadataWriterForSymbol(task_id, producer, output_slot)),
                     };
                 }
                 if (std::memcmp(&task.history, &expected, sizeof(expected)) != 0) {
@@ -2827,7 +2846,7 @@ private:
     std::atomic<uint64_t> aiv_done_{0U};
     std::atomic<uint32_t> aic_cursor_{0U};
     std::atomic<uint32_t> aiv_cursor_{0U};
-    std::atomic<uint32_t> committed_prefix_{0U};
+    std::atomic<uint32_t> committed_writer_count_{0U};
     std::vector<uint32_t> aic_task_ids_;
     std::vector<uint32_t> aiv_task_ids_;
     std::array<CpuOwner, kOwnerCount> owners_{};
@@ -3223,12 +3242,53 @@ bool ParseRounds(int argc, char **argv, uint32_t *rounds) {
     return true;
 }
 
+bool TestPerSymbolWriterContract() {
+    uint32_t writer_tasks = 0U;
+    uint32_t writer_records = 0U;
+    for (uint32_t task_id = 0U; task_id < kMainTaskCount; ++task_id) {
+        const uint32_t writer_count = MetadataWriterIntentCount(task_id);
+        const uint64_t contract = MetadataInsertContractForTask(task_id);
+        if (writer_count == 0U) {
+            if (contract != 0U || MetadataWriterPredecessorCount(task_id) != 0U ||
+                LatestMetadataWriterPredecessorTask(task_id) != UINT32_MAX) {
+                return false;
+            }
+            continue;
+        }
+        ++writer_tasks;
+        writer_records += writer_count;
+        if (contract != (kMetadataInsertContractPresent | writer_count) ||
+            (contract & ~kMetadataInsertContractAllowedMask) != 0U || MetadataWriterPredecessorCount(task_id) != 0U ||
+            LatestMetadataWriterPredecessorTask(task_id) != UINT32_MAX) {
+            return false;
+        }
+        std::array<uint32_t, kWriterHistoryMaxPerTask> symbol_keys{};
+        for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+            uint32_t producer = 0U;
+            uint32_t output_slot = 0U;
+            if (!MetadataWriterIntentAt(task_id, writer, producer, output_slot) || producer >= task_id ||
+                PreviousMetadataWriterForSymbol(task_id, producer, output_slot) != producer) {
+                return false;
+            }
+            symbol_keys[writer] = SharedSymbolKey(producer, output_slot);
+            for (uint32_t earlier = 0U; earlier < writer; ++earlier) {
+                if (symbol_keys[earlier] == symbol_keys[writer]) {
+                    return false;
+                }
+            }
+        }
+    }
+    return writer_tasks == kDefaultBatches && writer_records == 3U * kDefaultBatches &&
+           MetadataWriterTaskCount(kMainTaskCount) == kDefaultBatches;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
     uint32_t rounds = 0U;
-    if (!ParseRounds(argc, argv, &rounds) || !TestResetPreservesDispatch() || !TestCompetingBuilderClaimValidation() ||
-        !TestHalfPacketAndUniqueClaim() || !TestFourTokenWaitingBuilt() || !TestBuildExecuteOverlap()
+    if (!ParseRounds(argc, argv, &rounds) || !TestPerSymbolWriterContract() || !TestResetPreservesDispatch() ||
+        !TestCompetingBuilderClaimValidation() || !TestHalfPacketAndUniqueClaim() || !TestFourTokenWaitingBuilt() ||
+        !TestBuildExecuteOverlap()
 #if defined(SIMT_CROSS_CORE_U2)
         || !TestU2OrderedGenerationAndHeldCleanup()
 #endif
@@ -3268,7 +3328,7 @@ int main(int argc, char **argv) {
     );
 #else
     std::printf(
-        "[PASS] GM CPU complete: builders=1..8, B1/B256, leaders/builder=%u, unique build claim, "
+        "[PASS] GM CPU complete: builders=1..16, B1/B256, leaders/builder=%u, unique build claim, "
         "8-shard heap, exact DAG/payload, 4-token tickets, fanin/completion/drain/tail, "
         "same-address reuse rounds=%u\n",
         kBuilderLeaderCount, rounds

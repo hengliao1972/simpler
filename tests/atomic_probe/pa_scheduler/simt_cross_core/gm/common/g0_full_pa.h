@@ -362,12 +362,12 @@ PayloadTensorOutputSource(uint32_t task_id, uint32_t tensor_index, uint32_t &pro
 
 // 稀疏 metadata insert 的公共 task contract。writer intent 由 tensor access
 // tag 与 SharedOutputRef 共同决定；调度协议不识别具体算子，也不假设固定
-// task 间距。contract 只携带 writer 数和上一个真正的 metadata writer。
+// task 间距。contract 只携带 writer 数；每个 symbol 的精确前驱随 history
+// record 一起发布，避免把互不相关的 symbol 串入一条全局 writer 链。
 constexpr uint64_t kMetadataInsertContractPresent = uint64_t{1} << 63U;
 constexpr uint32_t kMetadataInsertWriterCountBits = 8U;
 constexpr uint64_t kMetadataInsertWriterCountMask = (uint64_t{1} << kMetadataInsertWriterCountBits) - 1U;
-constexpr uint32_t kMetadataInsertPredecessorShift = kMetadataInsertWriterCountBits;
-constexpr uint64_t kMetadataInsertPredecessorMask = UINT32_MAX;
+constexpr uint64_t kMetadataInsertContractAllowedMask = kMetadataInsertContractPresent | kMetadataInsertWriterCountMask;
 
 // full-PA 测试 workload 的 schema adapter。这里允许知道 TaskKind；下方
 // MetadataWriterIntent* 调度层只消费返回的 access tag 和 tensor ref。
@@ -440,25 +440,72 @@ SIMT_CROSS_CORE_G0_ABI_INLINE bool MetadataWriterIntentAt(
     return false;
 }
 
-SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t PreviousMetadataWriterTask(uint32_t task_id) {
-    if (MetadataWriterIntentCount(task_id) == 0U) {
+SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t
+PreviousMetadataWriterForSymbol(uint32_t task_id, uint32_t producer_task, uint32_t output_slot) {
+    if (producer_task >= task_id || output_slot >= kOutputsPerTask) {
         return UINT32_MAX;
     }
-    while (task_id != 0U) {
-        --task_id;
-        if (MetadataWriterIntentCount(task_id) != 0U) {
-            return task_id;
+
+    uint32_t candidate = task_id;
+    while (candidate > producer_task + 1U) {
+        --candidate;
+        const uint32_t writer_count = MetadataWriterIntentCount(candidate);
+        for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+            uint32_t candidate_producer = 0U;
+            uint32_t candidate_slot = 0U;
+            if (MetadataWriterIntentAt(candidate, writer, candidate_producer, candidate_slot) &&
+                candidate_producer == producer_task && candidate_slot == output_slot) {
+                return candidate;
+            }
         }
     }
-    return UINT32_MAX;
+    return producer_task;
 }
 
-SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t MetadataWriterOrdinal(uint32_t task_id) {
-    uint32_t ordinal = 0U;
-    for (uint32_t candidate = 0U; candidate < task_id; ++candidate) {
-        ordinal += MetadataWriterIntentCount(candidate) != 0U ? 1U : 0U;
+SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t MetadataWriterPredecessorCount(uint32_t task_id) {
+    const uint32_t writer_count = MetadataWriterIntentCount(task_id);
+    uint32_t predecessor_count = 0U;
+    for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+        uint32_t producer = 0U;
+        uint32_t output_slot = 0U;
+        if (!MetadataWriterIntentAt(task_id, writer, producer, output_slot)) {
+            return 0U;
+        }
+        const uint32_t predecessor = PreviousMetadataWriterForSymbol(task_id, producer, output_slot);
+        if (predecessor == UINT32_MAX || predecessor == producer) {
+            continue;
+        }
+        bool duplicate = false;
+        for (uint32_t earlier = 0U; earlier < writer; ++earlier) {
+            uint32_t earlier_producer = 0U;
+            uint32_t earlier_slot = 0U;
+            if (!MetadataWriterIntentAt(task_id, earlier, earlier_producer, earlier_slot)) {
+                return 0U;
+            }
+            const uint32_t earlier_predecessor =
+                PreviousMetadataWriterForSymbol(task_id, earlier_producer, earlier_slot);
+            duplicate = duplicate || (earlier_predecessor != earlier_producer && earlier_predecessor == predecessor);
+        }
+        predecessor_count += duplicate ? 0U : 1U;
     }
-    return ordinal;
+    return predecessor_count;
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t LatestMetadataWriterPredecessorTask(uint32_t task_id) {
+    const uint32_t writer_count = MetadataWriterIntentCount(task_id);
+    uint32_t latest = UINT32_MAX;
+    for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+        uint32_t producer = 0U;
+        uint32_t output_slot = 0U;
+        if (!MetadataWriterIntentAt(task_id, writer, producer, output_slot)) {
+            return UINT32_MAX;
+        }
+        const uint32_t predecessor = PreviousMetadataWriterForSymbol(task_id, producer, output_slot);
+        if (predecessor != UINT32_MAX && predecessor != producer && (latest == UINT32_MAX || predecessor > latest)) {
+            latest = predecessor;
+        }
+    }
+    return latest;
 }
 
 SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t MetadataWriterTaskCount(uint32_t task_count) {
@@ -474,10 +521,7 @@ SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t MetadataInsertContractForTask(uint32_t ta
     if (writer_count == 0U || writer_count > kWriterHistoryMaxPerTask) {
         return 0U;
     }
-    const uint32_t predecessor = PreviousMetadataWriterTask(task_id);
-    const uint64_t predecessor_code = predecessor == UINT32_MAX ? 0U : static_cast<uint64_t>(predecessor) + 1U;
-    return kMetadataInsertContractPresent | writer_count |
-           (predecessor_code << kMetadataInsertPredecessorShift);
+    return kMetadataInsertContractPresent | writer_count;
 }
 
 SIMT_CROSS_CORE_G0_ABI_INLINE bool MetadataInsertContractPresent(uint64_t contract) {
@@ -486,11 +530,6 @@ SIMT_CROSS_CORE_G0_ABI_INLINE bool MetadataInsertContractPresent(uint64_t contra
 
 SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t MetadataInsertWriterCount(uint64_t contract) {
     return static_cast<uint32_t>(contract & kMetadataInsertWriterCountMask);
-}
-
-SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t MetadataInsertPredecessorTask(uint64_t contract) {
-    const uint64_t code = (contract >> kMetadataInsertPredecessorShift) & kMetadataInsertPredecessorMask;
-    return code == 0U ? UINT32_MAX : static_cast<uint32_t>(code - 1U);
 }
 
 SIMT_CROSS_CORE_G0_ABI_INLINE bool

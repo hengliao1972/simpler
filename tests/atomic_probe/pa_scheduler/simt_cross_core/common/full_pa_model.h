@@ -40,9 +40,9 @@ constexpr uint32_t kAivOwnerCount = 64U;
 constexpr uint32_t kOwnerCount = kAicOwnerCount + kAivOwnerCount;
 constexpr uint32_t kBuilderOwner = 32U;
 constexpr uint32_t kDefaultBuilderCount = 1U;
-// 首轮多 builder 性能搜索上限，不是硬件或协议上限。8 个 builder 仍保留
-// 56 个 AIV executor；若端到端最优点落在边界，再用真机数据决定是否扩展。
-constexpr uint32_t kMaxBuilderCount = 8U;
+// 多 builder 性能搜索上限，不是协议上限。首轮 1..8 扫描的最优点落在 B8
+// 边界，因此扩到 16 个 builder；B16 仍保留 48 个 AIV executor。
+constexpr uint32_t kMaxBuilderCount = 16U;
 constexpr uint32_t kFirstAivExecutorOwner = kBuilderOwner + 1U;
 constexpr uint32_t kAivExecutorCount = kAivOwnerCount - 1U;
 constexpr uint32_t kExecutorCount = kAicOwnerCount + kAivExecutorCount;
@@ -363,12 +363,6 @@ BuilderExpectedLastTask(uint32_t thread_id, uint32_t task_count, uint32_t builde
                BuilderFirstTask(thread_id, builder_count) + (count - 1U) * BuilderLeaderCount(builder_count);
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
-BuilderExpectedInsertWaitCount(uint32_t thread_id, uint32_t task_count, uint32_t builder_count = kDefaultBuilderCount) {
-    const uint32_t count = BuilderExpectedTaskCount(thread_id, task_count, builder_count);
-    return count - (count != 0U && BuilderFirstTask(thread_id, builder_count) == 0U ? 1U : 0U);
-}
-
 SIMT_CROSS_CORE_G0_MODEL_INLINE uint64_t BuilderReportChecksum(
     uint64_t nonce, uint32_t thread_id, uint32_t task_count, uint32_t wins, uint32_t first_task, uint32_t last_task,
     uint32_t attempts, uint32_t prepares, uint32_t commits, uint32_t insert_waits, uint32_t claim_losses
@@ -386,16 +380,6 @@ SIMT_CROSS_CORE_G0_MODEL_INLINE uint64_t BuilderReportChecksum(
     value ^= value >> 29U;
     value *= 0xD6E8FEB86659FD93ULL;
     return value ^ (value >> 31U);
-}
-
-SIMT_CROSS_CORE_G0_MODEL_INLINE uint64_t
-BuilderReportChecksum(uint64_t nonce, uint32_t thread_id, uint32_t task_count) {
-    const uint32_t wins = BuilderExpectedTaskCount(thread_id, task_count);
-    return BuilderReportChecksum(
-        nonce, thread_id, task_count, wins, wins == 0U ? UINT32_MAX : BuilderFirstTask(thread_id),
-        BuilderExpectedLastTask(thread_id, task_count), wins, wins, wins,
-        BuilderExpectedInsertWaitCount(thread_id, task_count), 0U
-    );
 }
 
 SIMT_CROSS_CORE_G0_MODEL_INLINE bool
@@ -625,10 +609,10 @@ static_assert(
 static_assert(
     kMaxBuilderThreadCount == kBuilderThreadCount * kMaxBuilderCount &&
         kMaxBuilderLeaderCount == kBuilderLeaderCount * kMaxBuilderCount,
-    "GM builder scaling must retain up to eight independent configured-warp instances"
+    "GM builder scaling must retain up to sixteen independent configured-warp instances"
 );
 static_assert(
-    kOwnerCount == 96U && kExecutorCount == 95U && kAicOwnerCount + kAivOwnerCount - kMaxBuilderCount == 88U,
+    kOwnerCount == 96U && kExecutorCount == 95U && kAicOwnerCount + kAivOwnerCount - kMaxBuilderCount == 80U,
     "mixed owner topology changed"
 );
 static_assert(kWorkloadTileBytes == 65536U && kWorkloadBytes == 12713984U, "workload layout changed");
