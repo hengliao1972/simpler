@@ -5648,3 +5648,64 @@ head，新增 enqueue/dequeue 返回型 atomic。它不是“真正 ready queue�
 因此该生产代码完整回撤，不进入有效优化提交。后续若再次使用完成队列，至少要
 由依赖解除事件发布“真正 ready”的 task，或提供不会让 fanin-blocked token
 长期占槽的有界顺序窗口；不能再把所有 BUILT task 无差别送入全局 MPMC 队列。
+
+## 2026-08-06：S6.81 否决 AIC Execute-only 角色隔离
+
+### 要验证的问题
+
+S6.79 的 full-swimlane 显示，32 个 AIC Scalar 除执行 Cube kernel 外仍参与全局
+Build ticket，并承担 Materialize、Register、Fanin 和 WinnerBuild。为了区分
+“AIC 没有足够 Scalar 时间执行”与“Cube task 的依赖尚未就绪”，本阶段增加了
+一个仅用于受控取证的编译期角色参数：
+
+```text
+对照：32 AIC + 64 AIV 均可 Build，AIC 同时执行 Cube task
+候选：64 AIV 独占 Build，32 AIC 只执行 Cube task
+```
+
+该参数只按 AIC/AIV 后端角色划分，不读取 PA task kind、batch 或固定 DAG。
+Execute owner 规则、严格 TensorMap 插入链、fanin、TaskCell、DCCI 和 kernel
+负载均未改变。候选只让 AIC 不读取 Build cursor；因此终止越界 ticket 从 96
+次降到 64 次。
+
+CPU B8 的 40 task/32 kernel、payload、fanin、严格插入和 completion 全部通过；
+CCEC AIC/AIV perf-clock 构建及最终 ELF relocation 门槛通过。A5 B256 候选也完成
+1280 task、1024 kernel，所有语义与协议断言均为 PASS。
+
+### 同源 A5 对照结果
+
+两种配置均从同一份候选源码分别重编译，随后各运行 6 个独立 B256 进程；统一
+统计 startup 起点到最后 FinalDrain 结束：
+
+```text
+64 AIV 独占 Build：
+  977.363, 1013.222, 977.727, 1010.168, 1002.666, 989.027 us
+  min / median / max = 977.363 / 995.847 / 1013.222 us
+
+96 Scalar 均可 Build：
+  986.542, 969.940, 984.936, 1045.900, 1000.333, 1025.158 us
+  min / median / max = 969.940 / 993.438 / 1045.900 us
+
+候选相对对照中位：+2.409 us / +0.242%
+```
+
+工作分布同时发生了确定性迁移：
+
+```text
+                           64 AIV 独占 Build      96 Scalar 均可 Build
+Build ticket atomic               1344                    1376
+fanin load 范围              13896--15378             10054--11721
+EfDrain 执行 task              416--432                 880--902
+FinalDrain 执行 task           592--608                 122--144
+```
+
+候选虽然少了 32 次终止 ticket atomic，却使 Build 吞吐降低，并让更多可执行工作
+推迟到 FinalDrain；额外 fanin 轮询也抵消了 AIC 不参与 Build 所节省的 Scalar
+工作。端到端没有收益，说明当前主要限制不是 AIC 被 Build 代码简单占满，而是
+producer Build/执行/依赖解除的到达时间。仅隔离角色不能让 Cube fanin 更早
+ready。
+
+因此参数、host oracle、manifest 和 Build 脚本改动均已完整撤回，不保留中间
+配置。后续优化应直接减少依赖解除到 Execute 领取之间的延迟，并避免重新引入
+S6.80 已证伪的全局 queue-head 热点；不能再以“让 AIC 少 Build”替代真正的
+ready 传播。
