@@ -6520,3 +6520,72 @@ EfDrain 类别       基线样本/候选样本    基线非 atomic 中位    候
 本轮按“通用非 atomic 热路局部有效、端到端未证明改善”保留。
 后续不得把 `.text` 变小或单次局部数字改写为整体收益，也不得为扩大
 数字加入 PA 任务类型特判。
+
+## 2026-08-06：S6.91 否决 token 路由解码复用 Progress 计划头证明
+
+### 候选与通用性
+
+S6.90 后，`ProgressCrossCoreExec()` 入口已经证明 immutable
+dispatch header 有效，但每个活跃 token 和新 Execute ticket 仍通过
+`DecodeSharedExecDispatchRoute()` 重读 `task_count/executable_task_count`。
+候选曾增加一个只复用已验证 header 的内部 route decoder：
+
+- 仍然逐 task 读取并解码 `exec_route`；
+- 仍然检查 task id、engine role、token 和 cell 的动态匹配；
+- 公共 decoder 与独立测试仍完整校验 header；
+- 不读取 PA `TaskKind`、固定 DAG、batch、核数或 tensor 形状。
+
+因此该候选的协议边界具有泛化性，但泛化性合格不等于性能合格。
+
+### 构建、正确性与端到端
+
+CPU 全回归首次的 `independent_kernel_overlap` 线程时序钩子超时，
+但 10 个 task、8 个 dispatch、kernel 数与 fatal 终态均正确；随后直接重复
+同一定向二进制 3 次均 PASS，确认为 CPU 线程调度时序波动。其余
+CPU 协议门槛均通过。CCEC perf-clock 构建、split Finish、mixed ELF、
+manifest 和零残留 relocation 也全部通过，`4/4` 形状未变。
+
+perf-clock kernel `.text` 从 `303160 B` 降到 `301368 B`，减少
+`1792 B`。A5 B256 real-compute 继续闭合 1280 Build、1024 kernel、256
+metadata writer、2048 published output、6528 DCCI 与所有终态。
+
+冻结 `d1503fa6` 与候选后交错运行 12 对完整周期：
+
+```text
+                         min        median       max         mean
+d1503fa6 基线            909.512     944.617     988.756     942.993 us
+route-header 候选         899.260     944.863     969.900     940.841 us
+
+独立中位变化：候选慢 0.247 us / 0.027%
+独立均值变化：候选快 2.152 us / 0.228%
+逐对差中位：-0.886 us；候选获胜 7/12
+```
+
+端到端仍只能判定持平。
+
+### 直接区间否决证据
+
+以 S6.90 的纠正后 full-swimlane 为基线，与本候选按相同方式计算
+`EfDrain parent - union(kernel, atomic)`，再按是否实际领取 Execute
+ticket 分组：
+
+```text
+EfDrain 类别       基线样本/候选样本    基线非 atomic 中位    候选非 atomic 中位
+含 Execute ticket       653 / 660              4621 cycles           5066 cycles
+不含 Execute ticket     627 / 620              2346 cycles           2367.5 cycles
+```
+
+直接修改的含 ticket 路径中位回退 `445 cycles / 9.63%`，均值从
+`6010.00` 增到 `6243.99 cycles`，回退 `3.89%`。不含 ticket 路径基本
+持平。候选虽然删除了源码层 GM 摘要读取并缩小了 ELF，但取指/布局
+变化没有转化为 A5 上的直接区间收益。
+
+取证文件不提交：
+
+```text
+基线：outputs/pa_exec_plan_header_correct_20260806_092808_333989/
+候选：outputs/pa_scheduler_cross_core_shared_swimlane_20260806_095349_432989/
+```
+
+本轮按“通用性合格、性能证据不合格”否决，生产源码已完整恢复到
+`d1503fa6`。后续不得用 `.text` 缩小替代直接区间证据。

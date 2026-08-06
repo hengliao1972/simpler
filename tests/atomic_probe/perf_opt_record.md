@@ -6811,3 +6811,21 @@ EfDrain 非 atomic 中位从 `5074` 降到 `4621 cycles`，改善
 `2336/2346 cycles`，基本不变，收益与代码位置一致。本轮按“通用
 非 atomic 局部有效、端到端未证明改善”保留，完整数据见实现过程
 S6.90。
+
+### 15.66 否决 token 路由解码再复用计划头证明
+
+候选在 S6.90 基础上，让活跃 token 和新 Execute ticket 的路由解码
+复用当次 Progress 已验证的 `task_count`，不再重读 header。每 task
+`exec_route`、engine、token/cell 匹配仍逐次校验，且不依赖 PA 任务类型、
+固定 DAG、核数、batch 或 tensor 形状。
+
+CCEC perf-clock `.text` 从 `303160 B` 降到 `301368 B`，A5 B256
+正确性全部闭合。12 对端到端的基线/候选中位为
+`944.617/944.863 us`，候选慢 `0.027%`；均值快 `0.228%`，
+配对差中位 `-0.886 us`，只能判定持平。
+
+直接 full-swimlane 区间否决了候选：剔除 kernel 和 atomic 后，含 Execute
+ticket 的 EfDrain 非 atomic 中位从 `4621` 增到 `5066 cycles`，
+回退 `9.63%`；均值从 `6010.00` 增到 `6243.99 cycles`，回退
+`3.89%`。不含 ticket 路径基本持平。因此该候选虽然泛化边界正确且
+ELF 变小，仍因直接修改区间无收益而完整撤回。详细见实现过程 S6.91。
