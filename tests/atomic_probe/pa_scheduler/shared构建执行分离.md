@@ -2071,3 +2071,49 @@ published 等待只针对真实 fanin，不恢复全局 task 前缀。
   FinalDrain 终态全部闭合，raw 无丢记录；
 - 当前权威中位仍为 `967.078 us`，距 `0.8 ms` 约 `167.078 us`；后续不能
   以单次 `909.567 us` 代替冻结 A/B，也不能通过放宽真实 writer 顺序达标。
+
+### 2026-08-06：非 writer 只按真实 metadata 消费等待前缀
+
+稀疏 writer 链继续规定所有真实 writer 按 task id 严格发布，但不再要求每个
+非 writer 都等待最近 writer。新的公共合同是：
+
+```text
+writer N:
+  wait(previous_writer(N)) -> publish metadata(N) -> completion(N)
+
+non-writer reader N:
+  SharedOutputRef(P):
+    若 previous_writer(N) > P，则等待 writer 前缀
+    否则只等待 output[P,slot].published
+
+  ordinary GmTensor/LocalTensor:
+    全计划无 ordinary writer 时不等待 symbol-only 前缀
+    只要可能存在 ordinary writer，继续保守等待最近 metadata writer
+
+  manual dependency / pure Output:
+    不读取共享 TensorMap metadata，不等待
+```
+
+`SharedOutputRef` 的判定使用 `(producer, reader)` 开区间。producer 自己的
+fresh descriptor 由独占 `published` 完成字证明；位于 producer 之后、reader
+之前的 symbol writer 才可能改变 history 解析结果。真实 writer 无论引用形态
+如何都必须等待前一 writer，因此 writer-to-writer 全序不受 reader 快路径影响。
+
+host/operator 计划发布总 writer、ordinary writer、symbol writer 三个通用
+计数；计数只证明某一类 writer 为零，不替代逐 task bitset，也不允许设备把
+实际 delta 丢掉。若真实 delta 与零计数冲突，必须在 lookup 前 fatal。普通
+TensorMap 未来若需要更细的 reader 并行度，应增加 ordinary-writer 的精确前缀
+证明，不能按算子名字或 PA DAG 猜测。
+
+实现检查点：
+
+1. 公共热路不得读取 `TaskKind`、batch、固定 task 数或 UP；
+2. 前缀判定并入已有 writer-delta 参数扫描，不单独再扫 `TaskArgs`；
+3. writer 必须是 prefix task，converter 对 host prefix 列表与 site 19
+   PollBatch 做精确闭合；
+4. site 20 completion 数、writer bitset、history 签名和 DCCI 顺序必须保持；
+5. 有 ordinary writer 的未知算子默认保守等待，正确性优先于未证明的并行度。
+
+S6.85 的 A5 证据为 site 19 physical/logical `1275/5870 -> 255/979`，site 20
+仍为 256；12 对 trace-free B256 中位 `952.797 -> 945.690 us`。这只说明通用
+reader 快路径有效，不授权继续加入 PA task-kind 特例。

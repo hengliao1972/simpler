@@ -16,6 +16,54 @@
 // TensorMap 的 Submit 控制流独立放在这里，避免继续把两套协议塞进同一
 // 个宏分支密集的热函数；CPU 与 CCEC 仍复用相同的 Ops 和底层原语。
 
+PA_DEVICE bool SharedTensorArgNeedsMetadataPrefix(
+    const TaskTensorRef &reference, TensorArgType tag,
+    int32_t task_id, int32_t previous_metadata_writer,
+    bool ordinary_metadata_writers_exist,
+    bool &required
+) {
+    required = false;
+    if (tag == TensorArgType::Output) {
+        return true;
+    }
+    if (tag != TensorArgType::Input &&
+        tag != TensorArgType::Inout &&
+        tag != TensorArgType::OutputExisting) {
+        return false;
+    }
+    if (reference.kind == TensorRefKind::SharedOutputRef) {
+        const FdwicOutputRef output_ref =
+            SharedOutputReference(reference);
+        if (!IsPlainSharedOutputRef(output_ref) ||
+            output_ref.producer_task_id < 0 ||
+            output_ref.producer_task_id >= task_id) {
+            return false;
+        }
+        required = previous_metadata_writer >
+            output_ref.producer_task_id;
+        return true;
+    }
+    if (reference.kind == TensorRefKind::GmTensor) {
+        if (reference.pointer.gm_tensor == nullptr) {
+            return false;
+        }
+        required = ordinary_metadata_writers_exist &&
+            !reference.pointer.gm_tensor->manual_dep &&
+            previous_metadata_writer >= 0;
+        return true;
+    }
+    if (reference.kind == TensorRefKind::LocalTensor) {
+        if (reference.pointer.local_tensor == nullptr) {
+            return false;
+        }
+        required = ordinary_metadata_writers_exist &&
+            !reference.pointer.local_tensor->manual_dep &&
+            previous_metadata_writer >= 0;
+        return true;
+    }
+    return false;
+}
+
 struct SharedTaskWriterDelta {
     // ordinary entry 先在 owner 私有上下文中完整准备；只有拿到 task 的
     // exact insert turn 后才批量预检和发布。bucket/同桶序号及 symbol
@@ -30,6 +78,7 @@ struct SharedTaskWriterDelta {
     uint32_t ordinary_count;
     uint32_t symbol_count;
     bool writer_intent_required;
+    bool metadata_prefix_required;
 };
 static_assert(
     __is_trivially_constructible(SharedTaskWriterDelta),
@@ -42,19 +91,26 @@ static_assert(
 
 PA_DEVICE bool PrepareSharedTaskWriterDelta(
     const TaskArgs &args, const SubmitContext &context,
-    SharedTaskWriterDelta &delta
+    SharedTaskWriterDelta &delta,
+    int32_t previous_metadata_writer = -1,
+    bool ordinary_metadata_writers_exist = false,
+    bool classify_metadata_prefix = false
 ) {
     delta.prepared_task_id = -1;
     delta.ordinary_count = 0;
     delta.symbol_count = 0;
     delta.writer_intent_required = false;
+    delta.metadata_prefix_required = false;
     const int32_t task_id = context.task_id;
     if (!context.won || task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks) ||
         args.has_error || args.tensor_count < 0 ||
         args.tensor_count > static_cast<int32_t>(kMaxTaskTensors) ||
         context.result.task_id != static_cast<uint64_t>(task_id) ||
-        context.result.count > kSharedOutputMaxPerTask) {
+        context.result.count > kSharedOutputMaxPerTask ||
+        (classify_metadata_prefix &&
+         (previous_metadata_writer < -1 ||
+          previous_metadata_writer >= task_id))) {
         return false;
     }
 
@@ -74,6 +130,19 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
             1U << static_cast<uint32_t>(index);
         const TensorArgType tag =
             TaskTag(args, static_cast<uint32_t>(index));
+        if (classify_metadata_prefix) {
+            bool arg_requires_prefix = false;
+            if (!SharedTensorArgNeedsMetadataPrefix(
+                    args.tensors[index], tag, task_id,
+                    previous_metadata_writer,
+                    ordinary_metadata_writers_exist,
+                    arg_requires_prefix
+                )) {
+                return false;
+            }
+            delta.metadata_prefix_required |=
+                arg_requires_prefix;
+        }
         if (IsSharedWriterIntentTag(tag)) {
             expected_register_mask |= bit;
         }
@@ -191,6 +260,9 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
         return false;
     }
     delta.writer_intent_required = writer_required;
+    if (classify_metadata_prefix && writer_required) {
+        delta.metadata_prefix_required = true;
+    }
     delta.prepared_task_id = task_id;
     return true;
 }
@@ -633,6 +705,87 @@ PA_DEVICE bool DecodeSharedMetadataWriterPlan(
     }
 }
 
+PA_DEVICE bool ValidateSharedMetadataWriterSummary(
+    PA_GM const SharedBuildDispatchState &dispatch
+) {
+    if (dispatch.task_count == 0 ||
+        dispatch.task_count > kMaxTasks ||
+        dispatch.metadata_writer_count > dispatch.task_count ||
+        dispatch.ordinary_metadata_writer_count >
+            dispatch.task_count ||
+        dispatch.symbol_metadata_writer_count >
+            dispatch.task_count) {
+        return false;
+    }
+    // 一个 task 可以同时发布 ordinary 与 symbol metadata，所以 union
+    // writer 数必须落在 max(class_count) 与两类之和之间。
+    const uint32_t class_max =
+        dispatch.ordinary_metadata_writer_count >
+                dispatch.symbol_metadata_writer_count
+            ? dispatch.ordinary_metadata_writer_count
+            : dispatch.symbol_metadata_writer_count;
+    return dispatch.metadata_writer_count >= class_max &&
+        dispatch.metadata_writer_count <=
+            dispatch.ordinary_metadata_writer_count +
+                dispatch.symbol_metadata_writer_count;
+}
+
+// 判断 task N 的 Fanin 查询是否必须等待全部 metadata writer 前缀。
+//
+// 严格顺序只约束真正发布 metadata 的 task；非 writer 不应仅仅因为计划中
+// 存在更早 writer 就占住 Build worker 等待。对 SharedOutputRef，descriptor
+// 由 producer 的独占 published 字直接证明；只有 (producer, N) 之间存在
+// metadata writer 时，N 才必须等到 previous_metadata_writer 完成，确保
+// latest/history 已包含所有 writer<N。由于 previous_metadata_writer 已是
+// max(writer<N)，条件可等价写成 previous_metadata_writer>producer，无需
+// 再扫描一次 GM bitset。
+//
+// ordinary TensorMap lookup 没有 per-key completion；只要全计划可能存在
+// ordinary writer 且已有更早 metadata writer，就保守等待整个前缀。
+// 全计划 ordinary writer 数为 0 时，symbol-only writer 不可能改变 ordinary
+// lookup；这是算子无关的零写者快路径。manual_dep 不查询共享 TensorMap。
+// 当前 task 自己是 writer 时始终要求该前缀，从而不放宽 writer-to-writer
+// 的严格 task-id 顺序。该判定只读取算子通用 TaskArgs，不依赖 PA kind。
+PA_DEVICE bool SharedTaskNeedsMetadataPrefix(
+    const TaskArgs &args, int32_t task_id,
+    bool publishes_metadata, int32_t previous_metadata_writer,
+    bool ordinary_metadata_writers_exist,
+    bool &required
+) {
+    required = false;
+    if (task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks) ||
+        previous_metadata_writer < -1 ||
+        previous_metadata_writer >= task_id ||
+        args.has_error || args.tensor_count < 0 ||
+        args.tensor_count > static_cast<int32_t>(kMaxTaskTensors)) {
+        return false;
+    }
+    if (publishes_metadata) {
+        required = true;
+        return true;
+    }
+
+    for (int32_t index = 0; index < args.tensor_count; ++index) {
+        const TensorArgType tag =
+            TaskTag(args, static_cast<uint32_t>(index));
+        bool arg_requires_prefix = false;
+        if (!SharedTensorArgNeedsMetadataPrefix(
+                args.tensors[index], tag, task_id,
+                previous_metadata_writer,
+                ordinary_metadata_writers_exist,
+                arg_requires_prefix
+            )) {
+            return false;
+        }
+        if (arg_requires_prefix) {
+            required = true;
+            return true;
+        }
+    }
+    return true;
+}
+
 template <typename Ops>
 PA_DEVICE bool WaitForPreparedSharedWriterOutputs(
     PA_GM SchedulerState *state,
@@ -692,7 +845,10 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         static_cast<int32_t>(ticket.function_id);
     bool publishes_metadata = false;
     int32_t previous_metadata_writer = -1;
-    if (!DecodeSharedMetadataWriterPlan(
+    if (!ValidateSharedMetadataWriterSummary(
+            state->build_dispatch
+        ) ||
+        !DecodeSharedMetadataWriterPlan(
             state->build_dispatch, task_id,
             publishes_metadata, previous_metadata_writer
         )) {
@@ -752,7 +908,11 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     }
     SharedTaskWriterDelta writer_delta{};
     if (!PrepareSharedTaskWriterDelta(
-            args, context, writer_delta
+            args, context, writer_delta,
+            previous_metadata_writer,
+            state->build_dispatch
+                    .ordinary_metadata_writer_count != 0,
+            true
         ) ||
         !ValidatePreparedPaWriterShape(
             writer_delta, kind, static_cast<int32_t>(task_id),
@@ -772,6 +932,30 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
+    // count 只开启“该类 writer 全局为零”的快路径，不能授予 writer
+    // 资格。实际 delta 若推翻 host 的零计数，必须在任何 metadata lookup
+    // 前终止；非零但偏保守的计数最多增加等待，不会跳过依赖。
+    if ((writer_delta.ordinary_count != 0 &&
+         state->build_dispatch
+                 .ordinary_metadata_writer_count == 0) ||
+        (writer_delta.symbol_count != 0 &&
+         state->build_dispatch
+                 .symbol_metadata_writer_count == 0) ||
+        (publishes_metadata &&
+         state->build_dispatch.metadata_writer_count == 0)) {
+        RollbackSharedTaskOutputs<Ops>(
+            state->shared_map.shared_outputs[task_id],
+            expected_output_count,
+            static_cast<int32_t>(task_id), &stats
+        );
+        EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
+            pmu_context
+        );
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    const bool metadata_prefix_required =
+        writer_delta.metadata_prefix_required;
 #if PA_BUILD_TRACE_FREE
     const bool task_outputs_published =
         PublishSharedTaskOutputs<Ops, true, true, true>(
@@ -878,7 +1062,10 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     uint64_t insert_turn_load_count = 0;
     const bool turn_ready = WaitForSharedMetadataPredecessor<Ops>(
         state, static_cast<int32_t>(task_id),
-        previous_metadata_writer, stats,
+        metadata_prefix_required
+            ? previous_metadata_writer
+            : -1,
+        stats,
         ready_observed, insert_turn_load_count
     );
     // wait_end 对最后一次返回 Ready 的 atomic Load 建立数据依赖。只在

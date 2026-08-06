@@ -1472,7 +1472,15 @@ struct alignas(64) SharedBuildDispatchState {
     // 由 host 计划逐 task 统计，不允许 FinalDrain 用 PA 的
     // task_count-batches 形状反推。0 是合法值，可覆盖纯 metadata 计划。
     uint32_t executable_task_count;
-    uint8_t header_padding[64 - 3 * sizeof(uint32_t)];
+    // host/operator 在 launch 前发布 metadata writer 分类计数。当前热路
+    // 只消费 ordinary==0 的通用快路径：若全计划没有 ordinary writer，
+    // Gm/LocalTensor lookup 不必等待无关的 symbol-writer 前缀。总 writer
+    // 的 bitset 及逐 task delta 交叉校验仍决定严格插入链，计数不授予
+    // writer 资格。
+    uint32_t metadata_writer_count;
+    uint32_t ordinary_metadata_writer_count;
+    uint32_t symbol_metadata_writer_count;
+    uint8_t header_padding[64 - 6 * sizeof(uint32_t)];
     SharedBuildDispatchTaskIdentity tasks[kMaxTasks];
     uint64_t metadata_writer_bits[
         kSharedMetadataWriterWordCount
@@ -1488,6 +1496,13 @@ static_assert(
 static_assert(
     offsetof(SharedBuildDispatchState, executable_task_count) == 72,
     "shared Build dispatch executable count offset changed"
+);
+static_assert(
+    offsetof(
+        SharedBuildDispatchState,
+        ordinary_metadata_writer_count
+    ) == 80,
+    "shared Build dispatch ordinary-writer count offset changed"
 );
 static_assert(
     sizeof(SharedBuildDispatchState) ==

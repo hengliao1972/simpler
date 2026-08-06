@@ -1251,6 +1251,153 @@ void TestWriterDeltaRequiresExactRegisterMask() {
     );
 }
 
+void TestMetadataPrefixRequirementClassification() {
+    bool required = true;
+    TaskArgs empty_args;
+    ConstructTaskArgs(empty_args);
+    Check(
+        SharedTaskNeedsMetadataPrefix(
+            empty_args, 8, false, 4, false, required
+        ) && !required,
+        "metadata-free task does not wait for an unrelated earlier writer"
+    );
+    Check(
+        SharedTaskNeedsMetadataPrefix(
+            empty_args, 8, true, 4, false, required
+        ) && required,
+        "an actual metadata writer always preserves the writer prefix"
+    );
+    Check(
+        SharedTaskNeedsMetadataPrefix(
+            empty_args, 0, true, -1, false, required
+        ) && required,
+        "the first metadata writer keeps the writer contract without a predecessor"
+    );
+
+    const FdwicOutputRef direct_output{
+        5, 0, 0, 0, 0, 0
+    };
+    TaskArgs direct_args;
+    ConstructTaskArgs(direct_args);
+    AddOutputHandleTensor(
+        direct_args, direct_output, TensorArgType::Input
+    );
+    Check(
+        SharedTaskNeedsMetadataPrefix(
+            direct_args, 8, false, 4, true, required
+        ) && !required,
+        "direct output needs no prefix when the latest earlier writer precedes its producer"
+    );
+    Check(
+        SharedTaskNeedsMetadataPrefix(
+            direct_args, 8, false, 5, true, required
+        ) && !required,
+        "a writer at the descriptor producer is outside the open dependency interval"
+    );
+    Check(
+        SharedTaskNeedsMetadataPrefix(
+            direct_args, 8, false, 6, true, required
+        ) && required,
+        "a writer between descriptor producer and reader requires the complete prefix"
+    );
+    SubmitContext direct_context{};
+    direct_context.task_id = 8;
+    direct_context.won = true;
+    direct_context.result.task_id = 8;
+    SharedTaskWriterDelta fused_delta{};
+    Check(
+        PrepareSharedTaskWriterDelta(
+            direct_args, direct_context, fused_delta,
+            6, true, true
+        ) && fused_delta.metadata_prefix_required,
+        "writer-delta scan fuses the direct-output prefix classification"
+    );
+
+    TensorDesc ordinary = MakeTensor(0x456000000ULL);
+    TaskArgs ordinary_args;
+    ConstructTaskArgs(ordinary_args);
+    AddGmTensor(
+        ordinary_args, ordinary, TensorArgType::Input
+    );
+    Check(
+        SharedTaskNeedsMetadataPrefix(
+            ordinary_args, 8, false, -1, true, required
+        ) && !required,
+        "ordinary lookup skips a prefix when no earlier metadata writer exists"
+    );
+    Check(
+        SharedTaskNeedsMetadataPrefix(
+            ordinary_args, 8, false, 4, true, required
+        ) && required,
+        "ordinary lookup conservatively waits for every earlier metadata writer"
+    );
+    Check(
+        SharedTaskNeedsMetadataPrefix(
+            ordinary_args, 8, false, 4, false, required
+        ) && !required,
+        "zero ordinary-writer plan skips an unrelated symbol-writer prefix"
+    );
+    Check(
+        PrepareSharedTaskWriterDelta(
+            ordinary_args, direct_context, fused_delta,
+            4, false, true
+        ) && !fused_delta.metadata_prefix_required,
+        "writer-delta scan fuses the zero ordinary-writer fast path"
+    );
+
+    TaskArgs writer_args;
+    ConstructTaskArgs(writer_args);
+    AddOutputHandleTensor(
+        writer_args, direct_output, TensorArgType::Inout
+    );
+    direct_context.register_mask = 1;
+    Check(
+        PrepareSharedTaskWriterDelta(
+            writer_args, direct_context, fused_delta,
+            4, false, true
+        ) && fused_delta.writer_intent_required &&
+            fused_delta.metadata_prefix_required,
+        "writer-delta scan keeps every actual writer on the strict prefix"
+    );
+    direct_context.register_mask = 0;
+
+    TensorDesc manual = MakeTensor(
+        0x457000000ULL, kInvalidTaskId, true
+    );
+    TaskArgs manual_args;
+    ConstructTaskArgs(manual_args);
+    AddLocalTensor(
+        manual_args, manual, TensorArgType::Input
+    );
+    Check(
+        SharedTaskNeedsMetadataPrefix(
+            manual_args, 8, false, 4, true, required
+        ) && !required,
+        "manual dependency tensor does not consume shared TensorMap metadata"
+    );
+
+    const FdwicOutputRef future_output{
+        8, 0, 0, 0, 0, 0
+    };
+    TaskArgs invalid_args;
+    ConstructTaskArgs(invalid_args);
+    AddOutputHandleTensor(
+        invalid_args, future_output, TensorArgType::Input
+    );
+    Check(
+        !SharedTaskNeedsMetadataPrefix(
+            invalid_args, 8, false, 4, true, required
+        ),
+        "metadata-prefix classification rejects a non-predecessor output reference"
+    );
+    Check(
+        !SharedTaskNeedsMetadataPrefix(
+            direct_args, 8, false, 8, true, required
+        ),
+        "metadata-prefix classification rejects a non-predecessor writer cursor"
+    );
+}
+
 void TestWriterDeltaPrecomputesInterleavedBuckets(
     SchedulerState &state
 ) {
@@ -2201,6 +2348,7 @@ int main() {
     TestOrderedSymbolInsertBeforeLookup(*state);
     TestOrderedMixedWriterTransaction(*state);
     TestStrictLatestFaninWindow(*state);
+    TestMetadataPrefixRequirementClassification();
     TestOrdinaryWriterRangeValidation();
     TestManualWriterNeedsNoGate(*state);
     const bool fatal_clean = state->fatal.value == 0;

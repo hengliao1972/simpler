@@ -545,7 +545,11 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
     metadata_writer_tasks_raw = metadata.get(
         "shared_metadata_writer_tasks"
     )
+    metadata_prefix_tasks_raw = metadata.get(
+        "shared_metadata_prefix_tasks"
+    )
     shared_metadata_writer_tasks: tuple[int, ...] = ()
+    shared_metadata_prefix_tasks: tuple[int, ...] = ()
     if trace_schema_version == 5 and tensormap_mode == "shared":
         if not isinstance(metadata_writer_tasks_raw, list):
             raise ValueError(
@@ -574,9 +578,41 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
         metadata["shared_metadata_writer_tasks"] = list(
             normalized_writer_tasks
         )
+        if not isinstance(metadata_prefix_tasks_raw, list):
+            raise ValueError(
+                "metadata.shared_metadata_prefix_tasks must be an array "
+                "for shared schema-v5"
+            )
+        normalized_prefix_tasks = tuple(
+            _integer(
+                task_id,
+                f"metadata.shared_metadata_prefix_tasks[{index}]",
+            )
+            for index, task_id in enumerate(metadata_prefix_tasks_raw)
+        )
+        if any(task_id < 0 for task_id in normalized_prefix_tasks) or any(
+            left >= right
+            for left, right in zip(
+                normalized_prefix_tasks,
+                normalized_prefix_tasks[1:],
+            )
+        ):
+            raise ValueError(
+                "metadata.shared_metadata_prefix_tasks must be strictly "
+                "increasing nonnegative task ids"
+            )
+        shared_metadata_prefix_tasks = normalized_prefix_tasks
+        metadata["shared_metadata_prefix_tasks"] = list(
+            normalized_prefix_tasks
+        )
     elif metadata_writer_tasks_raw is not None:
         raise ValueError(
             "metadata.shared_metadata_writer_tasks is only valid for "
+            "shared schema-v5"
+        )
+    elif metadata_prefix_tasks_raw is not None:
+        raise ValueError(
+            "metadata.shared_metadata_prefix_tasks is only valid for "
             "shared schema-v5"
         )
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
@@ -1202,12 +1238,31 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
             v4_submit_semantics, num_cores, str(submit_topology)
         )
         writer_task_set = set(shared_metadata_writer_tasks)
+        metadata_prefix_task_set = set(
+            shared_metadata_prefix_tasks
+        )
         unknown_writer_tasks = writer_task_set - set(task_kind_by_id)
-        if tensormap_mode == "shared" and unknown_writer_tasks:
-            raise ValueError(
-                "metadata.shared_metadata_writer_tasks contains unknown "
-                f"tasks: {sorted(unknown_writer_tasks)[:8]}"
-            )
+        unknown_prefix_tasks = (
+            metadata_prefix_task_set - set(task_kind_by_id)
+        )
+        if tensormap_mode == "shared":
+            if unknown_writer_tasks:
+                raise ValueError(
+                    "metadata.shared_metadata_writer_tasks contains unknown "
+                    f"tasks: {sorted(unknown_writer_tasks)[:8]}"
+                )
+            if unknown_prefix_tasks:
+                raise ValueError(
+                    "metadata.shared_metadata_prefix_tasks contains unknown "
+                    f"tasks: {sorted(unknown_prefix_tasks)[:8]}"
+                )
+            if not writer_task_set.issubset(
+                metadata_prefix_task_set
+            ):
+                raise ValueError(
+                    "metadata writers must also require the strict metadata "
+                    "prefix"
+                )
         previous_writer_by_task: dict[int, int | None] = {}
         previous_writer: int | None = None
         for planned_task_id in sorted(task_kind_by_id):
@@ -1418,7 +1473,8 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     # 首个 writer 发布，后续每个 winner 都观察该真实前驱。
                     expected_poll_count = (
                         1
-                        if previous_writer_by_task[task_key[1]] is not None
+                        if task_key[1] in metadata_prefix_task_set
+                        and previous_writer_by_task[task_key[1]] is not None
                         else 0
                     )
                     if len(matching_polls) != expected_poll_count:
@@ -1544,6 +1600,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         _is_alloc,
                     ) in v4_claims.items()
                     if won and
+                    task_id in metadata_prefix_task_set and
                     previous_writer_by_task[task_id] is not None
                 )
                 if (

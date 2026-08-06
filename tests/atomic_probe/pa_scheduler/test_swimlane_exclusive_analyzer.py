@@ -505,6 +505,13 @@ def _v4_capture(  # noqa: PLR0912
                 if row[5] == "Atomic" and int(row[9]) == 20
             }
         )
+        metadata["shared_metadata_prefix_tasks"] = sorted(
+            {
+                int(row[3])
+                for row in rows
+                if row[5] == "Register"
+            }
+        )
     _refresh_summary(capture)
     return capture
 

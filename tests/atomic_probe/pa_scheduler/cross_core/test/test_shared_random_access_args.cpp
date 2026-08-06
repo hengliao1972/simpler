@@ -230,6 +230,8 @@ bool CheckCompactDispatchIdentity() {
     SharedBuildDispatchState dispatch{};
     dispatch.task_count = kTasks;
     dispatch.batch_count = kBatches;
+    dispatch.metadata_writer_count = kBatches;
+    dispatch.symbol_metadata_writer_count = kBatches;
     uint32_t task_cursor = 0;
     uint32_t executable_tasks = 0;
     for (uint32_t batch = 0; batch < kBatches; ++batch) {
@@ -353,12 +355,125 @@ bool CheckCompactDispatchIdentity() {
            );
 }
 
+bool CheckG1MetadataPrefixClassification() {
+    constexpr uint32_t kBatches = 4;
+    constexpr uint32_t kTasksPerBatch = 5;
+    constexpr uint32_t kTasks = kBatches * kTasksPerBatch;
+    int32_t contexts[kBatches] = {
+        8192, 8192, 8192, 8192,
+    };
+    SharedBuildDispatchState dispatch{};
+    dispatch.task_count = kTasks;
+    dispatch.batch_count = kBatches;
+
+    for (uint32_t batch = 0; batch < kBatches; ++batch) {
+        const uint32_t task_id =
+            batch * kTasksPerBatch + 4U;
+        dispatch.metadata_writer_bits[task_id / 64U] |=
+            uint64_t{1} << (task_id % 64U);
+    }
+
+    PaOrchestrationState orch{};
+    InitPaOrchestration(orch, kBatches, contexts);
+    TaskArgs args{};
+    LocalStats stats{};
+    uint32_t required_by_kind[
+        static_cast<uint32_t>(TaskKind::Count)
+    ] = {};
+    uint32_t physical_wait_tasks = 0;
+
+    for (uint32_t batch = 0; batch < kBatches; ++batch) {
+        SharedPaBatchPlan plan{};
+        const uint32_t batch_start =
+            batch * kTasksPerBatch;
+        if (!BuildSharedPaBatchPlan(
+                static_cast<uint64_t>(contexts[batch]),
+                batch_start, plan
+            ) ||
+            plan.task_count != kTasksPerBatch) {
+            return false;
+        }
+        for (uint32_t offset = 0;
+             offset < plan.task_count; ++offset) {
+            SharedPaPlannedTask planned{};
+            const uint32_t task_id = batch_start + offset;
+            if (!SharedPaPlannedTaskAt(plan, offset, planned) ||
+                !BindSharedPaTaskForRandomAccess(
+                    orch, batch, batch_start, task_id,
+                    planned.kind, planned.group_index
+                ) ||
+                !BuildArgsForKind(
+                    planned.kind, orch, args, batch, stats
+                )) {
+                return false;
+            }
+
+            bool publishes_metadata = false;
+            int32_t previous_metadata_writer = -1;
+            bool prefix_required = false;
+            if (!DecodeSharedMetadataWriterPlan(
+                    dispatch, task_id, publishes_metadata,
+                    previous_metadata_writer
+                ) ||
+                !SharedTaskNeedsMetadataPrefix(
+                    args, static_cast<int32_t>(task_id),
+                    publishes_metadata,
+                    previous_metadata_writer,
+                    dispatch.ordinary_metadata_writer_count != 0,
+                    prefix_required
+                ) ||
+                publishes_metadata !=
+                    (planned.kind == TaskKind::Up)) {
+                return false;
+            }
+            if (prefix_required) {
+                ++required_by_kind[
+                    static_cast<uint32_t>(planned.kind)
+                ];
+                physical_wait_tasks +=
+                    previous_metadata_writer >= 0 ? 1U : 0U;
+            }
+        }
+    }
+
+    std::printf(
+        "[RANDOM_ARGS_TEST] G1 metadata-prefix tasks="
+        "Alloc:%u,QK:%u,SF:%u,PV:%u,UP:%u physical_waits=%u\n",
+        required_by_kind[static_cast<uint32_t>(TaskKind::Alloc)],
+        required_by_kind[static_cast<uint32_t>(TaskKind::Qk)],
+        required_by_kind[static_cast<uint32_t>(TaskKind::Sf)],
+        required_by_kind[static_cast<uint32_t>(TaskKind::Pv)],
+        required_by_kind[static_cast<uint32_t>(TaskKind::Up)],
+        physical_wait_tasks
+    );
+    return required_by_kind[
+               static_cast<uint32_t>(TaskKind::Alloc)
+           ] == 0 &&
+        required_by_kind[
+            static_cast<uint32_t>(TaskKind::Qk)
+        ] == 0 &&
+        required_by_kind[
+            static_cast<uint32_t>(TaskKind::Sf)
+        ] == 0 &&
+        required_by_kind[
+            static_cast<uint32_t>(TaskKind::Pv)
+        ] == 0 &&
+        required_by_kind[
+            static_cast<uint32_t>(TaskKind::Up)
+        ] == kBatches &&
+        physical_wait_tasks == kBatches - 1U;
+}
+
 }  // namespace
 
 int main() {
     Check(CheckSequentialEquivalence(), "random-access args equal complete sequential G0/G1/G2/G4 replay");
     Check(CheckInvalidIdentityRejection(), "invalid batch bounds and task-local identities fail closed");
     Check(CheckCompactDispatchIdentity(), "compact immutable dispatch identities decode and bind each task");
+    Check(
+        CheckG1MetadataPrefixClassification(),
+        "G1 waits only actual metadata writers and preserves the cross-batch writer chain"
+    );
     std::printf("[RANDOM_ARGS_TEST] status=%s\n", g_failures == 0 ? "PASS" : "FAIL");
     return g_failures == 0 ? 0 : 1;
 }

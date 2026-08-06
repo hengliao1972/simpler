@@ -125,6 +125,7 @@ def _v5_capture(
     add_parents: bool = True,
     tensormap_mode: str = "private",
     metadata_writer_tasks: list[int] | None = None,
+    metadata_prefix_tasks: list[int] | None = None,
 ) -> dict[str, object]:
     """构造 phase-only schema-v5 raw；调用者显式提供 Claim/Submit/尾动作。"""
     all_rows = [list(row) for row in rows]
@@ -198,6 +199,17 @@ def _v5_capture(
         metadata["shared_metadata_writer_tasks"] = list(
             metadata_writer_tasks
         )
+        if metadata_prefix_tasks is None:
+            metadata_prefix_tasks = sorted(
+                {
+                    int(row[3])
+                    for row in all_rows
+                    if row[5] == "Submit" and int(row[8]) & 0x1
+                }
+            )
+        metadata["shared_metadata_prefix_tasks"] = list(
+            metadata_prefix_tasks
+        )
     return {
         "l2_swimlane_level": 1,
         "metadata": metadata,
@@ -246,6 +258,7 @@ def _refresh_summary(capture: dict[str, object]) -> None:
 def _v5_shared_register_atomic_capture(
     *,
     dependency_applied: bool = True,
+    metadata_prefix_tasks: list[int] | None = None,
 ) -> dict[str, object]:
     """构造五个 winner、两个真实 metadata writer 的稀疏链 v5 raw。
 
@@ -253,6 +266,8 @@ def _v5_shared_register_atomic_capture(
     但只有 task 0/4 发布自己的 completion。
     """
 
+    if metadata_prefix_tasks is None:
+        metadata_prefix_tasks = [0, 1, 2, 3, 4]
     rows: list[list[object]] = []
     for task_id in range(5):
         base = 100 + task_id * 50
@@ -409,6 +424,7 @@ def _v5_shared_register_atomic_capture(
         rows,
         tensormap_mode="shared",
         metadata_writer_tasks=[0, 4],
+        metadata_prefix_tasks=metadata_prefix_tasks,
     )
     capture["l2_swimlane_level"] = 4
     capture_rows = capture["fdwic_events"]
@@ -433,7 +449,7 @@ def _v5_shared_register_atomic_capture(
     )
     for task_id in range(5):
         base = 100 + task_id * 50
-        if task_id > 0:
+        if task_id > 0 and task_id in metadata_prefix_tasks:
             # 三次 Load（两次 Pending + 最后一次 Ready）聚成一条等待
             # episode；task 0 没有前驱，不产生此记录。
             capture_rows.append(
@@ -2003,6 +2019,51 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 input_path.write_text(json.dumps(capture), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, expected):
                     convert(input_path, output_path)
+
+    def test_v5_shared_metadata_prefix_plan_is_required_and_exact(
+        self,
+    ) -> None:
+        cases = (
+            ("missing", None, "must be an array"),
+            ("duplicate", [0, 1, 1, 4], "strictly increasing"),
+            ("unknown", [0, 1, 2, 3, 99], "contains unknown tasks"),
+            ("omits_writer", [0, 1, 2, 3], "writers must also require"),
+        )
+        for label, prefix_tasks, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                capture = _v5_shared_register_atomic_capture()
+                metadata = capture["metadata"]
+                assert isinstance(metadata, dict)
+                if prefix_tasks is None:
+                    metadata.pop("shared_metadata_prefix_tasks")
+                else:
+                    metadata["shared_metadata_prefix_tasks"] = prefix_tasks
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, expected):
+                    convert(input_path, output_path)
+
+    def test_v5_shared_sparse_prefix_waits_only_actual_writer_tasks(
+        self,
+    ) -> None:
+        capture = _v5_shared_register_atomic_capture(
+            metadata_prefix_tasks=[0, 4]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+            atomic_polls = [
+                event
+                for event in merged["traceEvents"]
+                if event.get("name") ==
+                "atomic.poll_batch.return_ready."
+                "shared_insert_predecessor_poll.load×3"
+            ]
+            self.assertEqual(len(atomic_polls), 1)
 
     def test_v5_shared_claim_tournament_atomics_are_named(self) -> None:
         capture = _v5_shared_register_atomic_capture()

@@ -375,6 +375,12 @@ struct SharedHostPlannedTask {
     // TaskKind 反推 writer 资格。device 还会用实际 delta
     // 与该位交叉校验，不信任 host 声明来跳过写集。
     bool publishes_metadata;
+    bool publishes_ordinary_metadata;
+    bool publishes_symbol_metadata;
+    // operator adapter 对通用 args/metadata 计划做出的只读判定；只供
+    // host 泳道完整性 oracle。device 会从真实 TaskArgs 独立计算并决定
+    // 是否等待，不能用这个 host 位绕过协议。
+    bool requires_metadata_prefix;
 };
 
 struct SharedHostTaskPlan {
@@ -535,6 +541,9 @@ inline bool BuildSharedHostTaskPlan(
                     has_following_group,
                     is_final_up,
                     task_offset + 1U == task_count,
+                    kind == TaskKind::Up,
+                    false,
+                    kind == TaskKind::Up,
                     kind == TaskKind::Up,
                 }
             );
@@ -734,10 +743,36 @@ inline bool PopulateSharedBuildDispatchPlan(
         identity.batch = static_cast<uint16_t>(task.batch);
         identity.encoded_meta = encoded;
         identity.exec_route = exec_route;
+        if (task.publishes_metadata !=
+                (task.publishes_ordinary_metadata ||
+                 task.publishes_symbol_metadata)) {
+            if (error != nullptr) {
+                *error =
+                    "shared metadata-writer classification is inconsistent";
+            }
+            std::memset(
+                &state->build_dispatch, 0,
+                sizeof(state->build_dispatch)
+            );
+            std::memset(
+                &state->exec_dispatch, 0,
+                sizeof(state->exec_dispatch)
+            );
+            return false;
+        }
         if (task.publishes_metadata) {
             state->build_dispatch.metadata_writer_bits[
                 task.task_id / 64U
             ] |= uint64_t{1} << (task.task_id % 64U);
+            ++state->build_dispatch.metadata_writer_count;
+        }
+        if (task.publishes_ordinary_metadata) {
+            ++state->build_dispatch
+                  .ordinary_metadata_writer_count;
+        }
+        if (task.publishes_symbol_metadata) {
+            ++state->build_dispatch
+                  .symbol_metadata_writer_count;
         }
         if (executable) {
             uint32_t *task_ids = nullptr;
@@ -2532,6 +2567,21 @@ inline bool ExportSwimlaneRecords(
             first_metadata_writer ? "" : ",", task.task_id
         );
         first_metadata_writer = false;
+    }
+    std::fprintf(output, "]");
+    std::fprintf(
+        output, ",\"shared_metadata_prefix_tasks\":["
+    );
+    bool first_metadata_prefix = true;
+    for (const SharedHostPlannedTask &task : shared_plan.tasks) {
+        if (!task.requires_metadata_prefix) {
+            continue;
+        }
+        std::fprintf(
+            output, "%s%u",
+            first_metadata_prefix ? "" : ",", task.task_id
+        );
+        first_metadata_prefix = false;
     }
     std::fprintf(output, "]");
 #endif
@@ -5370,6 +5420,25 @@ inline Metrics Validate(
     bool shared_metadata_writer_completions_ok = true;
     bool legacy_task_completion_canary_ok = true;
     uint32_t shared_completed_metadata_writers = 0;
+    uint32_t expected_metadata_writers = 0;
+    uint32_t expected_ordinary_metadata_writers = 0;
+    uint32_t expected_symbol_metadata_writers = 0;
+    for (const SharedHostPlannedTask &planned_task :
+         shared_plan.tasks) {
+        expected_metadata_writers +=
+            planned_task.publishes_metadata ? 1U : 0U;
+        expected_ordinary_metadata_writers +=
+            planned_task.publishes_ordinary_metadata ? 1U : 0U;
+        expected_symbol_metadata_writers +=
+            planned_task.publishes_symbol_metadata ? 1U : 0U;
+    }
+    shared_metadata_writer_completions_ok &=
+        state.build_dispatch.metadata_writer_count ==
+            expected_metadata_writers &&
+        state.build_dispatch.ordinary_metadata_writer_count ==
+            expected_ordinary_metadata_writers &&
+        state.build_dispatch.symbol_metadata_writer_count ==
+            expected_symbol_metadata_writers;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const SharedHostPlannedTask *planned_task =
             shared_plan.TaskAt(task_id);

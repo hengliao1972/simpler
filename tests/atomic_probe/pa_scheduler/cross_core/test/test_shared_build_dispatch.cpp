@@ -451,15 +451,25 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
 
                 bool publishes_metadata = false;
                 int32_t previous_metadata_writer = -1;
+                bool metadata_prefix_required = false;
                 if (!DecodeSharedMetadataWriterPlan(
                         state.build_dispatch, task_id,
                         publishes_metadata,
                         previous_metadata_writer
+                    ) ||
+                    !SharedTaskNeedsMetadataPrefix(
+                        args, static_cast<int32_t>(task_id),
+                        publishes_metadata,
+                        previous_metadata_writer,
+                        state.build_dispatch
+                                .ordinary_metadata_writer_count != 0,
+                        metadata_prefix_required
                     )) {
                     RecordFailure(evidence);
                     break;
                 }
-                if (previous_metadata_writer >= 0) {
+                if (metadata_prefix_required &&
+                    previous_metadata_writer >= 0) {
                     while (!evidence.abort.load(std::memory_order_acquire)) {
                         evidence.predecessor_loads.fetch_add(1, std::memory_order_relaxed);
                         const int64_t predecessor = TestOps::Load(

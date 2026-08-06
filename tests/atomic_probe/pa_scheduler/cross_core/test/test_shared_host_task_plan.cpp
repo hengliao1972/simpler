@@ -719,6 +719,17 @@ int main() {
         initialized_mixed_ok,
         "InitializeState writes the exact shared CLI context vector"
     );
+    uint32_t expected_metadata_writers = 0;
+    uint32_t expected_ordinary_metadata_writers = 0;
+    uint32_t expected_symbol_metadata_writers = 0;
+    for (const SharedHostPlannedTask &task : mixed.tasks) {
+        expected_metadata_writers +=
+            task.publishes_metadata ? 1U : 0U;
+        expected_ordinary_metadata_writers +=
+            task.publishes_ordinary_metadata ? 1U : 0U;
+        expected_symbol_metadata_writers +=
+            task.publishes_symbol_metadata ? 1U : 0U;
+    }
     bool dispatch_plan_ok =
         state->build_dispatch.next_task.value == 0 &&
         state->exec_dispatch.aic_next.value == 0 &&
@@ -728,7 +739,13 @@ int main() {
         state->build_dispatch.executable_task_count ==
             mixed.total_tasks - mixed.tasks_by_kind[
                 static_cast<uint32_t>(TaskKind::Alloc)
-            ];
+            ] &&
+        state->build_dispatch.metadata_writer_count ==
+            expected_metadata_writers &&
+        state->build_dispatch.ordinary_metadata_writer_count ==
+            expected_ordinary_metadata_writers &&
+        state->build_dispatch.symbol_metadata_writer_count ==
+            expected_symbol_metadata_writers;
     uint32_t expected_aic_tasks = 0;
     uint32_t expected_aiv_tasks = 0;
     int32_t expected_previous_metadata_writer = -1;
@@ -745,7 +762,15 @@ int main() {
             identity.exec_route ==
                 EncodeSharedHostExecRoute(
                     mixed.tasks[task_id].kind
-                );
+                ) &&
+            !mixed.tasks[task_id]
+                 .publishes_ordinary_metadata &&
+            mixed.tasks[task_id]
+                 .publishes_symbol_metadata ==
+                mixed.tasks[task_id].publishes_metadata &&
+            mixed.tasks[task_id]
+                 .requires_metadata_prefix ==
+                mixed.tasks[task_id].publishes_metadata;
         bool publishes_metadata = false;
         int32_t previous_metadata_writer = INT32_MIN;
         dispatch_plan_ok &= DecodeMetadataWriterPlanHost(

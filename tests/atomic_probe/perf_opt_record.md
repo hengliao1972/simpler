@@ -6701,3 +6701,24 @@ full-swimlane 的 1280 Build、1024 kernel、2048 fresh output、768 symbol
 commit 和 6528 次 DCCI 全部闭合；Materialize 的 output publish 前累计
 core-work 从 `7,309,547` 降至 `7,164,158 cycles`，与删除一次参数扫描的代码
 位置一致。该通用、小范围候选正式保留。
+
+### 15.60 按真实 metadata 消费缩减非 writer 前缀等待
+
+稀疏 writer 链建立后，1,024 个非 writer 仍无条件等待自己之前最后一个
+metadata writer。本轮将“严格 writer 顺序”和“reader 是否消费 writer
+metadata”分开：真实 writer 始终等待前一 writer；`SharedOutputRef(P)` 只有
+在 `(P,N)` 内存在 writer 时等待；全计划 ordinary writer 为零时，普通
+TensorMap lookup 不再等待无关的 symbol-only writer；manual dep 不等待。
+
+公共 device 判定只读取通用引用、task id 和 writer 计划，不读取 PA
+`TaskKind`。PA adapter 仅声明自身为零 ordinary writer；其他算子只要存在
+ordinary writer就自动走保守路径。host 终态也改为汇总通用 writer 属性，不再
+按 UP 数量反推。前缀分类合入已有 writer-delta 扫描，避免新增第二轮参数遍历。
+
+B256 full-swimlane 的 predecessor PollBatch 从 `1275/5870` 条物理/逻辑
+读取降至 `255/979`，writer completion 仍为 256；Register 累计 core-work
+从 `3704993` 降到 `567288 cycles`。冻结 12 对无泳道 A/B 的中位由
+`952.797 us` 降到 `945.690 us`，改善 `7.106 us / 0.746%`，候选
+`7/12` 对更快。收益小且存在波动，不把它写成稳定大幅提升；保留依据是严格链
+不变、无关等待确定减少且端到端未回退。完整理论、门槛和原始数据见实现过程
+S6.85。

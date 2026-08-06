@@ -6003,3 +6003,117 @@ raw                            52427 physical / 54987 logical / dropped=0
 本阶段判定为有效并保留。当前权威中位距新的 `0.8 ms` 目标仍约
 `167.078 us`；后续继续优化时，禁止用跳过真实 writer、截断 FinalDrain 或
 删减 kernel 工作量达标。
+
+## 2026-08-06：S6.85 按真实 metadata 消费缩减非 writer 前缀等待
+
+### 问题与通用合同
+
+S6.84-b 已把严格串行发布者从全部 1,280 个 task 收敛为 256 个真实
+metadata writer，但每个非 writer 仍等待自己之前最后一个 writer。该等待
+不是 TensorMap 严格顺序本身的要求：只有真正修改 metadata 的 task 才必须
+形成 `W0 -> W1 -> ...` 全序；非 writer 是否需要等待，取决于它后续实际
+lookup 是否可能消费尚未提交的 metadata。
+
+本阶段按通用 `TaskArgs` 和引用种类建立以下判定，不读取 PA `TaskKind`、
+batch、固定五 task 形状或 UP：
+
+```text
+真实 metadata writer N：
+  始终等待 previous_metadata_writer(N)
+
+SharedOutputRef(producer=P) 的 reader N：
+  previous_metadata_writer(N) > P  -> 等待完整 writer 前缀
+  previous_metadata_writer(N) <= P -> 只等待 (P,slot).published
+
+普通 GmTensor / LocalTensor lookup：
+  全计划 ordinary writer 数为 0 -> 不等待 symbol-only writer 前缀
+  否则只要已有更早 metadata writer -> 保守等待
+
+manual_dep / 纯 Output：
+  不消费共享 TensorMap metadata，不等待
+```
+
+`SharedOutputRef` 使用开区间 `(P,N)`：fresh descriptor 由 P 的独占
+`published` 证明；只有该区间内出现 symbol writer，reader 才可能需要沿
+history 解析更新后的 writer。普通 TensorMap 尚无 per-key completion，存在
+ordinary writer 时继续采用保守路径；因此其他算子最多得不到本快路径，不会
+因为粗粒度计数跳过必要等待。
+
+host/operator 计划新增总 writer、ordinary writer、symbol writer 三个通用
+计数。计数只允许开启“某类 writer 全局为零”的快路径，不授予逐 task writer
+资格；真实 `writer_delta` 若推翻零计数，在 lookup 前立即设置 fatal。终态校验
+直接汇总计划中的三类通用属性，不再用 `TaskKind::Up` 反推数量。PA adapter
+只负责把自身合同映射为“零 ordinary、UP 为 symbol writer”，公共 device
+路径没有 PA 分支。
+
+### 热路与观测收敛
+
+首版实现为判断前缀又单独扫描一次 `TaskArgs`，把等待收益的一部分转移到了
+Materialize。最终版本将判定并入原有 `PrepareSharedTaskWriterDelta()` 参数
+扫描，同时累计 `metadata_prefix_required`；writer mask、引用合法性、唯一性、
+region 和实际 delta 校验都保留。
+
+泳道 raw 只在 host metadata 中增加 `shared_metadata_prefix_tasks`，没有增加
+device record 或扩大每核缓冲。converter 以该列表校验 site 19：只有
+`prefix_required` 且存在前序 writer 的 task 才能出现一条 PollBatch；writer
+列表必须是 prefix 列表的子集。旧 raw 不兼容，继续采用同一版本采集和加工。
+
+### 正确性与泛化门槛
+
+最终源码通过：
+
+- pa_scheduler Python 全量 `168` 项；
+- cross-core CPU perf-clock 全构建，包括普通/符号混合 writer、manual dep、
+  非法 future ref、零 ordinary writer、乱序 96-thread Build 和 ordered
+  Submit；
+- CCEC perf-clock/full-swimlane 的 AIC/AIV、split Finish、mixed ELF、
+  relocation 与 manifest 门槛；
+- A5 B1/B256 real-compute `6,28,4,1` 的 1,280 Build、1,024 kernel、
+  TensorMap/history、payload、DCCI、FinalDrain 与全部 host 终态断言。
+
+最终 B256 full-swimlane 位于（测试产物不提交）：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260806_072000_4013429/
+```
+
+与 S6.84-b 基线泳道相比：
+
+```text
+                                      S6.84-b       S6.85
+predecessor PollBatch physical           1275          255
+predecessor logical atomic loads          5870          979
+writer completion                         256          256
+Register aggregate core-work          3704993       567288 cycles
+Materialize aggregate core-work       11250742     11669925 cycles
+WinnerBuild aggregate core-work        9013320      8932601 cycles
+raw Submit wall-clock                   783.153      759.617 us
+```
+
+site 19 等待 episode 减少 `80%`，site 20 writer completion 完全不变；严格
+writer 顺序没有以减少 writer 或省略 handoff 换性能。合并扫描前 Materialize
+一度为 `11971934 cycles`，最终降到 `11669925 cycles`，收回
+`302009 cycles` 的全核累计重复扫描成本。相对旧基线仍多
+`419183 cycles` 的通用分类工作，这也是本轮收益没有等比例转化为端到端时间的
+主要代价之一。泳道单样本只用于归因，不与无泳道 ELF 的绝对时间相减。
+
+### 冻结 perf-clock A/B
+
+冻结 S6.84-b 基线与最终候选，按 B-C/C-B 交错运行 12 对独立 A5 B256
+进程，统一统计 startup 起点到 FinalDrain 结束：
+
+```text
+                         min        median       max         mean
+S6.84-b 基线            930.712     952.797     989.816     956.093 us
+S6.85 候选              916.649     945.690     986.511     945.578 us
+
+独立中位改善：7.106 us / 0.746%
+逐对 baseline-candidate：median=8.084 us，mean=10.515 us
+候选获胜：7/12
+```
+
+收益明显小于硬件波动范围，不能宣称稳定接近 `0.8 ms`；但 80% site 19
+episode 消减、writer handoff 不变、严格链与完整业务闭合都能独立证明改动确实
+减少了无关协议工作。该候选按“小幅端到端收益 + 明确结构性消减”保留，后续
+不得为扩大 PA 数字加入 task-kind 特判；其他算子若存在 ordinary writer，自动
+回退到保守前缀等待。
