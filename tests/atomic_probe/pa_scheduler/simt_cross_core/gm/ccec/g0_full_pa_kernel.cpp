@@ -24,7 +24,14 @@
 #endif
 
 #include "../common/g0_full_pa.h"
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#include "../common/g0_swimlane.h"
+#endif
 #include "full_pa_workloads.h"
+
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) && !defined(SIMT_CROSS_CORE_G0_DISABLE_SIMT_ATOMIC_TRACE)
+#define SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED
+#endif
 
 namespace {
 
@@ -35,6 +42,18 @@ using namespace pto;
 constexpr int kSingleCacheLine = 0;
 constexpr uint32_t kWatchdogMask = 0x3FFU;
 constexpr uint32_t kDrainExpectedArrivals = 6U;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+namespace g0_swimlane = pa_scheduler::simt_cross_core::g0_swimlane;
+constexpr size_t kG0TraceFromTasksOffsetBytes =
+    offsetof(g0_swimlane::G0SwimlaneState, trace) -
+    offsetof(g0_swimlane::G0SwimlaneState, full_pa) - offsetof(FullPaState, tasks);
+static_assert(
+    offsetof(g0_swimlane::G0SwimlaneState, trace) >
+            offsetof(g0_swimlane::G0SwimlaneState, full_pa) + offsetof(FullPaState, tasks) &&
+        kG0TraceFromTasksOffsetBytes % alignof(g0_swimlane::TraceState) == 0U,
+    "G0 trace sidecar must remain aligned and forward-addressable from task_words"
+);
+#endif
 
 __aicore__ __attribute__((always_inline)) inline uint64_t ScalarAtomicLoad(__gm__ volatile int64_t *address) {
     return static_cast<uint64_t>(atomicAdd(const_cast<__gm__ int64_t *>(address), static_cast<int64_t>(0)));
@@ -92,7 +111,554 @@ __aicore__ __attribute__((always_inline)) inline bool ConfigValid(__gm__ const F
            state->exec_dispatch.aic_task_count == batches * 2U && state->exec_dispatch.aiv_task_count == batches * 2U;
 }
 
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+__aicore__ __attribute__((always_inline)) inline __gm__ g0_swimlane::TraceState *
+TraceStateFor(__gm__ FullPaState *state) {
+    return &reinterpret_cast<__gm__ g0_swimlane::G0SwimlaneState *>(state)->trace;
+}
+
+struct alignas(32U) ScalarTraceContext {
+    __gm__ g0_swimlane::TraceLogControl *control;
+    __gm__ g0_swimlane::TraceRecord *records;
+    uint64_t launch_nonce;
+    uint64_t atomic_calls;
+    uint64_t poll_calls;
+    uint64_t dcci_calls;
+    uint64_t dcci_lines;
+    uint32_t record_count;
+    uint32_t dropped_records;
+    uint32_t poll_records;
+    uint32_t dcci_records;
+    uint32_t owner;
+};
+
+struct alignas(32U) ScalarPollEpisode {
+    uint64_t begin;
+    uint64_t end;
+    uint32_t task_id;
+    uint32_t call_count;
+    g0_swimlane::AtomicSite site;
+    uint16_t reserved;
+};
+
+static_assert(alignof(ScalarTraceContext) == 32U, "Scalar trace context must be VEC-stack aligned");
+static_assert(alignof(ScalarPollEpisode) == 32U, "Scalar poll episode must be VEC-stack aligned");
+
+__aicore__ __attribute__((always_inline)) inline void
+InitializeScalarPollEpisode(ScalarPollEpisode *episode) {
+    // CCEC 可能把栈上聚合数组的 `{}` 初始化降成不可靠的 VEC-UB
+    // copy/store。逐字段标量写入，保证没有领取 task 的 executor 在退出
+    // flush 时也一定看到 call_count=0。
+    episode->begin = 0U;
+    episode->end = 0U;
+    episode->task_id = g0_swimlane::kTraceNoTask;
+    episode->call_count = 0U;
+    episode->site = g0_swimlane::AtomicSite::Count;
+    episode->reserved = 0U;
+}
+
+__aicore__ __attribute__((always_inline)) inline void
+AttachScalarTrace(__gm__ FullPaState *state, uint32_t owner, ScalarTraceContext *trace) {
+    // CCEC 可能把聚合零初始化/按值返回降成 UB 上的 VEC
+    // store/copy。这里保持 32B 对齐并只做标量逐字段初始化。
+    trace->control = &TraceStateFor(state)->scalar_logs[owner];
+    trace->records = &TraceStateFor(state)->scalar_records[owner][0];
+    trace->launch_nonce = state->control.launch_nonce;
+    trace->atomic_calls = 0U;
+    trace->poll_calls = 0U;
+    trace->dcci_calls = 0U;
+    trace->dcci_lines = 0U;
+    trace->record_count = 0U;
+    trace->dropped_records = 0U;
+    trace->poll_records = 0U;
+    trace->dcci_records = 0U;
+    trace->owner = owner;
+}
+
+__aicore__ __attribute__((always_inline)) inline uint64_t ScalarNowAfterAtomicResult(uint64_t value) {
+    uint64_t cycle = 0U;
+    // 与 cross_core 使用同一条返回依赖序列：先消费 atomic 返回寄存器，
+    // 再读 SYS_CNT；不增加 DSB/ISB/GM 访问。
+    asm volatile(
+        "MOV %0, %0\n"
+        "MOV %1, SYS_CNT\n"
+        : "+l"(value), "=&l"(cycle)
+    );
+    return cycle;
+}
+
+__aicore__ __attribute__((always_inline)) inline void ScalarTraceWriteRecord(
+    ScalarTraceContext &trace, uint64_t begin, uint64_t end, uint32_t task_id, uint16_t site,
+    g0_swimlane::TraceKind kind, uint8_t op, uint32_t flags, uint32_t call_count
+) {
+    if (trace.record_count >= g0_swimlane::kTraceScalarRecordsPerWriter) {
+        if (trace.dropped_records != UINT32_MAX) {
+            ++trace.dropped_records;
+        }
+        return;
+    }
+    __gm__ uint64_t *words =
+        reinterpret_cast<__gm__ uint64_t *>(&trace.records[trace.record_count++]);
+    const uint64_t meta = static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(site) << 32U) |
+                          (static_cast<uint64_t>(kind) << 48U) | (static_cast<uint64_t>(op) << 56U);
+    StoreDev64(words + 0U, begin);
+    StoreDev64(words + 1U, end);
+    StoreDev64(words + 2U, meta);
+    StoreDev64(words + 3U, static_cast<uint64_t>(flags) | (static_cast<uint64_t>(call_count) << 32U));
+}
+
+__aicore__ __attribute__((always_inline)) inline void ScalarTraceAtomicRecord(
+    ScalarTraceContext &trace, uint32_t task_id, g0_swimlane::AtomicSite site, uint64_t begin, uint64_t end,
+    g0_swimlane::AtomicOp op, bool result_used, bool value_zero
+) {
+    // ScalarNowAfterAtomicResult 先消费 atomic 返回寄存器再读
+    // SYS_CNT，因此这里可以如实标为 return_ready。
+    uint32_t flags = result_used ? g0_swimlane::kAtomicResultUsed | g0_swimlane::kAtomicReturnReady : 0U;
+    flags |= value_zero ? g0_swimlane::kAtomicValueZero : 0U;
+    ++trace.atomic_calls;
+    ScalarTraceWriteRecord(
+        trace, begin, end, task_id, static_cast<uint16_t>(site), g0_swimlane::TraceKind::Atomic,
+        static_cast<uint8_t>(op), flags, 1U
+    );
+}
+
+__aicore__ __attribute__((always_inline)) inline void
+ScalarTraceFlushPoll(ScalarTraceContext &trace, ScalarPollEpisode *episode) {
+    if (episode->call_count == 0U) {
+        return;
+    }
+    // episode->end 在热循环中暂存最后一次 atomic 返回值；只在退出
+    // episode 时建立一次返回依赖并读取 SYS_CNT，避免每轮 poll 都
+    // 读取时钟而反过来放大等待。
+    const uint64_t end = ScalarNowAfterAtomicResult(episode->end);
+    trace.atomic_calls += episode->call_count;
+    trace.poll_calls += episode->call_count;
+    ++trace.poll_records;
+    ScalarTraceWriteRecord(
+        trace, episode->begin, end, episode->task_id, static_cast<uint16_t>(episode->site),
+        g0_swimlane::TraceKind::Atomic, static_cast<uint8_t>(g0_swimlane::AtomicOp::Load),
+        g0_swimlane::kAtomicResultUsed | g0_swimlane::kAtomicReturnReady | g0_swimlane::kAtomicPollBatch,
+        episode->call_count
+    );
+    InitializeScalarPollEpisode(episode);
+}
+
+__aicore__ __attribute__((always_inline)) inline uint64_t ScalarTracePollLoad(
+    ScalarTraceContext &trace, ScalarPollEpisode *episode, uint32_t task_id, g0_swimlane::AtomicSite site,
+    __gm__ volatile int64_t *address
+) {
+    if (episode->call_count != 0U && (episode->task_id != task_id || episode->site != site)) {
+        ScalarTraceFlushPoll(trace, episode);
+    }
+    if (episode->call_count == 0U) {
+        episode->begin = static_cast<uint64_t>(get_sys_cnt());
+        episode->task_id = task_id;
+        episode->site = site;
+    }
+    const uint64_t old = ScalarAtomicLoad(address);
+    episode->end = old;
+    if (episode->call_count != UINT32_MAX) {
+        ++episode->call_count;
+    }
+    return old;
+}
+
+__aicore__ __attribute__((always_inline)) inline uint64_t ScalarTraceAtomicLoad(
+    ScalarTraceContext &trace, uint32_t task_id, g0_swimlane::AtomicSite site,
+    __gm__ volatile int64_t *address, bool result_used = true
+) {
+    const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
+    const uint64_t old = ScalarAtomicLoad(address);
+    const uint64_t end = result_used ? ScalarNowAfterAtomicResult(old) : static_cast<uint64_t>(get_sys_cnt());
+    ScalarTraceAtomicRecord(
+        trace, task_id, site, begin, end, g0_swimlane::AtomicOp::Load, result_used, old == 0U
+    );
+    return old;
+}
+
+__aicore__ __attribute__((always_inline)) inline uint64_t ScalarTraceAtomicLoad(
+    ScalarTraceContext &trace, uint32_t task_id, g0_swimlane::AtomicSite site,
+    __gm__ volatile uint64_t *address, bool result_used = true
+) {
+    const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
+    const uint64_t old = ScalarAtomicLoad(address);
+    const uint64_t end = result_used ? ScalarNowAfterAtomicResult(old) : static_cast<uint64_t>(get_sys_cnt());
+    ScalarTraceAtomicRecord(
+        trace, task_id, site, begin, end, g0_swimlane::AtomicOp::Load, result_used, old == 0U
+    );
+    return old;
+}
+
+__aicore__ __attribute__((always_inline)) inline uint64_t ScalarTraceCas(
+    ScalarTraceContext &trace, uint32_t task_id, g0_swimlane::AtomicSite site,
+    __gm__ volatile int64_t *address, uint64_t expected, uint64_t desired, bool result_used = true
+) {
+    const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
+    const uint64_t old = ScalarCas(address, expected, desired);
+    const uint64_t end = result_used ? ScalarNowAfterAtomicResult(old) : static_cast<uint64_t>(get_sys_cnt());
+    ScalarTraceAtomicRecord(
+        trace, task_id, site, begin, end, g0_swimlane::AtomicOp::CompareExchange, result_used, false
+    );
+    return old;
+}
+
+__aicore__ __attribute__((always_inline)) inline uint64_t ScalarTraceFetchAdd(
+    ScalarTraceContext &trace, uint32_t task_id, g0_swimlane::AtomicSite site,
+    __gm__ volatile int64_t *address, uint64_t increment, bool result_used = false
+) {
+    const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
+    const uint64_t old = ScalarFetchAdd(address, increment);
+    const uint64_t end = result_used ? ScalarNowAfterAtomicResult(old) : static_cast<uint64_t>(get_sys_cnt());
+    ScalarTraceAtomicRecord(
+        trace, task_id, site, begin, end, g0_swimlane::AtomicOp::FetchAdd, result_used, false
+    );
+    return old;
+}
+
+__aicore__ __attribute__((always_inline)) inline uint64_t ScalarTraceExchange(
+    ScalarTraceContext &trace, uint32_t task_id, g0_swimlane::AtomicSite site,
+    __gm__ volatile int64_t *address, uint64_t value, bool result_used = true
+) {
+    const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
+    const uint64_t old = ScalarExchange(address, value);
+    const uint64_t end = result_used ? ScalarNowAfterAtomicResult(old) : static_cast<uint64_t>(get_sys_cnt());
+    ScalarTraceAtomicRecord(
+        trace, task_id, site, begin, end, g0_swimlane::AtomicOp::Exchange, result_used, false
+    );
+    return old;
+}
+
+__aicore__ __attribute__((always_inline)) inline void ScalarTraceDcciRecord(
+    ScalarTraceContext &trace, uint32_t task_id, g0_swimlane::DcciSite site, g0_swimlane::DcciOp op,
+    uint64_t begin, uint64_t end, uint32_t call_count, uint32_t line_count
+) {
+    trace.dcci_calls += call_count;
+    trace.dcci_lines += line_count;
+    ++trace.dcci_records;
+    ScalarTraceWriteRecord(
+        trace, begin, end, task_id, static_cast<uint16_t>(site), g0_swimlane::TraceKind::Dcci,
+        static_cast<uint8_t>(op), g0_swimlane::PackDcciFlags(line_count), call_count
+    );
+}
+
+__aicore__ __attribute__((always_inline)) inline void ScalarTraceFinish(ScalarTraceContext &trace) {
+    __gm__ uint64_t *words = reinterpret_cast<__gm__ uint64_t *>(trace.control);
+    StoreDev64(words + 1U, trace.atomic_calls);
+    StoreDev64(words + 2U, trace.poll_calls);
+    StoreDev64(words + 3U, trace.dcci_calls);
+    StoreDev64(words + 4U, trace.dcci_lines);
+    StoreDev64(
+        words + 5U, static_cast<uint64_t>(trace.record_count) |
+                        (static_cast<uint64_t>(trace.dropped_records) << 32U)
+    );
+    StoreDev64(
+        words + 6U,
+        static_cast<uint64_t>(trace.poll_records) | (static_cast<uint64_t>(trace.dcci_records) << 32U)
+    );
+    StoreDev64(
+        words + 7U, static_cast<uint64_t>(trace.owner) |
+                        (static_cast<uint64_t>(g0_swimlane::TraceDomain::Scalar) << 32U)
+    );
+    StoreDev64(words + 0U, trace.launch_nonce);
+}
+
+__aicore__ __attribute__((always_inline)) inline __gm__ uint64_t *
+RoleTraceWords(__gm__ FullPaState *state, uint32_t owner) {
+    return reinterpret_cast<__gm__ uint64_t *>(&TraceStateFor(state)->roles[owner]);
+}
+
+__aicore__ __attribute__((always_inline)) inline void TraceRoleEnter(
+    __gm__ FullPaState *state, uint32_t owner, OwnerRole role, uint32_t physical_block, uint32_t subblock,
+    uint64_t entry
+) {
+    __gm__ uint64_t *words = RoleTraceWords(state, owner);
+    StoreDev64(words + 1U, entry);
+    StoreDev64(words + 8U, static_cast<uint64_t>(owner) | (static_cast<uint64_t>(role) << 32U));
+    StoreDev64(words + 9U, static_cast<uint64_t>(physical_block) | (static_cast<uint64_t>(subblock) << 32U));
+    StoreDev64(words, state->control.launch_nonce);
+}
+
+__aicore__ __attribute__((always_inline)) inline void
+TraceRoleTimestamp(__gm__ FullPaState *state, uint32_t owner, uint32_t word) {
+    StoreDev64(RoleTraceWords(state, owner) + word, static_cast<uint64_t>(get_sys_cnt()));
+}
+
+__aicore__ __attribute__((always_inline)) inline __gm__ uint64_t *
+ExecutorTraceWords(__gm__ FullPaState *state, uint32_t task_id) {
+    return reinterpret_cast<__gm__ uint64_t *>(&TraceStateFor(state)->executors[task_id]);
+}
+
+__aicore__ __attribute__((always_inline)) inline void
+TraceExecutorTicket(__gm__ FullPaState *state, uint32_t owner, uint32_t task_id) {
+    __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
+    StoreDev64(words + 1U, static_cast<uint64_t>(get_sys_cnt()));
+    StoreDev64(words + 6U, static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(owner) << 32U));
+    StoreDev64(
+        words + 7U,
+        static_cast<uint64_t>(TaskKindAt(task_id)) |
+            (static_cast<uint64_t>(g0_swimlane::kExecutorTicketRecorded) << 32U)
+    );
+}
+
+__aicore__ __attribute__((always_inline)) inline void
+TraceExecutorClaim(__gm__ FullPaState *state, uint32_t task_id) {
+    __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
+    StoreDev64(words + 2U, static_cast<uint64_t>(get_sys_cnt()));
+    StoreDev64(
+        words + 7U,
+        static_cast<uint64_t>(TaskKindAt(task_id)) |
+            (static_cast<uint64_t>(
+                 g0_swimlane::kExecutorTicketRecorded | g0_swimlane::kExecutorClaimRecorded
+             )
+             << 32U)
+    );
+}
+
+__aicore__ __attribute__((always_inline)) inline void
+TraceExecutorFaninReady(__gm__ FullPaState *state, uint32_t task_id) {
+    __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
+    StoreDev64(words + 3U, static_cast<uint64_t>(get_sys_cnt()));
+    StoreDev64(
+        words + 7U,
+        static_cast<uint64_t>(TaskKindAt(task_id)) |
+            (static_cast<uint64_t>(
+                 g0_swimlane::kExecutorTicketRecorded | g0_swimlane::kExecutorClaimRecorded |
+                 g0_swimlane::kExecutorFaninReadyRecorded
+             )
+             << 32U)
+    );
+}
+
+__aicore__ __attribute__((always_inline)) inline void
+TraceExecutorBegin(__gm__ FullPaState *state, uint32_t task_id) {
+    __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
+    StoreDev64(words + 4U, static_cast<uint64_t>(get_sys_cnt()));
+    StoreDev64(
+        words + 7U,
+        static_cast<uint64_t>(TaskKindAt(task_id)) |
+            (static_cast<uint64_t>(
+                 g0_swimlane::kExecutorTicketRecorded | g0_swimlane::kExecutorClaimRecorded |
+                 g0_swimlane::kExecutorFaninReadyRecorded | g0_swimlane::kExecutorBeginRecorded
+             )
+             << 32U)
+    );
+}
+
+__aicore__ __attribute__((always_inline)) inline void
+TraceExecutorEnd(__gm__ FullPaState *state, uint32_t task_id) {
+    __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
+    StoreDev64(words + 5U, static_cast<uint64_t>(get_sys_cnt()));
+    StoreDev64(
+        words + 7U,
+        static_cast<uint64_t>(TaskKindAt(task_id)) |
+            (static_cast<uint64_t>(g0_swimlane::kExpectedExecutorTraceBits) << 32U)
+    );
+    dsb(DSB_ALL);
+    StoreDev64(words, state->control.launch_nonce);
+}
+#endif
+
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#define G0_SCALAR_TRACE_PARAMETER , ScalarTraceContext &trace
+#define G0_SCALAR_TRACE_ARGUMENT , trace
+#define G0_TRACE_SCALAR_LOAD(trace, task_id, site, address, result_used) \
+    ScalarTraceAtomicLoad(trace, task_id, site, address, result_used)
+#define G0_TRACE_SCALAR_CAS(trace, task_id, site, address, expected, desired, result_used) \
+    ScalarTraceCas(trace, task_id, site, address, expected, desired, result_used)
+#define G0_TRACE_SCALAR_FETCH_ADD(trace, task_id, site, address, increment, result_used) \
+    ScalarTraceFetchAdd(trace, task_id, site, address, increment, result_used)
+#define G0_TRACE_SCALAR_EXCHANGE(trace, task_id, site, address, value, result_used) \
+    ScalarTraceExchange(trace, task_id, site, address, value, result_used)
+
+__aicore__ __attribute__((always_inline)) inline uint64_t
+TraceLoadFatal(__gm__ FullPaState *state, ScalarTraceContext &trace) {
+    return ScalarTraceAtomicLoad(
+        trace, g0_swimlane::kTraceNoTask, g0_swimlane::AtomicSite::FatalLoad, &state->fatal.state, true
+    );
+}
+
+__aicore__ __attribute__((always_inline)) inline void TracePublishFatal(
+    __gm__ FullPaState *state, ExecFatalReason reason, uint32_t owner, uint32_t task_id, ScalarTraceContext &trace
+) {
+    (void)ScalarTraceCas(
+        trace, task_id, g0_swimlane::AtomicSite::FatalSet, &state->fatal.state, 0U,
+        EncodeExecFatal(reason, owner, task_id), false
+    );
+}
+#else
+#define G0_SCALAR_TRACE_PARAMETER
+#define G0_SCALAR_TRACE_ARGUMENT
+#define G0_TRACE_SCALAR_LOAD(trace, task_id, site, address, result_used) ScalarAtomicLoad(address)
+#define G0_TRACE_SCALAR_CAS(trace, task_id, site, address, expected, desired, result_used) \
+    ScalarCas(address, expected, desired)
+#define G0_TRACE_SCALAR_FETCH_ADD(trace, task_id, site, address, increment, result_used) \
+    ScalarFetchAdd(address, increment)
+#define G0_TRACE_SCALAR_EXCHANGE(trace, task_id, site, address, value, result_used) ScalarExchange(address, value)
+#define TraceLoadFatal(state, trace) LoadFatal(state)
+#define TracePublishFatal(state, reason, owner, task_id, trace) PublishFatal(state, reason, owner, task_id)
+#endif
+
+
 #if defined(__DAV_VEC__)
+
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+struct alignas(32U) SimtTraceCounters {
+    volatile uint64_t atomic_calls;
+    volatile uint64_t poll_calls;
+    volatile uint32_t record_count;
+    volatile uint32_t dropped_records;
+    volatile uint32_t poll_records;
+    volatile uint32_t reserved;
+};
+
+static_assert(sizeof(SimtTraceCounters) == 32U, "SIMT trace counter ABI changed");
+static_assert(alignof(SimtTraceCounters) == 32U, "SIMT trace counters must satisfy VEC-stack alignment");
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t SimtTraceClock() {
+    return clock();
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
+SimtClockAfterAtomicResult(uint64_t value) {
+    // asc_atomic_* 与 CLOCK64 都是有副作用的 SIMT builtin；先保留
+    // 源码顺序，单独的返回寄存器依赖由 IR/ELF 检查后再定。
+    (void)value;
+    return SimtTraceClock();
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline __gm__ uint64_t *SimtTraceReserveRecord(
+    __gm__ g0_swimlane::TraceRecord *records, SimtTraceCounters *counters,
+    uint32_t task_id, uint16_t site, g0_swimlane::TraceKind kind, uint8_t op
+) {
+    // G0 的 task/writer 上界已由 g0_swimlane.h 静态证明小于容量。
+    // 不在每次 raw 写入前引入 SIMT 分歧，避免把 DVG stack
+    // 放大到 VF 无法启动。host 仍会检查 record_count 和 dropped=0。
+    const uint32_t slot = counters->record_count++;
+    __gm__ uint64_t *words = reinterpret_cast<__gm__ uint64_t *>(&records[slot]);
+    __gm__ uint32_t *meta_words = reinterpret_cast<__gm__ uint32_t *>(words + 2U);
+    const uint32_t encoded_kind_site = static_cast<uint32_t>(site) |
+                                       (static_cast<uint32_t>(kind) << 16U) |
+                                       (static_cast<uint32_t>(op) << 24U);
+    // SIMT store 直接落 GM：使用官方 st.cg（L1 NON_CACHEABLE）。
+    // metadata 在 atomic 之前先写完，使 task/site/kind/op 不跨越
+    // atomic 与两个 CLOCK64，避免 CCEC 因活跃值过多生成未对齐的
+    // VEC-UB spill。
+    asc_stcg(meta_words + 0U, task_id);
+    asc_stcg(meta_words + 1U, encoded_kind_site);
+    return words;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtTraceWriteAttributes(
+    __gm__ uint64_t *words, uint32_t flags, uint32_t call_count
+) {
+    __gm__ uint32_t *attribute_words = reinterpret_cast<__gm__ uint32_t *>(words + 3U);
+    asc_stcg(attribute_words + 0U, flags);
+    asc_stcg(attribute_words + 1U, call_count);
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtTraceWriteTimeEndpoints(
+    __gm__ uint64_t *words, uint64_t begin, uint64_t end
+) {
+    asc_stcg(words + 0U, begin);
+    asc_stcg(words + 1U, end);
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t SimtTraceAtomicAdd(
+    __gm__ g0_swimlane::TraceRecord *records, SimtTraceCounters *counters, uint32_t task_id,
+    g0_swimlane::AtomicSite site, __gm__ uint64_t *address, uint64_t value, bool result_used
+) {
+    const g0_swimlane::AtomicOp op =
+        value == 0U ? g0_swimlane::AtomicOp::Load : g0_swimlane::AtomicOp::FetchAdd;
+    __gm__ uint64_t *trace_words = SimtTraceReserveRecord(
+        records, counters, task_id, static_cast<uint16_t>(site), g0_swimlane::TraceKind::Atomic,
+        static_cast<uint8_t>(op)
+    );
+    // result_used 与 call_count 在发起 atomic 前已知，先写完后不再让
+    // attributes 跨 atomic/CLOCK64。value_zero 仅是可选展示信息；
+    // SIMT 路径不为它额外保留 atomic 返回值的活跃区间。
+    SimtTraceWriteAttributes(trace_words, result_used ? g0_swimlane::kAtomicResultUsed : 0U, 1U);
+    const uint64_t begin = SimtTraceClock();
+    const uint64_t old = asc_atomic_add(address, value);
+    const uint64_t end = result_used ? SimtClockAfterAtomicResult(old) : SimtTraceClock();
+    // CCEC 当前不接受 SIMT inline-asm 返回寄存器依赖。这些
+    // CLOCK64 边界只能如实标为 source_issue，不冒充 return_ready。
+    ++counters->atomic_calls;
+    SimtTraceWriteTimeEndpoints(trace_words, begin, end);
+    return old;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t SimtTraceAtomicCas(
+    __gm__ g0_swimlane::TraceRecord *records, SimtTraceCounters *counters, uint32_t task_id,
+    g0_swimlane::AtomicSite site, __gm__ uint64_t *address, uint64_t expected, uint64_t desired, bool result_used
+) {
+    __gm__ uint64_t *trace_words = SimtTraceReserveRecord(
+        records, counters, task_id, static_cast<uint16_t>(site), g0_swimlane::TraceKind::Atomic,
+        static_cast<uint8_t>(g0_swimlane::AtomicOp::CompareExchange)
+    );
+    SimtTraceWriteAttributes(trace_words, result_used ? g0_swimlane::kAtomicResultUsed : 0U, 1U);
+    const uint64_t begin = SimtTraceClock();
+    const uint64_t old = asc_atomic_cas(address, expected, desired);
+    const uint64_t end = result_used ? SimtClockAfterAtomicResult(old) : SimtTraceClock();
+    ++counters->atomic_calls;
+    SimtTraceWriteTimeEndpoints(trace_words, begin, end);
+    return old;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtTracePollRecord(
+    __gm__ g0_swimlane::TraceRecord *records, SimtTraceCounters *counters, uint32_t task_id,
+    g0_swimlane::AtomicSite site, uint64_t begin, uint32_t call_count
+) {
+    // SIMT 边界只声明 source_issue；在 episode 退出处取一次 end，
+    // 不在每轮 atomic load 后读取 CLOCK64。
+    const uint64_t end = SimtTraceClock();
+    __gm__ uint64_t *trace_words = SimtTraceReserveRecord(
+        records, counters, task_id, static_cast<uint16_t>(site), g0_swimlane::TraceKind::Atomic,
+        static_cast<uint8_t>(g0_swimlane::AtomicOp::Load)
+    );
+    counters->atomic_calls += call_count;
+    counters->poll_calls += call_count;
+    ++counters->poll_records;
+    SimtTraceWriteAttributes(
+        trace_words,
+        g0_swimlane::kAtomicResultUsed | g0_swimlane::kAtomicPollBatch,
+        call_count
+    );
+    SimtTraceWriteTimeEndpoints(trace_words, begin, end);
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtTraceFinish(
+    __gm__ g0_swimlane::TraceLogControl *control, SimtTraceCounters *counters,
+    uint64_t nonce, uint32_t writer
+) {
+    __gm__ uint64_t *words = reinterpret_cast<__gm__ uint64_t *>(control);
+    words[1] = counters->atomic_calls;
+    words[2] = counters->poll_calls;
+    words[3] = 0U;
+    words[4] = 0U;
+    words[5] = static_cast<uint64_t>(counters->record_count) |
+               (static_cast<uint64_t>(counters->dropped_records) << 32U);
+    words[6] = static_cast<uint64_t>(counters->poll_records);
+    words[7] = static_cast<uint64_t>(writer) |
+               (static_cast<uint64_t>(g0_swimlane::TraceDomain::Simt) << 32U);
+    asc_threadfence();
+    words[0] = nonce;
+    asc_threadfence();
+}
+
+#define G0_SIMT_TRACE_PARAMETER \
+    , __gm__ g0_swimlane::TraceRecord *simt_records, SimtTraceCounters *simt_counters
+#define G0_SIMT_TRACE_ARGUMENT , simt_records, simt_counters
+#define G0_TRACE_SIMT_ADD(simt_trace, task_id, site, address, value, result_used) \
+    SimtTraceAtomicAdd(simt_records, simt_counters, task_id, site, address, value, result_used)
+#define G0_TRACE_SIMT_CAS(simt_trace, task_id, site, address, expected, desired, result_used) \
+    SimtTraceAtomicCas(simt_records, simt_counters, task_id, site, address, expected, desired, result_used)
+#else
+#define G0_SIMT_TRACE_PARAMETER
+#define G0_SIMT_TRACE_ARGUMENT
+#define G0_TRACE_SIMT_ADD(simt_trace, task_id, site, address, value, result_used) asc_atomic_add(address, value)
+#define G0_TRACE_SIMT_CAS(simt_trace, task_id, site, address, expected, desired, result_used) \
+    asc_atomic_cas(address, expected, desired)
+#endif
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
 SimtFatalValue(ExecFatalReason reason, uint32_t owner, uint32_t task_id) {
@@ -100,10 +666,15 @@ SimtFatalValue(ExecFatalReason reason, uint32_t owner, uint32_t task_id) {
            (static_cast<uint64_t>(task_id) << kFatalTaskIdShift);
 }
 
-__simt_callee__ __aicore__ __attribute__((always_inline)) inline void
-SimtPublishFatal(__gm__ uint64_t *fatal, ExecFatalReason reason, uint32_t owner, uint32_t task_id) {
-    (void)asc_atomic_cas(fatal, static_cast<uint64_t>(0U), SimtFatalValue(reason, owner, task_id));
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtPublishFatal(
+    __gm__ uint64_t *fatal, ExecFatalReason reason, uint32_t owner, uint32_t task_id G0_SIMT_TRACE_PARAMETER
+) {
+    (void)G0_TRACE_SIMT_CAS(
+        simt_trace, task_id, g0_swimlane::AtomicSite::FatalSet, fatal, static_cast<uint64_t>(0U),
+        SimtFatalValue(reason, owner, task_id), false
+    );
 }
+
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t SimtBuilderReportChecksum(
     uint64_t nonce, uint32_t thread_id, uint32_t task_count, uint32_t wins, uint32_t first_task, uint32_t last_task,
@@ -124,9 +695,13 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t SimtBu
     return value ^ (value >> 31U);
 }
 
-__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
-SimtPublishBuildReportWord(__gm__ uint64_t *address, uint64_t value) {
-    return asc_atomic_cas(address, kReportPoisonWord, value) == kReportPoisonWord;
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPublishBuildReportWord(
+    __gm__ uint64_t *address, uint64_t value, uint32_t task_id G0_SIMT_TRACE_PARAMETER
+) {
+    return G0_TRACE_SIMT_CAS(
+               simt_trace, task_id, g0_swimlane::AtomicSite::SimtBuildReportPublish, address,
+               kReportPoisonWord, value, true
+           ) == kReportPoisonWord;
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t SimtDescriptorWord(
@@ -310,7 +885,7 @@ SimtCompetingExecStateValid(uint64_t raw, uint32_t task_id, uint32_t current_own
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t SimtTryClaimTask(
     __gm__ uint64_t *task_words, __gm__ uint64_t *fatal, uint64_t nonce, uint32_t task_id, uint32_t build_owner,
-    uint32_t builder_count
+    uint32_t builder_count G0_SIMT_TRACE_PARAMETER
 ) {
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
     constexpr uint32_t kCompletionOffsetWords = offsetof(FullPaTask, completion) / sizeof(uint64_t);
@@ -318,7 +893,10 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t SimtTr
     __gm__ uint64_t *task = task_words + task_id * kTaskStrideWords;
     if (task_id % kTasksPerBatch == static_cast<uint32_t>(TaskKind::Alloc)) {
         const uint64_t desired = SimtAllocBuildingState(nonce, task_id, build_owner);
-        const uint64_t observed = asc_atomic_cas(task + kCompletionOffsetWords, static_cast<uint64_t>(0U), desired);
+        const uint64_t observed = G0_TRACE_SIMT_CAS(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBuildClaim,
+            task + kCompletionOffsetWords, static_cast<uint64_t>(0U), desired, true
+        );
         if (observed == 0U) {
             return kSimtClaimWinner;
         }
@@ -336,7 +914,10 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t SimtTr
                                  (static_cast<uint64_t>(build_owner) << kStateBuildOwnerShift) |
                                  (static_cast<uint64_t>(kUnboundOwner) << kStateExecuteOwnerShift) |
                                  (static_cast<uint64_t>(task_id) << kStateTaskIdShift);
-        const uint64_t observed = asc_atomic_cas(task + kExecOffsetWords, static_cast<uint64_t>(0U), desired);
+        const uint64_t observed = G0_TRACE_SIMT_CAS(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBuildClaim, task + kExecOffsetWords,
+            static_cast<uint64_t>(0U), desired, true
+        );
         if (observed == 0U) {
             return kSimtClaimWinner;
         }
@@ -344,18 +925,26 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t SimtTr
             return kSimtClaimLost;
         }
     }
-    SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id);
+    SimtPublishFatal(
+        fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+    );
     return kSimtClaimFatal;
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitBuilderStart(
     __gm__ uint64_t *builder_started, __gm__ uint64_t *fatal, uint64_t timeout_ticks, uint32_t thread,
-    uint32_t build_owner, uint32_t builder_count, bool active
+    uint32_t build_owner, uint32_t builder_count, bool active G0_SIMT_TRACE_PARAMETER
 ) {
     if (thread == 0U) {
-        const uint64_t observed = asc_atomic_add(builder_started, static_cast<uint64_t>(1U));
+        const uint64_t observed = G0_TRACE_SIMT_ADD(
+            simt_trace, g0_swimlane::kTraceNoTask,
+            g0_swimlane::AtomicSite::SimtBuilderStartedIncrement, builder_started,
+            static_cast<uint64_t>(1U), true
+        );
         if (observed >= builder_count) {
-            SimtPublishFatal(fatal, ExecFatalReason::InvalidBuildInput, build_owner, UINT32_MAX);
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InvalidBuildInput, build_owner, UINT32_MAX G0_SIMT_TRACE_ARGUMENT
+            );
             return false;
         }
         asc_threadfence();
@@ -367,25 +956,56 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitBu
     uint32_t polls = 0U;
     while (clock() - begin <= timeout_ticks) {
         const uint64_t observed = asc_atomic_add(builder_started, static_cast<uint64_t>(0U));
+        ++polls;
         if (observed == builder_count) {
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, g0_swimlane::kTraceNoTask,
+                g0_swimlane::AtomicSite::SimtBuilderStartedPoll, begin, polls
+            );
+#endif
             return true;
         }
         if (observed > builder_count) {
-            SimtPublishFatal(fatal, ExecFatalReason::InvalidBuildInput, build_owner, UINT32_MAX);
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, g0_swimlane::kTraceNoTask,
+                g0_swimlane::AtomicSite::SimtBuilderStartedPoll, begin, polls
+            );
+#endif
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InvalidBuildInput, build_owner, UINT32_MAX G0_SIMT_TRACE_ARGUMENT
+            );
             return false;
         }
-        ++polls;
-        if ((polls & kWatchdogMask) == 0U && asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
+        if ((polls & kWatchdogMask) == 0U &&
+            G0_TRACE_SIMT_ADD(
+                simt_trace, g0_swimlane::kTraceNoTask, g0_swimlane::AtomicSite::FatalLoad, fatal,
+                static_cast<uint64_t>(0U), true
+            ) != 0U) {
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, g0_swimlane::kTraceNoTask,
+                g0_swimlane::AtomicSite::SimtBuilderStartedPoll, begin, polls
+            );
+#endif
             return false;
         }
     }
-    SimtPublishFatal(fatal, ExecFatalReason::Timeout, build_owner, UINT32_MAX);
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+    SimtTracePollRecord(
+        simt_records, simt_counters, g0_swimlane::kTraceNoTask,
+        g0_swimlane::AtomicSite::SimtBuilderStartedPoll,
+        begin, polls
+    );
+#endif
+    SimtPublishFatal(fatal, ExecFatalReason::Timeout, build_owner, UINT32_MAX G0_SIMT_TRACE_ARGUMENT);
     return false;
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitAtomicValue(
     __gm__ uint64_t *address, uint64_t expected, __gm__ uint64_t *fatal, uint64_t timeout_ticks, uint32_t task_id,
-    uint32_t build_owner, uint32_t *poll_count
+    uint32_t build_owner, uint32_t *poll_count G0_SIMT_TRACE_PARAMETER
 ) {
     const uint64_t begin = clock();
     uint32_t polls = 0U;
@@ -394,6 +1014,13 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitAt
         ++polls;
         if (observed == expected) {
             *poll_count += polls;
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, task_id,
+                g0_swimlane::AtomicSite::SimtInsertPredecessorPoll,
+                begin, polls
+            );
+#endif
             return true;
         }
         // insert_completion starts at predecessor_id-1 and is incremented
@@ -401,21 +1028,48 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitAt
         // a slow predecessor, so report it immediately instead of timing out.
         if (observed != expected - 1U) {
             *poll_count += polls;
-            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id);
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, task_id,
+                g0_swimlane::AtomicSite::SimtInsertPredecessorPoll,
+                begin, polls
+            );
+#endif
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
             return false;
         }
-        if ((polls & kWatchdogMask) == 0U && asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
+        if ((polls & kWatchdogMask) == 0U &&
+            G0_TRACE_SIMT_ADD(
+                simt_trace, task_id, g0_swimlane::AtomicSite::FatalLoad, fatal,
+                static_cast<uint64_t>(0U), true
+            ) != 0U) {
             *poll_count += polls;
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, task_id,
+                g0_swimlane::AtomicSite::SimtInsertPredecessorPoll,
+                begin, polls
+            );
+#endif
             return false;
         }
     }
     *poll_count += polls;
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+    SimtTracePollRecord(
+        simt_records, simt_counters, task_id, g0_swimlane::AtomicSite::SimtInsertPredecessorPoll,
+        begin, polls
+    );
+#endif
     return false;
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtLoadTaskBase(
     __gm__ uint64_t *task_words, uint32_t producer_task, __gm__ uint64_t *fatal, uint64_t timeout_ticks,
-    uint32_t build_owner, uint64_t *task_base, uint32_t *access_count
+    uint32_t consumer_task, uint32_t build_owner, uint64_t *task_base,
+    uint32_t *access_count G0_SIMT_TRACE_PARAMETER
 ) {
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
     constexpr uint32_t kBaseReportOffsetWords =
@@ -423,17 +1077,44 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtLoadTa
         sizeof(uint64_t);
     __gm__ uint64_t *report = task_words + producer_task * kTaskStrideWords + kBaseReportOffsetWords;
     const uint64_t begin = clock();
+    uint32_t local_access_count = 0U;
     while (clock() - begin <= timeout_ticks) {
         const uint64_t observed = asc_atomic_add(report, static_cast<uint64_t>(0U));
         ++*access_count;
+        ++local_access_count;
         if (observed != 0U) {
             *task_base = observed - 1U;
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, consumer_task,
+                g0_swimlane::AtomicSite::SimtProducerTaskBasePoll,
+                begin, local_access_count
+            );
+#endif
             return true;
         }
-        if (((*access_count) & kWatchdogMask) == 0U && asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
+        if (((*access_count) & kWatchdogMask) == 0U &&
+            G0_TRACE_SIMT_ADD(
+                simt_trace, consumer_task, g0_swimlane::AtomicSite::FatalLoad, fatal,
+                static_cast<uint64_t>(0U), true
+            ) != 0U) {
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, consumer_task,
+                g0_swimlane::AtomicSite::SimtProducerTaskBasePoll,
+                begin, local_access_count
+            );
+#endif
             return false;
         }
     }
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+    SimtTracePollRecord(
+        simt_records, simt_counters, consumer_task,
+        g0_swimlane::AtomicSite::SimtProducerTaskBasePoll,
+        begin, local_access_count
+    );
+#endif
     return false;
 }
 
@@ -485,7 +1166,8 @@ SimtTensorOutputSlot(uint32_t task_id, uint32_t tensor_index) {
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepareTask(
     __gm__ uint64_t *task_words, __gm__ uint64_t *heap_words, __gm__ uint64_t *fatal, uint64_t nonce,
     uint64_t timeout_ticks, uint32_t batch_count, uint32_t task_count, uint32_t task_id, uint32_t builder_thread,
-    uint32_t build_owner, uint64_t *completion_vend, uint32_t *payload_words_written, uint32_t *state_access_count
+    uint32_t build_owner, uint64_t *completion_vend, uint32_t *payload_words_written,
+    uint32_t *state_access_count G0_SIMT_TRACE_PARAMETER
 ) {
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
     constexpr uint32_t kPlanOffsetWords = offsetof(FullPaTask, plan) / sizeof(uint64_t);
@@ -561,20 +1243,39 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
     uint64_t task_base = 0U;
     uint64_t vend = 0U;
     if (reserve != 0U) {
-        const uint64_t cursor = asc_atomic_add(heap_words + shard * kHeapAtomicStrideWords, reserve);
-        const uint64_t observed_vend = asc_atomic_add(heap_words + kAggregateVendOffsetWords, reserve);
+        const uint64_t cursor = G0_TRACE_SIMT_ADD(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtHeapShardReserve,
+            heap_words + shard * kHeapAtomicStrideWords, reserve, true
+        );
+        const uint64_t observed_vend = G0_TRACE_SIMT_ADD(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtHeapVendReserve,
+            heap_words + kAggregateVendOffsetWords, reserve, true
+        );
         if (cursor > kHeapShardSpan - reserve || observed_vend > kHeapBytes - reserve) {
-            SimtPublishFatal(fatal, ExecFatalReason::HeapReservationFailed, build_owner, task_id);
+            SimtPublishFatal(
+                fatal, ExecFatalReason::HeapReservationFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
             return false;
         }
         task_base = static_cast<uint64_t>(shard) * kHeapShardSpan + cursor;
         vend = observed_vend + reserve;
     } else {
-        vend = asc_atomic_add(heap_words + kAggregateVendOffsetWords, static_cast<uint64_t>(0U));
+        vend = G0_TRACE_SIMT_ADD(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtHeapVendLoad,
+            heap_words + kAggregateVendOffsetWords, static_cast<uint64_t>(0U), true
+        );
     }
-    if (asc_atomic_cas(task + kBaseReportOffsetWords, 0U, task_base + 1U) != 0U ||
-        asc_atomic_cas(task + kVendReportOffsetWords, 0U, vend + 1U) != 0U) {
-        SimtPublishFatal(fatal, ExecFatalReason::HeapReservationFailed, build_owner, task_id);
+    if (G0_TRACE_SIMT_CAS(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBasePublish,
+            task + kBaseReportOffsetWords, 0U, task_base + 1U, true
+        ) != 0U ||
+        G0_TRACE_SIMT_CAS(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtCompletionVendReportPublish,
+            task + kVendReportOffsetWords, 0U, vend + 1U, true
+        ) != 0U) {
+        SimtPublishFatal(
+            fatal, ExecFatalReason::HeapReservationFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+        );
         return false;
     }
     *completion_vend = vend;
@@ -608,9 +1309,17 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
     for (uint32_t output = 0U; output < output_count; ++output) {
         __gm__ uint64_t *published = task + kPublishedOffsetWords + output * kAtomicStrideWords;
         __gm__ uint64_t *last_writer = task + kLastWriterOffsetWords + output * kAtomicStrideWords;
-        if (asc_atomic_cas(published, UINT64_MAX, task_id) != UINT64_MAX ||
-            asc_atomic_cas(last_writer, UINT64_MAX, task_id) != UINT64_MAX) {
-            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id);
+        if (G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtOutputPublishedPublish,
+                published, UINT64_MAX, task_id, true
+            ) != UINT64_MAX ||
+            G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtOutputLastWriterPublish,
+                last_writer, UINT64_MAX, task_id, true
+            ) != UINT64_MAX) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
             return false;
         }
     }
@@ -635,18 +1344,21 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
                 if (producer == task_id) {
                     producer_base = task_base;
                 } else if (!SimtLoadTaskBase(
-                               task_words, producer, fatal, timeout_ticks, build_owner, &producer_base,
-                               state_access_count
+                               task_words, producer, fatal, timeout_ticks, task_id, build_owner,
+                               &producer_base, state_access_count G0_SIMT_TRACE_ARGUMENT
                            )) {
-                    SimtPublishFatal(fatal, ExecFatalReason::Timeout, build_owner, task_id);
+                    SimtPublishFatal(
+                        fatal, ExecFatalReason::Timeout, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+                    );
                     return false;
                 }
             }
             for (uint32_t word = 0U; word < kTensorDescWords; ++word) {
-                payload[destination++] =
+                const uint64_t value =
                     producer == UINT32_MAX ?
                         SimtExternalDescriptorWord(batch_count, task_id, tensor, word) :
                         SimtOutputDescriptorWord(producer, SimtTensorOutputSlot(task_id, tensor), producer_base, word);
+                payload[destination++] = value;
             }
         }
         for (uint32_t scalar = 0U; scalar < scalar_count; ++scalar) {
@@ -687,7 +1399,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommitTask(
     __gm__ uint64_t *task_words, __gm__ uint64_t *alloc_done, __gm__ uint64_t *fatal, uint64_t nonce,
     uint64_t timeout_ticks, uint32_t task_id, uint32_t build_owner, uint64_t completion_vend,
-    uint32_t *insert_poll_count, int64_t *predecessor_observed
+    uint32_t *insert_poll_count, int64_t *predecessor_observed G0_SIMT_TRACE_PARAMETER
 ) {
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
     constexpr uint32_t kCompletionOffsetWords = offsetof(FullPaTask, completion) / sizeof(uint64_t);
@@ -704,10 +1416,13 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
         __gm__ uint64_t *predecessor = task_words + (task_id - 1U) * kTaskStrideWords + kInsertOffsetWords;
         uint32_t polls = 0U;
         if (!SimtWaitAtomicValue(
-                predecessor, static_cast<uint64_t>(task_id - 1U), fatal, timeout_ticks, task_id, build_owner, &polls
+                predecessor, static_cast<uint64_t>(task_id - 1U), fatal, timeout_ticks, task_id,
+                build_owner, &polls G0_SIMT_TRACE_ARGUMENT
             )) {
             *insert_poll_count += polls;
-            SimtPublishFatal(fatal, ExecFatalReason::Timeout, build_owner, task_id);
+            SimtPublishFatal(
+                fatal, ExecFatalReason::Timeout, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
             return false;
         }
         *insert_poll_count += polls;
@@ -730,31 +1445,54 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
     if (kind == static_cast<uint32_t>(TaskKind::Up)) {
         const uint32_t alloc = (task_id / kTasksPerBatch) * kTasksPerBatch;
         __gm__ uint64_t *alloc_last_writer = task_words + alloc * kTaskStrideWords + kLastWriterOffsetWords;
-        if (asc_atomic_cas(alloc_last_writer, alloc, task_id) != alloc) {
-            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id);
+        if (G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtAllocLastWriterCommit,
+                alloc_last_writer, alloc, task_id, true
+            ) != alloc) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
             return false;
         }
     }
 
     const uint64_t expected_insert = task_id == 0U ? UINT64_MAX : static_cast<uint64_t>(task_id - 1U);
-    const uint64_t insert_observed = asc_atomic_add(task + kInsertOffsetWords, static_cast<uint64_t>(1U));
+    const uint64_t insert_observed = G0_TRACE_SIMT_ADD(
+        simt_trace, task_id, g0_swimlane::AtomicSite::SimtInsertCompletionPublish,
+        task + kInsertOffsetWords, static_cast<uint64_t>(1U), true
+    );
     if (insert_observed != expected_insert) {
-        SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id);
+        SimtPublishFatal(
+            fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+        );
         return false;
     }
 
     if (kind == static_cast<uint32_t>(TaskKind::Alloc)) {
-        if (asc_atomic_cas(task + kCompletionOffsetWords + 1U, 0U, completion_vend) != 0U) {
-            SimtPublishFatal(fatal, ExecFatalReason::CompletionPublishFailed, build_owner, task_id);
+        if (G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtAllocCompletionVendPublish,
+                task + kCompletionOffsetWords + 1U, 0U, completion_vend, true
+            ) != 0U) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::CompletionPublishFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
             return false;
         }
         asc_threadfence();
         const uint64_t alloc_building = SimtAllocBuildingState(nonce, task_id, build_owner);
-        if (asc_atomic_cas(task + kCompletionOffsetWords, alloc_building, 1U) != alloc_building) {
-            SimtPublishFatal(fatal, ExecFatalReason::CompletionPublishFailed, build_owner, task_id);
+        if (G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtAllocCompletionFlagPublish,
+                task + kCompletionOffsetWords, alloc_building, 1U, true
+            ) != alloc_building) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::CompletionPublishFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
             return false;
         }
-        (void)asc_atomic_add(alloc_done, static_cast<uint64_t>(1U));
+        (void)G0_TRACE_SIMT_ADD(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtAllocDoneIncrement,
+            alloc_done, static_cast<uint64_t>(1U), false
+        );
     } else {
         uint32_t tensor_count = kind == static_cast<uint32_t>(TaskKind::Up) ? 7U : 4U;
         uint32_t scalar_count = kind == static_cast<uint32_t>(TaskKind::Sf) ? 3U : 2U;
@@ -778,8 +1516,13 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
                                (static_cast<uint64_t>(payload_lines) << kStatePayloadLinesShift) |
                                (static_cast<uint64_t>(task_id) << kStateTaskIdShift);
         asc_threadfence();
-        if (asc_atomic_cas(task + kExecOffsetWords, building, built) != building) {
-            SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id);
+        if (G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtExecBuiltPublish,
+                task + kExecOffsetWords, building, built, true
+            ) != building) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
             return false;
         }
     }
@@ -791,13 +1534,39 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
     __gm__ uint64_t *builder_started, __gm__ uint64_t *builder_finished, __gm__ uint64_t *fatal,
     __gm__ uint64_t *thread_report_words, uint64_t nonce, uint64_t timeout_ticks, uint32_t batch_count,
     uint32_t task_count, uint32_t builder_instance, uint32_t builder_count, uint32_t build_owner
-) {
+)
+{
     const uint32_t thread = static_cast<uint32_t>(threadIdx.x);
     const uint32_t warp = thread / kWarpSize;
     const uint32_t lane = thread % kWarpSize;
     const bool active = lane == 0U && warp < kBuilderWarpCount;
     const uint32_t global_thread = builder_instance * kBuilderThreadCount + thread;
     const uint32_t global_warp = builder_instance * kBuilderWarpCount + warp;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    // 保持与生产 G0 完全相同的 async_invoke 参数形状。CCEC 会把
+    // VF 参数打包到 UB，额外的 trace pointer 会触发 A5 未对齐访问；
+    // sidecar 按已冻结 ABI 从现有 task_words 向后推导。
+    __gm__ uint8_t *task_bytes = reinterpret_cast<__gm__ uint8_t *>(task_words);
+    __gm__ g0_swimlane::TraceState *trace_state =
+        reinterpret_cast<__gm__ g0_swimlane::TraceState *>(task_bytes + kG0TraceFromTasksOffsetBytes);
+#endif
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+    // volatile 字段强制 CCEC 逐字段生成标量 SIMT stack 访问，
+    // 不允许把 32B 计数器对象合并为要求额外对齐的 VEC 宽访问。
+    SimtTraceCounters simt_counter_storage;
+    simt_counter_storage.atomic_calls = 0U;
+    simt_counter_storage.poll_calls = 0U;
+    simt_counter_storage.record_count = 0U;
+    simt_counter_storage.dropped_records = 0U;
+    simt_counter_storage.poll_records = 0U;
+    simt_counter_storage.reserved = 0U;
+    SimtTraceCounters *simt_counters = &simt_counter_storage;
+    __gm__ g0_swimlane::TraceRecord *simt_records = &trace_state->simt_records[global_warp][0];
+    __gm__ g0_swimlane::TraceLogControl *simt_control = &trace_state->simt_logs[global_warp];
+#endif
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    __gm__ g0_swimlane::BuilderTaskTrace *builder_traces = &trace_state->builders[0];
+#endif
     uint32_t tasks_built = 0U;
     uint32_t prepared = 0U;
     uint32_t committed = 0U;
@@ -813,16 +1582,30 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
     constexpr uint32_t kBuildReportOffsetWords = offsetof(FullPaTask, build_report) / sizeof(uint64_t);
     constexpr uint32_t kThreadReportStrideWords = sizeof(FullPaBuilderThreadReport) / sizeof(uint64_t);
     const bool start_ready =
-        SimtWaitBuilderStart(builder_started, fatal, timeout_ticks, thread, build_owner, builder_count, active);
+        SimtWaitBuilderStart(
+            builder_started, fatal, timeout_ticks, thread, build_owner, builder_count,
+            active G0_SIMT_TRACE_ARGUMENT
+        );
     if (active && start_ready) {
         for (uint32_t task_id = warp; task_id < task_count; task_id += kBuilderTaskStride) {
-            if (asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
+            if (G0_TRACE_SIMT_ADD(
+                    simt_trace, task_id, g0_swimlane::AtomicSite::FatalLoad, fatal,
+                    static_cast<uint64_t>(0U), true
+                ) != 0U) {
                 break;
             }
             ++attempts;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            const uint64_t trace_attempt_begin = clock();
+#endif
             __gm__ uint64_t *report = task_words + task_id * kTaskStrideWords + kBuildReportOffsetWords;
-            (void)asc_atomic_add(report + 6U, static_cast<uint64_t>(1U));
-            const uint32_t claim = SimtTryClaimTask(task_words, fatal, nonce, task_id, build_owner, builder_count);
+            (void)G0_TRACE_SIMT_ADD(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBuildAttemptIncrement,
+                report + 6U, static_cast<uint64_t>(1U), false
+            );
+            const uint32_t claim = SimtTryClaimTask(
+                task_words, fatal, nonce, task_id, build_owner, builder_count G0_SIMT_TRACE_ARGUMENT
+            );
             if (claim == kSimtClaimLost) {
                 ++claim_losses;
                 continue;
@@ -830,24 +1613,44 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             if (claim != kSimtClaimWinner) {
                 break;
             }
-            (void)asc_atomic_add(report + 6U, static_cast<uint64_t>(1U) << 32U);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            __gm__ g0_swimlane::BuilderTaskTrace *builder_trace = builder_traces + task_id;
+            builder_trace->attempt_begin = trace_attempt_begin;
+            builder_trace->claim_end = clock();
+            builder_trace->task_id = task_id;
+            builder_trace->builder_thread = global_thread;
+            builder_trace->build_owner = build_owner;
+#endif
+            (void)G0_TRACE_SIMT_ADD(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBuildPreparedIncrement,
+                report + 6U, static_cast<uint64_t>(1U) << 32U, false
+            );
             uint64_t completion_vend = 0U;
             uint32_t payload_words = 0U;
             if (!SimtPrepareTask(
                     task_words, heap_words, fatal, nonce, timeout_ticks, batch_count, task_count, task_id,
-                    global_thread, build_owner, &completion_vend, &payload_words, &producer_base_polls
+                    global_thread, build_owner, &completion_vend, &payload_words,
+                    &producer_base_polls G0_SIMT_TRACE_ARGUMENT
                 )) {
                 break;
             }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            builder_trace->prepare_end = clock();
+            builder_trace->commit_begin = clock();
+#endif
             ++prepared;
             uint32_t task_insert_polls = 0U;
             int64_t predecessor_observed = -1;
-            if (!SimtCommitTask(
+                if (!SimtCommitTask(
                     task_words, alloc_done, fatal, nonce, timeout_ticks, task_id, build_owner, completion_vend,
-                    &task_insert_polls, &predecessor_observed
+                    &task_insert_polls, &predecessor_observed G0_SIMT_TRACE_ARGUMENT
                 )) {
                 break;
             }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            builder_trace->commit_end = clock();
+            builder_trace->insert_poll_count = task_insert_polls;
+#endif
             insert_waits += task_id == 0U ? 0U : 1U;
             ++committed;
             ++tasks_built;
@@ -865,30 +1668,52 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             uint32_t phases = kBuildPreparedBit | kBuildOutputsPublishedBit | kBuildInsertCommittedBit;
             phases |= kind == static_cast<uint32_t>(TaskKind::Alloc) ? kBuildAllocCompletedBit : kBuildExecPublishedBit;
             if (!SimtPublishBuildReportWord(
-                    report, static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(global_thread) << 32U)
+                    report, static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(global_thread) << 32U),
+                    task_id G0_SIMT_TRACE_ARGUMENT
                 ) ||
-                !SimtPublishBuildReportWord(report + 1U, static_cast<uint64_t>(global_warp)) ||
                 !SimtPublishBuildReportWord(
-                    report + 2U, static_cast<uint64_t>(phases) | (static_cast<uint64_t>(output_count) << 32U)
+                    report + 1U, static_cast<uint64_t>(global_warp), task_id G0_SIMT_TRACE_ARGUMENT
+                ) ||
+                !SimtPublishBuildReportWord(
+                    report + 2U, static_cast<uint64_t>(phases) | (static_cast<uint64_t>(output_count) << 32U),
+                    task_id G0_SIMT_TRACE_ARGUMENT
                 ) ||
                 !SimtPublishBuildReportWord(
                     report + 3U,
-                    static_cast<uint64_t>(payload_words) | (static_cast<uint64_t>(task_insert_polls) << 32U)
+                    static_cast<uint64_t>(payload_words) | (static_cast<uint64_t>(task_insert_polls) << 32U),
+                    task_id G0_SIMT_TRACE_ARGUMENT
                 ) ||
-                !SimtPublishBuildReportWord(report + 4U, static_cast<uint64_t>(predecessor_observed)) ||
                 !SimtPublishBuildReportWord(
-                    report + 5U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U)
+                    report + 4U, static_cast<uint64_t>(predecessor_observed), task_id G0_SIMT_TRACE_ARGUMENT
                 ) ||
-                !SimtPublishBuildReportWord(report + 7U, nonce)) {
-                SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id);
+                !SimtPublishBuildReportWord(
+                    report + 5U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U),
+                    task_id G0_SIMT_TRACE_ARGUMENT
+                ) ||
+                !SimtPublishBuildReportWord(report + 7U, nonce, task_id G0_SIMT_TRACE_ARGUMENT)) {
+                SimtPublishFatal(
+                    fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+                );
                 break;
             }
             asc_threadfence();
             if (task_id + 1U == task_count) {
-                if (asc_atomic_cas(builder_finished, static_cast<uint64_t>(0U), static_cast<uint64_t>(1U)) != 0U) {
-                    SimtPublishFatal(fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id);
+                if (G0_TRACE_SIMT_CAS(
+                        simt_trace, task_id, g0_swimlane::AtomicSite::SimtBuilderFinishedPublish,
+                        builder_finished, static_cast<uint64_t>(0U), static_cast<uint64_t>(1U), true
+                    ) != 0U) {
+                    SimtPublishFatal(
+                        fatal, ExecFatalReason::ControlPublishConflict, build_owner,
+                        task_id G0_SIMT_TRACE_ARGUMENT
+                    );
                 }
             }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            builder_trace->report_end = clock();
+            asc_threadfence();
+            builder_trace->launch_nonce = nonce;
+            asc_threadfence();
+#endif
         }
     }
 
@@ -909,6 +1734,11 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
         thread_report[7] = checksum;
         asc_threadfence();
     }
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+    if (active) {
+        SimtTraceFinish(simt_control, simt_counters, nonce, global_warp);
+    }
+#endif
 }
 
 #endif  // defined(__DAV_VEC__)
@@ -931,8 +1761,13 @@ __aicore__ __attribute__((always_inline)) inline void ResetToken(__gm__ Executio
 }
 
 __aicore__ __attribute__((always_inline)) inline void
-PublishTerminalTokenState(__gm__ FullPaState *state, uint32_t owner, uint32_t ticket_count) {
+PublishTerminalTokenState(
+    __gm__ FullPaState *state, uint32_t owner, uint32_t ticket_count G0_SCALAR_TRACE_PARAMETER
+) {
     const uint32_t used_tokens = ticket_count < kTokensPerOwner ? ticket_count : kTokensPerOwner;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t dcci_begin = used_tokens == 0U ? 0U : static_cast<uint64_t>(get_sys_cnt());
+#endif
     for (uint32_t slot = 0U; slot < used_tokens; ++slot) {
         __gm__ ExecutionToken *token = &state->tokens[owner][slot];
         dcci(static_cast<__gm__ void *>(&token->control), kSingleCacheLine);
@@ -949,6 +1784,13 @@ PublishTerminalTokenState(__gm__ FullPaState *state, uint32_t owner, uint32_t ti
         // clean+invalidate pass publishes both reset control and the retained
         // last binding without adding DCCI to every execution.
         dsb(DSB_ALL);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        const uint64_t dcci_end = static_cast<uint64_t>(get_sys_cnt());
+        ScalarTraceDcciRecord(
+            trace, g0_swimlane::kTraceNoTask, g0_swimlane::DcciSite::TerminalTokenInvalidate,
+            g0_swimlane::DcciOp::Invalidate, dcci_begin, dcci_end, 5U * used_tokens, 5U * used_tokens
+        );
+#endif
     }
 }
 
@@ -965,17 +1807,31 @@ __aicore__ __attribute__((always_inline)) inline uint64_t PayloadWord(__gm__ con
 }
 
 __aicore__ __attribute__((always_inline)) inline void
-InvalidatePayloadLines(__gm__ FullPaTask *task, uint32_t payload_lines) {
+InvalidatePayloadLines(
+    __gm__ FullPaTask *task, uint32_t task_id, uint32_t payload_lines G0_SCALAR_TRACE_PARAMETER
+) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t dcci_begin = static_cast<uint64_t>(get_sys_cnt());
+#endif
     __gm__ uint8_t *payload =
         reinterpret_cast<__gm__ uint8_t *>(const_cast<__gm__ uint64_t *>(&task->exec.payload.words[0]));
     for (uint32_t line = 0U; line < payload_lines; ++line) {
         dcci(static_cast<__gm__ void *>(payload + line * kCacheLineBytes), kSingleCacheLine);
     }
     dsb(DSB_ALL);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t dcci_end = static_cast<uint64_t>(get_sys_cnt());
+    ScalarTraceDcciRecord(
+        trace, task_id, g0_swimlane::DcciSite::ExecPayloadInvalidate,
+        g0_swimlane::DcciOp::Invalidate, dcci_begin, dcci_end, payload_lines, payload_lines
+    );
+#endif
 }
 
 __aicore__ __attribute__((always_inline)) inline bool
-ValidatePayloadAndBind(__gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionToken *token) {
+ValidatePayloadAndBind(
+    __gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionToken *token G0_SCALAR_TRACE_PARAMETER
+) {
     const uint32_t task_id = token->control.task_id;
     __gm__ FullPaTask *task = &state->tasks[task_id];
     const TaskKind kind = TaskKindAt(task_id);
@@ -986,7 +1842,7 @@ ValidatePayloadAndBind(__gm__ FullPaState *state, uint32_t owner, __gm__ Executi
         !ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout)) {
         return false;
     }
-    InvalidatePayloadLines(task, layout.payload_lines);
+    InvalidatePayloadLines(task, task_id, layout.payload_lines G0_SCALAR_TRACE_ARGUMENT);
     const uint64_t word0 = PayloadWord(task, 0U);
     const uint64_t word3 = PayloadWord(task, 3U);
     const uint64_t word4 = PayloadWord(task, 4U);
@@ -1009,8 +1865,10 @@ ValidatePayloadAndBind(__gm__ FullPaState *state, uint32_t owner, __gm__ Executi
         uint32_t producer = 0U;
         uint32_t output_slot = 0U;
         if (PayloadTensorOutputSource(task_id, tensor_index, producer, output_slot)) {
-            const uint64_t base_plus_one =
-                ScalarAtomicLoad(&state->tasks[producer].allocation.task_base_plus_one.value);
+            const uint64_t base_plus_one = G0_TRACE_SCALAR_LOAD(
+                trace, task_id, g0_swimlane::AtomicSite::ScalarProducerTaskBaseLoad,
+                &state->tasks[producer].allocation.task_base_plus_one.value, true
+            );
             if (base_plus_one == 0U) {
                 return false;
             }
@@ -1068,22 +1926,43 @@ ValidatePayloadAndBind(__gm__ FullPaState *state, uint32_t owner, __gm__ Executi
 }
 
 __aicore__ __attribute__((always_inline)) inline bool
-FaninReady(__gm__ FullPaState *state, __gm__ ExecutionToken *token) {
+FaninReady(
+    __gm__ FullPaState *state, __gm__ ExecutionToken *token
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    , ScalarPollEpisode *fanin_episode
+#endif
+    G0_SCALAR_TRACE_PARAMETER
+) {
     const uint32_t task_id = token->control.task_id;
     const uint32_t fanin_count = TaskFaninCount(task_id);
     while (token->control.fanin_ready_prefix < fanin_count) {
         const int32_t producer = TaskFanin(task_id, token->control.fanin_ready_prefix);
-        if (producer < 0 || ScalarAtomicLoad(&state->tasks[static_cast<uint32_t>(producer)].completion.flag) != 1U) {
+        if (producer < 0) {
+            return false;
+        }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        const uint64_t completion = ScalarTracePollLoad(
+            trace, fanin_episode, task_id, g0_swimlane::AtomicSite::ScalarFaninFlagPoll,
+            &state->tasks[static_cast<uint32_t>(producer)].completion.flag
+        );
+#else
+        const uint64_t completion =
+            ScalarAtomicLoad(&state->tasks[static_cast<uint32_t>(producer)].completion.flag);
+#endif
+        if (completion != 1U) {
             return false;
         }
         ++token->control.fanin_ready_prefix;
     }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    ScalarTraceFlushPoll(trace, fanin_episode);
+#endif
     return true;
 }
 
 __aicore__ __attribute__((always_inline)) inline bool PublishExecutionWitness(
     __gm__ FullPaState *state, uint32_t owner, uint32_t task_id, TaskKind kind, uint64_t output_checksum,
-    uint32_t fanin_ready_prefix
+    uint32_t fanin_ready_prefix G0_SCALAR_TRACE_PARAMETER
 ) {
     __gm__ FullPaExecutionWitness *witness = &state->tasks[task_id].execution_witness;
     __gm__ uint64_t *words = reinterpret_cast<__gm__ uint64_t *>(witness);
@@ -1095,12 +1974,16 @@ __aicore__ __attribute__((always_inline)) inline bool PublishExecutionWitness(
     StoreDev64(words + 6U, output_checksum);
     StoreDev64(words + 7U, fanin_ready_prefix);
     dsb(DSB_ALL);
-    return ScalarCas(&witness->state, 0U, ExecutionWitnessState(state->control.launch_nonce, task_id, kind, owner)) ==
-           0U;
+    return G0_TRACE_SCALAR_CAS(
+               trace, task_id, g0_swimlane::AtomicSite::ScalarExecutionWitnessPublish,
+               &witness->state, 0U, ExecutionWitnessState(state->control.launch_nonce, task_id, kind, owner), true
+           ) == 0U;
 }
 
 __aicore__ __attribute__((always_inline)) inline bool
-RunClaimedWorkload(__gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionToken *token) {
+RunClaimedWorkload(
+    __gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionToken *token G0_SCALAR_TRACE_PARAMETER
+) {
     const uint32_t task_id = token->control.task_id;
     const TaskKind kind = TaskKindAt(task_id);
     __gm__ float *workspace = reinterpret_cast<__gm__ float *>(state->control.workspace_base);
@@ -1126,7 +2009,9 @@ RunClaimedWorkload(__gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionTo
     } else if (kind == TaskKind::Up) {
         RunG0VectorMultiply(input_a, input_b, output, state->control.up_repeats);
     } else {
-        PublishFatal(state, ExecFatalReason::InvalidTokenPayload, owner, task_id);
+        TracePublishFatal(
+            state, ExecFatalReason::InvalidTokenPayload, owner, task_id, trace
+        );
         return false;
     }
 #else
@@ -1135,53 +2020,94 @@ RunClaimedWorkload(__gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionTo
     } else if (kind == TaskKind::Pv) {
         RunG0CubeMatmul(input_a, input_b, output, state->control.pv_repeats);
     } else {
-        PublishFatal(state, ExecFatalReason::InvalidTokenPayload, owner, task_id);
+        TracePublishFatal(
+            state, ExecFatalReason::InvalidTokenPayload, owner, task_id, trace
+        );
         return false;
     }
 #endif
     const uint64_t checksum = LoadDev64(reinterpret_cast<__gm__ const uint64_t *>(output));
     if (checksum != ExpectedWorkloadOutputPair(kind)) {
-        PublishFatal(state, ExecFatalReason::InvalidTokenPayload, owner, task_id);
+        TracePublishFatal(
+            state, ExecFatalReason::InvalidTokenPayload, owner, task_id, trace
+        );
         return false;
     }
-    if (!PublishExecutionWitness(state, owner, task_id, kind, checksum, token->control.fanin_ready_prefix)) {
-        PublishFatal(state, ExecFatalReason::CompletionPublishFailed, owner, task_id);
+    if (!PublishExecutionWitness(
+            state, owner, task_id, kind, checksum,
+            token->control.fanin_ready_prefix G0_SCALAR_TRACE_ARGUMENT
+        )) {
+        TracePublishFatal(
+            state, ExecFatalReason::CompletionPublishFailed, owner, task_id, trace
+        );
         return false;
     }
 
     __gm__ FullPaTask *task = &state->tasks[task_id];
-    if (ScalarExchange(
+    if (G0_TRACE_SCALAR_EXCHANGE(
+            trace, task_id, g0_swimlane::AtomicSite::ScalarCompletionVendPublish,
             reinterpret_cast<__gm__ volatile int64_t *>(const_cast<__gm__ uint64_t *>(&task->completion.vend)),
-            token->control.completion_vend
+            token->control.completion_vend, true
         ) != 0U ||
-        ScalarExchange(&task->completion.flag, 1U) != 0U) {
-        PublishFatal(state, ExecFatalReason::CompletionPublishFailed, owner, task_id);
+        G0_TRACE_SCALAR_EXCHANGE(
+            trace, task_id, g0_swimlane::AtomicSite::ScalarCompletionFlagPublish,
+            &task->completion.flag, 1U, true
+        ) != 0U) {
+        TracePublishFatal(
+            state, ExecFatalReason::CompletionPublishFailed, owner, task_id, trace
+        );
         return false;
     }
     const uint64_t claimed = ClaimedState(task_id, token->control.build_owner, owner);
-    if (ScalarCas(&task->exec.control.state, claimed, DoneState(task_id, token->control.build_owner, owner)) !=
-        claimed) {
-        PublishFatal(state, ExecFatalReason::CompletionStateConflict, owner, task_id);
+    if (G0_TRACE_SCALAR_CAS(
+            trace, task_id, g0_swimlane::AtomicSite::ScalarExecDonePublish,
+            &task->exec.control.state, claimed, DoneState(task_id, token->control.build_owner, owner), true
+        ) != claimed) {
+        TracePublishFatal(
+            state, ExecFatalReason::CompletionStateConflict, owner, task_id, trace
+        );
         return false;
     }
-    (void)ScalarFetchAdd(&state->drain.done_count.value, 1U);
+    (void)G0_TRACE_SCALAR_FETCH_ADD(
+        trace, task_id, g0_swimlane::AtomicSite::ScalarDoneCountIncrement,
+        &state->drain.done_count.value, 1U, false
+    );
     if (TaskEngine(kind) == ExecEngineClass::Aic) {
-        (void)ScalarFetchAdd(&state->drain.aic_done.value, 1U);
+        (void)G0_TRACE_SCALAR_FETCH_ADD(
+            trace, task_id, g0_swimlane::AtomicSite::ScalarEngineDoneIncrement,
+            &state->drain.aic_done.value, 1U, false
+        );
     } else {
-        (void)ScalarFetchAdd(&state->drain.aiv_done.value, 1U);
+        (void)G0_TRACE_SCALAR_FETCH_ADD(
+            trace, task_id, g0_swimlane::AtomicSite::ScalarEngineDoneIncrement,
+            &state->drain.aiv_done.value, 1U, false
+        );
     }
     return true;
 }
 
 __aicore__ __attribute__((always_inline)) inline bool
-AdvanceToken(__gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionToken *token, FullPaRoleResult *result) {
+AdvanceToken(
+    __gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionToken *token, FullPaRoleResult *result
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    , ScalarPollEpisode *built_episode, ScalarPollEpisode *fanin_episode
+#endif
+    G0_SCALAR_TRACE_PARAMETER
+) {
     if (token->control.phase == ExecTokenPhase::Idle) {
         return false;
     }
     const uint32_t task_id = token->control.task_id;
     __gm__ FullPaTask *task = &state->tasks[task_id];
     if (token->control.phase == ExecTokenPhase::WaitingBuilt) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        const uint64_t observed = ScalarTracePollLoad(
+            trace, built_episode, task_id, g0_swimlane::AtomicSite::ScalarExecStatePoll,
+            &task->exec.control.state
+        );
+#else
         const uint64_t observed = ScalarAtomicLoad(&task->exec.control.state);
+#endif
         if (observed == 0U) {
             return false;
         }
@@ -1194,36 +2120,63 @@ AdvanceToken(__gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionToken *t
         if (!decoded.valid || decoded.phase != ExecPhase::Built || decoded.task_id != task_id ||
             !IsBuilderOwner(decoded.build_owner, state->control.builder_count) ||
             observed != BuiltState(task_id, decoded.build_owner)) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            ScalarTraceFlushPoll(trace, built_episode);
+#endif
             ++result->claim_lost_count;
-            PublishFatal(state, ExecFatalReason::InvalidBuiltControl, owner, task_id);
+            TracePublishFatal(state, ExecFatalReason::InvalidBuiltControl, owner, task_id, trace);
             return false;
         }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        ScalarTraceFlushPoll(trace, built_episode);
+#endif
         token->control.build_owner = decoded.build_owner;
         const uint64_t claimed = ClaimedState(task_id, decoded.build_owner, owner);
-        if (ScalarCas(&task->exec.control.state, observed, claimed) != observed) {
+        if (G0_TRACE_SCALAR_CAS(
+                trace, task_id, g0_swimlane::AtomicSite::ScalarExecClaim,
+                &task->exec.control.state, observed, claimed, true
+            ) != observed) {
             ++result->claim_lost_count;
-            PublishFatal(state, ExecFatalReason::ControlPublishConflict, owner, task_id);
+            TracePublishFatal(state, ExecFatalReason::ControlPublishConflict, owner, task_id, trace);
             return false;
         }
         ++result->claim_count;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        TraceExecutorClaim(state, task_id);
+#endif
         token->control.phase = ExecTokenPhase::Binding;
-        if (!ValidatePayloadAndBind(state, owner, token)) {
-            PublishFatal(state, ExecFatalReason::ClaimedPayloadInvalid, owner, task_id);
+        if (!ValidatePayloadAndBind(state, owner, token G0_SCALAR_TRACE_ARGUMENT)) {
+            TracePublishFatal(state, ExecFatalReason::ClaimedPayloadInvalid, owner, task_id, trace);
             return false;
         }
         token->control.phase = ExecTokenPhase::WaitingFanin;
     }
     if (token->control.phase == ExecTokenPhase::WaitingFanin) {
-        if (!FaninReady(state, token)) {
+        if (!FaninReady(
+                state, token
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+                , fanin_episode
+#endif
+                G0_SCALAR_TRACE_ARGUMENT
+            )) {
             return false;
         }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        TraceExecutorFaninReady(state, task_id);
+#endif
         token->control.phase = ExecTokenPhase::EngineInflight;
     }
     if (token->control.phase == ExecTokenPhase::EngineInflight) {
         token->control.phase = ExecTokenPhase::Completing;
-        if (!RunClaimedWorkload(state, owner, token)) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        TraceExecutorBegin(state, task_id);
+#endif
+        if (!RunClaimedWorkload(state, owner, token G0_SCALAR_TRACE_ARGUMENT)) {
             return false;
         }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        TraceExecutorEnd(state, task_id);
+#endif
         ++result->execute_count;
         ++result->completed_by_kind[static_cast<uint32_t>(TaskKindAt(task_id))];
         ResetToken(token);
@@ -1233,15 +2186,35 @@ AdvanceToken(__gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionToken *t
 }
 
 __aicore__ __attribute__((always_inline)) inline uint32_t
-LoadDispatchTaskId(__gm__ const uint32_t *task_ids, uint32_t ticket) {
+LoadDispatchTaskId(
+    __gm__ const uint32_t *task_ids, uint32_t ticket G0_SCALAR_TRACE_PARAMETER
+) {
     __gm__ const uint32_t *line = task_ids + (ticket & ~15U);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t dcci_begin = static_cast<uint64_t>(get_sys_cnt());
+#endif
     dcci(static_cast<__gm__ void *>(const_cast<__gm__ uint32_t *>(line)), kSingleCacheLine);
     dsb(DSB_ALL);
-    return task_ids[ticket];
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t dcci_end = static_cast<uint64_t>(get_sys_cnt());
+#endif
+    const uint32_t task_id = task_ids[ticket];
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    ScalarTraceDcciRecord(
+        trace, task_id, g0_swimlane::DcciSite::DispatchTaskIdInvalidate,
+        g0_swimlane::DcciOp::Invalidate, dcci_begin, dcci_end, 1U, 1U
+    );
+#endif
+    return task_id;
 }
 
 __aicore__ __attribute__((always_inline)) inline void
-RunExecutor(__gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *result) {
+RunExecutor(
+    __gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *result G0_SCALAR_TRACE_PARAMETER
+) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceRoleTimestamp(state, owner, 3U);
+#endif
     const ExecEngineClass engine = OwnerEngine(owner, state->control.builder_count);
     __gm__ AtomicLine *cursor =
         engine == ExecEngineClass::Aic ? &state->exec_dispatch.aic_next : &state->exec_dispatch.aiv_next;
@@ -1250,6 +2223,26 @@ RunExecutor(__gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *result)
     const uint32_t task_count =
         engine == ExecEngineClass::Aic ? state->exec_dispatch.aic_task_count : state->exec_dispatch.aiv_task_count;
     bool exhausted = false;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    // 不对本地聚合数组做动态寻址。CCEC 在这种场景下可能把
+    // `&episodes[slot]` 指到 VEC spill 片段，而不是 C++ 对象字段。
+    ScalarPollEpisode built_episode0;
+    ScalarPollEpisode built_episode1;
+    ScalarPollEpisode built_episode2;
+    ScalarPollEpisode built_episode3;
+    ScalarPollEpisode fanin_episode0;
+    ScalarPollEpisode fanin_episode1;
+    ScalarPollEpisode fanin_episode2;
+    ScalarPollEpisode fanin_episode3;
+    InitializeScalarPollEpisode(&built_episode0);
+    InitializeScalarPollEpisode(&built_episode1);
+    InitializeScalarPollEpisode(&built_episode2);
+    InitializeScalarPollEpisode(&built_episode3);
+    InitializeScalarPollEpisode(&fanin_episode0);
+    InitializeScalarPollEpisode(&fanin_episode1);
+    InitializeScalarPollEpisode(&fanin_episode2);
+    InitializeScalarPollEpisode(&fanin_episode3);
+#endif
     const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
     uint32_t iterations = 0U;
     while (true) {
@@ -1258,13 +2251,19 @@ RunExecutor(__gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *result)
             if (token->control.phase != ExecTokenPhase::Idle) {
                 continue;
             }
-            const uint32_t ticket = static_cast<uint32_t>(ScalarFetchAdd(&cursor->value, 1U));
+            const uint32_t ticket = static_cast<uint32_t>(G0_TRACE_SCALAR_FETCH_ADD(
+                trace, g0_swimlane::kTraceNoTask, g0_swimlane::AtomicSite::ScalarDispatchTicket,
+                &cursor->value, 1U, true
+            ));
             if (ticket >= task_count) {
                 exhausted = true;
                 ++result->exhausted_ticket_count;
                 break;
             }
-            const uint32_t task_id = LoadDispatchTaskId(task_ids, ticket);
+            const uint32_t task_id = LoadDispatchTaskId(task_ids, ticket G0_SCALAR_TRACE_ARGUMENT);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            TraceExecutorTicket(state, owner, task_id);
+#endif
             token->control.phase = ExecTokenPhase::WaitingBuilt;
             token->control.task_id = task_id;
             token->control.build_owner = UINT32_MAX;
@@ -1275,30 +2274,64 @@ RunExecutor(__gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *result)
             const uint32_t busy = BusyTokenCount(state, owner);
             result->max_busy_tokens = busy > result->max_busy_tokens ? busy : result->max_busy_tokens;
         }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        (void)AdvanceToken(
+            state, owner, &state->tokens[owner][0U], result,
+            &built_episode0, &fanin_episode0, trace
+        );
+        (void)AdvanceToken(
+            state, owner, &state->tokens[owner][1U], result,
+            &built_episode1, &fanin_episode1, trace
+        );
+        (void)AdvanceToken(
+            state, owner, &state->tokens[owner][2U], result,
+            &built_episode2, &fanin_episode2, trace
+        );
+        (void)AdvanceToken(
+            state, owner, &state->tokens[owner][3U], result,
+            &built_episode3, &fanin_episode3, trace
+        );
+#else
         for (uint32_t slot = 0U; slot < kTokensPerOwner; ++slot) {
-            (void)AdvanceToken(state, owner, &state->tokens[owner][slot], result);
+            (void)AdvanceToken(
+                state, owner, &state->tokens[owner][slot], result G0_SCALAR_TRACE_ARGUMENT
+            );
         }
+#endif
         if (exhausted && BusyTokenCount(state, owner) == 0U) {
             break;
         }
         ++iterations;
         if ((iterations & kWatchdogMask) == 0U) {
-            if (LoadFatal(state) != 0U) {
+            if (TraceLoadFatal(state, trace) != 0U) {
                 break;
             }
             if (static_cast<uint64_t>(get_sys_cnt()) - begin > state->control.timeout_ticks) {
-                PublishFatal(state, ExecFatalReason::Timeout, owner, UINT32_MAX);
+                TracePublishFatal(state, ExecFatalReason::Timeout, owner, UINT32_MAX, trace);
                 break;
             }
         }
     }
-    if (LoadFatal(state) != 0U) {
+    if (TraceLoadFatal(state, trace) != 0U) {
         for (uint32_t slot = 0U; slot < kTokensPerOwner; ++slot) {
             ResetToken(&state->tokens[owner][slot]);
         }
     }
-    PublishTerminalTokenState(state, owner, result->ticket_count);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    ScalarTraceFlushPoll(trace, &built_episode0);
+    ScalarTraceFlushPoll(trace, &fanin_episode0);
+    ScalarTraceFlushPoll(trace, &built_episode1);
+    ScalarTraceFlushPoll(trace, &fanin_episode1);
+    ScalarTraceFlushPoll(trace, &built_episode2);
+    ScalarTraceFlushPoll(trace, &fanin_episode2);
+    ScalarTraceFlushPoll(trace, &built_episode3);
+    ScalarTraceFlushPoll(trace, &fanin_episode3);
+#endif
+    PublishTerminalTokenState(state, owner, result->ticket_count G0_SCALAR_TRACE_ARGUMENT);
     result->final_busy_tokens = BusyTokenCount(state, owner);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceRoleTimestamp(state, owner, 4U);
+#endif
 }
 
 __aicore__ __attribute__((always_inline)) inline void
@@ -1385,23 +2418,47 @@ InitializeRoleResult(FullPaRoleResult *result, uint32_t owner, uint32_t builder_
 }
 
 __aicore__ __attribute__((always_inline)) inline void
-ArriveAndDrain(__gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *result) {
+ArriveAndDrain(
+    __gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *result G0_SCALAR_TRACE_PARAMETER
+) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceRoleTimestamp(state, owner, 5U);
+#endif
     result->drain_arrival_count = 1U;
-    result->fatal_count = LoadFatal(state) == 0U ? 0U : 1U;
+    result->fatal_count = TraceLoadFatal(state, trace) == 0U ? 0U : 1U;
     PublishRoleResult(state, owner, *result);
     const int64_t contribution = EncodeDrainContribution(result->execute_count);
-    (void)ScalarFetchAdd(&state->drain.arrivals[result->drain_group].value, static_cast<uint64_t>(contribution));
+    (void)G0_TRACE_SCALAR_FETCH_ADD(
+        trace, g0_swimlane::kTraceNoTask, g0_swimlane::AtomicSite::ScalarDrainArrive,
+        &state->drain.arrivals[result->drain_group].value, static_cast<uint64_t>(contribution), false
+    );
     if (owner != kBuilderOwner) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        TraceRoleTimestamp(state, owner, 6U);
+        TraceRoleTimestamp(state, owner, 7U);
+#endif
         return;
     }
 
     const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    ScalarPollEpisode drain_episode;
+    InitializeScalarPollEpisode(&drain_episode);
+#endif
     uint64_t completed = 0U;
     while (true) {
         bool all_arrived = true;
         completed = 0U;
         for (uint32_t group = 0U; group < kDrainGroupCount; ++group) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            const int64_t raw = static_cast<int64_t>(ScalarTracePollLoad(
+                trace, &drain_episode, g0_swimlane::kTraceNoTask,
+                g0_swimlane::AtomicSite::ScalarDrainArrivalPoll,
+                &state->drain.arrivals[group].value
+            ));
+#else
             const int64_t raw = static_cast<int64_t>(ScalarAtomicLoad(&state->drain.arrivals[group].value));
+#endif
             all_arrived = all_arrived && DecodeDrainArrivals(raw) == kDrainExpectedArrivals;
             completed += DecodeDrainCompletions(raw);
         }
@@ -1409,30 +2466,72 @@ ArriveAndDrain(__gm__ FullPaState *state, uint32_t owner, FullPaRoleResult *resu
             break;
         }
         if (static_cast<uint64_t>(get_sys_cnt()) - begin > state->control.timeout_ticks) {
-            PublishFatal(state, ExecFatalReason::Timeout, owner, UINT32_MAX);
+            TracePublishFatal(state, ExecFatalReason::Timeout, owner, UINT32_MAX, trace);
             break;
         }
     }
-    if (LoadFatal(state) == 0U) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    ScalarTraceFlushPoll(trace, &drain_episode);
+#endif
+    if (TraceLoadFatal(state, trace) == 0U) {
         const uint32_t batches = state->control.batch_count;
         const bool valid = completed == state->control.kernel_task_count &&
-                           ScalarAtomicLoad(&state->drain.builder_started.value) == state->control.builder_count &&
-                           ScalarAtomicLoad(&state->drain.builder_finished.value) == 1U &&
-                           ScalarAtomicLoad(&state->drain.done_count.value) == state->control.kernel_task_count &&
-                           ScalarAtomicLoad(&state->drain.alloc_done.value) == batches &&
-                           ScalarAtomicLoad(&state->drain.aic_done.value) == batches * 2U &&
-                           ScalarAtomicLoad(&state->drain.aiv_done.value) == batches * 2U &&
-                           ScalarAtomicLoad(&state->exec_dispatch.aic_next.value) ==
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->drain.builder_started.value, true
+                           ) == state->control.builder_count &&
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->drain.builder_finished.value, true
+                           ) == 1U &&
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->drain.done_count.value, true
+                           ) == state->control.kernel_task_count &&
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->drain.alloc_done.value, true
+                           ) == batches &&
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->drain.aic_done.value, true
+                           ) == batches * 2U &&
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->drain.aiv_done.value, true
+                           ) == batches * 2U &&
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->exec_dispatch.aic_next.value, true
+                           ) ==
                                state->exec_dispatch.aic_task_count + kAicOwnerCount &&
-                           ScalarAtomicLoad(&state->exec_dispatch.aiv_next.value) ==
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->exec_dispatch.aiv_next.value, true
+                           ) ==
                                state->exec_dispatch.aiv_task_count + AivExecutorCount(state->control.builder_count);
         if (!valid) {
-            PublishFatal(state, ExecFatalReason::DrainMismatch, owner, UINT32_MAX);
+            TracePublishFatal(state, ExecFatalReason::DrainMismatch, owner, UINT32_MAX, trace);
         }
     }
-    if (ScalarCas(&state->drain.root_finished.value, 0U, 1U) != 0U) {
-        PublishFatal(state, ExecFatalReason::DrainMismatch, owner, UINT32_MAX);
+    if (G0_TRACE_SCALAR_CAS(
+            trace, g0_swimlane::kTraceNoTask, g0_swimlane::AtomicSite::ScalarRootFinishedPublish,
+            &state->drain.root_finished.value, 0U, 1U, true
+        ) != 0U) {
+        TracePublishFatal(state, ExecFatalReason::DrainMismatch, owner, UINT32_MAX, trace);
     }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceRoleTimestamp(state, owner, 6U);
+    TraceRoleTimestamp(state, owner, 7U);
+#endif
 }
 
 }  // namespace
@@ -1443,6 +2542,9 @@ PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_g0_0_mix_aiv, 1, 2);
 
 extern "C" __global__ __aicore__ void
 simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaState *state) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t startup_dcci_begin = static_cast<uint64_t>(get_sys_cnt());
+#endif
     dcci(static_cast<__gm__ void *>(&state->control), kSingleCacheLine);
     dcci(
         static_cast<__gm__ void *>(reinterpret_cast<__gm__ uint8_t *>(&state->control) + kCacheLineBytes),
@@ -1453,6 +2555,9 @@ simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
         kSingleCacheLine
     );
     dsb(DSB_ALL);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t startup_dcci_end = static_cast<uint64_t>(get_sys_cnt());
+#endif
     const uint32_t block = static_cast<uint32_t>(get_block_idx());
     const uint32_t subblock_dim = static_cast<uint32_t>(get_subblockdim());
     const uint32_t subblock = static_cast<uint32_t>(get_subblockid());
@@ -1464,16 +2569,37 @@ simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
     const uint32_t owner = kBuilderOwner + aiv_id;
     FullPaRoleResult result;
     InitializeRoleResult(&result, owner, state->control.builder_count, state->control.launch_nonce);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceRoleEnter(state, owner, result.role, result.physical_block, subblock, startup_dcci_begin);
+    alignas(32U) ScalarTraceContext trace;
+    AttachScalarTrace(state, owner, &trace);
+    ScalarTraceDcciRecord(
+        trace, g0_swimlane::kTraceNoTask, g0_swimlane::DcciSite::StartupConfigInvalidate,
+        g0_swimlane::DcciOp::Invalidate, startup_dcci_begin, startup_dcci_end, 3U, 3U
+    );
+#endif
     if (!ConfigValid(state)) {
-        PublishFatal(state, ExecFatalReason::InvalidBuildInput, owner, 0U);
-        ArriveAndDrain(state, owner, &result);
+        TracePublishFatal(state, ExecFatalReason::InvalidBuildInput, owner, 0U, trace);
+        ArriveAndDrain(state, owner, &result G0_SCALAR_TRACE_ARGUMENT);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        ScalarTraceFinish(trace);
+#endif
         return;
     }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceRoleTimestamp(state, owner, 2U);
+#endif
     if (aiv_id >= state->control.builder_count) {
-        RunExecutor(state, owner, &result);
-        ArriveAndDrain(state, owner, &result);
+        RunExecutor(state, owner, &result G0_SCALAR_TRACE_ARGUMENT);
+        ArriveAndDrain(state, owner, &result G0_SCALAR_TRACE_ARGUMENT);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        ScalarTraceFinish(trace);
+#endif
         return;
     }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceRoleTimestamp(state, owner, 3U);
+#endif
     cce::async_invoke<G0SimtBuildTasks>(
         cce::dim3{kBuilderThreadCount, 1U, 1U}, reinterpret_cast<__gm__ uint64_t *>(&state->tasks[0]),
         reinterpret_cast<__gm__ uint64_t *>(&state->heap),
@@ -1487,7 +2613,13 @@ simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
     );
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    ArriveAndDrain(state, owner, &result);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceRoleTimestamp(state, owner, 4U);
+#endif
+    ArriveAndDrain(state, owner, &result G0_SCALAR_TRACE_ARGUMENT);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    ScalarTraceFinish(trace);
+#endif
 }
 
 #else
@@ -1496,6 +2628,9 @@ PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_g0_0_mix_aic, 1, 2);
 
 extern "C" __global__ __aicore__ void
 simt_cross_core_g0_0_mix_aic(__gm__ pa_scheduler::simt_cross_core::g0::FullPaState *state) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t startup_dcci_begin = static_cast<uint64_t>(get_sys_cnt());
+#endif
     dcci(static_cast<__gm__ void *>(&state->control), kSingleCacheLine);
     dcci(
         static_cast<__gm__ void *>(reinterpret_cast<__gm__ uint8_t *>(&state->control) + kCacheLineBytes),
@@ -1506,15 +2641,36 @@ simt_cross_core_g0_0_mix_aic(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
         kSingleCacheLine
     );
     dsb(DSB_ALL);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t startup_dcci_end = static_cast<uint64_t>(get_sys_cnt());
+#endif
     const uint32_t owner = static_cast<uint32_t>(get_block_idx());
     FullPaRoleResult result;
     InitializeRoleResult(&result, owner, state->control.builder_count, state->control.launch_nonce);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceRoleEnter(
+        state, owner, result.role, result.physical_block, static_cast<uint32_t>(get_subblockid()),
+        startup_dcci_begin
+    );
+    alignas(32U) ScalarTraceContext trace;
+    AttachScalarTrace(state, owner, &trace);
+    ScalarTraceDcciRecord(
+        trace, g0_swimlane::kTraceNoTask, g0_swimlane::DcciSite::StartupConfigInvalidate,
+        g0_swimlane::DcciOp::Invalidate, startup_dcci_begin, startup_dcci_end, 3U, 3U
+    );
+#endif
     if (!ConfigValid(state)) {
-        PublishFatal(state, ExecFatalReason::InvalidBuildInput, owner, 0U);
+        TracePublishFatal(state, ExecFatalReason::InvalidBuildInput, owner, 0U, trace);
     } else {
-        RunExecutor(state, owner, &result);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        TraceRoleTimestamp(state, owner, 2U);
+#endif
+        RunExecutor(state, owner, &result G0_SCALAR_TRACE_ARGUMENT);
     }
-    ArriveAndDrain(state, owner, &result);
+    ArriveAndDrain(state, owner, &result G0_SCALAR_TRACE_ARGUMENT);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    ScalarTraceFinish(trace);
+#endif
 }
 
 #endif

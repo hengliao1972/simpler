@@ -2221,7 +2221,220 @@ SIMT-native MTE3，transport 仍是 UBUF volatile load 后的普通 GM word stor
 `max_busy=4` 只证明四个 anchor staging 区间曾同时存在，不声称
 64 个 warp 的所有指令都同周期并行，也不把 unlocked 运行写成性能数据。
 
-## 14. 阶段状态索引
+## 14. 2026-08-06：暂停 U2，补齐 Direct-GM 性能与泳道图
+
+### 15.1 工作切换、GM/UB 边界与栈配置
+
+用户要求先停止 U2，不再依据 stack-overflow 现象继续改 UBUF；本阶段只处理
+已经通过功能验证的 Direct-GM G0 性能和泳道。这里的“GM 路径”限定为
+descriptor/payload 的跨核 transport 直接落 GM，不表示编译后的 AIV 完全不
+访问 UB：函数局部量、寄存器 spill、SIMT stack 和 divergence stack 仍由 CCEC
+映射到 AIV 本地存储，编译器也可能为聚合初始化生成 VEC-UB copy。这类 UB
+访问不是 UBUF payload staging，更没有引入 MTE3。
+
+按用户指出的 ACL 初始化路径重新查证后，profiling host 把非空 JSON 路径直接
+传给第一次 `aclInit(configPath)`。当前真机闭合配置为：
+
+```json
+{
+  "StackSize": {
+    "simt_stack_size": 1536,
+    "simt_divergence_stack_size": 4608
+  }
+}
+```
+
+两项单位都是 byte，`simt_stack_size=1536` 使用 512 B stride 对齐；swimlane
+AIV 另外使用 `-mllvm -cce-vf-stack-size=0x3800`，最终 metadata 的 VF 总保留为
+16 KiB。生产 G0 不带这些 profiling 配置。此前 U2 在 `aclInit` 之后调用
+`rtDeviceSetLimit` 的实验不是同一接口，本阶段没有据此恢复 U2。
+
+### 15.2 atomic/DCCI 泳道实现与一致性口径
+
+G0 增加了与生产产物分离的 `swimlane` 编译变体。新版导出命令使用独立文件名：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-g0-swimlane
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-g0-swimlane --device 0 --batches 256 --runs 1 \
+  --swimlane-json \
+  tests/atomic_probe/pa_scheduler/simt_cross_core/test_record/2026-8-6/\
+gm_g0_b256_atomic_dcci_swimlane.json
+```
+
+导出器现在在参数解析和真正写文件前都检查目标路径，路径已存在时直接拒绝，
+不再静默 truncate。生产 G0 的 task/DAG/payload/executor 语义不变；profiling
+sidecar 固定追加 3,938,432 B，包含：
+
+- 每个 task 独立的 builder/executor 区间和每个物理 owner 的 Scalar role；
+- 64 个 SIMT writer，每 writer 最多 1024 条 32 B raw record；
+- 96 个 Scalar writer，每 writer 最多 512 条 32 B raw record；
+- 每 writer 独占 control 和 record 区，避免不同执行单元抢同一记录槽。
+
+每次非 poll atomic 都保留一条记录；连续 poll 只保留一个完整区间和精确
+`call_count`，所以 526 万余次 poll 不会展开成 526 万个 JSON event。Scalar
+atomic 通过消费返回寄存器后再读 `SYS_CNT`，标为 `return_ready`；当前 CCEC
+无法为 SIMT atomic 建立同样的返回寄存器依赖，因此只诚实标为
+`source_issue`，不把两个 `CLOCK64` 之间的区间冒充单次 atomic 返回延迟。
+
+SIMT GM 读写规则按实际接口区分：`asc_stcg` 是 L1 non-cacheable 的直接 GM
+store；普通 SIMT `__gm__` load 会经过 SIMT DCache，读跨 writer 或复用地址前
+必须先 `asc_dcci_single` invalidate。当前 G0 builder 对共享状态的读取全部是
+`asc_atomic_add(..., 0)` 或 CAS，没有普通 SIMT GM load，所以这份图中 SIMT
+DCCI 为 0 是真实调用点为 0，不是漏记。Scalar executor 的普通 GM 读仍在
+claim 后执行 DCCI+DSB，四类实际 DCCI 全部记录。
+
+时钟继续严格分域。Scalar 使用本机已校准的 `get_sys_cnt()` 1 ns/tick；SIMT
+使用 raw `CLOCK64`。两者 epoch 不同，只为显示把本 launch 的 SIMT 最早/最晚
+点仿射映射到 AIV0 VF invoke/join 包络。JSON 顶层同时写入
+`simt_alignment=affine_to_builder_scalar_vf_envelope_for_display_only` 和
+`simt_atomic_boundary=source_issue`；映射后的 SIMT `dur` 不能当真实 ns。
+
+### 15.3 真机暴露的记录损坏与最小修正
+
+atomic/DCCI raw trace 首版在真实 A5 暴露了两类 CCEC 本地存储问题：
+
+1. SIMT record 若在 atomic 之后继续携带 task/site/flags 等多个活跃值，CCEC
+   会生成未对齐的 VEC-UB spill，运行报 error 340。最终将 metadata/attributes
+   用 `asc_stcg` 在 atomic 前写完，atomic 后只保留 begin/end 两个 64-bit
+   endpoint；这不改变被测 atomic 顺序。
+2. Scalar executor 原先使用 `ScalarPollEpisode built[4]/fanin[4]`。没有领取
+   task 的 owner 在退出 flush 时会偶发读到 `task=0x4e408bc0`、
+   `call_count=4608`、`site=2` 的本地垃圾值。单纯把 ACL SIMT stack 从
+   1536 B 提到 2048 B 仍只有 4/10 PASS，证明不是容量不足；逐字段初始化后
+   为 7/10。最终去掉本地聚合数组的动态下标，把四个 token 的 built/fanin
+   episode 变成八个具名局部量，并显式展开四次 advance/flush，B1 达到
+   20/20 PASS。
+
+host trace oracle 会逐 writer 核对 nonce/domain/count、每条 task/site/op/flags、
+poll 精确计数、DCCI line 数、未用 tail poison 和汇总值；失败时额外打印四个
+raw word，避免把记录损坏误判成调度协议失败。修复后 B256 同地址复用 5/5，
+随后独立导出 1/1 PASS。
+
+### 15.4 真实 A5 atomic/DCCI 泳道结果
+
+设备为用户授权的单卡 device 0，ACL 报告 `Ascend950PR_958b`；当前 shell
+没有 `npu-smi`/`task-submit`，所以是 unlocked 运行。最终文件为：
+
+`test_record/2026-8-6/gm_g0_b256_atomic_dcci_swimlane.json`
+
+文件为 26,350,208 B，并通过 `python3 -m json.tool` 完整解析：
+
+| 事件类别 | event 数 |
+| -------- | -------: |
+| 全部事件 | 58,392 |
+| complete event | 58,230 |
+| metadata event | 162 |
+| `atomic.source_issue` | 28,514 |
+| `atomic.return_ready` | 11,413 |
+| `atomic.poll_batch` | 5,184 |
+| `dcci` | 2,239 |
+| Scalar role/setup/loop/drain | 384 |
+| SIMT task build 及五个子层 | 6,400 |
+| task lifecycle/wait/execute | 1,024 / 2,048 / 1,024 |
+
+raw 汇总既保存 event 数，也保存被合并后的真实调用次数：
+
+| 执行域 | atomic 调用 | 其中 poll 调用 | raw record | poll record | DCCI 调用/行 |
+| ------ | ----------: | -------------: | ---------: | ----------: | -------------: |
+| SIMT | 253,345 | 226,975 | 29,761 | 3,391 | 0 / 0 |
+| Scalar | 5,053,126 | 5,039,569 | 17,589 | 1,793 | 14,988 / 14,988 |
+
+六类合并 poll 的拆分如下，`record` 表示图上区间数，`call` 才是实际 atomic
+load 次数：
+
+| poll site | record | call |
+| --------- | -----: | ---: |
+| SIMT builder-start | 64 | 64 |
+| SIMT producer-task-base | 2,048 | 2,048 |
+| SIMT strict insert predecessor | 1,279 | 224,863 |
+| Scalar exec-state/BUILT | 1,024 | 5,038,146 |
+| Scalar fanin flag | 768 | 1,359 |
+| Scalar root drain arrival | 1 | 64 |
+
+DCCI 按真实调用点拆分为：
+
+| DCCI site | record | 调用/行 |
+| --------- | -----: | ------: |
+| startup config | 96 | 288 / 288 |
+| dispatch task-id | 1,024 | 1,024 / 1,024 |
+| exec payload | 1,024 | 11,776 / 11,776 |
+| terminal token | 95 | 1,900 / 1,900 |
+
+图上每个 builder task 为上层 `task[N] build`，下面依次包含 claim、prepare、
+ordered_insert 和 build-report publish；atomic/poll 作为更下层区间落在对应
+SIMT writer 泳道。每个 executor task 保留 lifecycle、wait、fanin 和 execute
+包含层；Scalar atomic/DCCI 落在各 owner 的独立底层泳道。
+
+可定量的 Scalar task 区间分布为：
+
+| 区间 | 最小/us | 中位/us | 平均/us | 最大/us | 1024 task 累加/us |
+| ---- | ------: | ------: | ------: | ------: | -----------------: |
+| 完整 lifecycle | 646.868 | 5376.107 | 6623.095 | 11374.393 | 6782049.322 |
+| wait_built + claim | 631.044 | 5360.574 | 6608.172 | 11358.546 | 6766768.503 |
+| bind + fanin wait | 4.293 | 6.674 | 7.327 | 14.379 | 7502.523 |
+| task execute | 4.644 | 7.782 | 7.559 | 11.196 | 7740.503 |
+
+本次 trace-on 的 Scalar device span 为 21,838.877 us，AIV0 VF 包络为
+21,813.620 us；导出轮 ACL event 为 22,256.912 us。最终产物另做 B256 5/5，
+event 中位为 21,887.661 us。逐 atomic 记录明显扰动调度，因此这些数值只
+用于说明这张图自身的时间范围，不能替代关闭埋点的性能结果。
+
+### 15.5 关闭泳道后的 Direct-GM 性能
+
+生产 G0 host 在 H2D 完成后记录 start event，在 mixed kernel 后记录 end
+event；`aclrtEventElapsedTime` 只覆盖 kernel，不包含 32 MB state 的 H2D/D2H、
+host oracle 和 JSON 导出。参数固定为：G0、1 个 AIV builder、B256、1280
+task/1024 kernel task、QK/SF/PV/UP repeats 均为 1。
+
+主取样命令：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-g0 --device 0 --batches 256 --runs 21
+```
+
+21/21 全部 PASS，同一 device allocation 重复使用。结果：
+
+| trace | 样本 | min/us | median/us | avg/us | max/us |
+| ----- | ---: | -----: | --------: | -----: | -----: |
+| off | 21 | 14916.198 | 14976.292 | 15006.951 | 15669.657 |
+
+同一最终产物另以 B1 同地址复用 10/10 回归。因设备未锁且首样本较高，本阶段
+只给出直观结论：**当前 Direct-GM G0 B256 的完整 mixed kernel 性能约为
+15.0 ms，不是 1.5 ms。**
+
+旧 overview-only 埋点曾得到 7/7 中位 14,411.556 us；新版逐 atomic/DCCI
+埋点 5/5 中位为 21,851.803 us。两者记录密度不同，都不能与 trace-off 直接
+相减成“固定埋点成本”。性能结论只采用 trace-off 数据。
+
+同一 base 产物还回归双 builder G1：B1 3/3、B256 3/3，后者每轮 winner
+精确为 `640/640`。因此 profiling 条件编译没有破坏 G0/G1 共用的生产路径。
+
+### 15.6 文件覆盖失误与防回归
+
+第一次按新增 atomic/DCCI 口径导出时，误用了已有 overview 图的同名路径，
+覆盖了未纳入 Git 的旧 1.4 MiB JSON；搜索工作区和临时目录后没有找到副本，
+不能声称原样恢复。新版随即改名为
+`gm_g0_b256_atomic_dcci_swimlane.json`。为避免再次依赖人工记忆，host 现在
+默认拒绝任何已存在的 `--swimlane-json` 目标，构建门槛也检查这条规则。
+
+### 15.7 本阶段结论
+
+Direct-GM 功能路径此前已经通过，本阶段补齐了此前明确缺失的两类证据：
+
+1. 一份包含 SIMT/Scalar atomic、合并 poll 精确次数、全部实际 DCCI、builder、
+   AIC/AIV task 和 Scalar role 的真实 B256 Chrome Trace；
+2. 关闭泳道后的 21 轮 ACL device-event 性能，稳定量级约 15.0 ms。
+
+泳道显示 executor 时间几乎都消耗在等待 builder 的 BUILT/claim，而
+final_drain 中位仅 1.779 us；后续若优化 GM，应先处理严格构建/插入
+关键路径，不能把重点放在 UBUF 或 final_drain。按用户要求，U2 在本阶段保持
+暂停。最终验证已覆盖 CPU optimized/ASan+UBSan/TSan、CCEC/bitcode/ELF、
+目标文件拒绝覆盖、泳道 B1 20/20 与 B256 5/5、base G0 B1 10/10 与 B256
+21/21，以及 base G1 B1/B256 各 3/3。
+
+## 15. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -2233,7 +2446,7 @@ SIMT-native MTE3，transport 仍是 UBUF volatile load 后的普通 GM word stor
 | A0 SIMT atomic 竞争 | 完成 | `dc61c014`：CPU 三套 PASS；CCEC/ELF 门槛 PASS；A5 32/64/1024/2048 线程各 100/100。 |
 | S4 多 task、单 builder | 完成 | 初版 `a29fa08e` 完成 4-lane 基线；随后修正为 4-warp/128-thread 交错映射，CPU/CCEC/ELF PASS，A5 同地址复用 100/100，完成计数 `1/8/8/16` 精确闭合。 |
 | A1 warp 推进语义 | 完成 | CPU 三套和 CCEC/ELF 门槛 PASS；A5 同地址复用 100/100，SameWarp 始终 T/S+disjoint，CrossWarp 始终 S/S+overlap。 |
-| G0 GM 完整 PA | 完成 | 64-warp/lane0 纯 SIMT 构建；CPU 三套与 CCEC/ELF 门槛 PASS；A5 B1/B256 首轮 fresh 及同地址 10 轮全部 PASS。 |
+| G0 GM 完整 PA | 完成 | 64-warp/lane0 纯 SIMT 构建；CPU 三套与 CCEC/ELF 门槛 PASS；A5 B1/B256 功能闭合；B256 atomic/DCCI 泳道已保存，trace-off ACL event 中位约 15.0 ms。 |
 | G1 双 builder GM | 完成 | 双 VF 各 2048-thread/64-warp/lane0 全量竞争；CPU 三套与 CCEC/ELF 门槛 PASS；A5 G1 B1/B256 及 G0 回归各同地址复用 10/10。 |
 | U0 UBUF 单槽 | 完成 | 64-warp/lane0 纯 SIMT 单槽；CPU 三套、CCEC/ELF 门槛和 A5 同地址 100/100 全部 PASS；G0/G1 四组真机回归 PASS。 |
 | U1 UBUF 多槽/多 task | 完成 | 本提交；CPU 三套、CCEC/bitcode/mixed ELF 门槛全部 PASS；A5 smoke 1/1 与同地址复用 100/100，四槽 `maxbusy=4`、每槽 generation `0..31`精确闭合。 |

@@ -202,6 +202,16 @@ atomic-only control line 依赖原子访问的同地址顺序，不能把这个�
 普通 payload line。`ld_dev` 仅在探针诊断路径中用于绕开 Scalar 普通
 DCache 读取，不代替正式 executor 的 reader DCCI 合同。
 
+SIMT 自身的普通 GM 访问也必须按读写方向区分。当前工具链的
+`asc_stcg(__gm__ T *, T)` 是 L1 non-cacheable 的直接 GM store，writer 不为
+这类写再做 DCCI；SIMT 普通 `__gm__` load 会经过 SIMT DCache，读取其他
+writer 发布的数据或复用地址前，必须先对目标行调用
+`asc_dcci_single(__gm__ void *)` 做 invalidate。GM G0 builder 当前对共享状态的
+观察全部使用 `asc_atomic_add(..., 0)`/CAS，没有普通 SIMT GM load，因此其
+泳道里没有 SIMT DCCI 是真实调用点为零，不是漏记。后续若新增普通 SIMT GM
+读取，必须同时增加对应 `asc_dcci_single`、发布/读取顺序验证和泳道记录；不能
+把 atomic load 的规则套到普通 cacheable load，也不能为了图上对称而伪造 DCCI。
+
 ### 3.3 UBUF 构建路径
 
 UBUF 是每个 AIV 私有、不可跨核共享的暂存区。第一版只做单槽，之后扩展

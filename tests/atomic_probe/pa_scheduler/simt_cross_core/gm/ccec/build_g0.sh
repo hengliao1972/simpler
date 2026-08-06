@@ -18,15 +18,37 @@ KERNEL_SOURCE="$SCRIPT_DIR/g0_full_pa_kernel.cpp"
 WORKLOAD_SOURCE="$SCRIPT_DIR/full_pa_workloads.h"
 MODEL_SOURCE="$SIMT_ROOT/common/full_pa_model.h"
 HOST_SOURCE="$SCRIPT_DIR/g0_full_pa_host.cpp"
-AIC_OBJECT="$BUILD_DIR/simt_cross_core_g0_aic.o"
-AIV_OBJECT="$BUILD_DIR/simt_cross_core_g0_aiv.o"
-AIC_BITCODE="$BUILD_DIR/simt_cross_core_g0_aic.bc"
-AIV_BITCODE="$BUILD_DIR/simt_cross_core_g0_aiv.bc"
-AIC_BITCODE_DUMP="$BUILD_DIR/simt_cross_core_g0_aic.bc.dump"
-AIV_BITCODE_DUMP="$BUILD_DIR/simt_cross_core_g0_aiv.bc.dump"
-KERNEL_ELF="$BUILD_DIR/simt_cross_core_g0_kernel.o"
-HOST_BINARY="$BUILD_DIR/simt_cross_core_g0_host"
-BUILD_MANIFEST="$BUILD_DIR/g0_build_manifest.sha256"
+SWIMLANE_ACL_CONFIG="$SCRIPT_DIR/g0_swimlane_acl.json"
+G0_VARIANT="${SIMT_CROSS_CORE_G0_VARIANT:-base}"
+case "$G0_VARIANT" in
+    base)
+        OUTPUT_TAG="g0"
+        DEVICE_VARIANT_FLAGS=()
+        AIV_VARIANT_FLAGS=()
+        HOST_VARIANT_FLAGS=()
+        ;;
+    swimlane)
+        OUTPUT_TAG="g0_swimlane"
+        DEVICE_VARIANT_FLAGS=(-DSIMT_CROSS_CORE_G0_SWIMLANE)
+        # cce-vf-stack-size 会叠加到默认 2 KiB compiler UB；0x3800
+        # 最终形成 tag7=0x4000，即 16 KiB 的 AIV VF 总保留。
+        AIV_VARIANT_FLAGS=(-mllvm -cce-vf-stack-size=0x3800)
+        HOST_VARIANT_FLAGS=(-DSIMT_CROSS_CORE_G0_SWIMLANE)
+        ;;
+    *)
+        echo "unknown SIMT_CROSS_CORE_G0_VARIANT: $G0_VARIANT (expected base or swimlane)" >&2
+        exit 1
+        ;;
+esac
+AIC_OBJECT="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aic.o"
+AIV_OBJECT="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aiv.o"
+AIC_BITCODE="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aic.bc"
+AIV_BITCODE="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aiv.bc"
+AIC_BITCODE_DUMP="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aic.bc.dump"
+AIV_BITCODE_DUMP="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aiv.bc.dump"
+KERNEL_ELF="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_kernel.o"
+HOST_BINARY="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_host"
+BUILD_MANIFEST="$BUILD_DIR/${OUTPUT_TAG}_build_manifest.sha256"
 AIC_ENTRY="simt_cross_core_g0_0_mix_aic"
 AIV_ENTRY="simt_cross_core_g0_0_mix_aiv"
 G0_BUILD_INPUTS=(
@@ -39,6 +61,9 @@ G0_BUILD_INPUTS=(
     gm/ccec/g0_full_pa_host.cpp
     gm/ccec/build_g0.sh
 )
+if [[ "$G0_VARIANT" == "swimlane" ]]; then
+    G0_BUILD_INPUTS+=(gm/common/g0_swimlane.h gm/ccec/g0_swimlane_acl.json)
+fi
 
 if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
     echo "ASCEND_HOME_PATH is not set; source the CANN environment first." >&2
@@ -86,6 +111,23 @@ for source in "$KERNEL_SOURCE" "$WORKLOAD_SOURCE" "$MODEL_SOURCE" "$HOST_SOURCE"
         exit 1
     fi
 done
+if [[ "$G0_VARIANT" == "swimlane" ]]; then
+    if [[ ! -s "$SWIMLANE_ACL_CONFIG" ]] ||
+       ! python3 - "$SWIMLANE_ACL_CONFIG" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    config = json.load(source)
+stack = config.get("StackSize", {})
+if stack != {"simt_stack_size": 1536, "simt_divergence_stack_size": 4608}:
+    raise SystemExit(1)
+PY
+    then
+        echo "G0 swimlane ACL config must encode the 512 B stride-aligned 1536 B SIMT and 4608 B DVG stack limits." >&2
+        exit 1
+    fi
+fi
 
 mkdir -p "$BUILD_DIR"
 
@@ -113,7 +155,7 @@ COMMON_DEVICE_FLAGS=(
     -I"$SIMT_ROOT/common"
 )
 
-echo "[CHECK] G0/G1 source closure, one/two 64-warp builders and publication order"
+echo "[CHECK] G0/G1 source closure, one/two 64-warp builders and publication order (variant=$G0_VARIANT)"
 if rg -n '#include.*(cross_core|ops-nn)' "$SIMT_ROOT" -g '*.h' -g '*.cpp'; then
     echo "G0 must not include cross_core or ops-nn source files." >&2
     exit 1
@@ -140,7 +182,7 @@ if ! grep -Fq 'BuilderCountValid(state->control.builder_count)' "$KERNEL_SOURCE"
     exit 1
 fi
 if ! grep -Fq 'if (thread == 0U)' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'asc_atomic_add(builder_started, static_cast<uint64_t>(1U))' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'g0_swimlane::AtomicSite::SimtBuilderStartedIncrement' "$KERNEL_SOURCE" ||
    ! grep -Fq 'asc_atomic_add(builder_started, static_cast<uint64_t>(0U))' "$KERNEL_SOURCE" ||
    ! grep -Fq 'if (observed == builder_count)' "$KERNEL_SOURCE"; then
     echo "G0/G1 each VF must contribute exactly one builder-start arrival before active leaders leave the gate." >&2
@@ -152,14 +194,25 @@ if ! grep -Fq 'const uint32_t aiv_id = block * subblock_dim + subblock;' "$KERNE
     echo "G0/G1 must derive dense AIV0/AIV1 owner ids from the checked 1:2 mixed topology." >&2
     exit 1
 fi
+if [[ "$G0_VARIANT" == "swimlane" ]]; then
+    if rg -q 'ScalarPollEpisode[[:space:]]+(built|fanin)_episodes\[' "$KERNEL_SOURCE" ||
+       ! grep -Fq 'ScalarPollEpisode built_episode0;' "$KERNEL_SOURCE" ||
+       ! grep -Fq 'ScalarPollEpisode fanin_episode3;' "$KERNEL_SOURCE" ||
+       ! grep -Fq 'InitializeScalarPollEpisode(&built_episode0);' "$KERNEL_SOURCE" ||
+       ! grep -Fq 'InitializeScalarPollEpisode(&fanin_episode3);' "$KERNEL_SOURCE" ||
+       ! grep -Fq 'refusing to overwrite existing swimlane output' "$HOST_SOURCE"; then
+        echo "G0 swimlane must keep four poll slots explicitly scalar-addressed and refuse output overwrite." >&2
+        exit 1
+    fi
+fi
 
 vf_start_line="$(grep -nF 'void G0SimtBuildTasks(' "$KERNEL_SOURCE" | cut -d: -f1)"
 vf_end_line="$(grep -nF '#endif  // defined(__DAV_VEC__)' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
-builder_publish_line="$(grep -nF 'asc_atomic_cas(builder_finished' "$KERNEL_SOURCE" | cut -d: -f1)"
+builder_publish_line="$(grep -nF 'g0_swimlane::AtomicSite::SimtBuilderFinishedPublish' "$KERNEL_SOURCE" | cut -d: -f1)"
 builder_gate_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /const bool start_ready/ {print NR; exit}' "$KERNEL_SOURCE")"
-attempt_line="$(grep -nF 'asc_atomic_add(report + 6U, static_cast<uint64_t>(1U))' "$KERNEL_SOURCE" | cut -d: -f1)"
-claim_line="$(grep -nF 'SimtTryClaimTask(task_words, fatal, nonce, task_id, build_owner, builder_count)' "$KERNEL_SOURCE" | cut -d: -f1)"
-win_line="$(grep -nF 'asc_atomic_add(report + 6U, static_cast<uint64_t>(1U) << 32U)' "$KERNEL_SOURCE" | cut -d: -f1)"
+attempt_line="$(grep -nF 'g0_swimlane::AtomicSite::SimtTaskBuildAttemptIncrement' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
+claim_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /const uint32_t claim = SimtTryClaimTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
+win_line="$(grep -nF 'g0_swimlane::AtomicSite::SimtTaskBuildPreparedIncrement' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
 prepare_call_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /if \(!SimtPrepareTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
 commit_call_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /if \(!SimtCommitTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
 async_line="$(grep -nF 'cce::async_invoke<G0SimtBuildTasks>' "$KERNEL_SOURCE" | cut -d: -f1)"
@@ -179,8 +232,9 @@ if [[ -z "$vf_start_line" || -z "$vf_end_line" || -z "$builder_publish_line" || 
     exit 1
 fi
 if grep -Eq '^[[:space:]]*report\[[0-7](U)?\][[:space:]]*=' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'SimtPublishBuildReportWord(__gm__ uint64_t *address, uint64_t value)' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'asc_atomic_cas(address, kReportPoisonWord, value)' "$KERNEL_SOURCE"; then
+   ! grep -Fq 'SimtPublishBuildReportWord(' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'g0_swimlane::AtomicSite::SimtBuildReportPublish' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'kReportPoisonWord, value, true' "$KERNEL_SOURCE"; then
     echo "G0/G1 task build-report cacheline must use atomics only; ordinary SIMT stores may race with word-6 evidence." >&2
     exit 1
 fi
@@ -205,8 +259,8 @@ if grep -Eq 'result(->|\.)build_count[[:space:]]*=[[:space:]]*state->control.tas
     exit 1
 fi
 if ! grep -Fq 'SimtAllocBuildingState(nonce, task_id, build_owner)' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'asc_atomic_cas(task + kCompletionOffsetWords, static_cast<uint64_t>(0U), desired)' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'asc_atomic_cas(task + kCompletionOffsetWords, alloc_building, 1U)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'g0_swimlane::AtomicSite::SimtTaskBuildClaim' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'g0_swimlane::AtomicSite::SimtAllocCompletionFlagPublish' "$KERNEL_SOURCE" ||
    ! grep -Fq 'SimtCompetingExecStateValid(observed, task_id, build_owner, builder_count)' "$KERNEL_SOURCE" ||
    ! grep -Fq 'return kSimtClaimLost;' "$KERNEL_SOURCE"; then
     echo "G0/G1 must give Alloc a special flag claim and treat only legal competing task states as a claim loss." >&2
@@ -226,7 +280,7 @@ fi
 prepare_start_line="$(grep -nF 'inline bool SimtPrepareTask(' "$KERNEL_SOURCE" | cut -d: -f1)"
 descriptor_line="$(grep -nF 'SimtOutputDescriptorWord(task_id, output, task_base, word)' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
 descriptor_fence_line="$(awk '/SimtOutputDescriptorWord\(task_id, output, task_base, word\)/ {inside=1; next} inside && /asc_threadfence\(\);/ {print NR; exit}' "$KERNEL_SOURCE")"
-fresh_publish_line="$(grep -nF 'asc_atomic_cas(published, UINT64_MAX, task_id)' "$KERNEL_SOURCE" | cut -d: -f1)"
+fresh_publish_line="$(grep -nF 'g0_swimlane::AtomicSite::SimtOutputPublishedPublish' "$KERNEL_SOURCE" | cut -d: -f1)"
 commit_start_line="$(grep -nF 'inline bool SimtCommitTask(' "$KERNEL_SOURCE" | cut -d: -f1)"
 predecessor_wait_line="$(grep -nF 'predecessor, static_cast<uint64_t>(task_id - 1U)' "$KERNEL_SOURCE" | cut -d: -f1)"
 if [[ -z "$prepare_start_line" || -z "$descriptor_line" || -z "$descriptor_fence_line" || -z "$fresh_publish_line" ||
@@ -238,11 +292,11 @@ if [[ -z "$prepare_start_line" || -z "$descriptor_line" || -z "$descriptor_fence
     exit 1
 fi
 
-invalidate_start_line="$(grep -nF 'InvalidatePayloadLines(__gm__ FullPaTask *task' "$KERNEL_SOURCE" | cut -d: -f1)"
-invalidate_dcci_line="$(awk '/InvalidatePayloadLines\(__gm__/ {inside=1} inside && /dcci\(/ {print NR; exit}' "$KERNEL_SOURCE")"
-invalidate_dsb_line="$(awk '/InvalidatePayloadLines\(__gm__/ {inside=1} inside && /dsb\(DSB_ALL\);/ {print NR; exit}' "$KERNEL_SOURCE")"
-invalidate_call_line="$(grep -nF 'InvalidatePayloadLines(task, layout.payload_lines);' "$KERNEL_SOURCE" | cut -d: -f1)"
-first_payload_read_line="$(awk '/InvalidatePayloadLines\(task, layout.payload_lines\);/ {inside=1; next} inside && /PayloadWord\(task,/ {print NR; exit}' "$KERNEL_SOURCE")"
+invalidate_start_line="$(grep -nF 'InvalidatePayloadLines(' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
+invalidate_dcci_line="$(awk '/InvalidatePayloadLines\(/ {inside=1} inside && /dcci\(/ {print NR; exit}' "$KERNEL_SOURCE")"
+invalidate_dsb_line="$(awk '/InvalidatePayloadLines\(/ {inside=1} inside && /dsb\(DSB_ALL\);/ {print NR; exit}' "$KERNEL_SOURCE")"
+invalidate_call_line="$(grep -nF 'InvalidatePayloadLines(task, task_id, layout.payload_lines' "$KERNEL_SOURCE" | cut -d: -f1)"
+first_payload_read_line="$(awk '/InvalidatePayloadLines\(task, task_id, layout.payload_lines/ {inside=1; next} inside && /PayloadWord\(task,/ {print NR; exit}' "$KERNEL_SOURCE")"
 if [[ -z "$invalidate_start_line" || -z "$invalidate_dcci_line" || -z "$invalidate_dsb_line" ||
       -z "$invalidate_call_line" || -z "$first_payload_read_line" ]] ||
    ! (( invalidate_start_line < invalidate_dcci_line && invalidate_dcci_line < invalidate_dsb_line &&
@@ -255,12 +309,12 @@ fi
 
 reset_dcci_count="$(awk '
     /ResetToken\(__gm__/ {inside=1}
-    /PublishTerminalTokenState\(__gm__/ {inside=0}
+    /PublishTerminalTokenState\(/ {inside=0}
     inside && /dcci\(/ {count++}
     END {print count + 0}
 ' "$KERNEL_SOURCE")"
 if [[ "$reset_dcci_count" -ne 0 ]] ||
-   ! grep -Fq 'PublishTerminalTokenState(state, owner, result->ticket_count);' "$KERNEL_SOURCE"; then
+   ! grep -Fq 'PublishTerminalTokenState(state, owner, result->ticket_count G0_SCALAR_TRACE_ARGUMENT);' "$KERNEL_SOURCE"; then
     echo "G0 token reset must retain dispatch and publish cache lines only once at executor drain." >&2
     exit 1
 fi
@@ -282,7 +336,7 @@ first_workload_line="$(grep -nE 'RunG0(VectorAdd|VectorMultiply|CubeMatmul)\(' "
 last_workload_line="$(grep -nE 'RunG0(VectorAdd|VectorMultiply|CubeMatmul)\(' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
 witness_line="$(grep -nF 'if (!PublishExecutionWitness(' "$KERNEL_SOURCE" | cut -d: -f1)"
 vend_line="$(grep -nF 'token->control.completion_vend' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
-flag_line="$(grep -nF 'ScalarExchange(&task->completion.flag, 1U)' "$KERNEL_SOURCE" | cut -d: -f1)"
+flag_line="$(grep -nF 'g0_swimlane::AtomicSite::ScalarCompletionFlagPublish' "$KERNEL_SOURCE" | cut -d: -f1)"
 done_line="$(grep -nF 'DoneState(task_id, token->control.build_owner, owner)' "$KERNEL_SOURCE" | cut -d: -f1)"
 if [[ -z "$poison_store_line" || -z "$poison_dsb_line" || -z "$first_workload_line" ||
       -z "$last_workload_line" || -z "$witness_line" || -z "$vend_line" || -z "$flag_line" ||
@@ -294,14 +348,16 @@ if [[ -z "$poison_store_line" || -z "$poison_dsb_line" || -z "$first_workload_li
     exit 1
 fi
 if ! grep -Fq 'StoreDev64(words + 7U, fanin_ready_prefix);' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'state, owner, task_id, kind, checksum, token->control.fanin_ready_prefix' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'state, owner, task_id, kind, checksum,' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'token->control.fanin_ready_prefix G0_SCALAR_TRACE_ARGUMENT' "$KERNEL_SOURCE" ||
    ! grep -Fq 'witness.fanin_ready_prefix == expected.fanin_count' "$HOST_SOURCE"; then
     echo "G0 execution witness must record the runtime token fanin-ready prefix and host must validate it." >&2
     exit 1
 fi
 if ! grep -Fq 'constexpr uint32_t kDrainExpectedArrivals = 6U;' "$KERNEL_SOURCE" ||
    ! grep -Fq 'for (uint32_t group = 0U; group < kDrainGroupCount; ++group)' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'ScalarAtomicLoad(&state->drain.builder_started.value) == state->control.builder_count' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'g0_swimlane::AtomicSite::ScalarDrainVerifyLoad' "$KERNEL_SOURCE" ||
+   ! grep -Fq '&state->drain.builder_started.value, true' "$KERNEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kDrainGroupCount = 16U;' "$SIMT_ROOT/common/full_pa_exec_protocol.h"; then
     echo "G0/G1 final drain must preserve 16 groups with 6 arrivals and verify every configured builder started." >&2
     exit 1
@@ -314,17 +370,19 @@ for workload in RunG0VectorAdd RunG0VectorMultiply RunG0CubeMatmul; do
 done
 
 echo "[BUILD] CCEC G0 AIC Cube executors (dav-c310-cube)"
-"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
+"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" "${DEVICE_VARIANT_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
     -o "$AIC_OBJECT" "$KERNEL_SOURCE"
 
 echo "[BUILD] CCEC G0 AIV 64-warp SIMT builder/Vector executors (dav-c310-vec)"
-"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" --cce-aicore-arch=dav-c310-vec \
+"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" "${DEVICE_VARIANT_FLAGS[@]}" "${AIV_VARIANT_FLAGS[@]}" \
+    --cce-aicore-arch=dav-c310-vec \
     -o "$AIV_OBJECT" "$KERNEL_SOURCE"
 
 echo "[BUILD] CCEC G0 optimized bitcode inventory"
-"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
+"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" "${DEVICE_VARIANT_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
     -Xclang -emit-llvm-bc -o "$AIC_BITCODE" "$KERNEL_SOURCE"
-"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" --cce-aicore-arch=dav-c310-vec \
+"$CCEC" "${COMMON_DEVICE_FLAGS[@]}" "${DEVICE_VARIANT_FLAGS[@]}" "${AIV_VARIANT_FLAGS[@]}" \
+    --cce-aicore-arch=dav-c310-vec \
     -Xclang -emit-llvm-bc -o "$AIV_BITCODE" "$KERNEL_SOURCE"
 "$LLVM_BCANALYZER" -dump "$AIC_BITCODE" > "$AIC_BITCODE_DUMP"
 "$LLVM_BCANALYZER" -dump "$AIV_BITCODE" > "$AIV_BITCODE_DUMP"
@@ -424,8 +482,15 @@ if [[ "$(grep -Fc 'KERNEL_TYPE: MIX_AIC_MAIN' <<<"$METADATA_OUTPUT")" -ne 2 ||
     exit 1
 fi
 AIV_META_HEX="$("$READELF_BIN" -x ".ascend.meta.$AIV_ENTRY" "$KERNEL_ELF")"
-if [[ "$AIV_META_HEX" != *"0c000400 04000000"* || "$AIV_META_HEX" != *"07000400 00200000"* ]]; then
-    echo "G0 AIV metadata must encode SIMD_SIMT_MIX_VF=4 and 8 KiB SIMT share memory." >&2
+EXPECTED_VF_STACK_META="00200000"
+SIMT_SHARE_BYTES=$((8 * 1024))
+if [[ "$G0_VARIANT" == "swimlane" ]]; then
+    EXPECTED_VF_STACK_META="00400000"
+    SIMT_SHARE_BYTES=$((16 * 1024))
+fi
+if [[ "$AIV_META_HEX" != *"0c000400 04000000"* ||
+      "$AIV_META_HEX" != *"07000400 $EXPECTED_VF_STACK_META"* ]]; then
+    echo "G0 AIV metadata must encode SIMD_SIMT_MIX_VF=4 and the variant-specific VF stack reserve." >&2
     printf '%s\n' "$AIV_META_HEX" >&2
     exit 1
 fi
@@ -438,18 +503,18 @@ if ! grep -Fq 'constexpr int kG0WorkloadTile = 128;' "$WORKLOAD_SOURCE" ||
 fi
 VECTOR_TILE_BYTES=$((128 * 128 * 4))
 VECTOR_UB_BYTES=$((0x20000 + VECTOR_TILE_BYTES))
-SIMT_SHARE_BYTES=$((8 * 1024))
 MAX_LOCAL_BYTES=$((224 * 1024))
 if (( VECTOR_TILE_BYTES != 64 * 1024 || VECTOR_UB_BYTES != 192 * 1024 ||
       VECTOR_UB_BYTES + SIMT_SHARE_BYTES > MAX_LOCAL_BYTES )); then
     echo "G0 Vector UB plus SIMT share memory exceeds the 224 KiB A5 budget." >&2
     exit 1
 fi
-echo "[CHECK] ELF has exact mixed entries/functions/metadata and a 192+8/224 KiB AIV local-memory budget"
+echo "[CHECK] ELF has exact mixed entries/functions/metadata and a $((VECTOR_UB_BYTES / 1024))+$((SIMT_SHARE_BYTES / 1024))/$((MAX_LOCAL_BYTES / 1024)) KiB AIV local-memory budget"
 
 echo "[BUILD] GCC 15 G0 ACL host ($("$GXX15" -dumpfullversion))"
 "$GXX15" -O2 -std=c++17 -Wall -Wextra -Werror \
     -Wno-deprecated-declarations \
+    "${HOST_VARIANT_FLAGS[@]}" \
     -I"$GM_ROOT/common" \
     -I"$SIMT_ROOT/common" \
     -I"$ASCEND_HOME_PATH/include" \
@@ -467,19 +532,19 @@ if [[ ! -s "$KERNEL_ELF" || ! -x "$HOST_BINARY" ]]; then
     exit 1
 fi
 
-manifest_tmp="$(mktemp "$BUILD_DIR/g0_build_manifest.XXXXXX")"
+manifest_tmp="$(mktemp "$BUILD_DIR/${OUTPUT_TAG}_build_manifest.XXXXXX")"
 trap 'rm -f -- "$manifest_tmp"' EXIT
 (
     cd "$SIMT_ROOT"
     sha256sum \
         "${G0_BUILD_INPUTS[@]}" \
-        gm/build/ccec/simt_cross_core_g0_kernel.o \
-        gm/build/ccec/simt_cross_core_g0_host
+        "gm/build/ccec/simt_cross_core_${OUTPUT_TAG}_kernel.o" \
+        "gm/build/ccec/simt_cross_core_${OUTPUT_TAG}_host"
 ) > "$manifest_tmp"
 mv -f -- "$manifest_tmp" "$BUILD_MANIFEST"
 trap - EXIT
 
-echo "[BUILD] G0 CCEC complete"
+echo "[BUILD] G0 CCEC complete (variant=$G0_VARIANT)"
 echo "[BUILD] kernel: $KERNEL_ELF"
 echo "[BUILD] host:   $HOST_BINARY"
 echo "[BUILD] manifest: $BUILD_MANIFEST"

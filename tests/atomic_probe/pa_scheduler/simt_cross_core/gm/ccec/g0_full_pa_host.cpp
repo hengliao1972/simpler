@@ -10,6 +10,9 @@
  */
 
 #include "../common/g0_full_pa.h"
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#include "../common/g0_swimlane.h"
+#endif
 
 #include "acl/acl.h"
 
@@ -21,7 +24,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <string>
@@ -30,8 +35,16 @@
 namespace {
 
 namespace g0 = pa_scheduler::simt_cross_core::g0;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+namespace g0_swimlane = pa_scheduler::simt_cross_core::g0_swimlane;
+#endif
 using pa_scheduler::simt_cross_core::g0::FullPaState;
 using pa_scheduler::simt_cross_core::g0::kWorkloadBytes;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+using LaunchState = pa_scheduler::simt_cross_core::g0_swimlane::G0SwimlaneState;
+#else
+using LaunchState = FullPaState;
+#endif
 
 struct Options {
     std::string kernel_path;
@@ -39,6 +52,10 @@ struct Options {
     uint32_t batches = 256U;
     uint32_t runs = 2U;
     uint32_t builder_count = g0::kDefaultBuilderCount;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    std::string swimlane_json;
+    std::string acl_config;
+#endif
 };
 
 constexpr uint32_t kHostTasksPerBatch = 5U;
@@ -547,6 +564,53 @@ void InitializeState(
     }
 }
 
+
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+void InitializeSwimlaneTrace(g0_swimlane::TraceState *trace, uint64_t nonce, uint32_t batches, uint32_t builder_count) {
+    std::memset(trace, 0xD3, sizeof(*trace));
+    trace->control.magic = g0_swimlane::kTraceMagic;
+    trace->control.version = g0_swimlane::kTraceVersion;
+    trace->control.launch_nonce = nonce;
+    trace->control.tick_ns = 1U;
+    trace->control.task_count = g0::TaskCount(batches);
+    trace->control.kernel_task_count = g0::KernelTaskCount(batches);
+    trace->control.builder_count = builder_count;
+    trace->control.role_count = g0::kOwnerCount;
+    trace->control.simt_writer_count = g0_swimlane::kTraceSimtWriterCount;
+    trace->control.scalar_writer_count = g0_swimlane::kTraceScalarWriterCount;
+    trace->control.simt_records_per_writer = g0_swimlane::kTraceSimtRecordsPerWriter;
+    trace->control.scalar_records_per_writer = g0_swimlane::kTraceScalarRecordsPerWriter;
+    trace->control.record_size_bytes = sizeof(g0_swimlane::TraceRecord);
+    trace->control.reserved32 = 0U;
+    std::memset(trace->control.reserved, 0, sizeof(trace->control.reserved));
+}
+#endif
+
+FullPaState &FullPaView(LaunchState &state) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    return state.full_pa;
+#else
+    return state;
+#endif
+}
+
+const FullPaState &FullPaView(const LaunchState &state) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    return state.full_pa;
+#else
+    return state;
+#endif
+}
+
+void InitializeLaunchState(
+    LaunchState *state, uint64_t nonce, uint32_t batches, uint32_t builder_count, uint64_t workspace_address
+) {
+    InitializeState(&FullPaView(*state), nonce, batches, builder_count, workspace_address);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    InitializeSwimlaneTrace(&state->trace, nonce, batches, builder_count);
+#endif
+}
+
 bool ExpectedPayloadTensor(
     const HostTaskOracle &task, uint32_t tensor_index, uint32_t batches, const std::vector<uint64_t> &task_bases,
     HostTensorDesc *expected
@@ -684,6 +748,7 @@ uint64_t ExpectedWitnessChecksum(HostTaskKind kind) {
 bool AtomicPaddingMatches(const g0::AtomicLine &actual, const g0::AtomicLine &initial) {
     return std::memcmp(actual.padding, initial.padding, sizeof(actual.padding)) == 0;
 }
+
 
 bool ValidateFixedRegions(
     const FullPaState &state, const FullPaState &initial, uint64_t nonce, uint32_t batches, ValidationFailure *failure
@@ -2038,6 +2103,874 @@ bool ValidateRun(
            ValidateWorkspace(state, workspace, builder_count, failure);
 }
 
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+bool TraceAtomicSiteAllowed(g0_swimlane::TraceDomain domain, g0_swimlane::AtomicSite site) {
+    if (site == g0_swimlane::AtomicSite::FatalLoad || site == g0_swimlane::AtomicSite::FatalSet) {
+        return true;
+    }
+    const uint32_t site_id = static_cast<uint32_t>(site);
+    return domain == g0_swimlane::TraceDomain::Simt ?
+               site_id >= static_cast<uint32_t>(g0_swimlane::AtomicSite::SimtBuilderStartedIncrement) &&
+                   site_id <= static_cast<uint32_t>(g0_swimlane::AtomicSite::SimtBuilderFinishedPublish) :
+               site_id >= static_cast<uint32_t>(g0_swimlane::AtomicSite::ScalarDispatchTicket) &&
+                   site_id <= static_cast<uint32_t>(g0_swimlane::AtomicSite::ScalarRootFinishedPublish);
+}
+
+bool ValidateTraceRecord(
+    const g0_swimlane::TraceRecord &record, g0_swimlane::TraceDomain domain, uint32_t task_count,
+    uint32_t writer, uint32_t slot, uint64_t role_begin, uint64_t role_end,
+    uint64_t *atomic_calls, uint64_t *poll_calls, uint64_t *dcci_calls, uint64_t *dcci_lines,
+    uint32_t *poll_records, uint32_t *dcci_records, ValidationFailure *failure
+) {
+    if (!RecordCheck(
+            record.begin <= record.end, failure, "swimlane-log-time-order", record.task_id, writer, slot,
+            record.begin, record.end
+        ) ||
+        !RecordCheck(
+            record.task_id == g0_swimlane::kTraceNoTask || record.task_id < task_count, failure,
+            "swimlane-log-task", record.task_id, writer, slot, task_count, record.task_id
+        )) {
+        return false;
+    }
+    if (domain == g0_swimlane::TraceDomain::Scalar &&
+        !RecordCheck(
+            role_begin <= record.begin && record.end <= role_end, failure, "swimlane-scalar-log-envelope",
+            record.task_id, writer, slot
+        )) {
+        return false;
+    }
+
+    if (record.kind == g0_swimlane::TraceKind::Atomic) {
+        const auto site = static_cast<g0_swimlane::AtomicSite>(record.site);
+        const auto op = static_cast<g0_swimlane::AtomicOp>(record.op);
+        const bool result_used = (record.flags & g0_swimlane::kAtomicResultUsed) != 0U;
+        const bool return_ready = (record.flags & g0_swimlane::kAtomicReturnReady) != 0U;
+        const bool poll_batch = (record.flags & g0_swimlane::kAtomicPollBatch) != 0U;
+        constexpr uint32_t kAllowedAtomicFlags =
+            g0_swimlane::kAtomicResultUsed | g0_swimlane::kAtomicReturnReady |
+            g0_swimlane::kAtomicValueZero | g0_swimlane::kAtomicPollBatch;
+        if (!RecordCheck(
+                record.site < static_cast<uint16_t>(g0_swimlane::AtomicSite::Count), failure,
+                "swimlane-atomic-site", record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                record.op < static_cast<uint8_t>(g0_swimlane::AtomicOp::Count), failure,
+                "swimlane-atomic-op", record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                TraceAtomicSiteAllowed(domain, site), failure, "swimlane-atomic-domain", record.task_id,
+                writer, slot
+            ) ||
+            !RecordCheck(
+                op == g0_swimlane::AtomicSiteExpectedOp(site), failure, "swimlane-atomic-site-op",
+                record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                (record.flags & ~kAllowedAtomicFlags) == 0U, failure, "swimlane-atomic-flags",
+                record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                !return_ready || result_used, failure, "swimlane-atomic-return-without-result",
+                record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                domain == g0_swimlane::TraceDomain::Scalar ? (!result_used || return_ready) : !return_ready,
+                failure, "swimlane-atomic-boundary", record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                poll_batch == g0_swimlane::AtomicSiteIsPoll(site), failure, "swimlane-atomic-poll-site",
+                record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                poll_batch ? (result_used && record.call_count > 0U) : record.call_count == 1U, failure,
+                "swimlane-atomic-call-count", record.task_id, writer, slot
+            )) {
+            return false;
+        }
+        *atomic_calls += record.call_count;
+        if (poll_batch) {
+            *poll_calls += record.call_count;
+            ++*poll_records;
+        }
+        return true;
+    }
+
+    if (record.kind == g0_swimlane::TraceKind::Dcci) {
+        const auto site = static_cast<g0_swimlane::DcciSite>(record.site);
+        const auto op = static_cast<g0_swimlane::DcciOp>(record.op);
+        const uint32_t lines = g0_swimlane::DcciLineCount(record.flags);
+        if (!RecordCheck(
+                domain == g0_swimlane::TraceDomain::Scalar, failure, "swimlane-dcci-domain",
+                record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                record.site < static_cast<uint16_t>(g0_swimlane::DcciSite::Count), failure,
+                "swimlane-dcci-site", record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                record.op < static_cast<uint8_t>(g0_swimlane::DcciOp::Count), failure,
+                "swimlane-dcci-op", record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                op == g0_swimlane::DcciOp::Invalidate, failure, "swimlane-dcci-site-op",
+                record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                (record.flags & g0_swimlane::kDcciTrailingDsb) != 0U &&
+                    (record.flags & ((1U << g0_swimlane::kDcciLineCountShift) - 1U)) ==
+                        g0_swimlane::kDcciTrailingDsb,
+                failure, "swimlane-dcci-flags", record.task_id, writer, slot
+            ) ||
+            !RecordCheck(
+                record.call_count > 0U && lines >= record.call_count && lines <= g0_swimlane::kDcciLineCountMax,
+                failure, "swimlane-dcci-counts", record.task_id, writer, slot
+            )) {
+            return false;
+        }
+        (void)site;
+        *dcci_calls += record.call_count;
+        *dcci_lines += lines;
+        ++*dcci_records;
+        return true;
+    }
+    return RecordCheck(false, failure, "swimlane-log-kind", record.task_id, writer, slot);
+}
+
+bool ValidateTraceLog(
+    const g0_swimlane::TraceLogControl &control, const g0_swimlane::TraceRecord *records,
+    const g0_swimlane::TraceRecord *initial_records, g0_swimlane::TraceDomain domain, uint32_t capacity,
+    uint64_t nonce, uint32_t task_count, uint32_t writer, uint64_t role_begin, uint64_t role_end,
+    ValidationFailure *failure
+) {
+    if (!RecordCheck(control.launch_nonce == nonce, failure, "swimlane-log-nonce", UINT32_MAX, writer) ||
+        !RecordCheck(control.writer_id == writer, failure, "swimlane-log-writer", UINT32_MAX, writer) ||
+        !RecordCheck(control.domain == domain, failure, "swimlane-log-domain", UINT32_MAX, writer) ||
+        !RecordCheck(
+            control.record_count > 0U && control.record_count <= capacity, failure, "swimlane-log-record-count",
+            UINT32_MAX, writer, UINT32_MAX, capacity, control.record_count
+        ) ||
+        !RecordCheck(
+            control.dropped_records == 0U, failure, "swimlane-log-dropped", UINT32_MAX, writer,
+            UINT32_MAX, 0U, control.dropped_records
+        )) {
+        return false;
+    }
+    uint64_t atomic_calls = 0U;
+    uint64_t poll_calls = 0U;
+    uint64_t dcci_calls = 0U;
+    uint64_t dcci_lines = 0U;
+    uint32_t poll_records = 0U;
+    uint32_t dcci_records = 0U;
+    for (uint32_t slot = 0U; slot < control.record_count; ++slot) {
+        if (!ValidateTraceRecord(
+                records[slot], domain, task_count, writer, slot, role_begin, role_end, &atomic_calls,
+                &poll_calls, &dcci_calls, &dcci_lines, &poll_records, &dcci_records, failure
+            )) {
+            return false;
+        }
+        if (domain == g0_swimlane::TraceDomain::Simt && records[slot].task_id != g0_swimlane::kTraceNoTask &&
+            !RecordCheck(
+                g0::BuilderThreadForTask(records[slot].task_id) / g0::kWarpSize == writer, failure,
+                "swimlane-simt-log-writer", records[slot].task_id, writer, slot,
+                g0::BuilderThreadForTask(records[slot].task_id) / g0::kWarpSize, writer
+            )) {
+            return false;
+        }
+    }
+    for (uint32_t slot = control.record_count; slot < capacity; ++slot) {
+        if (!RecordCheck(
+                std::memcmp(&records[slot], &initial_records[slot], sizeof(records[slot])) == 0, failure,
+                "swimlane-log-tail-mutated", UINT32_MAX, writer, slot
+            )) {
+            return false;
+        }
+    }
+    return RecordCheck(
+               control.atomic_calls == atomic_calls, failure, "swimlane-log-atomic-total", UINT32_MAX, writer,
+               UINT32_MAX, atomic_calls, control.atomic_calls
+           ) &&
+           RecordCheck(
+               control.poll_calls == poll_calls, failure, "swimlane-log-poll-total", UINT32_MAX, writer,
+               UINT32_MAX, poll_calls, control.poll_calls
+           ) &&
+           RecordCheck(
+               control.dcci_calls == dcci_calls, failure, "swimlane-log-dcci-total", UINT32_MAX, writer,
+               UINT32_MAX, dcci_calls, control.dcci_calls
+           ) &&
+           RecordCheck(
+               control.dcci_lines == dcci_lines, failure, "swimlane-log-dcci-lines", UINT32_MAX, writer,
+               UINT32_MAX, dcci_lines, control.dcci_lines
+           ) &&
+           RecordCheck(
+               control.poll_records == poll_records, failure, "swimlane-log-poll-records", UINT32_MAX, writer,
+               UINT32_MAX, poll_records, control.poll_records
+           ) &&
+           RecordCheck(
+               control.dcci_records == dcci_records, failure, "swimlane-log-dcci-records", UINT32_MAX, writer,
+               UINT32_MAX, dcci_records, control.dcci_records
+           );
+}
+
+bool ValidateSwimlaneTrace(
+    const LaunchState &state, const LaunchState &initial, uint64_t nonce, uint32_t batches, uint32_t builder_count,
+    ValidationFailure *failure
+) {
+    const g0_swimlane::TraceState &trace = state.trace;
+    const g0_swimlane::TraceState &initial_trace = initial.trace;
+    const uint32_t task_count = g0::TaskCount(batches);
+    if (!RecordCheck(
+            std::memcmp(&trace.control, &initial_trace.control, sizeof(trace.control)) == 0, failure,
+            "swimlane-control-mutated"
+        )) {
+        return false;
+    }
+    for (uint32_t owner = 0U; owner < g0::kOwnerCount; ++owner) {
+        const g0_swimlane::RoleTrace &role = trace.roles[owner];
+        const uint32_t expected_subblock = owner < g0::kAicOwnerCount ? 0U : (owner - g0::kAicOwnerCount) % 2U;
+        if (!RecordCheck(role.launch_nonce == nonce, failure, "swimlane-role-nonce", UINT32_MAX, owner) ||
+            !RecordCheck(role.owner == owner, failure, "swimlane-role-owner", UINT32_MAX, owner) ||
+            !RecordCheck(
+                role.role == static_cast<uint32_t>(g0::OwnerRoleAt(owner, builder_count)), failure,
+                "swimlane-role-kind", UINT32_MAX, owner
+            ) ||
+            !RecordCheck(
+                role.physical_block == g0::OwnerPhysicalBlock(owner), failure, "swimlane-role-block", UINT32_MAX,
+                owner
+            ) ||
+            !RecordCheck(
+                role.subblock == expected_subblock, failure, "swimlane-role-subblock", UINT32_MAX, owner
+            ) ||
+            !RecordCheck(
+                role.entry <= role.config_ready && role.config_ready <= role.work_begin &&
+                    role.work_begin <= role.work_end && role.work_end <= role.drain_begin &&
+                    role.drain_begin <= role.drain_end && role.drain_end <= role.exit,
+                failure, "swimlane-role-time-order", UINT32_MAX, owner
+            )) {
+            return false;
+        }
+    }
+
+    for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
+        const g0_swimlane::BuilderTaskTrace &builder = trace.builders[task_id];
+        const uint32_t expected_thread = g0::BuilderThreadForTask(task_id);
+        if (!RecordCheck(builder.launch_nonce == nonce, failure, "swimlane-builder-nonce", task_id) ||
+            !RecordCheck(builder.task_id == task_id, failure, "swimlane-builder-task", task_id) ||
+            !RecordCheck(
+                builder.builder_thread == expected_thread, failure, "swimlane-builder-thread", task_id,
+                UINT32_MAX, UINT32_MAX, expected_thread, builder.builder_thread
+            ) ||
+            !RecordCheck(
+                g0::IsBuilderOwner(builder.build_owner, builder_count), failure, "swimlane-builder-owner", task_id
+            ) ||
+            !RecordCheck(
+                builder.attempt_begin <= builder.claim_end && builder.claim_end <= builder.prepare_end &&
+                    builder.prepare_end <= builder.commit_begin && builder.commit_begin <= builder.commit_end &&
+                    builder.commit_end <= builder.report_end,
+                failure, "swimlane-builder-time-order", task_id
+            )) {
+            return false;
+        }
+        const g0::TaskKind kind = g0::TaskKindAt(task_id);
+        const g0_swimlane::ExecutorTaskTrace &executor = trace.executors[task_id];
+        if (!g0::TaskExecutable(kind)) {
+            if (!RecordCheck(
+                    std::memcmp(&executor, &initial_trace.executors[task_id], sizeof(executor)) == 0, failure,
+                    "swimlane-alloc-executor-mutated", task_id
+                )) {
+                return false;
+            }
+            continue;
+        }
+        if (!RecordCheck(executor.launch_nonce == nonce, failure, "swimlane-executor-nonce", task_id) ||
+            !RecordCheck(executor.task_id == task_id, failure, "swimlane-executor-task", task_id) ||
+            !RecordCheck(
+                executor.task_kind == static_cast<uint32_t>(kind), failure, "swimlane-executor-kind", task_id
+            ) ||
+            !RecordCheck(
+                g0::OwnerCanExecute(executor.execute_owner, g0::TaskEngine(kind), builder_count), failure,
+                "swimlane-executor-owner", task_id, executor.execute_owner
+            ) ||
+            !RecordCheck(
+                executor.phase_bits == g0_swimlane::kExpectedExecutorTraceBits, failure,
+                "swimlane-executor-phases", task_id, executor.execute_owner
+            ) ||
+            !RecordCheck(
+                executor.ticket_assigned <= executor.claim_end && executor.claim_end <= executor.fanin_ready &&
+                    executor.fanin_ready <= executor.execute_begin && executor.execute_begin <= executor.execute_end,
+                failure, "swimlane-executor-time-order", task_id, executor.execute_owner
+            )) {
+            return false;
+        }
+        const g0_swimlane::RoleTrace &executor_role = trace.roles[executor.execute_owner];
+        if (!RecordCheck(
+                executor_role.work_begin <= executor.ticket_assigned && executor.execute_end <= executor_role.work_end,
+                failure, "swimlane-executor-envelope", task_id, executor.execute_owner
+            )) {
+            return false;
+        }
+    }
+    for (uint32_t task_id = task_count; task_id < g0_swimlane::kTraceTaskCapacity; ++task_id) {
+        if (!RecordCheck(
+                std::memcmp(&trace.builders[task_id], &initial_trace.builders[task_id], sizeof(trace.builders[task_id])) ==
+                    0,
+                failure, "swimlane-inactive-builder-mutated", task_id
+            ) ||
+            !RecordCheck(
+                std::memcmp(
+                    &trace.executors[task_id], &initial_trace.executors[task_id], sizeof(trace.executors[task_id])
+                ) == 0,
+                failure, "swimlane-inactive-executor-mutated", task_id
+            )) {
+            return false;
+        }
+    }
+    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceSimtWriterCount; ++writer) {
+        if (!ValidateTraceLog(
+                trace.simt_logs[writer], &trace.simt_records[writer][0], &initial_trace.simt_records[writer][0],
+                g0_swimlane::TraceDomain::Simt, g0_swimlane::kTraceSimtRecordsPerWriter, nonce, task_count,
+                writer, 0U, UINT64_MAX, failure
+            )) {
+            return false;
+        }
+    }
+    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceScalarWriterCount; ++writer) {
+        if (!ValidateTraceLog(
+                trace.scalar_logs[writer], &trace.scalar_records[writer][0],
+                &initial_trace.scalar_records[writer][0], g0_swimlane::TraceDomain::Scalar,
+                g0_swimlane::kTraceScalarRecordsPerWriter, nonce, task_count, writer,
+                trace.roles[writer].entry, trace.roles[writer].exit, failure
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const char *TraceTaskKindName(g0::TaskKind kind) {
+    switch (kind) {
+    case g0::TaskKind::Alloc:
+        return "Alloc";
+    case g0::TaskKind::Qk:
+        return "QK";
+    case g0::TaskKind::Sf:
+        return "SF";
+    case g0::TaskKind::Pv:
+        return "PV";
+    case g0::TaskKind::Up:
+        return "UP";
+    case g0::TaskKind::Count:
+        return "Count";
+    }
+    return "Unknown";
+}
+
+const char *TraceRoleName(g0::OwnerRole role) {
+    switch (role) {
+    case g0::OwnerRole::AicExecutor:
+        return "AIC executor";
+    case g0::OwnerRole::AivBuilder:
+        return "AIV SIMT builder";
+    case g0::OwnerRole::AivExecutor:
+        return "AIV executor";
+    }
+    return "unknown role";
+}
+
+const char *TraceDomainName(g0_swimlane::TraceDomain domain) {
+    return domain == g0_swimlane::TraceDomain::Scalar ? "scalar" : "simt";
+}
+
+const char *TraceAtomicOpName(g0_swimlane::AtomicOp op) {
+    switch (op) {
+    case g0_swimlane::AtomicOp::Load:
+        return "load";
+    case g0_swimlane::AtomicOp::Exchange:
+        return "exchange";
+    case g0_swimlane::AtomicOp::FetchAdd:
+        return "fetch_add";
+    case g0_swimlane::AtomicOp::CompareExchange:
+        return "compare_exchange";
+    case g0_swimlane::AtomicOp::Count:
+        return "count";
+    }
+    return "unknown";
+}
+
+const char *TraceAtomicSiteName(g0_swimlane::AtomicSite site) {
+    switch (site) {
+    case g0_swimlane::AtomicSite::FatalLoad:
+        return "fatal_load";
+    case g0_swimlane::AtomicSite::FatalSet:
+        return "fatal_set";
+    case g0_swimlane::AtomicSite::SimtBuilderStartedIncrement:
+        return "simt_builder_started_increment";
+    case g0_swimlane::AtomicSite::SimtBuilderStartedPoll:
+        return "simt_builder_started_poll";
+    case g0_swimlane::AtomicSite::SimtTaskBuildAttemptIncrement:
+        return "simt_task_build_attempt_increment";
+    case g0_swimlane::AtomicSite::SimtTaskBuildPreparedIncrement:
+        return "simt_task_build_prepared_increment";
+    case g0_swimlane::AtomicSite::SimtTaskBuildClaim:
+        return "simt_task_build_claim";
+    case g0_swimlane::AtomicSite::SimtHeapShardReserve:
+        return "simt_heap_shard_reserve";
+    case g0_swimlane::AtomicSite::SimtHeapVendReserve:
+        return "simt_heap_vend_reserve";
+    case g0_swimlane::AtomicSite::SimtHeapVendLoad:
+        return "simt_heap_vend_load";
+    case g0_swimlane::AtomicSite::SimtTaskBasePublish:
+        return "simt_task_base_publish";
+    case g0_swimlane::AtomicSite::SimtCompletionVendReportPublish:
+        return "simt_completion_vend_report_publish";
+    case g0_swimlane::AtomicSite::SimtOutputPublishedPublish:
+        return "simt_output_published_publish";
+    case g0_swimlane::AtomicSite::SimtOutputLastWriterPublish:
+        return "simt_output_last_writer_publish";
+    case g0_swimlane::AtomicSite::SimtProducerTaskBasePoll:
+        return "simt_producer_task_base_poll";
+    case g0_swimlane::AtomicSite::SimtInsertPredecessorPoll:
+        return "simt_insert_predecessor_poll";
+    case g0_swimlane::AtomicSite::SimtAllocLastWriterCommit:
+        return "simt_alloc_last_writer_commit";
+    case g0_swimlane::AtomicSite::SimtInsertCompletionPublish:
+        return "simt_insert_completion_publish";
+    case g0_swimlane::AtomicSite::SimtAllocCompletionVendPublish:
+        return "simt_alloc_completion_vend_publish";
+    case g0_swimlane::AtomicSite::SimtAllocCompletionFlagPublish:
+        return "simt_alloc_completion_flag_publish";
+    case g0_swimlane::AtomicSite::SimtAllocDoneIncrement:
+        return "simt_alloc_done_increment";
+    case g0_swimlane::AtomicSite::SimtExecBuiltPublish:
+        return "simt_exec_built_publish";
+    case g0_swimlane::AtomicSite::SimtBuildReportPublish:
+        return "simt_build_report_publish";
+    case g0_swimlane::AtomicSite::SimtBuilderFinishedPublish:
+        return "simt_builder_finished_publish";
+    case g0_swimlane::AtomicSite::ScalarDispatchTicket:
+        return "scalar_dispatch_ticket";
+    case g0_swimlane::AtomicSite::ScalarProducerTaskBaseLoad:
+        return "scalar_producer_task_base_load";
+    case g0_swimlane::AtomicSite::ScalarExecStatePoll:
+        return "scalar_exec_state_poll";
+    case g0_swimlane::AtomicSite::ScalarExecClaim:
+        return "scalar_exec_claim";
+    case g0_swimlane::AtomicSite::ScalarFaninFlagPoll:
+        return "scalar_fanin_flag_poll";
+    case g0_swimlane::AtomicSite::ScalarExecutionWitnessPublish:
+        return "scalar_execution_witness_publish";
+    case g0_swimlane::AtomicSite::ScalarCompletionVendPublish:
+        return "scalar_completion_vend_publish";
+    case g0_swimlane::AtomicSite::ScalarCompletionFlagPublish:
+        return "scalar_completion_flag_publish";
+    case g0_swimlane::AtomicSite::ScalarExecDonePublish:
+        return "scalar_exec_done_publish";
+    case g0_swimlane::AtomicSite::ScalarDoneCountIncrement:
+        return "scalar_done_count_increment";
+    case g0_swimlane::AtomicSite::ScalarEngineDoneIncrement:
+        return "scalar_engine_done_increment";
+    case g0_swimlane::AtomicSite::ScalarDrainArrive:
+        return "scalar_drain_arrive";
+    case g0_swimlane::AtomicSite::ScalarDrainArrivalPoll:
+        return "scalar_drain_arrival_poll";
+    case g0_swimlane::AtomicSite::ScalarDrainVerifyLoad:
+        return "scalar_drain_verify_load";
+    case g0_swimlane::AtomicSite::ScalarRootFinishedPublish:
+        return "scalar_root_finished_publish";
+    case g0_swimlane::AtomicSite::Count:
+        return "count";
+    }
+    return "unknown";
+}
+
+const char *TraceDcciSiteName(g0_swimlane::DcciSite site) {
+    switch (site) {
+    case g0_swimlane::DcciSite::StartupConfigInvalidate:
+        return "startup_config";
+    case g0_swimlane::DcciSite::DispatchTaskIdInvalidate:
+        return "dispatch_task_id";
+    case g0_swimlane::DcciSite::ExecPayloadInvalidate:
+        return "exec_payload";
+    case g0_swimlane::DcciSite::TerminalTokenInvalidate:
+        return "terminal_token";
+    case g0_swimlane::DcciSite::Count:
+        return "count";
+    }
+    return "unknown";
+}
+
+const char *TraceDcciOpName(g0_swimlane::DcciOp op) {
+    switch (op) {
+    case g0_swimlane::DcciOp::Invalidate:
+        return "invalidate";
+    case g0_swimlane::DcciOp::CleanOut:
+        return "clean_out";
+    case g0_swimlane::DcciOp::Count:
+        return "count";
+    }
+    return "unknown";
+}
+
+void WriteTraceSeparator(std::ofstream *output, bool *first) {
+    if (!*first) {
+        *output << ",\n";
+    }
+    *first = false;
+}
+
+void WriteTraceMetadata(
+    std::ofstream *output, bool *first, const char *name, uint32_t pid, uint32_t tid, const std::string &value
+) {
+    WriteTraceSeparator(output, first);
+    *output << "{\"name\":\"" << name << "\",\"ph\":\"M\",\"pid\":" << pid << ",\"tid\":" << tid
+            << ",\"args\":{\"name\":\"" << value << "\"}}";
+}
+
+void WriteTraceEvent(
+    std::ofstream *output, bool *first, const std::string &name, const char *category, uint32_t pid, uint32_t tid,
+    uint64_t begin, uint64_t end, uint64_t origin, uint32_t task_id = UINT32_MAX, uint32_t owner = UINT32_MAX,
+    uint32_t polls = UINT32_MAX
+) {
+    WriteTraceSeparator(output, first);
+    const long double begin_us = static_cast<long double>(begin - origin) / 1000.0L;
+    const long double duration_us = static_cast<long double>(end - begin) / 1000.0L;
+    *output << std::fixed << std::setprecision(3) << "{\"name\":\"" << name << "\",\"cat\":\"" << category
+            << "\",\"ph\":\"X\",\"pid\":" << pid << ",\"tid\":" << tid << ",\"ts\":" << begin_us
+            << ",\"dur\":" << duration_us << ",\"args\":{";
+    bool first_argument = true;
+    const auto argument = [&](const char *key, uint32_t value) {
+        if (!first_argument) {
+            *output << ',';
+        }
+        *output << "\"" << key << "\":" << value;
+        first_argument = false;
+    };
+    if (task_id != UINT32_MAX) {
+        argument("task", task_id);
+        argument("batch", task_id / g0::kTasksPerBatch);
+    }
+    if (owner != UINT32_MAX) {
+        argument("owner", owner);
+    }
+    if (polls != UINT32_MAX) {
+        argument("polls", polls);
+    }
+    *output << "}}";
+}
+
+void WriteProfileTraceEvent(
+    std::ofstream *output, bool *first, const g0_swimlane::TraceRecord &record,
+    g0_swimlane::TraceDomain domain, uint32_t writer, uint32_t pid, uint32_t tid,
+    uint64_t begin, uint64_t end, uint64_t origin
+) {
+    const bool has_task = record.task_id != g0_swimlane::kTraceNoTask;
+    const uint64_t raw_ticks = record.end - record.begin;
+    std::string name;
+    std::string category;
+    if (record.kind == g0_swimlane::TraceKind::Atomic) {
+        const auto site = static_cast<g0_swimlane::AtomicSite>(record.site);
+        const auto op = static_cast<g0_swimlane::AtomicOp>(record.op);
+        const bool poll_batch = (record.flags & g0_swimlane::kAtomicPollBatch) != 0U;
+        const bool return_ready = (record.flags & g0_swimlane::kAtomicReturnReady) != 0U;
+        const std::string boundary = return_ready ? "return_ready" : "source_issue";
+        name = poll_batch ? "atomic.poll_batch." + boundary + "." : "atomic." + boundary + ".";
+        name += TraceAtomicSiteName(site);
+        name += ".";
+        name += TraceAtomicOpName(op);
+        if (poll_batch) {
+            name += "x" + std::to_string(record.call_count);
+        } else if (has_task) {
+            name += "#" + std::to_string(record.task_id);
+        }
+        category = poll_batch ? "atomic.poll_batch" : "atomic." + boundary;
+    } else {
+        const auto site = static_cast<g0_swimlane::DcciSite>(record.site);
+        const auto op = static_cast<g0_swimlane::DcciOp>(record.op);
+        name = "dcci." + std::string(TraceDcciSiteName(site)) + "." + TraceDcciOpName(op) + "x" +
+               std::to_string(record.call_count) + ".lines" +
+               std::to_string(g0_swimlane::DcciLineCount(record.flags));
+        if (has_task) {
+            name += "#" + std::to_string(record.task_id);
+        }
+        category = "dcci";
+    }
+
+    WriteTraceSeparator(output, first);
+    const long double begin_us = static_cast<long double>(begin - origin) / 1000.0L;
+    const long double duration_us = static_cast<long double>(end - begin) / 1000.0L;
+    *output << std::fixed << std::setprecision(3) << "{\"name\":\"" << name << "\",\"cat\":\""
+            << category << "\",\"ph\":\"X\",\"pid\":" << pid << ",\"tid\":" << tid
+            << ",\"ts\":" << begin_us << ",\"dur\":" << duration_us << ",\"args\":{";
+    *output << "\"phase\":\"" << (record.kind == g0_swimlane::TraceKind::Atomic ? "atomic" : "dcci")
+            << "\",\"execution_unit\":\"" << TraceDomainName(domain) << "\",\"writer\":" << writer;
+    if (has_task) {
+        *output << ",\"task_id\":" << record.task_id << ",\"batch\":"
+                << record.task_id / g0::kTasksPerBatch;
+    }
+    if (record.kind == g0_swimlane::TraceKind::Atomic) {
+        const bool poll_batch = (record.flags & g0_swimlane::kAtomicPollBatch) != 0U;
+        *output << ",\"site\":\""
+                << TraceAtomicSiteName(static_cast<g0_swimlane::AtomicSite>(record.site))
+                << "\",\"site_id\":" << record.site << ",\"op\":\""
+                << TraceAtomicOpName(static_cast<g0_swimlane::AtomicOp>(record.op))
+                << "\",\"op_id\":" << static_cast<uint32_t>(record.op)
+                << ",\"call_count\":" << record.call_count
+                << ",\"result_used\":"
+                << ((record.flags & g0_swimlane::kAtomicResultUsed) != 0U ? "true" : "false")
+                << ",\"return_ready_observed\":"
+                << ((record.flags & g0_swimlane::kAtomicReturnReady) != 0U ? "true" : "false")
+                << ",\"completion_boundary\":\""
+                << ((record.flags & g0_swimlane::kAtomicReturnReady) != 0U ? "return_value_ready" :
+                                                                                 "source_issue_bracket")
+                << "\",\"is_poll_batch\":" << (poll_batch ? "true" : "false");
+        if (poll_batch) {
+            *output << ",\"duration_semantics\":\"logical_poll_episode_envelope_not_single_atomic_latency\""
+                       ",\"estimate_formula\":\"call_count * calibrated_atomic_cost\"";
+        }
+        if (static_cast<g0_swimlane::AtomicOp>(record.op) == g0_swimlane::AtomicOp::Load) {
+            *output << ",\"value_zero\":"
+                    << ((record.flags & g0_swimlane::kAtomicValueZero) != 0U ? "true" : "false");
+        }
+    } else {
+        *output << ",\"site\":\"" << TraceDcciSiteName(static_cast<g0_swimlane::DcciSite>(record.site))
+                << "\",\"site_id\":" << record.site << ",\"op\":\""
+                << TraceDcciOpName(static_cast<g0_swimlane::DcciOp>(record.op))
+                << "\",\"op_id\":" << static_cast<uint32_t>(record.op)
+                << ",\"call_count\":" << record.call_count << ",\"cache_line_count\":"
+                << g0_swimlane::DcciLineCount(record.flags) << ",\"trailing_dsb\":true";
+    }
+    *output << ",\"raw_ticks\":" << raw_ticks << ",\"clock_domain\":\""
+            << (domain == g0_swimlane::TraceDomain::Scalar ? "scalar_sys_cnt_1ghz" : "simt_clock64")
+            << "\",\"flags\":" << record.flags << "}}";
+}
+
+bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
+    std::error_code path_error;
+    if (std::filesystem::exists(path, path_error) || path_error) {
+        std::fprintf(
+            stderr, "refusing to overwrite existing swimlane output: %s%s\n", path.c_str(),
+            path_error ? " (path check failed)" : ""
+        );
+        return false;
+    }
+    const g0_swimlane::TraceState &trace = state.trace;
+    struct TraceTotals {
+        uint64_t atomic_calls = 0U;
+        uint64_t poll_calls = 0U;
+        uint64_t dcci_calls = 0U;
+        uint64_t dcci_lines = 0U;
+        uint64_t records = 0U;
+        uint64_t poll_records = 0U;
+        uint64_t dcci_records = 0U;
+    } simt_totals, scalar_totals;
+    const auto add_control = [](TraceTotals *totals, const g0_swimlane::TraceLogControl &control) {
+        totals->atomic_calls += control.atomic_calls;
+        totals->poll_calls += control.poll_calls;
+        totals->dcci_calls += control.dcci_calls;
+        totals->dcci_lines += control.dcci_lines;
+        totals->records += control.record_count;
+        totals->poll_records += control.poll_records;
+        totals->dcci_records += control.dcci_records;
+    };
+    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceSimtWriterCount; ++writer) {
+        add_control(&simt_totals, trace.simt_logs[writer]);
+    }
+    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceScalarWriterCount; ++writer) {
+        add_control(&scalar_totals, trace.scalar_logs[writer]);
+    }
+
+    uint64_t origin = UINT64_MAX;
+    uint64_t finish = 0U;
+    for (uint32_t owner = 0U; owner < g0::kOwnerCount; ++owner) {
+        origin = std::min(origin, trace.roles[owner].entry);
+        finish = std::max(finish, trace.roles[owner].exit);
+    }
+    if (origin == UINT64_MAX || finish < origin) {
+        return false;
+    }
+    uint64_t simt_raw_begin = UINT64_MAX;
+    uint64_t simt_raw_end = 0U;
+    const uint32_t task_count = state.full_pa.control.task_count;
+    for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
+        const g0_swimlane::BuilderTaskTrace &builder = trace.builders[task_id];
+        simt_raw_begin = std::min(simt_raw_begin, builder.attempt_begin);
+        simt_raw_end = std::max(simt_raw_end, builder.report_end);
+    }
+    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceSimtWriterCount; ++writer) {
+        const uint32_t record_count = trace.simt_logs[writer].record_count;
+        for (uint32_t slot = 0U; slot < record_count; ++slot) {
+            simt_raw_begin = std::min(simt_raw_begin, trace.simt_records[writer][slot].begin);
+            simt_raw_end = std::max(simt_raw_end, trace.simt_records[writer][slot].end);
+        }
+    }
+    const g0_swimlane::RoleTrace &builder_role = trace.roles[g0::kBuilderOwner];
+    if (simt_raw_begin == UINT64_MAX || simt_raw_end <= simt_raw_begin ||
+        builder_role.work_end <= builder_role.work_begin) {
+        return false;
+    }
+    const auto align_simt_clock = [&](uint64_t raw) {
+        const long double raw_offset = static_cast<long double>(raw - simt_raw_begin);
+        const long double scalar_span = static_cast<long double>(builder_role.work_end - builder_role.work_begin);
+        const long double raw_span = static_cast<long double>(simt_raw_end - simt_raw_begin);
+        return builder_role.work_begin + static_cast<uint64_t>(raw_offset * scalar_span / raw_span + 0.5L);
+    };
+    std::ofstream output(path, std::ios::out | std::ios::trunc);
+    if (!output) {
+        std::fprintf(stderr, "cannot open swimlane output: %s\n", path.c_str());
+        return false;
+    }
+    output << "{\"schema\":\"simt_cross_core_g0_swimlane_v2\","
+              "\"clock\":\"Scalar get_sys_cnt: 1 ns/tick; SIMT CLOCK64: raw ticks\","
+              "\"simt_alignment\":\"affine_to_builder_scalar_vf_envelope_for_display_only\","
+              "\"simt_atomic_boundary\":\"source_issue; CCEC SIMT return-register dependency is not claimed\","
+              "\"instrumented\":true,\"batches\":"
+           << state.full_pa.control.batch_count << ",\"tasks\":" << state.full_pa.control.task_count
+           << ",\"device_span_ns\":" << (finish - origin) << ",\"simt_clock64_span_ticks\":"
+           << (simt_raw_end - simt_raw_begin) << ",\"atomic_dcci_summary\":{"
+           << "\"simt\":{\"atomic_calls\":" << simt_totals.atomic_calls << ",\"poll_calls\":"
+           << simt_totals.poll_calls << ",\"records\":" << simt_totals.records
+           << ",\"poll_records\":" << simt_totals.poll_records << "},\"scalar\":{\"atomic_calls\":"
+           << scalar_totals.atomic_calls << ",\"poll_calls\":" << scalar_totals.poll_calls
+           << ",\"dcci_calls\":" << scalar_totals.dcci_calls << ",\"dcci_cache_lines\":"
+           << scalar_totals.dcci_lines << ",\"records\":" << scalar_totals.records
+           << ",\"poll_records\":" << scalar_totals.poll_records << ",\"dcci_records\":"
+           << scalar_totals.dcci_records << "}},\"traceEvents\":[\n";
+    bool first = true;
+    WriteTraceMetadata(&output, &first, "process_name", 1U, 0U, "Main Scalar roles + task/atomic/DCCI overlays");
+    WriteTraceMetadata(&output, &first, "process_name", 2U, 0U, "SIMT builder warps + atomic overlays");
+    for (uint32_t owner = 0U; owner < g0::kOwnerCount; ++owner) {
+        const g0::OwnerRole role = g0::OwnerRoleAt(owner, state.full_pa.control.builder_count);
+        const std::string owner_name = std::string(TraceRoleName(role)) + " #" + std::to_string(owner);
+        WriteTraceMetadata(&output, &first, "thread_name", 1U, owner, owner_name);
+        const g0_swimlane::RoleTrace &record = trace.roles[owner];
+        WriteTraceEvent(
+            &output, &first, "Scalar role lifetime", "scalar", 1U, owner, record.entry, record.exit, origin,
+            UINT32_MAX, owner
+        );
+        WriteTraceEvent(
+            &output, &first, "setup/config", "scalar", 1U, owner, record.entry, record.config_ready, origin,
+            UINT32_MAX, owner
+        );
+        WriteTraceEvent(
+            &output, &first, role == g0::OwnerRole::AivBuilder ? "SIMT VF build" : "executor loop", "scalar", 1U,
+            owner, record.work_begin, record.work_end, origin, UINT32_MAX, owner
+        );
+        WriteTraceEvent(
+            &output, &first, "final_drain", "scalar", 1U, owner, record.drain_begin, record.drain_end, origin,
+            UINT32_MAX, owner
+        );
+    }
+    for (uint32_t warp = 0U; warp < g0::kBuilderWarpCount; ++warp) {
+        WriteTraceMetadata(
+            &output, &first, "thread_name", 2U, warp, "AIV0 SIMT warp " + std::to_string(warp)
+        );
+    }
+    for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
+        const g0_swimlane::BuilderTaskTrace &builder = trace.builders[task_id];
+        const g0::TaskKind kind = g0::TaskKindAt(task_id);
+        const uint32_t warp = builder.builder_thread / g0::kWarpSize;
+        const std::string prefix = "task[" + std::to_string(task_id) + "] " + TraceTaskKindName(kind);
+        const uint64_t attempt_begin = align_simt_clock(builder.attempt_begin);
+        const uint64_t claim_end = align_simt_clock(builder.claim_end);
+        const uint64_t prepare_end = align_simt_clock(builder.prepare_end);
+        const uint64_t commit_begin = align_simt_clock(builder.commit_begin);
+        const uint64_t commit_end = align_simt_clock(builder.commit_end);
+        const uint64_t report_end = align_simt_clock(builder.report_end);
+        WriteTraceEvent(
+            &output, &first, prefix + " build", "simt_build", 2U, warp, attempt_begin, report_end, origin, task_id,
+            builder.build_owner, builder.insert_poll_count
+        );
+        WriteTraceEvent(
+            &output, &first, "claim", "simt_build", 2U, warp, attempt_begin, claim_end, origin, task_id,
+            builder.build_owner
+        );
+        WriteTraceEvent(
+            &output, &first, "prepare", "simt_build", 2U, warp, claim_end, prepare_end, origin, task_id,
+            builder.build_owner
+        );
+        WriteTraceEvent(
+            &output, &first, "ordered_insert", "simt_build", 2U, warp, commit_begin, commit_end, origin, task_id,
+            builder.build_owner, builder.insert_poll_count
+        );
+        WriteTraceEvent(
+            &output, &first, "build_report_publish", "simt_build", 2U, warp, commit_end, report_end, origin,
+            task_id, builder.build_owner
+        );
+        if (!g0::TaskExecutable(kind)) {
+            continue;
+        }
+        const g0_swimlane::ExecutorTaskTrace &executor = trace.executors[task_id];
+        WriteTraceEvent(
+            &output, &first, prefix + " lifecycle", "task", 1U, executor.execute_owner, executor.ticket_assigned,
+            executor.execute_end, origin, task_id, executor.execute_owner
+        );
+        WriteTraceEvent(
+            &output, &first, "wait_built+claim", "task_wait", 1U, executor.execute_owner,
+            executor.ticket_assigned, executor.claim_end, origin, task_id, executor.execute_owner
+        );
+        WriteTraceEvent(
+            &output, &first, "bind+fanin_wait", "task_wait", 1U, executor.execute_owner, executor.claim_end,
+            executor.fanin_ready, origin, task_id, executor.execute_owner
+        );
+        WriteTraceEvent(
+            &output, &first, "task_execute", "task_execute", 1U, executor.execute_owner, executor.execute_begin,
+            executor.execute_end, origin, task_id, executor.execute_owner
+        );
+    }
+    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceSimtWriterCount; ++writer) {
+        for (uint32_t slot = 0U; slot < trace.simt_logs[writer].record_count; ++slot) {
+            const g0_swimlane::TraceRecord &record = trace.simt_records[writer][slot];
+            WriteProfileTraceEvent(
+                &output, &first, record, g0_swimlane::TraceDomain::Simt, writer, 2U, writer,
+                align_simt_clock(record.begin), align_simt_clock(record.end), origin
+            );
+        }
+    }
+    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceScalarWriterCount; ++writer) {
+        for (uint32_t slot = 0U; slot < trace.scalar_logs[writer].record_count; ++slot) {
+            const g0_swimlane::TraceRecord &record = trace.scalar_records[writer][slot];
+            WriteProfileTraceEvent(
+                &output, &first, record, g0_swimlane::TraceDomain::Scalar, writer, 1U, writer,
+                record.begin, record.end, origin
+            );
+        }
+    }
+    output << "\n]}\n";
+    if (!output.good()) {
+        std::fprintf(stderr, "failed to write swimlane output: %s\n", path.c_str());
+        return false;
+    }
+    std::printf(
+        "[SWIMLANE] file=%s instrumented=yes scalar_clock=1ns simt_clock=affine-display "
+        "device_span_us=%.3Lf simt_build_span_us=%.3Lf atomic_calls(simt/scalar)=%llu/%llu "
+        "dcci_calls=%llu dcci_lines=%llu\n",
+        path.c_str(), static_cast<long double>(finish - origin) / 1000.0L,
+        static_cast<long double>(builder_role.work_end - builder_role.work_begin) / 1000.0L,
+        static_cast<unsigned long long>(simt_totals.atomic_calls),
+        static_cast<unsigned long long>(scalar_totals.atomic_calls),
+        static_cast<unsigned long long>(scalar_totals.dcci_calls),
+        static_cast<unsigned long long>(scalar_totals.dcci_lines)
+    );
+    return true;
+}
+#endif
+
+bool ValidateLaunchRun(
+    const LaunchState &state, const LaunchState &initial, const std::vector<float> &workspace,
+    uint64_t device_state_address, uint64_t nonce, uint32_t batches, uint32_t builder_count, ValidationFailure *failure
+) {
+    if (!ValidateRun(
+            FullPaView(state), FullPaView(initial), workspace, device_state_address, nonce, batches, builder_count,
+            failure
+        )) {
+        return false;
+    }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    return ValidateSwimlaneTrace(state, initial, nonce, batches, builder_count, failure);
+#else
+    return true;
+#endif
+}
+
 bool ParseUnsigned(const char *raw, uint64_t maximum, uint64_t *value) {
     errno = 0;
     char *end = nullptr;
@@ -2076,15 +3009,47 @@ bool ParseOptions(int argc, char **argv, Options *options) {
             options->runs = static_cast<uint32_t>(value);
         } else if (std::strcmp(argv[index], "--builders") == 0 && index + 1 < argc) {
             uint64_t value = 0U;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            if (!ParseUnsigned(argv[++index], 1U, &value) || value != 1U) {
+                std::fprintf(stderr, "invalid --builders value: %s (G0 swimlane requires 1)\n", argv[index]);
+                return false;
+            }
+#else
             if (!ParseUnsigned(argv[++index], g0::kMaxBuilderCount, &value) ||
                 !g0::BuilderCountValid(static_cast<uint32_t>(value))) {
                 std::fprintf(stderr, "invalid --builders value: %s (expected 1 or 2)\n", argv[index]);
                 return false;
             }
+#endif
             options->builder_count = static_cast<uint32_t>(value);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        } else if (std::strcmp(argv[index], "--swimlane-json") == 0 && index + 1 < argc) {
+            options->swimlane_json = argv[++index];
+            if (options->swimlane_json.empty()) {
+                std::fprintf(stderr, "--swimlane-json requires a non-empty path\n");
+                return false;
+            }
+        } else if (std::strcmp(argv[index], "--acl-config") == 0 && index + 1 < argc) {
+            options->acl_config = argv[++index];
+            if (options->acl_config.empty()) {
+                std::fprintf(stderr, "--acl-config requires a non-empty path\n");
+                return false;
+            }
+#endif
         } else {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            constexpr const char *kBuilderUsage = "1";
+#else
+            constexpr const char *kBuilderUsage = "1|2";
+#endif
             std::fprintf(
-                stderr, "usage: %s --kernel FILE [--device N] [--batches 1|256] [--runs N] [--builders 1|2]\n", argv[0]
+                stderr,
+                "usage: %s --kernel FILE [--device N] [--batches 1|256] [--runs N] [--builders %s]"
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+                " [--swimlane-json FILE] --acl-config FILE"
+#endif
+                "\n",
+                argv[0], kBuilderUsage
             );
             return false;
         }
@@ -2093,6 +3058,26 @@ bool ParseOptions(int argc, char **argv, Options *options) {
         std::fprintf(stderr, "--kernel FILE is required\n");
         return false;
     }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    if (options->acl_config.empty()) {
+        std::fprintf(stderr, "G0 swimlane requires --acl-config FILE for its measured SIMT/DVG stack sizes\n");
+        return false;
+    }
+    if (!options->swimlane_json.empty() && options->runs != 1U) {
+        std::fprintf(stderr, "--swimlane-json requires --runs 1 so one file maps to one launch\n");
+        return false;
+    }
+    if (!options->swimlane_json.empty()) {
+        std::error_code path_error;
+        if (std::filesystem::exists(options->swimlane_json, path_error) || path_error) {
+            std::fprintf(
+                stderr, "--swimlane-json refuses to overwrite an existing path: %s%s\n",
+                options->swimlane_json.c_str(), path_error ? " (path check failed)" : ""
+            );
+            return false;
+        }
+    }
+#endif
     return true;
 }
 
@@ -2132,6 +3117,12 @@ public:
         if (binary_ != nullptr) {
             (void)aclrtBinaryUnLoad(binary_);
         }
+        if (kernel_end_event_ != nullptr) {
+            (void)aclrtDestroyEvent(kernel_end_event_);
+        }
+        if (kernel_start_event_ != nullptr) {
+            (void)aclrtDestroyEvent(kernel_start_event_);
+        }
         if (stream_ != nullptr) {
             (void)aclrtDestroyStream(stream_);
         }
@@ -2143,9 +3134,11 @@ public:
         }
     }
 
-    bool Initialize(int32_t device, const std::vector<char> &binary_data) {
+    bool Initialize(
+        int32_t device, const std::vector<char> &binary_data, const char *acl_config
+    ) {
         device_ = device;
-        if (!CheckAcl(aclInit(nullptr), "aclInit")) {
+        if (!CheckAcl(aclInit(acl_config), "aclInit")) {
             return false;
         }
         acl_initialized_ = true;
@@ -2159,7 +3152,9 @@ public:
             return false;
         }
         soc_name_ = soc_name;
-        if (!CheckAcl(aclrtCreateStream(&stream_), "aclrtCreateStream")) {
+        if (!CheckAcl(aclrtCreateStream(&stream_), "aclrtCreateStream") ||
+            !CheckAcl(aclrtCreateEvent(&kernel_start_event_), "aclrtCreateEvent(kernel start)") ||
+            !CheckAcl(aclrtCreateEvent(&kernel_end_event_), "aclrtCreateEvent(kernel end)")) {
             return false;
         }
         aclrtBinaryLoadOption option{};
@@ -2172,7 +3167,7 @@ public:
             ) ||
             !CheckAcl(aclrtBinaryGetFunctionByEntry(binary_, 0U, &function_), "aclrtBinaryGetFunctionByEntry") ||
             !CheckAcl(
-                aclrtMalloc(&device_state_, sizeof(FullPaState), ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(FullPaState)"
+                aclrtMalloc(&device_state_, sizeof(LaunchState), ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(LaunchState)"
             ) ||
             !CheckAcl(
                 aclrtMalloc(&device_workspace_, kWorkloadBytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(G0 workload)"
@@ -2180,7 +3175,7 @@ public:
             return false;
         }
         if ((reinterpret_cast<uintptr_t>(device_state_) & 63U) != 0U) {
-            std::fprintf(stderr, "device FullPaState is not 64-byte aligned: %p\n", device_state_);
+            std::fprintf(stderr, "device LaunchState is not 64-byte aligned: %p\n", device_state_);
             return false;
         }
         if ((reinterpret_cast<uintptr_t>(device_workspace_) & 63U) != 0U) {
@@ -2196,14 +3191,14 @@ public:
 
     uint64_t DeviceWorkspaceAddress() const { return reinterpret_cast<uint64_t>(device_workspace_); }
 
-    bool Run(FullPaState *state, std::vector<float> *workspace) {
-        if (workspace == nullptr || workspace->size() * sizeof(float) != kWorkloadBytes) {
+    bool Run(LaunchState *state, std::vector<float> *workspace, float *kernel_ms) {
+        if (workspace == nullptr || workspace->size() * sizeof(float) != kWorkloadBytes || kernel_ms == nullptr) {
             std::fprintf(stderr, "invalid host G0 workload image\n");
             return false;
         }
         if (!CheckAcl(
                 aclrtMemcpy(device_state_, sizeof(*state), state, sizeof(*state), ACL_MEMCPY_HOST_TO_DEVICE),
-                "aclrtMemcpy(H2D FullPaState)"
+                "aclrtMemcpy(H2D LaunchState)"
             ) ||
             !CheckAcl(
                 aclrtMemcpy(
@@ -2216,15 +3211,21 @@ public:
         struct KernelArgs {
             uint64_t state_pointer;
         } args{reinterpret_cast<uint64_t>(device_state_)};
-        static_assert(sizeof(KernelArgs) == sizeof(uint64_t), "unexpected G0 kernel argument ABI");
-        return CheckAcl(
+        static_assert(sizeof(KernelArgs) == sizeof(uint64_t), "unexpected mixed-kernel argument ABI");
+        return CheckAcl(aclrtRecordEvent(kernel_start_event_, stream_), "aclrtRecordEvent(kernel start)") &&
+               CheckAcl(
                    aclrtLaunchKernelWithHostArgs(function_, 32U, stream_, nullptr, &args, sizeof(args), nullptr, 0U),
-                   "aclrtLaunchKernelWithHostArgs(G0 mixed 1:2)"
+                   "aclrtLaunchKernelWithHostArgs(mixed 1:2)"
                ) &&
-               CheckAcl(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream(G0)") &&
+               CheckAcl(aclrtRecordEvent(kernel_end_event_, stream_), "aclrtRecordEvent(kernel end)") &&
+               CheckAcl(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream(mixed kernel)") &&
+               CheckAcl(
+                   aclrtEventElapsedTime(kernel_ms, kernel_start_event_, kernel_end_event_),
+                   "aclrtEventElapsedTime(mixed kernel)"
+               ) &&
                CheckAcl(
                    aclrtMemcpy(state, sizeof(*state), device_state_, sizeof(*state), ACL_MEMCPY_DEVICE_TO_HOST),
-                   "aclrtMemcpy(D2H FullPaState)"
+                   "aclrtMemcpy(D2H LaunchState)"
                ) &&
                CheckAcl(
                    aclrtMemcpy(
@@ -2240,6 +3241,8 @@ private:
     int32_t device_ = 0;
     std::string soc_name_;
     aclrtStream stream_ = nullptr;
+    aclrtEvent kernel_start_event_ = nullptr;
+    aclrtEvent kernel_end_event_ = nullptr;
     aclrtBinHandle binary_ = nullptr;
     aclrtFuncHandle function_ = nullptr;
     void *device_state_ = nullptr;
@@ -2258,36 +3261,50 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     AclSession session;
-    if (!session.Initialize(options.device, binary_data)) {
+    if (!session.Initialize(
+            options.device, binary_data,
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            options.acl_config.c_str()
+#else
+            nullptr
+#endif
+        )) {
         return EXIT_FAILURE;
     }
     if (session.SocName().rfind("Ascend950", 0U) != 0U) {
-        std::fprintf(stderr, "G0 requires A5/Ascend950, but ACL reports: %s\n", session.SocName().c_str());
+        std::fprintf(
+            stderr, "the full-PA probe requires A5/Ascend950, but ACL reports: %s\n", session.SocName().c_str()
+        );
         return EXIT_FAILURE;
     }
 
     std::printf(
         "[DEVICE] id=%d soc=%s topology=32*(1AIC+2AIV) builders=%u "
         "simt_threads_per_builder=%u simt_threads_total=%u warps_per_builder=%u "
-        "state_bytes=%zu state=0x%llx workspace_bytes=%llu workspace=0x%llx batches=%u runs=%u\n",
+        "state_bytes=%zu state=0x%llx workspace_bytes=%llu workspace=0x%llx batches=%u runs=%u"
+        "\n",
         options.device, session.SocName().c_str(), options.builder_count, kHostBuilderThreadCount,
-        g0::BuilderThreadCount(options.builder_count), kHostBuilderWarpCount, sizeof(FullPaState),
+        g0::BuilderThreadCount(options.builder_count), kHostBuilderWarpCount, sizeof(LaunchState),
         static_cast<unsigned long long>(session.DeviceStateAddress()), static_cast<unsigned long long>(kWorkloadBytes),
         static_cast<unsigned long long>(session.DeviceWorkspaceAddress()), options.batches, options.runs
     );
 
-    auto state = std::make_unique<FullPaState>();
-    auto initial = std::make_unique<FullPaState>();
+    auto state = std::make_unique<LaunchState>();
+    auto initial = std::make_unique<LaunchState>();
     std::vector<float> workspace;
+    std::vector<double> kernel_times_us;
     uint32_t passes = 0U;
     for (uint32_t run = 0U; run < options.runs; ++run) {
         const uint64_t nonce = UINT64_C(0xA550000000000000) ^ (static_cast<uint64_t>(options.batches) << 32U) ^
                                (static_cast<uint64_t>(options.builder_count) << 24U) ^
                                (static_cast<uint64_t>(run) + 1U);
-        InitializeState(state.get(), nonce, options.batches, options.builder_count, session.DeviceWorkspaceAddress());
+        InitializeLaunchState(
+            state.get(), nonce, options.batches, options.builder_count, session.DeviceWorkspaceAddress()
+        );
         std::memcpy(initial.get(), state.get(), sizeof(*state));
         InitializeWorkspace(&workspace);
-        if (!session.Run(state.get(), &workspace)) {
+        float kernel_ms = 0.0F;
+        if (!session.Run(state.get(), &workspace, &kernel_ms)) {
             std::fprintf(
                 stderr, "[FAIL] run=%u nonce=0x%llx ACL launch/copy failed\n", run + 1U,
                 static_cast<unsigned long long>(nonce)
@@ -2295,10 +3312,12 @@ int main(int argc, char **argv) {
             break;
         }
         ValidationFailure failure{};
-        if (!ValidateRun(
+        if (!ValidateLaunchRun(
                 *state, *initial, workspace, session.DeviceStateAddress(), nonce, options.batches,
                 options.builder_count, &failure
             )) {
+            const FullPaState &full_pa = FullPaView(*state);
+            const FullPaState &initial_full_pa = FullPaView(*initial);
             std::fprintf(
                 stderr,
                 "[FAIL] run=%u nonce=0x%llx reason=%s task=%u owner=%u index=%u "
@@ -2312,11 +3331,11 @@ int main(int argc, char **argv) {
                 std::array<uint64_t, sizeof(g0::ExecutionTokenControl) / sizeof(uint64_t)> actual_words{};
                 std::array<uint64_t, sizeof(g0::ExecutionTokenControl) / sizeof(uint64_t)> expected_words{};
                 std::memcpy(
-                    actual_words.data(), &state->tokens[failure.owner][failure.index].control,
+                    actual_words.data(), &full_pa.tokens[failure.owner][failure.index].control,
                     sizeof(g0::ExecutionTokenControl)
                 );
                 std::memcpy(
-                    expected_words.data(), &initial->tokens[failure.owner][failure.index].control,
+                    expected_words.data(), &initial_full_pa.tokens[failure.owner][failure.index].control,
                     sizeof(g0::ExecutionTokenControl)
                 );
                 std::fprintf(
@@ -2332,7 +3351,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (failure.owner < g0::kOwnerCount && std::strncmp(failure.reason, "role-", 5U) == 0) {
-                const g0::FullPaRoleResult &role = state->roles[failure.owner];
+                const g0::FullPaRoleResult &role = full_pa.roles[failure.owner];
                 std::fprintf(
                     stderr,
                     "[ROLE] owner=%u role=%u build=%u commit=%u execute=%u ticket=%u exhausted=%u "
@@ -2344,12 +3363,42 @@ int main(int argc, char **argv) {
                     role.completed_by_kind[4], role.drain_arrival_count, role.fatal_count
                 );
             }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            if (failure.owner < g0_swimlane::kTraceScalarWriterCount &&
+                failure.index < g0_swimlane::kTraceScalarRecordsPerWriter &&
+                std::strncmp(failure.reason, "swimlane-log-", 13U) == 0) {
+                const g0_swimlane::TraceRecord &record = state->trace.scalar_records[failure.owner][failure.index];
+                const uint64_t *record_words = reinterpret_cast<const uint64_t *>(&record);
+                const g0_swimlane::TraceLogControl &control = state->trace.scalar_logs[failure.owner];
+                std::fprintf(
+                    stderr,
+                    "[SWIMLANE_SCALAR_RECORD] owner=%u slot=%u count=%u atomic=%llu poll=%llu dcci=%llu "
+                    "words=[0x%016llx,0x%016llx,0x%016llx,0x%016llx]\n",
+                    failure.owner, failure.index, control.record_count,
+                    static_cast<unsigned long long>(control.atomic_calls),
+                    static_cast<unsigned long long>(control.poll_calls),
+                    static_cast<unsigned long long>(control.dcci_calls),
+                    static_cast<unsigned long long>(record_words[0]),
+                    static_cast<unsigned long long>(record_words[1]),
+                    static_cast<unsigned long long>(record_words[2]),
+                    static_cast<unsigned long long>(record_words[3])
+                );
+            }
+#endif
             continue;
         }
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+        if (!options.swimlane_json.empty() && !WriteSwimlaneJson(*state, options.swimlane_json)) {
+            std::fprintf(stderr, "[FAIL] run=%u could not export swimlane\n", run + 1U);
+            continue;
+        }
+#endif
         ++passes;
+        kernel_times_us.push_back(static_cast<double>(kernel_ms) * 1000.0);
+        const FullPaState &full_pa = FullPaView(*state);
         std::array<uint32_t, g0::kMaxBuilderCount> builder_wins{};
         for (uint32_t task_id = 0U; task_id < options.batches * kHostTasksPerBatch; ++task_id) {
-            const uint32_t builder = state->tasks[task_id].plan.builder_owner - g0::kBuilderOwner;
+            const uint32_t builder = full_pa.tasks[task_id].plan.builder_owner - g0::kBuilderOwner;
             ++builder_wins[builder];
         }
         std::printf(
@@ -2362,7 +3411,28 @@ int main(int argc, char **argv) {
         if (options.builder_count == g0::kMaxBuilderCount) {
             std::printf("/%u", builder_wins[1]);
         }
-        std::printf(" same_device_addresses=yes\n");
+        std::printf(" same_device_addresses=yes kernel_event_us=%.3f\n", static_cast<double>(kernel_ms) * 1000.0);
+    }
+    if (!kernel_times_us.empty()) {
+        std::sort(kernel_times_us.begin(), kernel_times_us.end());
+        long double sum = 0.0L;
+        for (double value : kernel_times_us) {
+            sum += value;
+        }
+        const size_t count = kernel_times_us.size();
+        const double median = count % 2U == 0U ?
+                                  (kernel_times_us[count / 2U - 1U] + kernel_times_us[count / 2U]) / 2.0 :
+                                  kernel_times_us[count / 2U];
+        std::printf(
+            "[PERF] scope=acl_event_kernel_only trace=%s samples=%zu min_us=%.3f median_us=%.3f avg_us=%.3Lf "
+            "max_us=%.3f\n",
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            "on",
+#else
+            "off",
+#endif
+            count, kernel_times_us.front(), median, sum / static_cast<long double>(count), kernel_times_us.back()
+        );
     }
     std::printf(
         "[SUMMARY] G%u builders=%u B%u passes=%u/%u fresh_initialization=yes same_address_reuse=%s\n",
