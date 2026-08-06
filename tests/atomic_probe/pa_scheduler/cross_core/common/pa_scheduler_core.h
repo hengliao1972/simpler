@@ -4249,7 +4249,11 @@ struct SharedExecTicketResult {
     uint32_t task_id;
 };
 
-template <typename Ops>
+// 默认入口继续逐次校验 immutable plan header，供独立协议调用保持
+// fail-closed。正式中央调度只有在 RunSchedulerImpl 已于首张 ticket 前
+// 校验同一 header 后才实例化 PlanHeaderValidated=true；task-id、角色路由、
+// cursor 上界和返回型 Atomic 结果仍逐次检查。
+template <typename Ops, bool PlanHeaderValidated = false>
 PA_DEVICE SharedExecTicketResult TakeSharedExecTicket(
     PA_GM SchedulerState *state, uint32_t worker_id,
     CoreRole role, uint32_t task_count, LocalStats &stats
@@ -4281,15 +4285,17 @@ PA_DEVICE SharedExecTicketResult TakeSharedExecTicket(
             SharedExecTicketStatus::Invalid, UINT32_MAX
         };
     }
-    if (role_task_count > task_count ||
-        state->exec_dispatch.aic_task_count > task_count ||
-        state->exec_dispatch.aiv_task_count > task_count ||
-        state->exec_dispatch.aic_task_count +
-                state->exec_dispatch.aiv_task_count !=
-            state->build_dispatch.executable_task_count) {
-        return SharedExecTicketResult{
-            SharedExecTicketStatus::Invalid, UINT32_MAX
-        };
+    if constexpr (!PlanHeaderValidated) {
+        if (role_task_count > task_count ||
+            state->exec_dispatch.aic_task_count > task_count ||
+            state->exec_dispatch.aiv_task_count > task_count ||
+            state->exec_dispatch.aic_task_count +
+                    state->exec_dispatch.aiv_task_count !=
+                state->build_dispatch.executable_task_count) {
+            return SharedExecTicketResult{
+                SharedExecTicketStatus::Invalid, UINT32_MAX
+            };
+        }
     }
 
     const int64_t observed = TraceAtomicFetchAdd<Ops>(
@@ -4873,25 +4879,33 @@ PA_DEVICE bool ProgressCrossCoreOwnedTokens(
     return true;
 }
 
-template <typename Ops>
+// PlanHeaderValidated 只消除 launch 前一次发布、运行期只读的摘要复核，
+// 不放宽 token/cell/payload/fanin/completion 的动态协议检查。
+template <typename Ops, bool PlanHeaderValidated = false>
 PA_DEVICE uint32_t ProgressCrossCoreExec(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     uint32_t task_count, bool production_closed,
     DrainPlace place, LocalStats &stats
 ) {
     (void)production_closed;
-    if (state == nullptr || worker.core_idx < 0 ||
-        static_cast<uint32_t>(worker.core_idx) >= kWorkers ||
-        task_count == 0 || task_count > kMaxTasks ||
-        state->build_dispatch.task_count != task_count ||
-        state->exec_dispatch.aic_task_count > task_count ||
-        state->exec_dispatch.aiv_task_count > task_count ||
-        state->exec_dispatch.aic_task_count +
-                state->exec_dispatch.aiv_task_count !=
-            state->build_dispatch.executable_task_count ||
-        !CrossCoreExecWorkerMatchesRole(
+    const bool basic_input_valid =
+        state != nullptr && worker.core_idx >= 0 &&
+        static_cast<uint32_t>(worker.core_idx) < kWorkers &&
+        task_count != 0 && task_count <= kMaxTasks &&
+        CrossCoreExecWorkerMatchesRole(
             static_cast<uint32_t>(worker.core_idx), worker.role
-        )) {
+        );
+    bool plan_header_valid = true;
+    if constexpr (!PlanHeaderValidated) {
+        plan_header_valid = basic_input_valid &&
+            state->build_dispatch.task_count == task_count &&
+            state->exec_dispatch.aic_task_count <= task_count &&
+            state->exec_dispatch.aiv_task_count <= task_count &&
+            state->exec_dispatch.aic_task_count +
+                    state->exec_dispatch.aiv_task_count ==
+                state->build_dispatch.executable_task_count;
+    }
+    if (!basic_input_valid || !plan_header_valid) {
         if (state != nullptr && worker.core_idx >= 0 &&
             static_cast<uint32_t>(worker.core_idx) < kWorkers) {
             PublishCrossCoreRuntimeFailure<Ops>(
@@ -4927,7 +4941,7 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             break;
         }
         const SharedExecTicketResult ticket =
-            TakeSharedExecTicket<Ops>(
+            TakeSharedExecTicket<Ops, PlanHeaderValidated>(
                 state, worker_id, worker.role,
                 task_count, stats
             );
@@ -5012,23 +5026,30 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
     return completed_count;
 }
 
+template <bool PlanHeaderValidated = false>
 PA_DEVICE bool CrossCoreExecWorkerDrained(
     PA_GM const SchedulerState *state,
     PA_GM const WorkerState &worker, uint32_t task_count,
     const LocalStats &stats
 ) {
-    if (state == nullptr || worker.core_idx < 0 ||
-        static_cast<uint32_t>(worker.core_idx) >= kWorkers ||
-        task_count > kMaxTasks ||
-        state->build_dispatch.task_count != task_count ||
-        state->exec_dispatch.aic_task_count > task_count ||
-        state->exec_dispatch.aiv_task_count > task_count ||
-        state->exec_dispatch.aic_task_count +
-                state->exec_dispatch.aiv_task_count !=
-            state->build_dispatch.executable_task_count ||
-        !CrossCoreExecWorkerMatchesRole(
+    const bool basic_input_valid =
+        state != nullptr && worker.core_idx >= 0 &&
+        static_cast<uint32_t>(worker.core_idx) < kWorkers &&
+        task_count <= kMaxTasks &&
+        CrossCoreExecWorkerMatchesRole(
             static_cast<uint32_t>(worker.core_idx), worker.role
-        )) {
+        );
+    bool plan_header_valid = true;
+    if constexpr (!PlanHeaderValidated) {
+        plan_header_valid = basic_input_valid &&
+            state->build_dispatch.task_count == task_count &&
+            state->exec_dispatch.aic_task_count <= task_count &&
+            state->exec_dispatch.aiv_task_count <= task_count &&
+            state->exec_dispatch.aic_task_count +
+                    state->exec_dispatch.aiv_task_count ==
+                state->build_dispatch.executable_task_count;
+    }
+    if (!basic_input_valid || !plan_header_valid) {
         return false;
     }
     const uint32_t worker_id =
@@ -5155,7 +5176,7 @@ PA_DEVICE bool ValidateCrossCoreExecTerminalCells(
     );
 }
 
-template <typename Ops>
+template <typename Ops, bool PlanHeaderValidated = false>
 PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     uint32_t task_count, LocalStats &stats,
@@ -5185,7 +5206,7 @@ PA_DEVICE bool ProgressCrossCoreExecDrainClosure(
         static_cast<uint32_t>(worker.block_id) %
         cross_core::kExecDrainArrivalGroups;
     if (!arrived) {
-        if (!CrossCoreExecWorkerDrained(
+        if (!CrossCoreExecWorkerDrained<PlanHeaderValidated>(
                 state, worker, task_count, stats
             ) ||
             !CrossCoreExecAllTokensFullyReset(state, worker_id)) {
@@ -6162,7 +6183,7 @@ PA_DEVICE bool DispatchOneSharedBuildTask(
     if (CrossCoreExecHasLocalProgressWork(
             state, worker_id, role, task_count, stats
         )) {
-        (void)ProgressCrossCoreExec<Ops>(
+        (void)ProgressCrossCoreExec<Ops, true>(
             state, worker, task_count,
             /*production_closed=*/false,
             DrainPlace::EfDrain, stats
@@ -6776,7 +6797,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
             cross_core_exec_ok = false;
         }
         const uint32_t freed = cross_core_exec_ok
-            ? ProgressCrossCoreExec<Ops>(
+            ? ProgressCrossCoreExec<Ops, true>(
                   state, worker, task_count,
                   /*production_closed=*/false,
                   DrainPlace::FinalDrain, stats
@@ -6788,11 +6809,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         // 完成越界 ticket 后才能到达。只有 scanner/token 全部排空的核
         // 才能发布一次携带 owner-local completion 数的到达。
         if (cross_core_exec_ok &&
-            CrossCoreExecWorkerDrained(
+            CrossCoreExecWorkerDrained<true>(
                 state, worker, task_count, stats
             )) {
             cross_core_exec_ok =
-                ProgressCrossCoreExecDrainClosure<Ops>(
+                ProgressCrossCoreExecDrainClosure<Ops, true>(
                     state, worker, task_count, stats,
                     cross_core_drain_arrived,
                     cross_core_drain_closed
@@ -6991,7 +7012,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // 汇总完成 device 级收口。非零表示该轮不能宣称 executor 排空。
     stats.result.final_occupied =
         cross_core_drain_closed &&
-                CrossCoreExecWorkerDrained(
+                CrossCoreExecWorkerDrained<true>(
                     state, worker, task_count, stats
                 ) &&
                 CrossCoreExecAllTokensFullyReset(state, worker_id)

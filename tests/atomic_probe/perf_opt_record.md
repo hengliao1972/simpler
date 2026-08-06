@@ -6786,3 +6786,28 @@ joint 字段的重复写入收敛为每 worker 一次初始化。该改动不依
 最终 kernel `.text` 大小仍为 `0x4a438`，且基线/候选 `.text` 的逐字节 SHA256
 完全相同。CCEC 已自动消除该源码重复；设备指令没有变化，多轮 A/B 没有统计
 意义。因此生产代码完整撤回，详细取证见实现过程 S6.89。
+
+### 15.65 复用入口校验结果消除 Execute 计划头重复读取
+
+host/operator 发布的 Build/Execute dispatch header 在 kernel 运行期不变，
+`RunSchedulerImpl()` 也已在首张 ticket 前校验 task/batch、writer 摘要、
+executable 数和 AIC/AIV 角色数。本轮让正式中央调度热路复用这份
+入口证明，不在每次 Execute progress/ticket/drain 中重读同一摘要；
+默认入口和使用动态 replay 前缀的路径仍完整校验。task id、角色、
+cursor、cell/payload/fanin/token/completion 等动态协议均未放宽。
+
+改动不读取 PA `TaskKind`、固定 DAG、batch/核数或 tensor 形状。
+CPU 故障用例分别破坏 metadata writer 和 Execute role 摘要，两者都在
+Build/AIC/AIV cursor 为 0 时收敛 fatal，96 worker 全部返回。CPU 全回归、
+CCEC perf-clock/full-swimlane 和 A5 B256 全部正确性门槛通过。构建
+继续精确检查两类 ELF 的 finish relocation `4/4` 与 `3/3`。
+perf-clock kernel `.text` 从 `304184 B` 降到 `303160 B`。
+
+12 对交错端到端中，基线/候选中位为 `940.315/942.063 us`，候选
+慢 `0.186%`；均值候选仅快 `0.081%`，且只在 `4/12` 对获胜，因此
+不宣称端到端收益。排除 kernel 与 atomic 后，含 Execute ticket 的
+EfDrain 非 atomic 中位从 `5074` 降到 `4621 cycles`，改善
+`8.93%`；均值改善 `7.06%`。不含 ticket 的中位为
+`2336/2346 cycles`，基本不变，收益与代码位置一致。本轮按“通用
+非 atomic 局部有效、端到端未证明改善”保留，完整数据见实现过程
+S6.90。

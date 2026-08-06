@@ -782,7 +782,14 @@ bool RunSharedBuildFatalPollCadenceTest() {
     return ok;
 }
 
-bool RunInvalidMetadataWriterSummaryRejectedBeforeBuildTest() {
+enum class InvalidImmutablePlanSummary : uint32_t {
+    MetadataWriter = 0,
+    ExecuteRoleCount = 1,
+};
+
+bool RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
+    InvalidImmutablePlanSummary invalid_summary
+) {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
         return false;
@@ -796,11 +803,20 @@ bool RunInvalidMetadataWriterSummaryRejectedBeforeBuildTest() {
     pa_scheduler::host::InitializeState(state, options);
     pa_scheduler::host::ConfigureTrace(state, options, nullptr);
 
-    // build_dispatch header 是 host 在 launch 前发布、device 只读的算子
-    // 通用计划。破坏 union writer 数后，所有 worker 都必须在领取第一张
-    // Build ticket 前终止，避免错误计划产生任何 Materialize/Register 副作用。
-    state->build_dispatch.metadata_writer_count =
-        state->build_dispatch.task_count + 1U;
+    // Build/Execute dispatch header 都是 host 在 launch 前发布、device 只读
+    // 的算子通用计划。无论破坏 writer union 还是 engine role 总数，所有
+    // worker 都必须在领取第一张 ticket 前终止；正式热路随后才可以复用
+    // 这份入口证明，不在每次 progress 中重复读取同一摘要。
+    const char *summary_name = nullptr;
+    if (invalid_summary == InvalidImmutablePlanSummary::MetadataWriter) {
+        state->build_dispatch.metadata_writer_count =
+            state->build_dispatch.task_count + 1U;
+        summary_name = "metadata";
+    } else {
+        state->exec_dispatch.aic_task_count =
+            state->build_dispatch.task_count + 1U;
+        summary_name = "execute-role";
+    }
 
     std::vector<std::thread> workers;
     workers.reserve(kWorkers);
@@ -826,10 +842,13 @@ bool RunInvalidMetadataWriterSummaryRejectedBeforeBuildTest() {
     const bool ok =
         state->fatal.value == 1 &&
         state->build_dispatch.next_task.value == 0 &&
+        state->exec_dispatch.aic_next.value == 0 &&
+        state->exec_dispatch.aiv_next.value == 0 &&
         completed_submits == 0 && all_workers_returned;
     std::printf(
-        "[ORDERED_SUBMIT] invalid_metadata_summary_pre_dispatch=%s "
+        "[ORDERED_SUBMIT] invalid_%s_summary_pre_dispatch=%s "
         "cursor=%lld submits=%llu all_workers_returned=%u\n",
+        summary_name,
         ok ? "PASS" : "FAIL",
         static_cast<long long>(
             state->build_dispatch.next_task.value
@@ -2011,7 +2030,13 @@ int main() {
     const bool build_fatal_poll_cadence_ok =
         RunSharedBuildFatalPollCadenceTest();
     const bool invalid_metadata_summary_ok =
-        RunInvalidMetadataWriterSummaryRejectedBeforeBuildTest();
+        RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
+            InvalidImmutablePlanSummary::MetadataWriter
+        );
+    const bool invalid_exec_summary_ok =
+        RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
+            InvalidImmutablePlanSummary::ExecuteRoleCount
+        );
     const bool task_id_prefix_ok =
         RunSplitReplayTaskIdPrefixTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
@@ -2031,6 +2056,7 @@ int main() {
     if (!claim_accounting_ok || !build_ticket_budget_ok ||
         !build_fatal_poll_cadence_ok ||
         !invalid_metadata_summary_ok ||
+        !invalid_exec_summary_ok ||
         !task_id_prefix_ok || !loser_ok ||
         !output_prepare_ok ||
         !fanin_compaction_ok || !efdrain_skip_ok ||

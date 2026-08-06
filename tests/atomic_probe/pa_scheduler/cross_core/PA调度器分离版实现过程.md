@@ -6424,3 +6424,99 @@ published output、6,528 DCCI 及全部终态断言。
 只会比较同一份机器码的硬件波动，不能产生候选证据。因此本轮不做多轮性能
 统计，生产源码完整恢复，仅保留该静态反例。后续若优化 execution payload，
 必须先证明最终 `.text` 或明确的 GM/atomic/DCCI 动作发生变化。
+
+## 2026-08-06：S6.90 复用入口证明消除 Execute 计划头重复校验
+
+### 通用协议边界
+
+`RunSchedulerImpl()` 在领取首张 Build/Execute ticket 之前，已经对
+host/operator 一次发布、运行期只读的 dispatch header 完成全量校验：
+
+- `task_count` 与 `batch_count` 范围；
+- metadata writer 摘要；
+- `executable_task_count` 上界；
+- AIC/AIV 任务数上界及两者之和。
+
+此前 `ProgressCrossCoreExec()`、`TakeSharedExecTicket()` 以及 FinalDrain
+排空判定仍反复从 GM 读取同一组不变摘要。本轮为这些公共
+入口增加默认为 `false` 的 `PlanHeaderValidated` 编译期合同：
+
+- 独立协议测试和未证明的调用点继续逐次校验；
+- 只有正式中央 Build/Execute 路径在入口校验后使用 `true`；
+- 旧全员 replay 路径传入的是动态前缀，明确保留默认复核；
+- task id、worker role、ticket cursor、cell/payload/fanin/token/completion
+  等运行期状态仍逐次检查。
+
+这个边界只依赖“发布后不变的算子执行计划”，不读取 PA
+`TaskKind`、固定 DAG、batch 数、核数、输出数量或 tensor 形状。
+
+### 错误计划与构建门槛
+
+CPU ordered-Submit 测试新增两类故障注入：分别破坏 metadata
+writer 摘要和 AIC/AIV 角色数摘要。两类都精确满足：
+
+```text
+fatal                         1
+build_dispatch.next_task      0
+exec_dispatch.aic_next        0
+exec_dispatch.aiv_next        0
+completed Submit              0
+96 个 worker                  全部返回
+```
+
+完整 CPU perf-clock 回归通过，包括 ordinary TensorMap ring、随机计划、
+稀疏 writer 严格插入、96-worker Build、execution payload/scan/drain 和
+FinalDrain。CCEC perf-clock/full-swimlane 的 AIC/AIV generic probe、split
+Finish、mixed ELF、manifest 和零残留 relocation 也全部通过。两种构建
+的真实 finish relocation 形状分别为 `4/4` 和 `3/3`，构建门槛
+仍按精确值检查，没有放宽为范围。
+
+perf-clock 最终 kernel `.text` 从 `304184 B` 降到 `303160 B`，
+减少 `1024 B`。A5 B256 real-compute 继续精确闭合 1280 Build、1024
+kernel、256 metadata writer、2048 published output、6528 DCCI 与全部
+host 终态。
+
+### A5 性能证据
+
+冻结提交 `d13d46c0` 的基线 ELF 与候选 ELF，按 B-C/C-B 交错运行
+12 对 `startup begin -> FinalDrain end` 完整周期：
+
+```text
+                         min        median       max         mean
+d13d46c0 基线            920.803     940.315     956.523     939.684 us
+计划头复用候选          912.538     942.063     963.047     938.927 us
+
+独立中位变化：候选慢 1.747 us / 0.186%
+独立均值变化：候选快 0.757 us / 0.081%
+逐对差中位：+7.160 us；候选获胜 4/12
+```
+
+端到端只能判定持平，不宣称整体改善。为排除 kernel 和 atomic
+波动，对精确基线与纠正后候选的 full-swimlane 按每个 EfDrain
+计算 `parent - union(kernel, atomic)`，再按是否实际领取 Execute ticket
+分组：
+
+```text
+EfDrain 类别       基线样本/候选样本    基线非 atomic 中位    候选非 atomic 中位
+含 Execute ticket       672 / 653              5074 cycles           4621 cycles
+不含 Execute ticket     608 / 627              2336 cycles           2346 cycles
+```
+
+含 ticket 路径的非 atomic 中位下降 `453 cycles / 8.93%`，均值从
+`6466.67` 降到 `6010.00 cycles`，下降 `7.06%`；不含 ticket 的中位
+基本不变。虽然两次调度的 ticket 数有所不同，同类样本归一后仍稳定
+指向被修改的 Execute progress 入口。EfDrain 全部 1280 次的非 atomic
+聚合值从 `6321928` 降到 `5914847 cycles`，作为辅助证据，不用它
+代替分组归一结果。FinalDrain 对应非 atomic 聚合仅为
+`75618 -> 76622 cycles`，没有改善。
+
+取证文件不提交：
+
+```text
+基线：outputs/pa_scheduler_cross_core_shared_swimlane_20260806_081402_73408/
+候选：outputs/pa_exec_plan_header_correct_20260806_092808_333989/
+```
+
+本轮按“通用非 atomic 热路局部有效、端到端未证明改善”保留。
+后续不得把 `.text` 变小或单次局部数字改写为整体收益，也不得为扩大
+数字加入 PA 任务类型特判。
