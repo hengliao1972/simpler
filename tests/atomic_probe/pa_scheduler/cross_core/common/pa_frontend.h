@@ -1578,7 +1578,8 @@ PA_DEVICE bool SharedCreateInfoBytes(
 #endif
 
 #if PTO_FDWIC_SHARED_MAP
-template <typename Ops, bool ObserveSharedAtomics = false>
+template <typename Ops, bool ObserveSharedAtomics = false,
+          bool DirectSharedOutputs = false>
 #endif
 PA_DEVICE bool MaterializeTask(
     PA_GM WorkerState &worker, uint32_t task_id, const TaskArgs &args, SubmitContext &context,
@@ -1770,7 +1771,9 @@ PA_DEVICE bool MaterializeTask(
 
     uint64_t output_offset = 0;
     // 各 Output 在同一 task_base 内按参数顺序排布；result 只收集 Output，索引与
-    // TaskArgs 中非输出槽无关，而 payload 仍按原参数 index 保存 descriptor。
+    // TaskArgs 中非输出槽无关。默认入口仍按原参数 index 写 worker payload；
+    // cross-core 的预留后直写实例则直接写 task-indexed shared output cell，
+    // result 指针成为后续 Build 的统一权威来源，避免再复制一遍 128B descriptor。
     for (int32_t index = 0; output_mask != 0; ++index, output_mask >>= 1) {
         if ((output_mask & 1U) == 0) {
             continue;
@@ -1780,14 +1783,24 @@ PA_DEVICE bool MaterializeTask(
 #else
         const uint64_t physical = (task_base + output_offset) % heap_size;
 #endif
+        const uint32_t output_ordinal = context.result.count;
+#if PTO_FDWIC_SHARED_MAP
+        PA_GM TensorDesc *tensor_address =
+            &context.payload->tensors[index];
+        if constexpr (DirectSharedOutputs) {
+            tensor_address = &shared_map.shared_outputs[task_id]
+                                  .tensors[output_ordinal];
+        }
+        PA_GM TensorDesc &tensor = *tensor_address;
+#else
         PA_GM TensorDesc &tensor = context.payload->tensors[index];
+#endif
         if (!InitTensorFromCreateInfo(
                 tensor, *args.tensors[index].pointer.create_info, heap_base + physical, layout.buffer_sizes[index]
             )) {
             return false;
         }
         tensor.owner_task_id = task_id;
-        const uint32_t output_ordinal = context.result.count;
         context.result.tensors[output_ordinal] = &tensor;
         ++context.result.count;
         output_offset += FrontendAlignUp(layout.buffer_sizes[index], kOutputAlignment);

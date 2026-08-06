@@ -200,7 +200,8 @@ static_assert(
 );
 
 #if PTO_FDWIC_SHARED_MAP
-template <typename Ops, typename Observer>
+template <typename Ops, bool FreshOutputsFromResult = false,
+          typename Observer>
 PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
     PA_GM SchedulerState &state, const TaskArgs &args,
     const SubmitContext &context, uint32_t task_id,
@@ -222,6 +223,7 @@ PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
 
     source.gm_tensor_mask = 0;
     source.reference_mask = 0;
+    uint32_t output_ordinal = 0;
 
     for (int32_t index = 0; index < args.tensor_count; ++index) {
         const uint32_t tensor_index = static_cast<uint32_t>(index);
@@ -231,9 +233,20 @@ PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
             if (reference.kind != TensorRefKind::CreateInfo) {
                 return false;
             }
-            // Materialize 已把 fresh Output 放进本 task 的 GM payload。
-            source.tensors[tensor_index].gm_tensor =
-                &context.payload->tensors[tensor_index];
+            if constexpr (FreshOutputsFromResult) {
+                // 原位 Materialize 的 result 指针直接指向最终 shared cell；
+                // 只有显式实例能使用该合同，兼容入口仍从 worker payload 取值。
+                if (output_ordinal >= context.result.count ||
+                    context.result.tensors[output_ordinal] == nullptr) {
+                    return false;
+                }
+                source.tensors[tensor_index].gm_tensor =
+                    context.result.tensors[output_ordinal];
+                ++output_ordinal;
+            } else {
+                source.tensors[tensor_index].gm_tensor =
+                    &context.payload->tensors[tensor_index];
+            }
             source.gm_tensor_mask |= uint32_t{1} << tensor_index;
         } else if (reference.kind == TensorRefKind::SharedOutputRef) {
             const FdwicOutputRef output_ref =
@@ -293,17 +306,22 @@ PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
         }
         source.fanin[static_cast<uint32_t>(edge)] = producer;
     }
+    if constexpr (FreshOutputsFromResult) {
+        return output_ordinal == context.result.count;
+    }
     return true;
 }
 
-template <typename Ops>
+template <typename Ops, bool FreshOutputsFromResult = false>
 PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
     PA_GM SchedulerState &state, const TaskArgs &args,
     const SubmitContext &context, uint32_t task_id,
     PaExecPayloadSource &source
 ) {
     DirectExecObserver<Ops> observer{};
-    return ResolvePaExecPayloadSourceAfterFanin<Ops>(
+    return ResolvePaExecPayloadSourceAfterFanin<
+        Ops, FreshOutputsFromResult
+    >(
         state, args, context, task_id, source, observer
     );
 }

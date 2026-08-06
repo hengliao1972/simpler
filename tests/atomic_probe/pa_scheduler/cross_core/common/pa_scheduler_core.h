@@ -3490,35 +3490,22 @@ PA_DEVICE_NOINLINE void RollbackSharedTaskOutputs(
     }
 }
 
-// 可选时间戳 out-param 只在正式 Materialize 泳道路径传入；单元测试与
-// 其它 helper 继续走默认空指针，不强制携带 LocalStats。
+// 唯一 output publisher 在写 descriptor 前预留全部 writer 控制字。
+// 默认 Publish 仍在内部调用；cross-core 原位构造实例则先显式预留，保证
+// descriptor 尚未覆盖时就能拒绝旧轮残留或非法重复 publisher。
 template <typename Ops, bool ObserveAtomics = false>
-PA_DEVICE bool PublishSharedTaskOutputs(
-    PA_GM SharedTensorMapSidecar &map, const SubmitContext &context,
-    uint32_t task_id, LocalStats *stats = nullptr,
-    uint64_t *copy_begin = nullptr, uint64_t *copy_end = nullptr,
-    uint64_t *flush_begin = nullptr, uint64_t *flush_end = nullptr
+PA_DEVICE bool ReserveSharedTaskOutputWriters(
+    PA_GM SharedTensorMapSidecar &map, uint32_t task_id,
+    uint32_t output_count, LocalStats *stats = nullptr
 ) {
-    if (task_id >= kMaxTasks || context.shared_result.TaskId() != static_cast<int32_t>(task_id) ||
-        context.shared_result.Size() != context.result.count ||
-        context.result.count > kSharedOutputMaxPerTask) {
+    if (task_id >= kMaxTasks ||
+        output_count > kSharedOutputMaxPerTask) {
         return false;
     }
     PA_GM SharedOutputCell &cell = map.shared_outputs[task_id];
-    // 先只预检 builder 私有的 descriptor 地址。A5 Scalar 间没有 cache
-    // coherence，published/last_writer 即使独占 cache line，也不能用普通
-    // GM load 判断跨轮初始化值：前一 kernel 留在本核 DCache 中的旧值可能
-    // 遮住 host H2D 写入的 -1。下面的返回型 FetchMax 与 Exchange 才是
-    // 控制字的权威读取/线性化边界；异常旧值仍会在覆盖 payload 前被拒绝。
-    for (uint32_t output = 0; output < context.result.count; ++output) {
-        PA_GM TensorDesc *source = context.result.tensors[output];
-        if (source == nullptr) {
-            return false;
-        }
-    }
     // task-cell 唯一 winner 使预检到写入之间不存在合法竞争。仍用
     // FetchMax 预留全部 writer 控制字，并在异常旧值时撤回本次已预留项。
-    for (uint32_t output = 0; output < context.result.count; ++output) {
+    for (uint32_t output = 0; output < output_count; ++output) {
         uint64_t retries = 0;
         const int64_t observed =
             TraceConfiguredAtomicFetchMax<Ops, ObserveAtomics>(
@@ -3558,6 +3545,48 @@ PA_DEVICE bool PublishSharedTaskOutputs(
             return false;
         }
     }
+    return true;
+}
+
+// 可选时间戳 out-param 只在正式 Materialize 泳道路径传入；单元测试与
+// 其它 helper 继续走默认空指针，不强制携带 LocalStats。预留后原位构造
+// 实例在编译期跳过 writer reserve 与 descriptor copy，发布/DCCI 不变。
+template <typename Ops, bool ObserveAtomics = false,
+          bool WritersAlreadyReserved = false,
+          bool DescriptorsAlreadyInCell = false>
+PA_DEVICE bool PublishSharedTaskOutputs(
+    PA_GM SharedTensorMapSidecar &map, const SubmitContext &context,
+    uint32_t task_id, LocalStats *stats = nullptr,
+    uint64_t *copy_begin = nullptr, uint64_t *copy_end = nullptr,
+    uint64_t *flush_begin = nullptr, uint64_t *flush_end = nullptr
+) {
+    if (task_id >= kMaxTasks || context.shared_result.TaskId() != static_cast<int32_t>(task_id) ||
+        context.shared_result.Size() != context.result.count ||
+        context.result.count > kSharedOutputMaxPerTask) {
+        return false;
+    }
+    PA_GM SharedOutputCell &cell = map.shared_outputs[task_id];
+    // A5 Scalar 间没有 cache coherence，published/last_writer 即使独占
+    // cache line，也不能用普通 GM load 判断跨轮初始化值。返回型 FetchMax
+    // 仍是预留的权威线性化边界；直写实例只把该边界提前到 descriptor 写入前。
+    for (uint32_t output = 0; output < context.result.count; ++output) {
+        PA_GM TensorDesc *source = context.result.tensors[output];
+        if (source == nullptr) {
+            return false;
+        }
+        if constexpr (DescriptorsAlreadyInCell) {
+            if (source != &cell.tensors[output]) {
+                return false;
+            }
+        }
+    }
+    if constexpr (!WritersAlreadyReserved) {
+        if (!ReserveSharedTaskOutputWriters<Ops, ObserveAtomics>(
+                map, task_id, context.result.count, stats
+            )) {
+            return false;
+        }
+    }
     // 把原先“每 slot copy 后立刻 flush”拆成两段整批动作，便于泳道单独
     // 展示 copy 与 flush；语义不变：全部 desc 写完后再统一 flush，再
     // barrier + published。零输出 task 也保留零时长边界，保证每个
@@ -3574,9 +3603,11 @@ PA_DEVICE bool PublishSharedTaskOutputs(
         *copy_begin = 0;
     }
 #endif
-    for (uint32_t output = 0; output < context.result.count; ++output) {
-        PA_GM TensorDesc *source = context.result.tensors[output];
-        CopyGmTensor(cell.tensors[output], *source);
+    if constexpr (!DescriptorsAlreadyInCell) {
+        for (uint32_t output = 0; output < context.result.count; ++output) {
+            PA_GM TensorDesc *source = context.result.tensors[output];
+            CopyGmTensor(cell.tensors[output], *source);
+        }
     }
 #if !PA_BUILD_TRACE_FREE
     if (copy_end != nullptr || flush_begin != nullptr) {
@@ -4333,7 +4364,7 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
         );
         return false;
     }
-    if (!cross_core::ResolvePaExecPayloadSourceAfterFanin<Ops>(
+    if (!cross_core::ResolvePaExecPayloadSourceAfterFanin<Ops, true>(
             *state, args, context, task_id, source,
             observer
         )) {

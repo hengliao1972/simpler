@@ -446,10 +446,12 @@ AIC 首次执行问题已经解决。当前最直接的 full-swimlane 证据仍�
 正确性、full-swimlane 归因、冻结 A/B 端到端性能。不能只看第一条 kernel
 时间而忽略总周期和共享访问增量。
 
-### 3.2 已排除：在严格 Register 等待中增加有界调度点
+### 3.2 已实测否决：在严格 Register 纯等待中同步执行 kernel
 
-以下内容只保留为方案分析，不属于当前实施计划。用户已经明确否决在长 Build
-或 Register 等待中加入协作式让出点，因此不得据此修改生产代码。
+边界已重新对齐：不允许 kernel 执行过程中让出 Scalar，也不在
+Materialize/Fanin 等实际计算段插调度点；但 Register 确认前序 metadata 尚未
+发布后的纯 Atomic 轮询间隙，可以同步执行一个本核已经持有的 Execute token，
+kernel 与 completion 完成后再返回当前 Build。
 
 #### 基本思路
 
@@ -461,7 +463,7 @@ AIC 首次执行问题已经解决。当前最直接的 full-swimlane 证据仍�
 若 predecessor 已完成:
     继续当前 Build 的 Register
 若尚未完成:
-    只推进本核已经持有的 Execute token
+    每 K 次 pending 轮询只检查一个本核已经持有的 Execute token
     不领取新的 Execute ticket
     再继续轮询 predecessor
 ```
@@ -490,6 +492,22 @@ AIC 首次执行问题已经解决。当前最直接的 full-swimlane 证据仍�
 - 不能在持有已经对其他核可见、但尚未闭合的共享 metadata 临界状态时让出。
   当前最合适的点是“writer delta 已在本地准备完成、前驱尚未 ready、当前 task
   尚未开始 metadata commit”的等待段。
+
+现有 B256 的 1,279 次等待中，pending-load 中位数为 `20`、p75 为 `32`；
+达到 16 次的等待覆盖 `93.6%` 的轮询 load。首轮因此只试 `K=16`，且每次
+轮转检查四个 owner-local token 中的一个，不调用完整 token 扫描器。
+
+该版 CPU、CCEC 与 A5 正确性全部通过，也确实把首个 AIC kernel 从旧证据约
+`113.609 us` 提前到 `56.909 us`。但 826/1024 个 kernel 被搬入 Register
+等待后，前序等待中位从约 `5.647 us` 放大到 `178.413 us`，p95 达
+`344.486 us`；trace-free 端到端从同窗 `996.663 us` 回退到
+`2985.751 us`。
+
+原因是同步 kernel 通常长于触发点之后剩余的 predecessor 等待。kernel 运行
+期间前序即使发布，当前 owner 也不能交出自己的 insert completion，延迟会沿
+严格插入链传播。固定 K 不能预测剩余等待，因此该方向已撤回，不再通过枚举
+阈值延续。否决泳道保存在
+`test_record/2026-8-6/register_wait_exec_k16_rejected.json`。
 
 #### 首轮验收指标
 
@@ -672,3 +690,29 @@ Build 完成后发布到同角色动态 Execute 队列的协议。
 首个 AIC 滞后，必须设计一种协议来改变“task 在 `BUILT` 前就绑定唯一 owner”
 的现状；否则外围常数优化只能改善端到端时间，不能消除 AIC 已 ready 但仍被
 长 Build 阻塞的核心现象。当前接受这一边界，不用协作式让出点强行解决。
+
+## 5. 2026-08-06 补充：Register 后有限机会也已实测否决
+
+在不触碰严格插入链的前提下，又验证了一个比 Register-wait 更克制的候选：
+task N 发布 insert completion 后、Fanin/BUILT 前，推进至多一个已有 token。
+它不领取新 Execute ticket，固定四 token 中选择最老 task，理论上不会把 kernel
+阻塞传播给 N+1 的 Register。
+
+机制按预期工作：B256 泳道有 208 个 kernel 在该机会点完成；但它们全部来自
+常规 EfDrain 的位置迁移，FinalDrain 仍为 122。每个 1280 Build 都新增二次
+split Finish、continuation 交接和 token 扫描，且执行旧 task 会延后当前 task
+的 Fanin/BUILT。6 对冻结反转 A/B 的端到端中位由 `1011.904 us` 回退到
+`1035.376 us`，候选全部六对均更慢。
+
+这进一步收窄了问题边界：既不能在严格 Register 等待中同步执行，也不能在
+Register 后对每个 Build 无条件插入一次检查。后续若继续解决 AIC 提前问题，
+候选必须做到至少一项：
+
+- 只在高置信 ready 且会进入 FinalDrain 的任务上付费；
+- 把机会触发成本从“每 Build”降为“每实际 ready 事件”；
+- 改变 BUILT 前绑定唯一 Execute owner 的协议，使任意空闲同角色 Scalar 能
+  O(1) 取得已发布任务。
+
+在出现这种新协议前，现行实现保持外层 Execute-first，不再恢复两种 Build 内
+检查点。完整实验见
+`PA_Build_Phase_Aware_Execute_Opportunity_Proposal.md`。

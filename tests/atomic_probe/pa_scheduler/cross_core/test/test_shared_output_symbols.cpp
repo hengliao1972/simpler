@@ -828,6 +828,57 @@ void TestPublishAndResolve() {
     );
 }
 
+void TestPreReservedDirectOutputPublication() {
+    auto map = std::make_unique<SharedTensorMapSidecar>();
+    ResetSharedState(*map);
+
+    constexpr uint32_t kTask = 7;
+    SharedOutputCell &cell = map->shared_outputs[kTask];
+    cell.tensors[0] = MakeTensor(0x330000000ULL, kTask);
+    const TensorDesc expected = cell.tensors[0];
+
+    SubmitContext producer{};
+    producer.task_id = static_cast<int32_t>(kTask);
+    producer.result.task_id = kTask;
+    producer.result.count = 1;
+    producer.result.tensors[0] = &cell.tensors[0];
+    producer.shared_result.Reset(static_cast<int32_t>(kTask));
+    Check(
+        producer.shared_result.AddOutputRef(
+            static_cast<int32_t>(kTask), 0
+        ),
+        "direct producer prepares its task-indexed output"
+    );
+
+    Check(
+        ReserveSharedTaskOutputWriters<SymbolTestOps>(
+            *map, kTask, 1
+        ),
+        "direct producer reserves writer control before descriptor construction"
+    );
+    Check(
+        PublishSharedTaskOutputs<
+            SymbolTestOps, false, true, true
+        >(*map, producer, kTask),
+        "pre-reserved in-place descriptor publishes without a second copy"
+    );
+    Check(
+        cell.last_writer[0].value == static_cast<int64_t>(kTask) &&
+            cell.published[0].value == static_cast<int64_t>(kTask),
+        "direct publication preserves writer and publication control"
+    );
+    Check(
+        SameTensor(cell.tensors[0], expected),
+        "direct publication leaves the already-final descriptor unchanged"
+    );
+    Check(
+        !ReserveSharedTaskOutputWriters<SymbolTestOps>(
+            *map, kTask, 1
+        ) && SameTensor(cell.tensors[0], expected),
+        "duplicate pre-reservation fails before overwriting the descriptor"
+    );
+}
+
 void TestPaTwoGroupWriterReadyGate() {
     SchedulerState *state = MapSparseSchedulerState();
     if (state == nullptr) {
@@ -2949,6 +3000,7 @@ int main() {
     TestSharedCompletionPublishesWithoutFrontier();
     TestSharedDrainUsesEntryOccupancySnapshot();
     TestPublishAndResolve();
+    TestPreReservedDirectOutputPublication();
     TestPaTwoGroupWriterReadyGate();
     TestPaWriterIntentPreGateFailuresDoNotPublishGate();
     TestWriterCommitFailuresKeepTerminalEvidence();
