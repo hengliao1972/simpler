@@ -5789,3 +5789,57 @@ ccec/merged_swimlane.json
   理想模拟只用于筛方向，不能替代上板结果。
 
 本阶段仅新增离线分析工具与结论，device code **未修改**。
+
+## 2026-08-06：S6.83 否决 `ld_dev` 预筛严格插入完成字
+
+### 候选协议与正确性边界
+
+S6.82 已确认 Build 释放受严格 Register 链限制。为验证“减少返回型 Atomic
+轮询”能否缩短该链，本阶段只改 task `N` 等待 `N-1` 插入完成字的读取方式：
+
+```text
+完成字布局：每 task 独占 128 B，单写者只做一次 pending -> task_id 发布
+等待者：每个完成字最多一个直接后继 task 的 Register owner
+
+候选读取：
+  ld_dev hint == pending       -> 继续轮询，不据此判定协议状态
+  ld_dev hint != pending       -> 返回型 Atomic Load 复核
+  Atomic == predecessor id     -> ready
+  Atomic 为其他值             -> fatal
+```
+
+因此 `ld_dev` 从未承担 acquire、ready 或损坏值判定；最终协议边界仍由返回型
+Atomic Load 给出。CPU 定向测试覆盖了 pending 等待、发布后唤醒、损坏值和重复
+发布；CCEC perf-clock/full-swimlane 均通过编译、链接和 B256 全部协议断言。
+
+### A5 反例
+
+冻结 `1020735a` 的原始 Atomic 轮询 ELF 与候选 ELF，交错运行得到：
+
+```text
+原始 Atomic： 986.113 us, 993.490 us
+ld_dev 预筛：1223.637 us, 1258.362 us
+```
+
+候选稳定回退约 23%--27%，不是可接受波动。full-swimlane 进一步给出：
+
+```text
+                                      原始 Atomic       ld_dev 预筛
+完整泳道 lifecycle                    1105.275 us       1653.597 us
+Submit makespan 分析窗口                892.326 us       1431.004 us
+逻辑 Atomic 调用                         95,261            37,715
+其中批量 poll 调用                       65,072             7,716
+DCCI 调用                                 6,528             6,528
+Register 累计 core-work                 9.906 ms          40.127 ms
+其中 predecessor wait                   9.549 ms          39.819 ms
+```
+
+候选确实少做约 57.5K 次逻辑 Atomic，却让严格链等待累计膨胀约 4.17 倍并显著
+拉长端到端。这里不能套用“单个 one-shot 地址用 `ld_dev` 预筛有效”的隔离微基准：
+虽然每个完成字只有一个读者，但全局同时存在大量等待不同地址的 Register owner；
+它们持续发射旁路 GM load，缺少 Atomic 路径已有的串行化与流量约束，反而放大
+GM/互连压力。
+
+因此设备、CPU 与测试中的 `ld_dev` 候选代码全部撤回，只保留本节反例。后续不再
+通过替换轮询 primitive 优化这条链；必须减少严格链中的 handoff 数量，或把不需要
+全序的发布语义从该链拆开。
