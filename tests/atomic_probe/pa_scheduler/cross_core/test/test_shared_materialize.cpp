@@ -173,6 +173,41 @@ void TestValidQkMaterialize() {
     );
 }
 
+void TestValidQkDirectSharedMaterialize() {
+    Fixture fixture;
+    Check(
+        MaterializeTask<MaterializeTestOps, false, true>(
+            *fixture.worker, 1, fixture.args, fixture.context,
+            *fixture.map, kSyntheticHeapBase, kHeapBytes,
+            TaskKind::Qk, 0, 0
+        ),
+        "pre-reserved QK output materializes in its final shared cell"
+    );
+
+    const uint64_t bytes =
+        static_cast<uint64_t>(kPaHeads) *
+        kPaBlocksPerRequest * kPaBlockSize * 2;
+    const uint64_t shard_span =
+        SharedHeapAlignDown(kHeapBytes / kSharedHeapShards);
+    TensorDesc &shared = fixture.map->shared_outputs[1].tensors[0];
+    Check(
+        fixture.context.result.count == 1 &&
+            fixture.context.result.tensors[0] == &shared,
+        "direct materialize publishes the final descriptor address in result"
+    );
+    Check(
+        shared.buffer_addr == kSyntheticHeapBase + shard_span &&
+            shared.buffer_size == bytes &&
+            shared.owner_task_id == 1,
+        "direct materialize constructs the exact descriptor in the shared cell"
+    );
+    Check(
+        fixture.payload->tensors[0].buffer_addr == 0 &&
+            fixture.payload->tensors[0].buffer_size == 0,
+        "direct materialize does not create a redundant worker-payload descriptor"
+    );
+}
+
 void TestCheckedShapeAndStride() {
     {
         Fixture fixture;
@@ -309,6 +344,7 @@ void TestHeapAddressOverflowPreflight() {
 
 int main() {
     TestValidQkMaterialize();
+    TestValidQkDirectSharedMaterialize();
     TestCheckedShapeAndStride();
     TestMalformedInputPreflight();
     TestHeapAddressOverflowPreflight();

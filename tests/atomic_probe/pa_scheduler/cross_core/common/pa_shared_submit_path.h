@@ -610,16 +610,35 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     BeginSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
         pmu_context
     );
-    const bool materialized = MaterializeTask<Ops, true>(
-        worker, task_id, args, context, state->shared_map,
-        state->heap_base, state->heap_size,
-        kind, task_meta.batch_start, task_meta.group_index,
-        &stats.trace, &stats.result
-    );
+    // output_count 已由 callback 的 task-kind 形状闭合。先用原有返回型
+    // FetchMax 预留 task-indexed writer 控制字，再允许 Materialize 覆盖
+    // 最终 descriptor cell；这样非法旧轮状态仍在任何 payload 写入前失败。
+    const uint32_t expected_output_count =
+        context.shared_result.Size();
+    const bool output_writers_reserved =
+        ReserveSharedTaskOutputWriters<Ops, true>(
+            state->shared_map, task_id, expected_output_count,
+            &stats
+        );
+    const bool materialized =
+        output_writers_reserved &&
+        MaterializeTask<Ops, true, true>(
+            worker, task_id, args, context, state->shared_map,
+            state->heap_base, state->heap_size,
+            kind, task_meta.batch_start, task_meta.group_index,
+            &stats.trace, &stats.result
+        );
     if (materialized) {
         stats.result.materialized_outputs += context.result.count;
     }
     if (!materialized) {
+        if (output_writers_reserved) {
+            RollbackSharedTaskOutputs<Ops>(
+                state->shared_map.shared_outputs[task_id],
+                expected_output_count,
+                static_cast<int32_t>(task_id), &stats
+            );
+        }
         EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
             pmu_context
         );
@@ -635,6 +654,11 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
             expected_previous,
             static_cast<int32_t>(task_meta.batch_start)
         )) {
+        RollbackSharedTaskOutputs<Ops>(
+            state->shared_map.shared_outputs[task_id],
+            expected_output_count,
+            static_cast<int32_t>(task_id), &stats
+        );
         EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
             pmu_context
         );
@@ -643,7 +667,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     }
 #if PA_BUILD_TRACE_FREE
     const bool task_outputs_published =
-        PublishSharedTaskOutputs<Ops, true>(
+        PublishSharedTaskOutputs<Ops, true, true, true>(
             state->shared_map, context, task_id, &stats
         );
 #else
@@ -654,7 +678,7 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     uint64_t task_outputs_flush_begin = task_outputs_begin;
     uint64_t task_outputs_flush_end = task_outputs_begin;
     const bool task_outputs_published =
-        PublishSharedTaskOutputs<Ops, true>(
+        PublishSharedTaskOutputs<Ops, true, true, true>(
             state->shared_map, context, task_id, &stats,
             &task_outputs_copy_begin, &task_outputs_copy_end,
             &task_outputs_flush_begin, &task_outputs_flush_end
@@ -663,6 +687,11 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         TraceTimestamp<Ops>(stats.trace, stats.result);
 #endif
     if (!task_outputs_published) {
+        // published Exchange 的异常由 helper 原地回滚；若失败来自内部
+        // descriptor/result 合同校验，则整轮立即进入 terminal fatal，残留
+        // writer 控制字只作为错误证据保留，后续不会继续调度或复用本 cell。
+        // 不在这个热函数复制一遍完整 rollback 冷路径，避免只为不可恢复
+        // 错误放大 AIC/AIV 的正常指令工作集。
         EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
             pmu_context
         );
