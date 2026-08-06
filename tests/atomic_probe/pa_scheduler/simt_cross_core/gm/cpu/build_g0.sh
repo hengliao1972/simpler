@@ -16,11 +16,19 @@ SIMT_ROOT="$(cd "$GM_ROOT/.." && pwd)"
 BUILD_DIR="$GM_ROOT/build/cpu"
 SOURCE="$GM_ROOT/test/test_g0_full_pa.cpp"
 CXX_BIN="${CXX:-g++}"
+BUILDER_WARP_COUNT="${SIMT_CROSS_CORE_GM_BUILDER_WARPS:-16}"
+
+if [[ ! "$BUILDER_WARP_COUNT" =~ ^[0-9]+$ ]] ||
+   (( BUILDER_WARP_COUNT < 1 || BUILDER_WARP_COUNT > 64 )); then
+    echo "SIMT_CROSS_CORE_GM_BUILDER_WARPS must be an integer in 1..64." >&2
+    exit 1
+fi
 
 mkdir -p "$BUILD_DIR"
 
 COMMON_FLAGS=(
     -std=c++17 -pthread -Wall -Wextra -Werror
+    "-DSIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT=$BUILDER_WARP_COUNT"
     -I"$GM_ROOT/common"
     -I"$SIMT_ROOT/common"
 )

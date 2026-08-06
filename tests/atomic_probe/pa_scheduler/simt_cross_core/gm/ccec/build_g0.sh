@@ -20,6 +20,12 @@ MODEL_SOURCE="$SIMT_ROOT/common/full_pa_model.h"
 HOST_SOURCE="$SCRIPT_DIR/g0_full_pa_host.cpp"
 SWIMLANE_ACL_CONFIG="$SCRIPT_DIR/g0_swimlane_acl.json"
 G0_VARIANT="${SIMT_CROSS_CORE_G0_VARIANT:-base}"
+BUILDER_WARP_COUNT="${SIMT_CROSS_CORE_GM_BUILDER_WARPS:-16}"
+if [[ ! "$BUILDER_WARP_COUNT" =~ ^[0-9]+$ ]] ||
+   (( BUILDER_WARP_COUNT < 1 || BUILDER_WARP_COUNT > 64 )); then
+    echo "SIMT_CROSS_CORE_GM_BUILDER_WARPS must be an integer in 1..64." >&2
+    exit 1
+fi
 case "$G0_VARIANT" in
     base)
         OUTPUT_TAG="g0"
@@ -133,6 +139,7 @@ mkdir -p "$BUILD_DIR"
 
 COMMON_DEVICE_FLAGS=(
     -c -O3 -g -x cce -Wall -std=c++17
+    "-DSIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT=$BUILDER_WARP_COUNT"
     --cce-aicore-only
     -Wno-logical-op-parentheses
     -Wno-unused-but-set-variable
@@ -155,23 +162,23 @@ COMMON_DEVICE_FLAGS=(
     -I"$SIMT_ROOT/common"
 )
 
-echo "[CHECK] G0/G1 source closure, one/two 16-warp builders and publication order (variant=$G0_VARIANT)"
+echo "[CHECK] GM source closure, 1..8 independent builders, warps/builder=$BUILDER_WARP_COUNT and publication order (variant=$G0_VARIANT)"
 if rg -n '#include.*(cross_core|ops-nn)' "$SIMT_ROOT" -g '*.h' -g '*.cpp'; then
     echo "G0 must not include cross_core or ops-nn source files." >&2
     exit 1
 fi
-if ! grep -Fq 'constexpr uint32_t kBuilderWarpCount = 16U;' "$MODEL_SOURCE" ||
+if ! grep -Fq 'constexpr uint32_t kBuilderWarpCount = SIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kBuilderThreadCount = kBuilderWarpCount * kWarpSize;' "$MODEL_SOURCE" ||
-   ! grep -Fq 'constexpr uint32_t kMaxBuilderCount = 2U;' "$MODEL_SOURCE" ||
+   ! grep -Fq 'constexpr uint32_t kMaxBuilderCount = 8U;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kMaxBuilderThreadCount = kBuilderThreadCount * kMaxBuilderCount;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kBuilderTaskStride = kBuilderWarpCount;' "$MODEL_SOURCE" ||
-   ! rg -q -U 'static_assert\(\s*kBuilderThreadCount == 512U && kBuilderLeaderCount == 16U' "$MODEL_SOURCE" ||
+   ! rg -q -U 'static_assert\(\s*kBuilderWarpCount >= 1U && kBuilderWarpCount <= 64U' "$MODEL_SOURCE" ||
    ! grep -Fq 'const bool active = lane == 0U && warp < kBuilderWarpCount;' "$KERNEL_SOURCE" ||
    ! grep -Fq 'const uint32_t first_assigned_task = builder_instance * kBuilderWarpCount + warp;' "$KERNEL_SOURCE" ||
    ! grep -Fq 'const uint32_t task_stride = builder_count * kBuilderWarpCount;' "$KERNEL_SOURCE" ||
    ! grep -Fq 'task_id = first_assigned_task; task_id < task_count; task_id += task_stride' "$KERNEL_SOURCE" ||
    ! grep -Fq 'cce::dim3{kBuilderThreadCount, 1U, 1U}' "$KERNEL_SOURCE"; then
-    echo "G0/G1 must launch 512 SIMT threads per builder and statically shard tasks across lane 0 of every builder warp." >&2
+    echo "GM must launch the configured SIMT warp count per builder and statically shard tasks across lane 0." >&2
     exit 1
 fi
 if ! grep -Fq 'BuilderCountValid(state->control.builder_count)' "$KERNEL_SOURCE" ||
@@ -180,7 +187,7 @@ if ! grep -Fq 'BuilderCountValid(state->control.builder_count)' "$KERNEL_SOURCE"
    ! grep -Fq 'const uint32_t global_warp = builder_instance * kBuilderWarpCount + warp;' "$KERNEL_SOURCE" ||
    ! grep -Fq 'if (aiv_id >= state->control.builder_count)' "$KERNEL_SOURCE" ||
    ! grep -Fq 'state->control.builder_count, owner' "$KERNEL_SOURCE"; then
-    echo "G0/G1 must keep 512 threads per VF while selecting one or two fixed builder AIVs at runtime." >&2
+    echo "GM must keep the configured threads per VF while selecting 1..8 fixed builder AIVs at runtime." >&2
     exit 1
 fi
 if ! grep -Fq 'if (thread == 0U)' "$KERNEL_SOURCE" ||
@@ -517,6 +524,7 @@ echo "[CHECK] ELF has exact mixed entries/functions/metadata and a $((VECTOR_UB_
 echo "[BUILD] GCC 15 G0 ACL host ($("$GXX15" -dumpfullversion))"
 "$GXX15" -O2 -std=c++17 -Wall -Wextra -Werror \
     -Wno-deprecated-declarations \
+    "-DSIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT=$BUILDER_WARP_COUNT" \
     "${HOST_VARIANT_FLAGS[@]}" \
     -I"$GM_ROOT/common" \
     -I"$SIMT_ROOT/common" \

@@ -59,7 +59,7 @@ struct Options {
 };
 
 constexpr uint32_t kHostTasksPerBatch = 5U;
-constexpr uint32_t kHostBuilderWarpCount = 16U;
+constexpr uint32_t kHostBuilderWarpCount = g0::kBuilderWarpCount;
 constexpr uint32_t kHostWarpThreads = 32U;
 constexpr uint32_t kHostBuilderThreadCount = kHostBuilderWarpCount * kHostWarpThreads;
 constexpr uint32_t kHostMaxBuilderThreadCount = kHostBuilderThreadCount * g0::kMaxBuilderCount;
@@ -3061,7 +3061,9 @@ bool ParseOptions(int argc, char **argv, Options *options) {
             uint64_t value = 0U;
             if (!ParseUnsigned(argv[++index], g0::kMaxBuilderCount, &value) ||
                 !g0::BuilderCountValid(static_cast<uint32_t>(value))) {
-                std::fprintf(stderr, "invalid --builders value: %s (expected 1 or 2)\n", argv[index]);
+                std::fprintf(
+                    stderr, "invalid --builders value: %s (expected 1..%u)\n", argv[index], g0::kMaxBuilderCount
+                );
                 return false;
             }
             options->builder_count = static_cast<uint32_t>(value);
@@ -3080,7 +3082,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
             }
 #endif
         } else {
-            constexpr const char *kBuilderUsage = "1|2";
+            const std::string builder_usage = "1.." + std::to_string(g0::kMaxBuilderCount);
             std::fprintf(
                 stderr,
                 "usage: %s --kernel FILE [--device N] [--batches 1|256] [--runs N] [--builders %s]"
@@ -3088,7 +3090,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
                 " [--swimlane-json FILE] --acl-config FILE"
 #endif
                 "\n",
-                argv[0], kBuilderUsage
+                argv[0], builder_usage.c_str()
             );
             return false;
         }
@@ -3447,13 +3449,13 @@ int main(int argc, char **argv) {
         }
         std::printf(
             "[PASS] run=%u nonce=0x%llx active_tasks=%u kernel_tasks=%u heap_bytes=%llu "
-            "builder_attempts_per_task=%u builder_wins=%u",
+            "builder_attempts_per_task=%u builder_wins=",
             run + 1U, static_cast<unsigned long long>(nonce), options.batches * kHostTasksPerBatch,
             options.batches * 4U, static_cast<unsigned long long>(ExpectedHeapBytes(options.batches)),
-            1U, builder_wins[0]
+            1U
         );
-        if (options.builder_count == g0::kMaxBuilderCount) {
-            std::printf("/%u", builder_wins[1]);
+        for (uint32_t builder = 0U; builder < options.builder_count; ++builder) {
+            std::printf("%s%u", builder == 0U ? "" : "/", builder_wins[builder]);
         }
         std::printf(
             " insert_polls=%llu max_insert_polls=%u same_device_addresses=yes kernel_event_us=%.3f\n",
@@ -3483,8 +3485,8 @@ int main(int argc, char **argv) {
         );
     }
     std::printf(
-        "[SUMMARY] G%u builders=%u B%u passes=%u/%u fresh_initialization=yes same_address_reuse=%s\n",
-        options.builder_count - 1U, options.builder_count, options.batches, passes, options.runs,
+        "[SUMMARY] GM builders=%u B%u passes=%u/%u fresh_initialization=yes same_address_reuse=%s\n",
+        options.builder_count, options.batches, passes, options.runs,
         options.runs > 1U ? "validated" : "not-requested"
     );
     return passes == options.runs ? EXIT_SUCCESS : EXIT_FAILURE;

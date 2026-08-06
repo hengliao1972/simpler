@@ -27,10 +27,9 @@ constexpr uint64_t kTracePoison = UINT64_C(0xD3D3D3D3D3D3D3D3);
 constexpr uint32_t kTraceTaskCapacity = kDefaultBatches * kTasksPerBatch;
 constexpr uint32_t kTraceSimtWriterCount = kMaxBuilderLeaderCount;
 constexpr uint32_t kTraceScalarWriterCount = kOwnerCount;
-// profiling 变体同时覆盖单/双 builder。数组按两个 builder 的最大 writer
-// 数预留；control.simt_writer_count 只记录本次启动的活跃 writer。8192 条
-// 可覆盖每 builder 低至 8 warp 的性能扫描，任意长度 poll 仍合成一条。
-constexpr uint32_t kTraceSimtRecordsPerWriter = 8192U;
+// profiling 变体同时覆盖 1..8 builder。数组按本次构建的最大 writer 数预留；
+// control.simt_writer_count 只记录实际启动的 writer。每 writer 容量按其最多
+// task 数精确推导，避免降低 warp 数时用固定大数组把 sidecar 放大。
 constexpr uint32_t kTraceScalarRecordsPerWriter = 512U;
 constexpr uint32_t kTraceNoTask = UINT32_MAX;
 // 单 builder 是每个 writer 的最坏任务数。当前协议每 task 最多
@@ -40,6 +39,8 @@ constexpr uint32_t kTraceSimtMaxTasksPerWriter =
     (kTraceTaskCapacity + kBuilderWarpCount - 1U) / kBuilderWarpCount;
 constexpr uint32_t kTraceSimtMaxRecordsPerTask = 40U;
 constexpr uint32_t kTraceSimtFixedRecordsPerWriter = 16U;
+constexpr uint32_t kTraceSimtRecordsPerWriter =
+    kTraceSimtMaxTasksPerWriter * kTraceSimtMaxRecordsPerTask + kTraceSimtFixedRecordsPerWriter;
 static_assert(
     kTraceSimtMaxTasksPerWriter * kTraceSimtMaxRecordsPerTask + kTraceSimtFixedRecordsPerWriter <=
         kTraceSimtRecordsPerWriter,

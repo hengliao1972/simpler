@@ -10,7 +10,8 @@
 ### 1.1 目标
 
 使用少量固定 AIV 上的 SIMT 线程构建 PA task，其余 AIC/AIV 只领取并执行
-task。第一版固定 AIV0 为 builder，后续扩展为 AIV0、AIV1 两个 builder。
+task。第一版固定 AIV0 为 builder，随后扩展为 AIV0、AIV1 两个 builder；
+性能阶段继续把占用的 builder AIV 数量作为独立参数，不把 2 当成架构上限。
 builder 与 executor 必须严格分工：
 
 - builder AIV 只构建、发布 task，不执行任何 PA task；
@@ -120,8 +121,8 @@ AIV1..AIV63            观察 BUILT -> Claim -> 执行 AIV task -> DONE
 - AIV owner 保持 `32 + aiv_id`；
 - 单 builder 时 owner 32 对应 AIV0，但该 owner 不持有 execution token；
 - 双 builder 时 owner 32、33 对应 AIV0、AIV1，二者都不持有 token；
-- 单 builder 的 AIV executor 为 AIV1..AIV63；双 builder 时为
-  AIV2..AIV63；AIC executor 数量始终不变；
+- 通用 `B`-builder 配置占用 AIV0..AIV(B-1)，对应 owner `32..32+B-1`；
+  AIV executor 从 AIV-B 开始，数量为 `64-B`，AIC executor 数量始终为 32；
 - host 终态必须分别证明 builder 的执行次数为 0、executor 的构建次数为 0。
 
 AIV0 的 `__aicore__` entry 是工具链要求的 VF 启动壳，不是
@@ -560,6 +561,55 @@ AIV1 executor 同样必须在每次 `BUILT->CLAIMED` 之前检查 fatal，并在
 claim 成功后、读取 payload 前再次检查。第二个窗口若观察到首错，owner33
 必须用精确 CAS 将自己的 `CLAIMED` 恢复为 `BUILT`，不得增加 claim/done
 计数；payload 校验完成到 `DONE` 之前再做一次同样的 fatal 边界检查。
+### 3.11 Direct-GM 多 builder 性能扩展
+
+G1 的“两份完整 VF 竞争同一 task”是双 builder 正确性阶段，不是最终性能
+拓扑。性能路径在已经验证角色互斥、严格 insert 和完整 PA oracle 后采用静态
+唯一分片，并把 builder 数 `B` 参数化：
+
+```text
+builder AIV        = AIV0 .. AIV(B-1)
+logical leader     = builder_instance * 16 + local_warp
+task owner leader  = task_id % (B * 16)
+task stride        = B * 16
+AIV executor count = 64 - B
+```
+
+任意 `B` 下，每个 task 仍只有一个确定 builder writer；相邻 task 映射到不同
+warp，严格 `task[N-1].insert_completion` 链、五类 task、DAG、payload 和
+executor 协议均不改变。增加 builder 的收益来自把 descriptor/payload 构造
+分散到更多物理 AIV，代价是减少 AIV executor，并可能增加严格链上的跨 AIV
+交接与 atomic poll 压力，因此不能只看构建时间或 CAS 数判断最优点。
+
+首轮有界搜索允许 `B=1..8`，每个 builder 固定 16 warp。8 只是控制 CPU/设备
+诊断数组和泳道 sidecar 规模的首轮软件上限，同时仍保留 56 个 AIV executor，
+不是 A5 硬件上限；若端到端最优点落在 8，必须继续扩展边界后才能下结论。
+每个候选先用 trace-off 多轮 event 得到性能，再分别导出不覆盖旧文件、文件名
+包含该候选性能的泳道图；trace-on 数值只解释自身时序。
+
+builder 内活跃 warp 数同样是性能参数，不与 builder 数绑死。源码默认值仍为
+16，构建时只允许通过 `SIMT_CROSS_CORE_GM_BUILDER_WARPS=1..64` 同时覆盖
+CPU、device 和 host；不能只改 kernel launch 后让 host/device ABI 失配。任务
+映射相应改为：
+
+```text
+logical leader     = builder_instance * W + local_warp
+task owner leader  = task_id % (B * W)
+task stride        = B * W
+```
+
+泳道 raw 容量也按 `ceil(1280 / W) * 40 + 16` 条/实际 writer 静态推导，数组
+writer 上界再乘本次 `W * 8`。这既覆盖低 warp 配置，又避免沿用固定 8192 条/
+writer 造成无意义的设备内存膨胀；poll 仍只记录一个区间和精确次数。
+
+2026-08-06 的真实 A5 有界扫描已经得到内部最优点，而不是落在 `B=8` 边界：
+固定 `W=16` 时，B256 的 B=1..8 中位数依次为 6.871、3.748、2.435、
+2.076、2.082、2.118、2.151、2.100 ms，当前选择 `B=4`。固定 `B=4` 时，
+W=8/12/16/24 的中位数为 2.240/2.231/2.076/2.192 ms，当前选择 `W=16`。
+最终同源码 21 轮复测为 2.068 ms。该结论只冻结当前 Direct-GM 首轮最优配置；
+若以后改变 strict insert、payload 构造或 executor 协议，必须重新扫描，不能把
+`B=4,W=16` 写成架构常量。
+
 
 ## 4. 目录与分阶段实施
 
@@ -608,6 +658,7 @@ simt_cross_core/
 | S4 | 多 task、单 builder | task-id 扫描、fanin、token busy 和无遗失。 |
 | G0 | GM 完整 PA | shared TensorMap 主 Case 的五类 task、DAG 和 golden 闭合。 |
 | G1 | AIV0+AIV1 GM | 两 builder 竞争构建；两者仍零 task execute。 |
+| GN | Direct-GM builder 数扫描 | 1..N 个 builder 静态唯一分片，量化构建、poll、AIV executor 损失和端到端最优点。 |
 | U0 | UBUF 单槽探针 | 64 个 warp leader 的 VF→UB、SIMT 直接 GM store、publish 顺序和重复复用正确；明确 `mte3_count=0`。 |
 | U1 | UBUF 多槽/多 task | 纯 SIMT 槽所有权、无提前复用、无覆盖、异常可收口。 |
 | U2 | UBUF 完整 PA | 与 G0 相同 task/DAG/golden，GM 与当前可用的 UBUF 路径长期共存。 |

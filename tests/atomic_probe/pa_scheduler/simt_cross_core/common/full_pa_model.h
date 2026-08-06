@@ -40,12 +40,18 @@ constexpr uint32_t kAivOwnerCount = 64U;
 constexpr uint32_t kOwnerCount = kAicOwnerCount + kAivOwnerCount;
 constexpr uint32_t kBuilderOwner = 32U;
 constexpr uint32_t kDefaultBuilderCount = 1U;
-constexpr uint32_t kMaxBuilderCount = 2U;
+// 首轮多 builder 性能搜索上限，不是硬件或协议上限。8 个 builder 仍保留
+// 56 个 AIV executor；若端到端最优点落在边界，再用真机数据决定是否扩展。
+constexpr uint32_t kMaxBuilderCount = 8U;
 constexpr uint32_t kFirstAivExecutorOwner = kBuilderOwner + 1U;
 constexpr uint32_t kAivExecutorCount = kAivOwnerCount - 1U;
 constexpr uint32_t kExecutorCount = kAicOwnerCount + kAivExecutorCount;
 constexpr uint32_t kWarpSize = 32U;
-constexpr uint32_t kBuilderWarpCount = 16U;
+#ifndef SIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT
+#define SIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT 16U
+#endif
+// 性能扫描可由构建参数覆盖；LAUNCH_BOUND 及 host/device ABI 会随同一宏一起编译。
+constexpr uint32_t kBuilderWarpCount = SIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT;
 constexpr uint32_t kBuilderThreadCount = kBuilderWarpCount * kWarpSize;
 constexpr uint32_t kBuilderLeaderCount = kBuilderWarpCount;
 constexpr uint32_t kMaxBuilderThreadCount = kBuilderThreadCount * kMaxBuilderCount;
@@ -602,15 +608,17 @@ SIMT_CROSS_CORE_G0_MODEL_INLINE uint64_t ExpectedWorkloadOutputPair(TaskKind kin
 
 static_assert(kMainTaskCount == 1280U && kMainKernelTaskCount == 1024U, "main PA task counts changed");
 static_assert(
-    kBuilderThreadCount == 512U && kBuilderLeaderCount == 16U && kBuilderTasksPerLeaderMain == 80U,
-    "G0 builder must use 16 warp leaders from a 512-thread launch"
+    kBuilderWarpCount >= 1U && kBuilderWarpCount <= 64U && kBuilderThreadCount == kBuilderWarpCount * kWarpSize &&
+        kBuilderLeaderCount == kBuilderWarpCount,
+    "GM builder warp count must describe a 1..64 warp, lane0-only launch"
 );
 static_assert(
-    kMaxBuilderThreadCount == 1024U && kMaxBuilderLeaderCount == 32U,
-    "G1 must retain two independent 16-warp builder instances"
+    kMaxBuilderThreadCount == kBuilderThreadCount * kMaxBuilderCount &&
+        kMaxBuilderLeaderCount == kBuilderLeaderCount * kMaxBuilderCount,
+    "GM builder scaling must retain up to eight independent configured-warp instances"
 );
 static_assert(
-    kOwnerCount == 96U && kExecutorCount == 95U && kAicOwnerCount + kAivOwnerCount - kMaxBuilderCount == 94U,
+    kOwnerCount == 96U && kExecutorCount == 95U && kAicOwnerCount + kAivOwnerCount - kMaxBuilderCount == 88U,
     "mixed owner topology changed"
 );
 static_assert(kWorkloadTileBytes == 65536U && kWorkloadBytes == 12713984U, "workload layout changed");

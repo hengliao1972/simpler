@@ -2619,7 +2619,213 @@ task 分片和直接诊断 report store，B256 最佳扫描中位 **3.637 ms**�
 但仍明显高于约 1.5 ms 的 same-core 参考；按用户要求先提交这一版证据和
 可复现状态，再决定是否继续缩短严格 insert 关键链。
 
-## 17. 阶段状态索引
+## 17. 2026-08-06：Direct-GM 的 1～8 Builder 与联合 warp 扫描
+
+### 17.1 本轮目标和边界
+
+用户明确指出：用于 SIMT 调度的 Vector 数量也是可调参数，不能把双 AIV
+builder 当成最终拓扑。因此本轮仍只处理已经功能闭合的 Direct-GM，U2 的
+源码草案完整保留但不继续开发，也不把它混入本轮结论。保持不变的合同包括：
+
+- builder AIV 完全不执行 task，executor AIV 完全不参与构建；
+- 每个 SIMT warp 仍只有 lane0 工作，不回退到 Main Scalar 构建；
+- 每个 task 只有一个静态 writer，五类 task、DAG、payload、strict insert、
+  四 token 执行、fanin、completion 和 final drain 均不改变；
+- 性能只使用 trace-off 的 ACL kernel event；trace-on 只解释自身泳道；
+- 每个性能候选单独保存 JSON，继续拒绝覆盖已有文件。
+
+开始实现前先复查本机 `ops-nn`。`hash/embedding_hash_table_export` 的 arch35
+SIMT kernel 在固定 `LAUNCH_BOUND` 下使用运行时 `dim3{maxThreadNum_}`，
+`init_embedding_hash_table` 也存在独立的实际 thread 数选择，证明活跃 SIMT
+thread 数并非必须等于单一固定值。本阶段没有照抄源码，也没有新增仓间依赖；
+为了让 CPU、device、host、LAUNCH_BOUND、trace 容量和构建清单始终同源，
+先采用构建期参数，而不是临时扩展 PA control ABI。
+
+### 17.2 参数化实现
+
+首轮 builder 数上界从 2 扩到 8。这个 8 只是有界搜索范围，不是 A5 硬件
+上限；B=8 时仍有 56 个 AIV executor。如果最优点落在 B=8，才需要继续
+扩大边界。本轮的实际映射为：
+
+```text
+W = SIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT，默认 16
+logical_leader = builder_instance * W + local_warp
+task_owner = task_id % (B * W)
+task_stride = B * W
+AIV executor count = 64 - B
+```
+
+实现没有复制第三套 kernel：
+
+- `common/full_pa_model.h` 将诊断/host/device builder 上界同步扩到 8，增加
+  `SIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT`，合法范围为 1～64；
+- `gm/cpu/build_g0.sh` 与 `gm/ccec/build_g0.sh` 从
+  `SIMT_CROSS_CORE_GM_BUILDER_WARPS` 读取同一构建值并同步传给所有产物；
+- host、CPU oracle、设备入口和报告校验全部接受 1～8 个 builder；B1/B256
+  winner 分布必须与静态映射精确一致；
+- `run.sh` 新增通用 `build-gm`、`run-gm --builders N`、
+  `build-gm-swimlane` 和 `run-gm-swimlane --builders N`，原有固定 B=1 的
+  G0 与固定 B=2 的 G1 入口继续兼容；
+- profiling 的 SIMT writer 上界随 `8 * W` 推导，每 writer record 容量从
+  固定 8192 改为 `ceil(1280 / W) * 40 + 16`。默认 W=16 时 trace state 为
+  47,025,408 B，生产 state 为 32,007,296 B；连续 poll 仍合并成一个有区间
+  的事件并保留精确次数。
+
+### 17.3 完整构建与静态验证
+
+默认 W=16 的完整入口为：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-gm
+```
+
+它覆盖 CPU optimized 的 B=1..8、B1/B256 和四轮同地址复用，并覆盖
+ASan+UBSan、TSan；随后分别构建 AIC/AIV bitcode、检查 SIMT atomic/fence、
+Scalar DCCI、Vector add/multiply、Cube matmul、drain atomic，最后检查静态
+1:2 mixed ELF、metadata、本地内存预算和 ACL host。W=8、12、24 的 B=4
+候选也分别重新执行了同一完整构建门槛，不能把只改宏后的一次上板当成有效
+性能点。所有构建和静态门槛均通过。
+
+默认 W=16 的 B1 真实 A5 smoke 为 B=1..8 各 1/1 PASS。B1 只有 5 个 task，
+按当前映射都落在 builder0，因此它只证明参数化 launch/oracle 闭合，不用于
+判断多 builder 负载均衡。B256 才是性能与 winner 分布的主口径。
+
+### 17.4 固定 16 warp 的 B=1..8 扫描
+
+设备为 ACL 报告的 `Ascend950PR_958b` device0；环境仍没有
+`npu-smi`/`task-submit`，是用户授权的 unlocked 单卡运行。每组 B256 均为
+11/11 PASS，1280 个 task 都只有一次 builder attempt；表中 poll 为该组
+多轮输出的典型总量，只用于解释趋势，不冒充稳定常量。
+
+| Builder 数 B | AIV executor | builder_wins | insert poll 典型值 | min/us | median/us | avg/us | max/us | 相对 B1 |
+| ------------: | -----------: | ------------ | -------------------: | -----: | --------: | -----: | -----: | -------: |
+| 1 | 63 | 1280 | 约 4.08 万 | 6814.707 | 6871.043 | 6937.757 | 7583.894 | 基线 |
+| 2 | 62 | 640/640 | 约 6.4 万 | 3709.292 | 3747.599 | 3796.482 | 4383.371 | -45.46% |
+| 3 | 61 | 432/432/416 | 约 6.5 万 | 2419.847 | 2435.067 | 2493.910 | 3091.143 | -64.56% |
+| **4** | **60** | **320/320/320/320** | **约 10.3 万** | **2060.366** | **2076.408** | **2135.426** | **2727.320** | **-69.78%** |
+| 5 | 59 | 256/256/256/256/256 | 约 16.8 万 | 2070.682 | 2082.290 | 2137.793 | 2722.898 | -69.69% |
+| 6 | 58 | 224/224/208/208/208/208 | 约 23.5 万 | 2101.184 | 2117.766 | 2178.894 | 2795.951 | -69.18% |
+| 7 | 57 | 192/192/192/176/176/176/176 | 约 30.4 万 | 2142.236 | 2151.302 | 2220.668 | 2828.489 | -68.69% |
+| 8 | 56 | 160/160/160/160/160/160/160/160 | 约 35.4 万 | 2087.441 | 2099.708 | 2158.992 | 2739.923 | -69.44% |
+
+B=4 是明确的内部最优点，不在 B=8 搜索边界，因此本轮没有理由继续占用更多
+Vector。B=1→4 把中位缩短 4,794.635 us；B=4→8 没有继续缩短，反而多
+23.300 us。新增 builder 同时发生三件事：descriptor/payload 构造继续分摊，
+strict insert 仍是一条全局串行链，且每增加一个 builder 就少一个 AIV
+executor。B≥4 后第一项基本饱和，跨 AIV 的前驱轮询和 executor 损失开始抵消
+收益；这也是不能用“SIMT 数翻倍”直接外推墙钟减半的具体数据。
+
+八份对应泳道的 raw 汇总如下。这里的 span 和 atomic 都来自 trace-on，记录
+本身会显著扰动运行，只能对图内事件负责；DCCI 随 builder 增加每次少 20，
+是因为被占作 builder 的 AIV 不再执行 terminal-token 等 Scalar DCCI。
+
+| B | trace-on device span/us | SIMT atomic call | Scalar atomic call | Scalar DCCI call |
+| -: | ----------------------: | ---------------: | -----------------: | ---------------: |
+| 1 | 约 9226 | 58,649 | 2,166,119 | 14,988 |
+| 2 | 约 4986 | 95,647 | 1,098,082 | 14,968 |
+| 3 | 约 4969 | 257,221 | 1,073,236 | 14,948 |
+| 4 | 约 4980 | 411,377 | 1,037,409 | 14,928 |
+| 5 | 约 4994 | 561,001 | 1,018,887 | 14,908 |
+| 6 | 约 4974 | 704,636 | 989,791 | 14,888 |
+| 7 | 约 4981 | 852,415 | 952,284 | 14,868 |
+| 8 | 约 4952 | 991,431 | 923,974 | 14,848 |
+
+### 17.5 固定四 builder 的 warp 联合扫描
+
+只扫 builder 数仍可能把“B=4 最好”与每个 builder 的活跃 warp 数混在一起。
+因此固定 B=4，再对 W=8/12/16/24 做有界扫描；每个点同样 11/11 PASS：
+
+| 每 builder warp W | 每 builder thread | 总 leader | builder_wins | insert poll 典型值 | min/us | median/us | avg/us | max/us | 相对 W16 |
+| -----------------: | ------------------: | ----------: | ------------ | -------------------: | -----: | --------: | -----: | -----: | ---------: |
+| 8 | 256 | 32 | 320/320/320/320 | 约 4.6 万 | 2181.513 | 2239.565 | 2286.970 | 2890.144 | +7.86% |
+| 12 | 384 | 48 | 324/324/320/312 | 约 6.95 万 | 2216.341 | 2230.759 | 2286.503 | 2853.491 | +7.43% |
+| **16** | **512** | **64** | **320/320/320/320** | **约 10.3 万** | **2060.366** | **2076.408** | **2135.426** | **2727.320** | **最优** |
+| 24 | 768 | 96 | 336/320/312/312 | 约 13.2 万 | 2179.024 | 2191.867 | 2252.824 | 2864.483 | +5.56% |
+
+W=8/12 虽然 poll 更少，但用于 descriptor/payload 构造的独立 leader 不足；
+W=24 又产生更多 outstanding strict-insert poll 和 SIMT atomic 压力。W=16
+同时被更低和更高样本包围，因此当前联合最优为 B=4、W=16。W=12/24 的
+1280 task 不能在各 builder 完全均分，winner 分布由静态映射精确解释，并非
+丢 task 或重复构建。
+
+### 17.6 最终复测、泳道与自动校验
+
+恢复默认 W=16 并重新完整构建后，最终生产产物结果为：
+
+| 配置 | 样本 | min/us | median/us | avg/us | max/us | 结果 |
+| ---- | ---: | -----: | --------: | -----: | -----: | ---- |
+| B4/W16，B1 | 5 | 148.926 | 149.701 | 287.256 | 821.506 | 5/5 PASS；首轮 warm-up 821.506 us |
+| B4/W16，B256 | 21 | 2051.269 | **2067.660** | 2096.794 | 2734.328 | 21/21 PASS；每轮 wins=320×4 |
+
+最终 21 轮中位只比扫描轮低 8.748 us（0.42%），说明 2.07 ms 结论可复现。
+当前 Direct-GM 的约 1.5 ms same-core 参考仍有约 0.57 ms 差距，但原双 builder
+阶段的 3.64～3.74 ms 异常 gap 已继续缩到 2.07 ms。下一步若继续优化 GM，
+应针对全局 strict-insert 链、跨 builder publication 与 builder/executor
+重叠找证据，不能靠继续盲加 AIV。
+
+本轮在 `test_record/2026-8-6/` 保存 12 份互不覆盖的泳道：
+
+| 扫描 | trace-off median/us | 文件 |
+| ---- | ------------------: | ---- |
+| B1/W16 | 6871.043 | `gm_b1_b256_warp16_traceoff_6871us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B2/W16 | 3747.599 | `gm_b2_b256_warp16_traceoff_3748us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B3/W16 | 2435.067 | `gm_b3_b256_warp16_traceoff_2435us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B4/W16 扫描轮 | 2076.408 | `gm_b4_b256_warp16_traceoff_2076us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B5/W16 | 2082.290 | `gm_b5_b256_warp16_traceoff_2082us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B6/W16 | 2117.766 | `gm_b6_b256_warp16_traceoff_2118us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B7/W16 | 2151.302 | `gm_b7_b256_warp16_traceoff_2151us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B8/W16 | 2099.708 | `gm_b8_b256_warp16_traceoff_2100us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B4/W8 | 2239.565 | `gm_b4_b256_warp8_traceoff_2240us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B4/W12 | 2230.759 | `gm_b4_b256_warp12_traceoff_2231us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B4/W24 | 2191.867 | `gm_b4_b256_warp24_traceoff_2192us_atomic_dcci_per_builder_clock_swimlane.json` |
+| B4/W16 最终复测 | 2067.660 | `gm_b4_b256_warp16_traceoff_2068us_bounded_trace_capacity_atomic_dcci_per_builder_clock_swimlane.json` |
+
+最后一份新图没有覆盖扫描轮 W16 图。它的 trace-on ACL event 为
+5526.665 us、Scalar device span 为 4927.921 us，SIMT/Scalar atomic call
+分别为 408,502/1,044,639，DCCI 为 14,928 次/行。文件名中的 2068 us 来自
+独立 trace-off 21 轮中位，不是 trace-on 数值。
+
+12 份图全部用 `jq` 自动核验：schema 均为
+`simt_cross_core_g0_swimlane_v4`；每份 builder clock span 数与文件中的 B
+一致；每份都有 6400 个 SIMT build 完整区间和 1024 个 task_execute；零/负
+区间为 0；逐 task 检查 execute 早于自身 ordered_insert 结束的违规为 0。
+
+### 17.7 复现命令与阶段结论
+
+默认最优配置的生产复现命令为：
+
+```bash
+SIMT_CROSS_CORE_GM_BUILDER_WARPS=16 \
+  tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-gm
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-gm --builders 4 --device 0 --batches 256 --runs 21
+```
+
+warp 候选必须先按相同值重建，例如：
+
+```bash
+SIMT_CROSS_CORE_GM_BUILDER_WARPS=8 \
+  tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-gm
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-gm --builders 4 --device 0 --batches 256 --runs 11
+```
+
+泳道使用同一 warp 构建参数和独立输出名：
+
+```bash
+SIMT_CROSS_CORE_GM_BUILDER_WARPS=16 \
+  tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-gm-swimlane
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-gm-swimlane --builders 4 --device 0 --batches 256 --runs 1 \
+  --swimlane-json <新的、不重复的输出文件名>
+```
+
+阶段结论：**当前 Direct-GM 首轮有界最优配置为 4 个 builder AIV、每个
+16 warp/512 thread，B256 trace-off 中位 2.068 ms。** B=4 与 W=16 都是
+内部最优点，不是搜索边界；这是一份有真实 A5 功能 oracle、完整构建门槛和
+独立泳道支撑的当前结论。U2 仍保持进行中，本阶段没有把它写成完成。
+
+## 18. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -2633,6 +2839,7 @@ task 分片和直接诊断 report store，B256 最佳扫描中位 **3.637 ms**�
 | A1 warp 推进语义 | 完成 | CPU 三套和 CCEC/ELF 门槛 PASS；A5 同地址复用 100/100，SameWarp 始终 T/S+disjoint，CrossWarp 始终 S/S+overlap。 |
 | G0 GM 完整 PA | 完成 | 16-warp/lane0 纯 SIMT 构建；CPU 三套与 CCEC/ELF 门槛 PASS；A5 B1/B256 功能闭合；原始 64-warp B256 trace-off 中位约 15.0 ms。 |
 | G1 双 builder GM | 完成 | 双 VF 各 512-thread/16-warp/lane0 静态唯一分片；B256 trace-off 中位 3.637 ms；五组独立 v4 atomic/DCCI 泳道已保存。 |
+| GN 多 builder GM 扫描 | 完成 | B=1..8 与 B4/W=8/12/16/24 全部通过 CPU 三套、CCEC/ELF、A5 B1/B256 oracle；当前 B4/W16 最优，B256 最终 21 轮中位 2.068 ms；12 份独立 v4 泳道已保存并通过计数/因果校验。 |
 | U0 UBUF 单槽 | 完成 | 64-warp/lane0 纯 SIMT 单槽；CPU 三套、CCEC/ELF 门槛和 A5 同地址 100/100 全部 PASS；G0/G1 四组真机回归 PASS。 |
 | U1 UBUF 多槽/多 task | 完成 | 本提交；CPU 三套、CCEC/bitcode/mixed ELF 门槛全部 PASS；A5 smoke 1/1 与同地址复用 100/100，四槽 `maxbusy=4`、每槽 generation `0..31`精确闭合。 |
 | U2 UBUF 完整 PA | 未开始 | - |

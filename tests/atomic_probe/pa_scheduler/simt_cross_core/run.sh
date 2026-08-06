@@ -50,10 +50,14 @@ Usage:
   ./run.sh run-g0 [--device N] [--batches 1|256] [--runs N]
   ./run.sh build-g1
   ./run.sh run-g1 [--device N] [--batches 1|256] [--runs N]
+  ./run.sh build-gm
+  ./run.sh run-gm --builders 1..8 [--device N] [--batches 1|256] [--runs N]
   ./run.sh build-g0-swimlane
   ./run.sh run-g0-swimlane [--device N] [--batches 1|256] --runs 1 --swimlane-json FILE
   ./run.sh build-g1-swimlane
   ./run.sh run-g1-swimlane [--device N] [--batches 1|256] --runs 1 --swimlane-json FILE
+  ./run.sh build-gm-swimlane
+  ./run.sh run-gm-swimlane --builders 1..8 [--device N] [--batches 1|256] --runs 1 --swimlane-json FILE
   ./run.sh build-u0
   ./run.sh run-u0 [--device N] [--runs N]
   ./run.sh build-u1
@@ -79,10 +83,14 @@ run-g0 先做 A5 precheck、构建清单校验和 600 秒有界运行，再由 5
 build-g1 复用同一份参数化源码，验证单/双 builder CPU 模型并重建完整 PA CCEC/ELF/ACL host。
 run-g1 执行 AIV0+AIV1 两个独立 VF：各 512 SIMT thread/16 个 lane0 leader，按 task-id 静态分片，
 每个 task 只有一个固定 builder；其余 94 个 AIC/AIV owner 只执行完整 PA DAG，每个 warp 仍严格只有 lane0 工作。
+build-gm 在同一份源码上验证 1..8 个 builder，并重建通用 GM 产物。
+run-gm 显式接收 --builders N；AIV0..AIV(N-1) 只构建，剩余 AIV 只执行，task 在 N*16 个 leader 间唯一分片。
 build-g0-swimlane 构建与生产 G0 分离的 profiling 变体；builder/executor 按 task 写独立 cache line。
 run-g0-swimlane 在真实 A5 上导出 Chrome Trace JSON；该数据用于观察时序，性能结论使用关闭埋点的 run-g0。
 build-g1-swimlane 复用同一 profiling 源码并验证双 builder trace 容量与 writer 映射。
 run-g1-swimlane 导出 AIV0+AIV1 双 builder Chrome Trace JSON；性能结论使用关闭埋点的 run-g1。
+build-gm-swimlane 构建覆盖 1..8 builder writer 上界的 profiling 产物。
+run-gm-swimlane 显式接收 --builders N，并为对应 N-builder 配置导出一份不覆盖旧文件的泳道图。
 build-u0 运行 UBUF 单槽 CPU 三套测试，并构建、静态检查 U0 CCEC/bitcode/mixed ELF/ACL host。
 run-u0 在真实 A5 上验证 AIV0 的 64 个 lane0 leader 竞争单个 UBUF slot，由同一
 SIMT leader 读回 UBUF 并直接写 GM；AIV1 Scalar 只执行，mte3_count 必须为 0。
@@ -254,7 +262,7 @@ case "$ACTION" in
         "$GM_BUILD/simt_cross_core_s4_host" \
             --kernel "$GM_BUILD/simt_cross_core_s4_kernel.o" "$@"
         ;;
-    build-g0|build-g1)
+    build-g0|build-g1|build-gm)
         if [[ $# -ne 0 ]]; then
             echo "$ACTION does not accept additional arguments." >&2
             exit 1
@@ -262,7 +270,7 @@ case "$ACTION" in
         "$GM_ROOT/cpu/build_g0.sh"
         "$GM_ROOT/ccec/build_g0.sh"
         ;;
-    build-g0-swimlane|build-g1-swimlane)
+    build-g0-swimlane|build-g1-swimlane|build-gm-swimlane)
         if [[ $# -ne 0 ]]; then
             echo "$ACTION does not accept additional arguments." >&2
             exit 1
@@ -286,11 +294,15 @@ case "$ACTION" in
         "$UBUF_ROOT/cpu/build_u1.sh"
         "$UBUF_ROOT/ccec/build_u1.sh"
         ;;
-    run-g0|run-g1)
+    run-g0|run-g1|run-gm)
         full_pa_stage="${ACTION#run-}"
-        full_pa_builders=1
+        full_pa_fixed_builder_args=(--builders 1)
+        full_pa_builder_arg_required=0
         if [[ "$ACTION" == "run-g1" ]]; then
-            full_pa_builders=2
+            full_pa_fixed_builder_args=(--builders 2)
+        elif [[ "$ACTION" == "run-gm" ]]; then
+            full_pa_fixed_builder_args=()
+            full_pa_builder_arg_required=1
         fi
         if [[ ! -x "$GM_BUILD/simt_cross_core_g0_host" ||
               ! -s "$GM_BUILD/simt_cross_core_g0_kernel.o" ||
@@ -304,6 +316,7 @@ case "$ACTION" in
         fi
         require_a5_access "${full_pa_stage^^}"
         full_pa_device_args=()
+        full_pa_builder_arg_seen=0
         for argument in "$@"; do
             case "$argument" in
                 --kernel|--kernel=*)
@@ -311,8 +324,11 @@ case "$ACTION" in
                     exit 1
                     ;;
                 --builders|--builders=*)
-                    echo "$ACTION fixes --builders=$full_pa_builders; do not override the stage topology." >&2
-                    exit 1
+                    if [[ "$full_pa_builder_arg_required" -eq 0 ]]; then
+                        echo "$ACTION fixes its builder count; use run-gm for an explicit 1..8 builder scan." >&2
+                        exit 1
+                    fi
+                    full_pa_builder_arg_seen=1
                     ;;
                 --device|--device=*)
                     if [[ -n "${TASK_DEVICE:-}" ]]; then
@@ -322,37 +338,57 @@ case "$ACTION" in
                     ;;
             esac
         done
+        if [[ "$full_pa_builder_arg_required" -eq 1 && "$full_pa_builder_arg_seen" -ne 1 ]]; then
+            echo "run-gm requires an explicit --builders N value in 1..8." >&2
+            exit 1
+        fi
         if [[ -n "${TASK_DEVICE:-}" ]]; then
             full_pa_device_args=(--device "$TASK_DEVICE")
         fi
         timeout --foreground 600s "$GM_BUILD/simt_cross_core_g0_host" \
-            --kernel "$GM_BUILD/simt_cross_core_g0_kernel.o" --builders "$full_pa_builders" \
+            --kernel "$GM_BUILD/simt_cross_core_g0_kernel.o" "${full_pa_fixed_builder_args[@]}" \
             "${full_pa_device_args[@]}" "$@"
         ;;
-    run-g0-swimlane|run-g1-swimlane)
-        swimlane_builders=1
-        swimlane_stage=0
+    run-g0-swimlane|run-g1-swimlane|run-gm-swimlane)
+        swimlane_fixed_builder_args=(--builders 1)
+        swimlane_builder_arg_required=0
+        swimlane_label="G0"
+        swimlane_build_action="build-g0-swimlane"
         if [[ "$ACTION" == "run-g1-swimlane" ]]; then
-            swimlane_builders=2
-            swimlane_stage=1
+            swimlane_fixed_builder_args=(--builders 2)
+            swimlane_label="G1"
+            swimlane_build_action="build-g1-swimlane"
+        elif [[ "$ACTION" == "run-gm-swimlane" ]]; then
+            swimlane_fixed_builder_args=()
+            swimlane_builder_arg_required=1
+            swimlane_label="GM"
+            swimlane_build_action="build-gm-swimlane"
         fi
         if [[ ! -x "$GM_BUILD/simt_cross_core_g0_swimlane_host" ||
               ! -s "$GM_BUILD/simt_cross_core_g0_swimlane_kernel.o" ||
               ! -s "$G0_SWIMLANE_BUILD_MANIFEST" ]]; then
-            echo "G$swimlane_stage swimlane artifacts are missing; run: $0 build-g$swimlane_stage-swimlane" >&2
+            echo "$swimlane_label swimlane artifacts are missing; run: $0 $swimlane_build_action" >&2
             exit 1
         fi
         if ! (cd "$SCRIPT_DIR" && sha256sum --check --status "$G0_SWIMLANE_BUILD_MANIFEST"); then
             echo "G0 swimlane sources and runtime artifacts do not match the successful-build manifest; rebuild it." >&2
             exit 1
         fi
-        require_a5_access "G$swimlane_stage swimlane"
+        require_a5_access "$swimlane_label swimlane"
         full_pa_device_args=()
+        swimlane_builder_arg_seen=0
         for argument in "$@"; do
             case "$argument" in
-                --kernel|--kernel=*|--builders|--builders=*|--acl-config|--acl-config=*)
-                    echo "$ACTION fixes its kernel, --builders=$swimlane_builders and ACL stack config; do not override them." >&2
+                --kernel|--kernel=*|--acl-config|--acl-config=*)
+                    echo "$ACTION fixes its kernel and ACL stack config; do not override them." >&2
                     exit 1
+                    ;;
+                --builders|--builders=*)
+                    if [[ "$swimlane_builder_arg_required" -eq 0 ]]; then
+                        echo "$ACTION fixes its builder count; use run-gm-swimlane for an explicit 1..8 builder trace." >&2
+                        exit 1
+                    fi
+                    swimlane_builder_arg_seen=1
                     ;;
                 --device|--device=*)
                     if [[ -n "${TASK_DEVICE:-}" ]]; then
@@ -362,11 +398,15 @@ case "$ACTION" in
                     ;;
             esac
         done
+        if [[ "$swimlane_builder_arg_required" -eq 1 && "$swimlane_builder_arg_seen" -ne 1 ]]; then
+            echo "run-gm-swimlane requires an explicit --builders N value in 1..8." >&2
+            exit 1
+        fi
         if [[ -n "${TASK_DEVICE:-}" ]]; then
             full_pa_device_args=(--device "$TASK_DEVICE")
         fi
         timeout --foreground 600s "$GM_BUILD/simt_cross_core_g0_swimlane_host" \
-            --kernel "$GM_BUILD/simt_cross_core_g0_swimlane_kernel.o" --builders "$swimlane_builders" \
+            --kernel "$GM_BUILD/simt_cross_core_g0_swimlane_kernel.o" "${swimlane_fixed_builder_args[@]}" \
             --acl-config "$G0_SWIMLANE_ACL_CONFIG" \
             "${full_pa_device_args[@]}" "$@"
         ;;

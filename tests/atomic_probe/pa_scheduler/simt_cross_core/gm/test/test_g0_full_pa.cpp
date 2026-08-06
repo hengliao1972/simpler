@@ -2483,10 +2483,10 @@ int main(int argc, char **argv) {
         }
     }
     std::printf(
-        "[PASS] G0 CPU complete: builders=1/2, B1/B256, 16 leaders/builder, unique build claim, "
+        "[PASS] GM CPU complete: builders=1..8, B1/B256, leaders/builder=%u, unique build claim, "
         "8-shard heap, exact DAG/payload, 4-token tickets, fanin/completion/drain/tail, "
         "same-address reuse rounds=%u\n",
-        rounds
+        kBuilderLeaderCount, rounds
     );
     return EXIT_SUCCESS;
 }
