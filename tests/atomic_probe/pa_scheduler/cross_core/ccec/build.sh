@@ -215,11 +215,12 @@ SPLIT_STATE_STORAGE_BYTES=1728
 # CPU 动态协议测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
 # 内联/删除，又不把 CCEC 对等尾部的有益合并误判成覆盖缺失。
 # execution plan header 在 worker 入口校验后，shared startup 允许 Build
-# 先行并在全员到达后开放 Execute。CCEC 当前将 perf-clock AIC 的一个
-# 等价 Finish 尾部合并，AIV 仍保留四处；readelf 逐条确认 relocation
+# 先行并在全员到达后开放 Execute。FinalDrain 的 fatal 轮询相位按 worker
+# 错开后，CCEC 当前保留 perf-clock AIC 三处、AIV 四处等价 Finish 尾部；
+# readelf 逐条确认 relocation
 # 只指向本角色唯一 finish。任务种类覆盖继续由 dispatch、CPU 动态协议
 # 门槛和 A5 finish_calls 精确终态共同证明，不能把精确值放宽成范围。
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=2
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=3
 SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=4
 # full-swimlane AIC/AIV 当前分别生成三个等价 finish 出口。readelf
 # 逐条确认这些 relocation 都只

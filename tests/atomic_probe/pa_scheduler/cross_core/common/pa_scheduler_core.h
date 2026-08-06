@@ -6852,7 +6852,11 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     bool cross_core_exec_ok = true;
     bool cross_core_drain_arrived = false;
     bool cross_core_drain_closed = false;
-    uint32_t final_fatal_poll_iterations = 0;
+    // 各 worker 使用不同的轮询相位，避免正常路径进入 FinalDrain 时同时
+    // 对同一 global-fatal 地址发起返回型 Atomic。任一仍滞留在 drain 中的
+    // worker 最迟在 255 轮内完成首次观察，之后仍保持每 256 轮一次的既有
+    // 有界错误收敛；这里不依赖 task kind、DAG 或具体 worker 总数。
+    uint32_t final_fatal_poll_iterations = worker_id & 255U;
     uint32_t final_watchdog_polls = 0;
     const uint64_t final_watchdog_begin = Ops::Now();
     while (true) {
@@ -6864,8 +6868,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 ) >= static_cast<int64_t>(state->config.workers);
         }
         // 错误只需最终可见，不为成功路径的每次 progress 付出同地址返回型
-        // Atomic。第 0 轮立即检查，随后每 256 轮检查一次；命中后本核 token
-        // 进入 Faulted 并结束。正常成功路径由执行排空到达证明完整性。
+        // Atomic。各 worker 的首次检查按 owner-local 相位错开，随后每 256
+        // 轮检查一次；命中后本核 token 进入 Faulted 并结束。正常成功路径
+        // 由执行排空到达证明完整性。
         if (cross_core_exec_ok &&
             ((final_fatal_poll_iterations++ & 255U) == 0U) &&
             ObserveCrossCoreFinalDrainFatal<Ops>(

@@ -6972,3 +6972,76 @@ S6.96 候选              823.210     835.266     852.739    835.822 us
 候选正确性、真实后端、端到端收益和算子泛化边界均闭合，正式保留。当前权威
 中位距 `0.8 ms` 目标仍约 `35.3 us`；后续继续优化公共调度协议，不得通过
 减少参与者、识别 PA task kind 或放宽 TensorMap 严格插入达标。
+
+## S6.97 FinalDrain fatal 轮询按 worker 错相
+
+### 问题与通用协议判断
+
+S6.96 最新 B256 full-swimlane 显示，FinalDrain 入口有 96 条
+`atomic.poll_batch.fatal_poll.load×1`。它们聚合占 `5577.564 us` core-time，
+单核平均 `58.100 us`、最大 `164.327 us`。这些区间是 96 个 worker 同时读取
+同一个 scheduler-fatal 地址形成的争用包络；该读取只确认正常路径没有错误，
+不承担 TensorMap 插入、Build/Execute 唯一领取、payload 发布或 kernel
+completion 的顺序语义。
+
+不能直接删除 FinalDrain 最终观察：若某核持有无法完成的 token，它仍必须看到
+其他子系统发布的 scheduler fatal，并将本地 token 转为 `FAULTED`。本阶段只把
+所有 worker 同相位的计数器改成 `worker_id & 255` 初值。每核仍以 256 轮为周期，
+最晚 255 轮内完成第一次观察；只有正常快速收口路径省掉无意义的同步读取。
+
+该候选完全位于公共 cross-core FinalDrain 状态机，不读取 PA `TaskKind`、固定
+DAG、batch、worker 总数、输出形状或 tensor 数量。严格 metadata writer
+completion 链、中央 Build/Execute ticket、payload DCCI、fanin、completion 与
+2 秒 watchdog 全部不变，因此可以泛化到使用同一调度合同的其他算子。
+
+### 正确性与真实后端门槛
+
+- cross-core CPU perf-clock 全构建通过；`remote_fatal_cadence_closure` 证明只
+  发布 scheduler fatal、不伪造 `exec_fatal` 时，所有 worker 仍能有界退出；
+- CCEC perf-clock/full-swimlane 的 AIC/AIV、generic probe、split Finish、mixed
+  ELF、manifest 与零 relocation 门槛通过；perf-clock 的真实 Finish relocation
+  为 `3/4`，full-swimlane 保持 `3/3`；
+- A5 B1 scalar-nop 和 B256 real-compute `6,28,4,1` 的 1,280 Build、1,024
+  kernel、256 metadata writer、2,048 output、6,528 DCCI、严格 writer history、
+  fatal 与 FinalDrain 终态全部 PASS；
+- perf-clock 最终 ELF `.text` 从 `0x3d338` 降到 `0x3ca38`，减少 `0x900 =
+  2304 B`。
+
+最新 B256 full-swimlane 位于：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260806_133114_829489/ccec/
+```
+
+与 S6.96 的同类泳道相比：
+
+```text
+FinalDrain fatal PollBatch ×1       96 -> 1
+direct fatal return-ready           157 -> 154（运行时波动，不作为改动目标）
+Build / kernel / metadata writer    1280 / 1024 / 256（不变）
+published output / DCCI             2048 / 6528（不变）
+raw trace drops                     0
+```
+
+这里的 `96 -> 1` 与源码相位修改直接对应；PollBatch 是轮询 episode，不能把其
+持续时间解释成单条 Atomic 指令延迟。
+
+### 冻结交错 A/B 与结论
+
+冻结 S6.96 与候选，先执行 6 对基线→候选，再执行 6 对候选→基线；两边各自使用
+独立 perf-clock host/kernel，统一统计最早 startup 到最后 FinalDrain 结束：
+
+```text
+                         min        median       max        mean
+S6.96 基线              828.967     835.004     844.746    835.089 us
+S6.97 候选              819.636     825.133     842.307    827.799 us
+
+独立中位改善：9.870 us / 1.182%
+独立均值改善：7.290 us / 0.873%
+配对改善中位：11.262 us
+候选获胜：9/12
+```
+
+候选同时通过算子泛化、错误收敛、真实 CCEC、严格插入与端到端收益门槛，正式
+保留。当前权威中位距 `0.8 ms` 目标约 `25.1 us`；下一阶段继续审视公共协议，
+不得用 PA task 形状或减少参与 worker 来达标。

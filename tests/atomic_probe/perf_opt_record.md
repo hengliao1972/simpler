@@ -6924,3 +6924,26 @@ kernel、6,528 DCCI 和全部终态保持。CPU 全回归、CCEC 两类构建、
 `3.129%`，却连续三次破坏 CPU independent-overlap 门槛，因泛化风险撤回。
 最终保留项不改变算子语义和 TensorMap
 顺序，按“通用协议消冗且端到端收益已证明”保留；完整依据见实现过程 S6.96。
+
+### 15.72 FinalDrain fatal 轮询按 worker 错相
+
+S6.96 的 B256 full-swimlane 中，96 个 worker 在 FinalDrain 第 0 轮同时读取
+同一 scheduler-fatal 地址，形成 96 条
+`atomic.poll_batch.fatal_poll.load×1`；聚合 core-time 为 `5577.564 us`。
+该读取只观察终止状态，不承担 TensorMap 严格插入、Build/Execute 唯一领取、
+payload/DCCI 或 completion 的顺序职责。
+
+候选不删除最终错误观察，而是以 `worker_id mod 256` 设置每核轮询初始相位；
+每核继续每 256 轮观察一次，持有未完成 token 的 owner 最晚 255 轮内看到错误，
+本核错误发布和 2 秒 watchdog 不变。公共实现不读取 PA `TaskKind`、固定 DAG、
+batch、核数或输出形状，因此不是算子特例。
+
+CPU 全回归、远端 fatal 定向闭合、CCEC 两类构建及 A5 B1/B256 全部门槛通过。
+B256 泳道中的上述 FinalDrain 轮询由 `96` 条降为 `1` 条，同时保持 1,280 Build、
+1,024 kernel、256 metadata writer、2,048 output、6,528 DCCI 与严格 writer
+history。perf-clock `.text` 从 `0x3d338` 降至 `0x3ca38`，减少 `2304 B`。
+
+冻结 12 对 startup→FinalDrain 交错 A/B 中，基线/候选中位为
+`835.004/825.133 us`，改善 `9.870 us / 1.182%`；均值改善 `0.873%`，配对
+改善中位 `11.262 us`，候选胜 `9/12`。正确性、泛化边界、直接因果和端到端
+收益均闭合，正式保留；详细证据见实现过程 S6.97。

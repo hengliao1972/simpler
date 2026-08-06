@@ -2186,3 +2186,34 @@ B256 泳道中启动原子为 96 次 `startup_increment` 和 122 次机会式
 Atomic，而是让原先的等待时间承载 Build 工作。1,280 Build、1,024 kernel、
 256 metadata writer、6,528 DCCI、严格 writer history 和 FinalDrain 全部闭合，
 raw 无丢记录。该收益不来自减少参与核、改变任务计划或放宽 TensorMap 顺序。
+
+### 2026-08-06：FinalDrain 的 fatal 最终观察按 worker 错相
+
+S6.27 把 FinalDrain 的 global-fatal 观察从每次 progress 收敛为第 0 轮一次、
+之后每 256 轮一次，但所有 worker 仍在第 0 轮同时读取同一条返回型 Atomic。
+成功路径并不需要 96 份同步的“无错误”证明；真正需要保证的是：持有未完成
+token、因而仍停留在 FinalDrain 的 worker 必须在有界时间内看到错误并把本核
+token 收敛为 `FAULTED`。
+
+当前合同改为让每个 worker 用 `worker_id mod 256` 作为 owner-local 初始相位：
+
+- 每个 worker 之后仍每 256 轮观察一次，单核最晚首次观察距离不超过 255 轮；
+- 正常快速收口时不再让全部 worker 在同一轮争用 fatal cache line；
+- 若某个 token 无法排空，其 owner 会继续留在 FinalDrain，必然到达自己的观察
+  相位；已有 2 秒 watchdog 仍是独立的最终停机界限；
+- 已排空且正常退出的 worker 没有待转为 `FAULTED` 的本地 token，不需要为了
+  重复确认全局错误而延长成功路径；
+- 本核发现 payload、control、DCCI 或 completion 错误时，仍立即发布精确
+  `exec_fatal` 和 scheduler fatal，不经过该节流路径。
+
+该规则只依赖 worker 身份、owner-local token 和 FinalDrain 状态机，不读取
+`TaskKind`、固定 DAG、batch、核数、输出数量或 tensor shape；中央 Build/Execute
+ticket、metadata writer completion 严格插入链、payload/DCCI、fanin 和
+completion 合同均不变。
+
+CPU 完整回归及 `remote_fatal_cadence_closure` 通过；A5 B1/B256 与
+full-swimlane 的全部终态通过。B256 泳道中 FinalDrain 的
+`atomic.poll_batch.fatal_poll.load×1` 从 `96` 条降为 `1` 条，同时保持
+1,280 Build、1,024 kernel、256 metadata writer 和 6,528 次 DCCI。冻结 12 对
+startup 到 FinalDrain 交错 A/B 中，基线/候选中位为
+`835.004/825.133 us`，改善 `9.870 us / 1.182%`；候选胜 `9/12` 对。
