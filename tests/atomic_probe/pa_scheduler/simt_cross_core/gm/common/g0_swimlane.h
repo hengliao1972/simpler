@@ -87,7 +87,7 @@ enum class AtomicSite : uint16_t {
     SimtOutputLastWriterPublish = 13U,
     SimtProducerTaskBasePoll = 14U,
     SimtInsertPredecessorPoll = 15U,
-    SimtAllocLastWriterCommit = 16U,
+    SimtMetadataLastWriterCommit = 16U,
     SimtInsertCompletionPublish = 17U,
     SimtAllocCompletionVendPublish = 18U,
     SimtAllocCompletionFlagPublish = 19U,
@@ -111,7 +111,8 @@ enum class AtomicSite : uint16_t {
     ScalarDrainVerifyLoad = 37U,
     ScalarRootFinishedPublish = 38U,
     SimtMetadataOutputPublishedPoll = 39U,
-    Count = 40U,
+    SimtMetadataLastWriterLoad = 40U,
+    Count = 41U,
 };
 
 enum class DcciOp : uint8_t {
@@ -150,6 +151,7 @@ SIMT_CROSS_CORE_G0_TRACE_INLINE AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
     case AtomicSite::SimtProducerTaskBasePoll:
     case AtomicSite::SimtInsertPredecessorPoll:
     case AtomicSite::SimtMetadataOutputPublishedPoll:
+    case AtomicSite::SimtMetadataLastWriterLoad:
     case AtomicSite::ScalarProducerTaskBaseLoad:
     case AtomicSite::ScalarExecStatePoll:
     case AtomicSite::ScalarFaninFlagPoll:

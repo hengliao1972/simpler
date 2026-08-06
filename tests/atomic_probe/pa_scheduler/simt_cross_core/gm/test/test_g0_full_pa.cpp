@@ -224,6 +224,24 @@ bool TensorEqual(const TensorDesc &lhs, const TensorDesc &rhs) {
     return std::memcmp(&lhs, &rhs, sizeof(TensorDesc)) == 0;
 }
 
+int32_t LatestMetadataWriterBefore(
+    uint32_t task_limit, uint32_t producer_task, uint32_t output_slot
+) {
+    int32_t latest = static_cast<int32_t>(producer_task);
+    for (uint32_t task_id = producer_task + 1U; task_id < task_limit; ++task_id) {
+        const uint32_t writer_count = MetadataWriterIntentCount(task_id);
+        for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+            uint32_t candidate_producer = 0U;
+            uint32_t candidate_slot = 0U;
+            if (MetadataWriterIntentAt(task_id, writer, candidate_producer, candidate_slot) &&
+                candidate_producer == producer_task && candidate_slot == output_slot) {
+                latest = static_cast<int32_t>(task_id);
+            }
+        }
+    }
+    return latest;
+}
+
 uint64_t PackOutputPair(const std::array<float, 2> &values) {
     std::array<uint32_t, 2> bits{};
     std::memcpy(bits.data(), values.data(), sizeof(bits));
@@ -459,13 +477,36 @@ public:
     }
 
     bool Validate() const {
-        const bool full_pa_valid = ValidateCounts() && ValidateBuilderMapping() && ValidateHeapAndOutputs() &&
-                                   ValidatePayloads() && ValidateCompletionAndWitnesses() && ValidateRolesAndDrain();
+        const bool counts_valid = ValidateCounts();
+        const bool builders_valid = ValidateBuilderMapping();
+        const bool heap_valid = ValidateHeapAndOutputs();
+        const bool payloads_valid = ValidatePayloads();
+        const bool completion_valid = ValidateCompletionAndWitnesses();
+        const bool roles_valid = ValidateRolesAndDrain();
 #if defined(SIMT_CROSS_CORE_U2)
-        return full_pa_valid && ValidateU2Transport();
+        const bool transport_valid = ValidateU2Transport();
+        if (!(counts_valid && builders_valid && heap_valid && payloads_valid && completion_valid && roles_valid &&
+              transport_valid)) {
+            std::fprintf(
+                stderr,
+                "[FAIL] U2 CPU validation sections counts=%u builders=%u heap=%u payloads=%u completion=%u roles=%u "
+                "transport=%u\n",
+                counts_valid, builders_valid, heap_valid, payloads_valid, completion_valid, roles_valid,
+                transport_valid
+            );
+            return false;
+        }
 #else
-        return full_pa_valid;
+        if (!(counts_valid && builders_valid && heap_valid && payloads_valid && completion_valid && roles_valid)) {
+            std::fprintf(
+                stderr, "[FAIL] G0 CPU validation sections counts=%u builders=%u heap=%u payloads=%u completion=%u "
+                        "roles=%u\n",
+                counts_valid, builders_valid, heap_valid, payloads_valid, completion_valid, roles_valid
+            );
+            return false;
+        }
 #endif
+        return true;
     }
 
 #if defined(SIMT_CROSS_CORE_U2)
@@ -927,12 +968,7 @@ private:
             report.last_task = task_id;
             ++report.prepare_count;
             ++report.commit_count;
-#if defined(SIMT_CROSS_CORE_U2)
-            report.insert_wait_count += task_id == 0U ? 0U : 1U;
-#else
-            report.insert_wait_count +=
-                TaskKindAt(task_id) == TaskKind::Up && TaskBatch(task_id) != 0U ? 1U : 0U;
-#endif
+            report.insert_wait_count += PreviousMetadataWriterTask(task_id) == UINT32_MAX ? 0U : 1U;
         }
         report.checksum = BuilderReportChecksum(
             nonce_, thread_id, task_count_, report.task_count, report.first_task, report.last_task,
@@ -1131,12 +1167,37 @@ private:
 #endif
         uint32_t insert_polls = 0U;
         int64_t predecessor_observed = -1;
+        const uint64_t metadata_insert_contract = MetadataInsertContractForTask(task_id);
+        const uint32_t writer_count = MetadataInsertWriterCount(metadata_insert_contract);
+        const uint32_t predecessor_task = MetadataInsertPredecessorTask(metadata_insert_contract);
+        for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+            uint32_t producer = 0U;
+            uint32_t output_slot = 0U;
+            if (!MetadataWriterIntentAt(task_id, writer, producer, output_slot)) {
 #if defined(SIMT_CROSS_CORE_U2)
-        if (task_id != 0U) {
+                (void)abort_u2_payload();
+#endif
+                return BuildAttemptResult::Error;
+            }
+            uint32_t output_polls = 0U;
             if (!WaitFor(
-                    [this, task_id] {
-                        return tasks_[task_id - 1U].insert_completion.load(std::memory_order_acquire) ==
-                               static_cast<int64_t>(task_id - 1U);
+                    [this, producer, output_slot] {
+                        return tasks_[producer].published[output_slot].load(std::memory_order_acquire) ==
+                               static_cast<int64_t>(producer);
+                    },
+                    &output_polls
+                )) {
+#if defined(SIMT_CROSS_CORE_U2)
+                (void)abort_u2_payload();
+#endif
+                return BuildAttemptResult::Error;
+            }
+        }
+        if (predecessor_task != UINT32_MAX) {
+            if (!WaitFor(
+                    [this, predecessor_task] {
+                        return tasks_[predecessor_task].insert_completion.load(std::memory_order_acquire) ==
+                               static_cast<int64_t>(predecessor_task);
                     },
                     &insert_polls
                 )) {
@@ -1145,93 +1206,89 @@ private:
 #endif
                 return BuildAttemptResult::Error;
             }
-            predecessor_observed = tasks_[task_id - 1U].insert_completion.load(std::memory_order_acquire);
+            predecessor_observed = tasks_[predecessor_task].insert_completion.load(std::memory_order_acquire);
         }
-#else
-        if (kind == TaskKind::Up) {
-            const uint32_t alloc_task = BatchTaskId(TaskBatch(task_id), TaskKind::Alloc);
-            uint32_t output_polls = 0U;
-            if (!WaitFor(
-                    [this, alloc_task] {
-                        return tasks_[alloc_task].published[0].load(std::memory_order_acquire) ==
-                               static_cast<int64_t>(alloc_task);
-                    },
-                    &output_polls
-                )) {
-                return BuildAttemptResult::Error;
-            }
-            if (TaskBatch(task_id) != 0U) {
-                const uint32_t predecessor_task = task_id - kTasksPerBatch;
-                if (!WaitFor(
-                        [this, predecessor_task] {
-                            return tasks_[predecessor_task].insert_completion.load(std::memory_order_acquire) ==
-                                   static_cast<int64_t>(predecessor_task);
-                        },
-                        &insert_polls
-                    )) {
-                    return BuildAttemptResult::Error;
-                }
-                predecessor_observed =
-                    tasks_[predecessor_task].insert_completion.load(std::memory_order_acquire);
-            }
-        }
-#endif
 #if defined(SIMT_CROSS_CORE_U2)
         if (TaskExecutable(kind) && fatal_.load(std::memory_order_acquire) != 0U) {
             (void)abort_u2_payload();
             return BuildAttemptResult::Error;
         }
 #endif
-        if (kind == TaskKind::Up) {
+        if (MetadataInsertContractPresent(metadata_insert_contract)) {
             task.history.magic = kWriterHistoryMagic;
             task.history.writer_task = static_cast<int32_t>(task_id);
-            task.history.count = 3U;
+            task.history.count = writer_count;
             task.history.reserved = 0U;
-            const uint32_t batch = TaskBatch(task_id);
-            const int32_t previous_writer = static_cast<int32_t>(BatchTaskId(batch, TaskKind::Alloc));
-            for (uint32_t index = 0U; index < 3U; ++index) {
-                task.history.entries[index] = WriterHistoryRecord{
-                    WriterHistorySymbolKey(batch, index),
-                    previous_writer,
+            for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+                uint32_t producer = 0U;
+                uint32_t output_slot = 0U;
+                if (!MetadataWriterIntentAt(task_id, writer, producer, output_slot)) {
+#if defined(SIMT_CROSS_CORE_U2)
+                    (void)abort_u2_payload();
+#endif
+                    return BuildAttemptResult::Error;
+                }
+                const int64_t previous_writer =
+                    tasks_[producer].last_writer[output_slot].load(std::memory_order_acquire);
+                if (previous_writer < static_cast<int64_t>(producer) ||
+                    previous_writer >= static_cast<int64_t>(task_id)) {
+#if defined(SIMT_CROSS_CORE_U2)
+                    (void)abort_u2_payload();
+#endif
+                    return BuildAttemptResult::Error;
+                }
+                task.history.entries[writer] = WriterHistoryRecord{
+                    SharedSymbolKey(producer, output_slot),
+                    static_cast<int32_t>(previous_writer),
                 };
             }
-            tasks_[BatchTaskId(batch, TaskKind::Alloc)].last_writer[0].store(task_id, std::memory_order_release);
-        }
+            // writer_count>0 is guaranteed by the contract.  The release half
+            // of the first successful last-writer CAS publishes all preceding
+            // history stores, so a standalone fence is redundant in the CPU
+            // semantic model (and is not modeled by GCC TSan).
+            for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+                const WriterHistoryRecord record = task.history.entries[writer];
+                uint32_t producer = 0U;
+                uint32_t output_slot = 0U;
+                if (!DecodeSharedSymbolKey(record.symbol_key, producer, output_slot)) {
 #if defined(SIMT_CROSS_CORE_U2)
-        uint32_t expected_prefix = task_id;
-        if (!committed_prefix_.compare_exchange_strong(
-                expected_prefix, task_id + 1U, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-#if defined(SIMT_CROSS_CORE_U2)
-            (void)abort_u2_payload();
+                    (void)abort_u2_payload();
 #endif
-            return BuildAttemptResult::Error;
+                    return BuildAttemptResult::Error;
+                }
+                int64_t expected_writer = record.previous_writer;
+                if (!tasks_[producer].last_writer[output_slot].compare_exchange_strong(
+                        expected_writer, static_cast<int64_t>(task_id), std::memory_order_acq_rel,
+                        std::memory_order_acquire
+                    )) {
+#if defined(SIMT_CROSS_CORE_U2)
+                    (void)abort_u2_payload();
+#endif
+                    return BuildAttemptResult::Error;
+                }
+            }
         }
-#else
-        if (kind == TaskKind::Up) {
-            uint32_t expected_prefix = TaskBatch(task_id);
+        if (MetadataInsertContractPresent(metadata_insert_contract)) {
+            uint32_t expected_prefix = MetadataWriterOrdinal(task_id);
             if (!committed_prefix_.compare_exchange_strong(
-                    expected_prefix, TaskBatch(task_id) + 1U, std::memory_order_acq_rel,
+                    expected_prefix, expected_prefix + 1U, std::memory_order_acq_rel,
                     std::memory_order_acquire
                 )) {
+#if defined(SIMT_CROSS_CORE_U2)
+                (void)abort_u2_payload();
+#endif
                 return BuildAttemptResult::Error;
             }
         }
-#endif
-#if defined(SIMT_CROSS_CORE_U2)
-        const int64_t previous_insert = task.insert_completion.fetch_add(1, std::memory_order_acq_rel);
-        if (previous_insert != InsertCompletionInitialValue(task_id)) {
-            (void)abort_u2_payload();
-            return BuildAttemptResult::Error;
-        }
-#else
-        if (kind == TaskKind::Up) {
+        if (MetadataInsertContractPresent(metadata_insert_contract)) {
             const int64_t previous_insert = task.insert_completion.fetch_add(1, std::memory_order_acq_rel);
             if (previous_insert != InsertCompletionInitialValue(task_id)) {
+#if defined(SIMT_CROSS_CORE_U2)
+                (void)abort_u2_payload();
+#endif
                 return BuildAttemptResult::Error;
             }
         }
-#endif
         if (kind == TaskKind::Alloc) {
             task.completion_vend.store(vend, std::memory_order_relaxed);
             if (!task.completion_flag.compare_exchange_strong(
@@ -1279,7 +1336,7 @@ private:
             static_cast<uint16_t>(build_owner),
             AlignOutputBytes(TaskOutputBytes(kind)),
             nonce_,
-            0U,
+            metadata_insert_contract,
         };
         const uint32_t phase_bits = kBuildPreparedBit | kBuildOutputsPublishedBit | kBuildInsertCommittedBit |
                                     (TaskExecutable(kind) ? kBuildExecPublishedBit : kBuildAllocCompletedBit);
@@ -1681,12 +1738,7 @@ private:
             alloc_done_.load(std::memory_order_acquire) != batches_ ||
             aic_done_.load(std::memory_order_acquire) != 2U * batches_ ||
             aiv_done_.load(std::memory_order_acquire) != 2U * batches_ ||
-            committed_prefix_.load(std::memory_order_acquire) !=
-#if defined(SIMT_CROSS_CORE_U2)
-                task_count_ ||
-#else
-                batches_ ||
-#endif
+            committed_prefix_.load(std::memory_order_acquire) != MetadataWriterTaskCount(task_count_) ||
             aic_cursor_.load(std::memory_order_acquire) != 2U * batches_ + kAicOwnerCount ||
             aiv_cursor_.load(std::memory_order_acquire) != 2U * batches_ + AivExecutorCount(builder_count_)) {
             return false;
@@ -1741,7 +1793,9 @@ private:
                 task.plan.exec_route != EncodeTaskExecRoute(TaskKindAt(task_id)) ||
                 task.plan.builder_owner != build_owner ||
                 task.plan.reserved_bytes != AlignOutputBytes(TaskOutputBytes(kind)) ||
-                task.plan.launch_nonce != nonce_ || task.plan.reserved != 0U || task.build_report.task_id != task_id ||
+                task.plan.launch_nonce != nonce_ ||
+                task.plan.metadata_insert_contract != MetadataInsertContractForTask(task_id) ||
+                task.build_report.task_id != task_id ||
                 task.build_report.builder_thread != builder_thread ||
                 task.build_report.builder_warp != BuilderWarp(builder_thread) || task.build_report.builder_lane != 0U ||
                 task.build_report.phase_bits != expected_phase_bits ||
@@ -1750,42 +1804,25 @@ private:
                 task.build_report.build_attempt_count != 1U || task.build_report.build_win_count != 1U ||
                 task.build_report.prepare_count != 1U || task.build_report.commit_count != 1U ||
                 task.insert_completion.load(std::memory_order_acquire) !=
-#if defined(SIMT_CROSS_CORE_U2)
-                    static_cast<int64_t>(task_id)) {
-#else
-                    (kind == TaskKind::Up ? static_cast<int64_t>(task_id) : InsertCompletionInitialValue(task_id))) {
-#endif
+                    (MetadataWriterIntentCount(task_id) != 0U ? static_cast<int64_t>(task_id) :
+                                                               InsertCompletionInitialValue(task_id))) {
                 return false;
             }
-#if defined(SIMT_CROSS_CORE_U2)
-            if (task_id == 0U) {
-                if (task.build_report.predecessor_observed != -1 || task.build_report.insert_poll_count != 0U) {
-                    return false;
-                }
-            } else if (task.build_report.predecessor_observed != static_cast<int64_t>(task_id - 1U) ||
-                       task.build_report.insert_poll_count == 0U) {
-                return false;
-            }
-#else
-            if (kind == TaskKind::Up && TaskBatch(task_id) != 0U) {
-                if (task.build_report.predecessor_observed != static_cast<int64_t>(task_id - kTasksPerBatch) ||
+            const uint32_t predecessor_task = PreviousMetadataWriterTask(task_id);
+            if (predecessor_task != UINT32_MAX) {
+                if (task.build_report.predecessor_observed != static_cast<int64_t>(predecessor_task) ||
                     task.build_report.insert_poll_count == 0U) {
                     return false;
                 }
             } else if (task.build_report.predecessor_observed != -1 || task.build_report.insert_poll_count != 0U) {
                 return false;
             }
-#endif
             ++expected_wins[builder_thread];
             if (expected_first[builder_thread] == kNoTask) {
                 expected_first[builder_thread] = task_id;
             }
             expected_last[builder_thread] = task_id;
-#if defined(SIMT_CROSS_CORE_U2)
-            expected_waits[builder_thread] += task_id == 0U ? 0U : 1U;
-#else
-            expected_waits[builder_thread] += kind == TaskKind::Up && TaskBatch(task_id) != 0U ? 1U : 0U;
-#endif
+            expected_waits[builder_thread] += predecessor_task == UINT32_MAX ? 0U : 1U;
         }
 
         uint64_t total_attempts = 0U;
@@ -1865,10 +1902,7 @@ private:
             const uint32_t output_count = TaskOutputCount(kind);
             for (uint32_t slot = 0U; slot < kOutputsPerTask; ++slot) {
                 if (slot < output_count) {
-                    int64_t expected_writer = task_id;
-                    if (kind == TaskKind::Alloc && slot == 0U) {
-                        expected_writer = BatchTaskId(TaskBatch(task_id), TaskKind::Up);
-                    }
+                    const int64_t expected_writer = LatestMetadataWriterBefore(task_count_, task_id, slot);
                     if (task.published[slot].load(std::memory_order_acquire) != static_cast<int64_t>(task_id) ||
                         task.last_writer[slot].load(std::memory_order_acquire) != expected_writer ||
                         !TensorEqual(task.outputs[slot], MakeTaskOutputDescriptor(task_id, slot, task_base))) {
@@ -1883,15 +1917,21 @@ private:
                     }
                 }
             }
-            if (kind == TaskKind::Up) {
+            const uint32_t writer_count = MetadataWriterIntentCount(task_id);
+            if (writer_count != 0U) {
                 WriterHistoryCell expected{};
                 expected.magic = kWriterHistoryMagic;
                 expected.writer_task = static_cast<int32_t>(task_id);
-                expected.count = 3U;
-                for (uint32_t index = 0U; index < 3U; ++index) {
-                    expected.entries[index] = WriterHistoryRecord{
-                        WriterHistorySymbolKey(TaskBatch(task_id), index),
-                        static_cast<int32_t>(BatchTaskId(TaskBatch(task_id), TaskKind::Alloc)),
+                expected.count = writer_count;
+                for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+                    uint32_t producer = 0U;
+                    uint32_t output_slot = 0U;
+                    if (!MetadataWriterIntentAt(task_id, writer, producer, output_slot)) {
+                        return false;
+                    }
+                    expected.entries[writer] = WriterHistoryRecord{
+                        SharedSymbolKey(producer, output_slot),
+                        LatestMetadataWriterBefore(task_id, producer, output_slot),
                     };
                 }
                 if (std::memcmp(&task.history, &expected, sizeof(expected)) != 0) {
@@ -3222,7 +3262,7 @@ int main(int argc, char **argv) {
 #if defined(SIMT_CROSS_CORE_U2)
     std::printf(
         "[PASS] U2 CPU complete: builder=1, B1/B256, ordered four-slot UBUF, task1..4 anchors, "
-        "exact written-word GM copy/tail, strict insert/full PA oracle, held-slot cleanup, "
+        "exact written-word GM copy/tail, generic sparse writer-intent insert/full PA oracle, held-slot cleanup, "
         "same-address reuse rounds=%u\n",
         rounds
     );

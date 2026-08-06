@@ -101,11 +101,11 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     config = json.load(source)
-if config.get("StackSize") != {"simt_stack_size": 1536, "simt_divergence_stack_size": 1536}:
+if config.get("StackSize") != {"simt_stack_size": 1536, "simt_divergence_stack_size": 2048}:
     raise SystemExit(1)
 PY
 then
-    echo "U2 ACL config must encode 1536 B SIMT and 1536 B divergence stack limits." >&2
+    echo "U2 ACL config must encode 1536 B SIMT and 2048 B divergence stack limits." >&2
     exit 1
 fi
 
@@ -170,6 +170,19 @@ if ! grep -Fq 'for (uint32_t attempt = 0U; attempt < kU2AtomicCasAttemptLimit' "
     echo "U2 must bound remaining CAS loops, use native atomic-max, keep prepare out of the divergent caller and preserve exact slot cleanup on failure." >&2
     exit 1
 fi
+if ! grep -Fq 'const uint64_t metadata_insert_contract = task[kPlanOffsetWords + 7U];' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'for (uint32_t writer = 0U; writer < writer_count; ++writer)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'SimtDecodeSharedSymbolKey(' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'SimtWaitOutputPublished(' "$KERNEL_SOURCE" ||
+   awk '
+       /inline bool SimtCommitTask\(/ {inside=1}
+       inside && /if \(kind == static_cast<uint32_t>\(TaskKind::Alloc\)\)/ {inside=0}
+       inside && /TaskKind::Up/ {found=1}
+       END {exit found ? 0 : 1}
+   ' "$KERNEL_SOURCE"; then
+    echo "U2 must consume the generic sparse writer-intent contract; operator-specific TaskKind branches are forbidden." >&2
+    exit 1
+fi
 
 ubuf_store_line="$(grep -nF 'staging_payload[destination++] =' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
 ubuf_complete_line="$(grep -nF 'bool guards_valid = true;' "$KERNEL_SOURCE" | cut -d: -f1)"
@@ -187,7 +200,7 @@ if [[ -z "$ubuf_store_line" || -z "$ubuf_complete_line" || -z "$gm_store_line" |
    ! (( ubuf_store_line < ubuf_complete_line && ubuf_complete_line < gm_store_line &&
          gm_store_line < gm_complete_line && gm_complete_line < commit_line && commit_line < release_line &&
          release_line < report_phase_line )); then
-    echo "U2 order must remain UBUF stage -> GM copy -> strict commit/BUILT -> slot release." >&2
+    echo "U2 order must remain UBUF stage -> GM copy -> sparse metadata commit/BUILT -> slot release." >&2
     exit 1
 fi
 if ! grep -Fq 'u2-global-max-busy-depth' "$HOST_SOURCE" ||
@@ -379,8 +392,8 @@ if [[ "$AIV_META_HEX" != *"0c000400 04000000"* ]] ||
    (( COMPILER_ALLOC_UB_BYTES != 0x4000 || SU_STACK_BYTES <= 0 || SU_STACK_BYTES > 0x1000 ||
       SIMT_WARP_STACK_BYTES <= 0 || SIMT_WARP_STACK_BYTES > 0x1000 ||
       SIMT_DVG_STACK_BYTES <= 0 || SIMT_DVG_STACK_BYTES >= 0x1000 ||
-      SIMT_WARP_STACK_BYTES > 1536 || SIMT_DVG_STACK_BYTES > 1536 )); then
-    echo "U2 AIV metadata must encode SIMD_SIMT_MIX_VF=4, fit its 16 KiB compiler UB and fit the 1536/1536 B ACL-init SIMT/DVG stack config." >&2
+      SIMT_WARP_STACK_BYTES > 1536 || SIMT_DVG_STACK_BYTES > 2048 )); then
+    echo "U2 AIV metadata must encode SIMD_SIMT_MIX_VF=4, fit its 16 KiB compiler UB and fit the 1536/2048 B ACL-init SIMT/DVG stack config." >&2
     printf '%s\n' "$AIV_META_HEX" >&2
     exit 1
 fi
@@ -394,7 +407,7 @@ if (( UBUF_REGION_BYTES != 4608 ||
     exit 1
 fi
 echo "[CHECK] stack metadata: SU=$SU_STACK_BYTES SIMT=$SIMT_WARP_STACK_BYTES DVG=$SIMT_DVG_STACK_BYTES bytes"
-echo "[CHECK] ACL-init stack config: SIMT=1536 DVG=1536 bytes"
+echo "[CHECK] ACL-init stack config: SIMT=1536 DVG=2048 bytes"
 echo "[CHECK] ELF has exact entries/functions/metadata and 4608 B staging in 16 KiB compiler UB, 192+16/224 KiB local budget"
 
 echo "[BUILD] GCC 15 U2 ACL host ($("$GXX15" -dumpfullversion))"

@@ -303,6 +303,18 @@ if [[ -z "$prepare_start_line" || -z "$descriptor_line" || -z "$descriptor_fence
     echo "G0 fresh outputs must publish after descriptor construction; sparse metadata writers must acquire their target before the strict writer-predecessor wait." >&2
     exit 1
 fi
+if ! grep -Fq 'const uint64_t metadata_insert_contract = task[kPlanOffsetWords + 7U];' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'for (uint32_t writer = 0U; writer < writer_count; ++writer)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'SimtDecodeSharedSymbolKey(' "$KERNEL_SOURCE" ||
+   awk '
+       /inline bool SimtCommitTask\(/ {inside=1}
+       inside && /if \(kind == static_cast<uint32_t>\(TaskKind::Alloc\)\)/ {inside=0}
+       inside && /TaskKind::Up/ {found=1}
+       END {exit found ? 0 : 1}
+   ' "$KERNEL_SOURCE"; then
+    echo "G0 metadata commit must consume the generic writer-intent contract; operator-specific TaskKind branches are forbidden." >&2
+    exit 1
+fi
 
 invalidate_start_line="$(grep -nF 'InvalidatePayloadLines(' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
 invalidate_dcci_line="$(awk '/InvalidatePayloadLines\(/ {inside=1} inside && /dcci\(/ {print NR; exit}' "$KERNEL_SOURCE")"

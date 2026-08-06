@@ -653,18 +653,19 @@ ACL 调用中执行 `aclInit(configPath)`。独立最小栈探针使用：
 {
   "StackSize": {
     "simt_stack_size": 1536,
-    "simt_divergence_stack_size": 1536
+    "simt_divergence_stack_size": 2048
   }
 }
 ```
 
-两项为 byte 且按 128 B 对齐。完整 U2 的 AIV metadata 为 SU 808 B、
-SIMT 456 B、DVG 1280 B，但 metadata 不能单独证明动态调用链不会溢出。
+两项为 byte，ACL 容量按 512 B 步长保守取整。加入通用 writer-intent
+helper 后，完整 U2 的 AIV metadata 为 SU 808 B、SIMT 496 B、DVG 1920 B，
+但 metadata 不能单独证明动态调用链不会溢出。
 真实 A5 对照中，1024/1536 B 和 1024/4608 B 都得到 AIV0 错误码 354
 `VEC SIMT stack overflows`；1536/1536 B 和 1536/4608 B 均通过 B1，且
-1536/1536 B 继续通过 B256。因此最终值只增大 SIMT stack，DVG 保持满足
-metadata 的 1536 B。配置成功仍不等于 U2 功能成功，必须保留完整 host
-oracle。
+1536/1536 B 继续通过当时的 B256。协议通用化后 DVG metadata 增至
+1920 B，所以最终配置为 1536/2048 B。配置成功仍不等于 U2 功能成功，
+必须保留完整 host oracle。
 
 G0 性能与泳道长期保持两个产物：生产 G0 不写 task trace，只由 ACL event
 测 mixed-kernel 时间；泳道变体在 `FullPaState` 后追加固定容量 sidecar，
@@ -722,32 +723,36 @@ W=8/12/16/24 的中位数为 2.240/2.231/2.076/2.192 ms，当前选择 `W=16`。
 若以后改变 strict insert、payload 构造或 executor 协议，必须重新扫描，不能把
 `B=4,W=16` 写成架构常量。
 
-### 3.14 Direct-GM 稀疏 metadata writer 链
+### 3.14 通用稀疏 metadata writer-intent 链
 
-3.8 的全 task 严格链是 G0 首次功能闭合时的保守合同，也继续用于
-UBUF/U2。Direct-GM 在完整审核五类 task 的真实 writer 集合后允许使用
-更精确的合同：每 batch 只有 UP 写 `writer_history` 并修改 Alloc
-`last_writer[0]`，因此只有 UP 参与 metadata 插入链。
+3.8 的全 task 严格链是 G0/U2 首次功能闭合时的保守合同。最终
+优化不能识别某个算子、`TaskKind` 或固定 task 间距，而是使用如下
+通用合同，同时适用于 Direct-GM 和 UBUF/U2：
 
-Direct-GM 的 UP 提交必须依次满足：
+1. workload schema 为每个 tensor 提供 `Input/Output/Inout/OutputExisting/NoDependency`
+   access tag 和引用。这是测试 workload 的输入，不是调度器特判。
+2. builder 只将 `Inout/OutputExisting + SharedOutputRef` 转成 writer intent，并在
+   task plan/history 中写入 writer 数、上一个真正的 metadata-writer task 以及
+   全部 symbol key。
+3. commit 只消费上述合同：等待每个目标 output 发布，再等待上一个
+   metadata writer，逐 symbol 读取 `last_writer`，写完整 history，fence 后逐
+   symbol CAS 发布当前 writer，最后发布 `insert_completion`。
+4. 没有 writer intent 的 task 不进入 metadata 前驱链；它们的 descriptor/output/
+   payload 发布和 executor acquire/DCCI 合同不变。
 
-1. 用 atomic load 观察到本 batch Alloc `output[0].published` 已等于 Alloc
-   task id；
-2. batch 0 无 metadata 前驱，batch N 等待 batch N-1 的 UP
-   `insert_completion`，在 task id 上即 `UP[N] -> UP[N-5]`；
-3. 写完 history 并 fence，CAS 本 batch Alloc `last_writer[0]`，最后发布
-   本 UP 的 `insert_completion`。
+因此协议中明确禁止固定 `N-5`、固定 writer 数、固定 Alloc/某个 slot，
+也禁止利用“多个 symbol 总是同步推进”合并 latest。本 PA 测试 schema 导出
+每 batch 一个 writer task、每个 writer 三个 symbol，只是该 workload 输入的计算
+结果，不是调度规则。
 
-Alloc/QK/PV/SF 不等待 metadata 前驱，也不更新自身
-`insert_completion`；其 descriptor/output/payload 的发布和 executor 原有的
-acquire/DCCI 合同不变。`kBuildInsertCommittedBit` 对这些非 UP task 表示
-“metadata 决策阶段已完成”，不得解读为一定发布过该 task 的
-`insert_completion`。
+`last_writer` CAS 是 history 的发布边界，所以不能用一次 atomic exchange 在不知道
+previous writer 时提前改写 latest；否则 reader 可能已看到新 writer，却还看不到
+完整 history。最终实现保留“读 previous → 写 history → fence → CAS 发布”顺序。
 
-该优化改变了 3.13 的性能拓扑，所以已重新扫描 builder 数。真实
-A5 B256 的新最优点为 `B=5,W=16`，trace-off 21 轮中位
-0.710 ms；原 `B=4,W=16` 的 2.068 ms 只作为历史全 task 链基线，
-不再是当前最优配置。
+历史 `B=5,W=16` 0.710 ms 候选只更新一个代表地址，依赖 PA 三个
+accumulator 同步推进，已判定为不泛化且不完整，不是最终结论。通用版对
+全部 symbol 保留 history 和 CAS，重新扫描后当前最优为 `B=6,W=4`；真实
+A5 B256 trace-off 21/21 PASS，中位 **1.233 ms**。
 
 ## 4. 目录与分阶段实施
 

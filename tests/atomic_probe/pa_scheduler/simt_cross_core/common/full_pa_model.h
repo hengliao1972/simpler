@@ -113,6 +113,16 @@ enum class TaskKind : uint32_t {
     Count = 5,
 };
 
+// 任务 schema 的 tensor 访问语义。metadata writer 的判定必须来自参数
+// access tag 与 SharedOutputRef，而不是来自某个算子或 TaskKind 名称。
+enum class TensorAccess : uint8_t {
+    Input = 0,
+    Output = 1,
+    Inout = 2,
+    OutputExisting = 3,
+    NoDependency = 4,
+};
+
 enum class DataType : uint8_t {
     Float32 = 0,
     Float16 = 1,

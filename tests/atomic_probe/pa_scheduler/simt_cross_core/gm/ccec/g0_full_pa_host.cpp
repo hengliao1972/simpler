@@ -269,6 +269,69 @@ HostTaskOracle BuildHostTaskOracle(uint32_t task_id) {
     return task;
 }
 
+struct HostSharedWriterIntent {
+    uint32_t producer_task;
+    uint32_t output_slot;
+};
+
+// Host oracle 独立按 PA 参数 schema 重建 shared writer intent；device 侧只会
+// 看到打包后的通用 contract，不能用 TaskKind 直接决定是否进入插入链。
+uint32_t HostMetadataWriterIntentCount(uint32_t task_id) {
+    return BuildHostTaskOracle(task_id).kind == HostTaskKind::Up ? 3U : 0U;
+}
+
+bool HostMetadataWriterIntentAt(uint32_t task_id, uint32_t writer, HostSharedWriterIntent *intent) {
+    const HostTaskOracle task = BuildHostTaskOracle(task_id);
+    if (intent == nullptr || task.kind != HostTaskKind::Up || writer >= 3U) {
+        return false;
+    }
+    intent->producer_task = task.batch * kHostTasksPerBatch;
+    intent->output_slot = 2U - writer;
+    return true;
+}
+
+uint32_t HostPreviousMetadataWriterTask(uint32_t task_id) {
+    if (HostMetadataWriterIntentCount(task_id) == 0U) {
+        return UINT32_MAX;
+    }
+    while (task_id != 0U) {
+        --task_id;
+        if (HostMetadataWriterIntentCount(task_id) != 0U) {
+            return task_id;
+        }
+    }
+    return UINT32_MAX;
+}
+
+uint64_t HostMetadataInsertContract(uint32_t task_id) {
+    constexpr uint64_t kPresent = uint64_t{1} << 63U;
+    constexpr uint32_t kPredecessorShift = 8U;
+    const uint32_t writer_count = HostMetadataWriterIntentCount(task_id);
+    if (writer_count == 0U) {
+        return 0U;
+    }
+    const uint32_t predecessor = HostPreviousMetadataWriterTask(task_id);
+    const uint64_t predecessor_code = predecessor == UINT32_MAX ? 0U : static_cast<uint64_t>(predecessor) + 1U;
+    return kPresent | writer_count | (predecessor_code << kPredecessorShift);
+}
+
+int32_t HostLatestMetadataWriterBefore(
+    uint32_t task_limit, uint32_t producer_task, uint32_t output_slot
+) {
+    int32_t latest = static_cast<int32_t>(producer_task);
+    for (uint32_t task_id = producer_task + 1U; task_id < task_limit; ++task_id) {
+        const uint32_t writer_count = HostMetadataWriterIntentCount(task_id);
+        for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+            HostSharedWriterIntent intent{};
+            if (HostMetadataWriterIntentAt(task_id, writer, &intent) &&
+                intent.producer_task == producer_task && intent.output_slot == output_slot) {
+                latest = static_cast<int32_t>(task_id);
+            }
+        }
+    }
+    return latest;
+}
+
 uint64_t ExpectedBuilderChecksum(
     uint64_t nonce, uint32_t thread_id, uint32_t task_count, uint32_t wins, uint32_t first_task, uint32_t last_task,
     uint32_t attempts, uint32_t prepares, uint32_t commits, uint32_t insert_waits, uint32_t claim_losses
@@ -1259,7 +1322,9 @@ bool ValidateTask(
             plan.launch_nonce
         ) ||
         !RecordCheck(
-            plan.reserved == 0U, failure, "task-plan-reserved", task_id, UINT32_MAX, UINT32_MAX, 0U, plan.reserved
+            plan.metadata_insert_contract == HostMetadataInsertContract(task_id), failure,
+            "task-plan-metadata-insert-contract", task_id, UINT32_MAX, UINT32_MAX,
+            HostMetadataInsertContract(task_id), plan.metadata_insert_contract
         )) {
         return false;
     }
@@ -1283,18 +1348,11 @@ bool ValidateTask(
         ) ||
         !RecordCheck(
             task.insert_completion.value ==
-#if defined(SIMT_CROSS_CORE_U2)
-                static_cast<int64_t>(task_id),
-#else
-                (expected.kind == HostTaskKind::Up ? static_cast<int64_t>(task_id) :
-                                                     static_cast<int64_t>(task_id) - 1),
-#endif
+                (HostMetadataWriterIntentCount(task_id) != 0U ? static_cast<int64_t>(task_id) :
+                                                               static_cast<int64_t>(task_id) - 1),
             failure, "insert-completion", task_id, UINT32_MAX, UINT32_MAX,
-#if defined(SIMT_CROSS_CORE_U2)
-            task_id,
-#else
-            expected.kind == HostTaskKind::Up ? task_id : static_cast<uint64_t>(static_cast<int64_t>(task_id) - 1),
-#endif
+            HostMetadataWriterIntentCount(task_id) != 0U ?
+                task_id : static_cast<uint64_t>(static_cast<int64_t>(task_id) - 1),
             static_cast<uint64_t>(task.insert_completion.value)
         ) ||
         !RecordCheck(
@@ -1307,10 +1365,8 @@ bool ValidateTask(
     for (uint32_t slot = 0U; slot < g0::kOutputsPerTask; ++slot) {
         const bool active = slot < expected.output_count;
         const int64_t expected_published = active ? static_cast<int64_t>(task_id) : -1;
-        int64_t expected_writer = expected_published;
-        if (expected.kind == HostTaskKind::Alloc && slot == 0U) {
-            expected_writer = static_cast<int64_t>(expected.batch * kHostTasksPerBatch + 4U);
-        }
+        const int64_t expected_writer =
+            active ? HostLatestMetadataWriterBefore(batches * kHostTasksPerBatch, task_id, slot) : -1;
         if (!RecordCheck(
                 task.outputs.published[slot].value == expected_published, failure, "output-published", task_id,
                 UINT32_MAX, slot, static_cast<uint64_t>(expected_published),
@@ -1352,7 +1408,8 @@ bool ValidateTask(
         }
     }
 
-    if (expected.kind != HostTaskKind::Up) {
+    const uint32_t writer_count = HostMetadataWriterIntentCount(task_id);
+    if (writer_count == 0U) {
         if (!RecordCheck(
                 std::memcmp(&task.writer_history, &initial_task.writer_history, sizeof(task.writer_history)) == 0,
                 failure, "unexpected-writer-history", task_id
@@ -1360,7 +1417,6 @@ bool ValidateTask(
             return false;
         }
     } else {
-        const uint32_t alloc = expected.batch * kHostTasksPerBatch;
         const g0::WriterHistoryCell &history = task.writer_history;
         if (!RecordCheck(
                 history.magic == UINT32_C(0x57484953), failure, "history-magic", task_id, UINT32_MAX, UINT32_MAX,
@@ -1371,7 +1427,8 @@ bool ValidateTask(
                 UINT32_MAX, task_id, static_cast<uint64_t>(history.writer_task)
             ) ||
             !RecordCheck(
-                history.count == 3U, failure, "history-count", task_id, UINT32_MAX, UINT32_MAX, 3U, history.count
+                history.count == writer_count, failure, "history-count", task_id, UINT32_MAX, UINT32_MAX,
+                writer_count, history.count
             ) ||
             !RecordCheck(
                 history.reserved == 0U, failure, "history-reserved", task_id, UINT32_MAX, UINT32_MAX, 0U,
@@ -1379,28 +1436,35 @@ bool ValidateTask(
             )) {
             return false;
         }
-        for (uint32_t index = 0U; index < 3U; ++index) {
-            const uint32_t expected_key = alloc * 8U + 3U - index;
+        for (uint32_t index = 0U; index < writer_count; ++index) {
+            HostSharedWriterIntent intent{};
+            if (!HostMetadataWriterIntentAt(task_id, index, &intent)) {
+                return false;
+            }
+            const uint32_t expected_key = intent.producer_task * 8U + intent.output_slot + 1U;
+            const int32_t expected_previous =
+                HostLatestMetadataWriterBefore(task_id, intent.producer_task, intent.output_slot);
             if (!RecordCheck(
                     history.entries[index].symbol_key == expected_key, failure, "history-symbol-key", task_id,
                     UINT32_MAX, index, expected_key, history.entries[index].symbol_key
                 ) ||
                 !RecordCheck(
-                    history.entries[index].previous_writer == static_cast<int32_t>(alloc), failure,
-                    "history-previous-writer", task_id, UINT32_MAX, index, alloc,
+                    history.entries[index].previous_writer == expected_previous, failure,
+                    "history-previous-writer", task_id, UINT32_MAX, index,
+                    static_cast<uint64_t>(expected_previous),
                     static_cast<uint64_t>(history.entries[index].previous_writer)
                 )) {
                 return false;
             }
         }
-        constexpr size_t kWrittenHistoryBytes =
-            offsetof(g0::WriterHistoryCell, entries) + 3U * sizeof(g0::WriterHistoryRecord);
+        const size_t written_history_bytes =
+            offsetof(g0::WriterHistoryCell, entries) + writer_count * sizeof(g0::WriterHistoryRecord);
         const auto *history_bytes = reinterpret_cast<const uint8_t *>(&history);
         const auto *initial_bytes = reinterpret_cast<const uint8_t *>(&initial_task.writer_history);
         if (!RecordCheck(
                 std::memcmp(
-                    history_bytes + kWrittenHistoryBytes, initial_bytes + kWrittenHistoryBytes,
-                    sizeof(history) - kWrittenHistoryBytes
+                    history_bytes + written_history_bytes, initial_bytes + written_history_bytes,
+                    sizeof(history) - written_history_bytes
                 ) == 0,
                 failure, "history-tail-mutated", task_id
             )) {
@@ -1409,6 +1473,7 @@ bool ValidateTask(
     }
 
     const g0::FullPaBuildReport &report = task.build_report;
+    const uint32_t metadata_predecessor = HostPreviousMetadataWriterTask(task_id);
     const uint32_t expected_phase_bits = expected.engine == HostEngine::None ? 0x17U : 0x0FU;
     if (!RecordCheck(
             report.task_id == task_id, failure, "build-report-task", task_id, UINT32_MAX, UINT32_MAX, task_id,
@@ -1439,31 +1504,16 @@ bool ValidateTask(
             UINT32_MAX, expected.written_words, report.payload_words
         ) ||
         !RecordCheck(
-#if defined(SIMT_CROSS_CORE_U2)
-            task_id == 0U ? report.insert_poll_count == 0U : report.insert_poll_count >= 1U,
-#else
-            expected.kind == HostTaskKind::Up && expected.batch != 0U ? report.insert_poll_count >= 1U :
-                                                                           report.insert_poll_count == 0U,
-#endif
+            metadata_predecessor != UINT32_MAX ? report.insert_poll_count >= 1U :
+                                                 report.insert_poll_count == 0U,
             failure, "build-report-insert-poll", task_id
         ) ||
         !RecordCheck(
             report.predecessor_observed ==
-#if defined(SIMT_CROSS_CORE_U2)
-                static_cast<int64_t>(task_id) - 1,
-#else
-                (expected.kind == HostTaskKind::Up && expected.batch != 0U ?
-                     static_cast<int64_t>(task_id - kHostTasksPerBatch) :
-                     -1),
-#endif
+                (metadata_predecessor != UINT32_MAX ? static_cast<int64_t>(metadata_predecessor) : -1),
             failure, "build-report-predecessor", task_id, UINT32_MAX, UINT32_MAX,
-#if defined(SIMT_CROSS_CORE_U2)
-            static_cast<uint64_t>(static_cast<int64_t>(task_id) - 1),
-#else
-            static_cast<uint64_t>(expected.kind == HostTaskKind::Up && expected.batch != 0U ?
-                                      static_cast<int64_t>(task_id - kHostTasksPerBatch) :
-                                      -1),
-#endif
+            static_cast<uint64_t>(metadata_predecessor != UINT32_MAX ?
+                                      static_cast<int64_t>(metadata_predecessor) : -1),
             static_cast<uint64_t>(report.predecessor_observed)
         ) ||
         !RecordCheck(
@@ -1661,12 +1711,7 @@ bool ValidateBuilderThreads(
             expected_first[thread_id] = task_id;
         }
         expected_last[thread_id] = task_id;
-#if defined(SIMT_CROSS_CORE_U2)
-        expected_waits[thread_id] += task_id == 0U ? 0U : 1U;
-#else
-        const HostTaskOracle task = BuildHostTaskOracle(task_id);
-        expected_waits[thread_id] += task.kind == HostTaskKind::Up && task.batch != 0U ? 1U : 0U;
-#endif
+        expected_waits[thread_id] += HostPreviousMetadataWriterTask(task_id) == UINT32_MAX ? 0U : 1U;
     }
 
     uint64_t win_sum = 0U;
@@ -2373,7 +2418,8 @@ bool TraceAtomicSiteAllowed(g0_swimlane::TraceDomain domain, g0_swimlane::Atomic
     return domain == g0_swimlane::TraceDomain::Simt ?
                (site_id >= static_cast<uint32_t>(g0_swimlane::AtomicSite::SimtBuilderStartedIncrement) &&
                     site_id <= static_cast<uint32_t>(g0_swimlane::AtomicSite::SimtBuilderFinishedPublish)) ||
-                   site == g0_swimlane::AtomicSite::SimtMetadataOutputPublishedPoll :
+                   site == g0_swimlane::AtomicSite::SimtMetadataOutputPublishedPoll ||
+                   site == g0_swimlane::AtomicSite::SimtMetadataLastWriterLoad :
                site_id >= static_cast<uint32_t>(g0_swimlane::AtomicSite::ScalarDispatchTicket) &&
                    site_id <= static_cast<uint32_t>(g0_swimlane::AtomicSite::ScalarRootFinishedPublish);
 }
@@ -2808,8 +2854,8 @@ const char *TraceAtomicSiteName(g0_swimlane::AtomicSite site) {
         return "simt_producer_task_base_poll";
     case g0_swimlane::AtomicSite::SimtInsertPredecessorPoll:
         return "simt_insert_predecessor_poll";
-    case g0_swimlane::AtomicSite::SimtAllocLastWriterCommit:
-        return "simt_alloc_last_writer_commit";
+    case g0_swimlane::AtomicSite::SimtMetadataLastWriterCommit:
+        return "simt_metadata_last_writer_commit";
     case g0_swimlane::AtomicSite::SimtInsertCompletionPublish:
         return "simt_insert_completion_publish";
     case g0_swimlane::AtomicSite::SimtAllocCompletionVendPublish:
@@ -2856,6 +2902,8 @@ const char *TraceAtomicSiteName(g0_swimlane::AtomicSite site) {
         return "scalar_root_finished_publish";
     case g0_swimlane::AtomicSite::SimtMetadataOutputPublishedPoll:
         return "simt_metadata_output_published_poll";
+    case g0_swimlane::AtomicSite::SimtMetadataLastWriterLoad:
+        return "simt_metadata_last_writer_load";
     case g0_swimlane::AtomicSite::Count:
         return "count";
     }

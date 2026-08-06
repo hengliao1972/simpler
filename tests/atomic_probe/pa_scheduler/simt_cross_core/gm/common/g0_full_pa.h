@@ -80,7 +80,7 @@ struct alignas(kCacheLineBytes) FullPaTaskPlan {
     uint16_t builder_owner;
     uint64_t reserved_bytes;
     uint64_t launch_nonce;
-    uint64_t reserved;
+    uint64_t metadata_insert_contract;
 };
 
 struct alignas(kCacheLineBytes) FullPaBuildReport {
@@ -358,6 +358,139 @@ PayloadTensorOutputSource(uint32_t task_id, uint32_t tensor_index, uint32_t &pro
         return false;
     }
     return true;
+}
+
+// 稀疏 metadata insert 的公共 task contract。writer intent 由 tensor access
+// tag 与 SharedOutputRef 共同决定；调度协议不识别具体算子，也不假设固定
+// task 间距。contract 只携带 writer 数和上一个真正的 metadata writer。
+constexpr uint64_t kMetadataInsertContractPresent = uint64_t{1} << 63U;
+constexpr uint32_t kMetadataInsertWriterCountBits = 8U;
+constexpr uint64_t kMetadataInsertWriterCountMask = (uint64_t{1} << kMetadataInsertWriterCountBits) - 1U;
+constexpr uint32_t kMetadataInsertPredecessorShift = kMetadataInsertWriterCountBits;
+constexpr uint64_t kMetadataInsertPredecessorMask = UINT32_MAX;
+
+// full-PA 测试 workload 的 schema adapter。这里允许知道 TaskKind；下方
+// MetadataWriterIntent* 调度层只消费返回的 access tag 和 tensor ref。
+SIMT_CROSS_CORE_G0_ABI_INLINE TensorAccess TaskTensorAccessAt(uint32_t task_id, uint32_t tensor_index) {
+    const TaskKind kind = TaskKindAt(task_id);
+    if (kind == TaskKind::Qk) {
+        return tensor_index == 3U ? TensorAccess::Output : TensorAccess::Input;
+    }
+    if (kind == TaskKind::Sf) {
+        return tensor_index == 0U ? TensorAccess::Input : TensorAccess::Output;
+    }
+    if (kind == TaskKind::Pv) {
+        return tensor_index == 3U ? TensorAccess::Output : TensorAccess::Input;
+    }
+    if (kind == TaskKind::Up) {
+        return tensor_index >= 3U ? TensorAccess::Inout : TensorAccess::Input;
+    }
+    return TensorAccess::NoDependency;
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t SharedSymbolKey(uint32_t producer_task, uint32_t output_slot) {
+    return producer_task * kOutputsPerTask + output_slot + 1U;
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE bool
+DecodeSharedSymbolKey(uint32_t symbol_key, uint32_t &producer_task, uint32_t &output_slot) {
+    if (symbol_key == 0U) {
+        return false;
+    }
+    --symbol_key;
+    producer_task = symbol_key / kOutputsPerTask;
+    output_slot = symbol_key % kOutputsPerTask;
+    return producer_task < kMaxTasks && output_slot < kOutputsPerTask;
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t MetadataWriterIntentCount(uint32_t task_id) {
+    const uint32_t tensor_count = TaskShape(TaskKindAt(task_id)).tensor_count;
+    uint32_t count = 0U;
+    for (uint32_t tensor = 0U; tensor < tensor_count; ++tensor) {
+        const TensorAccess access = TaskTensorAccessAt(task_id, tensor);
+        uint32_t producer = 0U;
+        uint32_t output_slot = 0U;
+        if ((access == TensorAccess::Inout || access == TensorAccess::OutputExisting) &&
+            PayloadTensorOutputSource(task_id, tensor, producer, output_slot)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE bool MetadataWriterIntentAt(
+    uint32_t task_id, uint32_t writer_index, uint32_t &producer_task, uint32_t &output_slot
+) {
+    const uint32_t tensor_count = TaskShape(TaskKindAt(task_id)).tensor_count;
+    uint32_t current = 0U;
+    for (uint32_t tensor = 0U; tensor < tensor_count; ++tensor) {
+        const TensorAccess access = TaskTensorAccessAt(task_id, tensor);
+        uint32_t producer = 0U;
+        uint32_t slot = 0U;
+        if ((access != TensorAccess::Inout && access != TensorAccess::OutputExisting) ||
+            !PayloadTensorOutputSource(task_id, tensor, producer, slot)) {
+            continue;
+        }
+        if (current++ == writer_index) {
+            producer_task = producer;
+            output_slot = slot;
+            return true;
+        }
+    }
+    return false;
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t PreviousMetadataWriterTask(uint32_t task_id) {
+    if (MetadataWriterIntentCount(task_id) == 0U) {
+        return UINT32_MAX;
+    }
+    while (task_id != 0U) {
+        --task_id;
+        if (MetadataWriterIntentCount(task_id) != 0U) {
+            return task_id;
+        }
+    }
+    return UINT32_MAX;
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t MetadataWriterOrdinal(uint32_t task_id) {
+    uint32_t ordinal = 0U;
+    for (uint32_t candidate = 0U; candidate < task_id; ++candidate) {
+        ordinal += MetadataWriterIntentCount(candidate) != 0U ? 1U : 0U;
+    }
+    return ordinal;
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t MetadataWriterTaskCount(uint32_t task_count) {
+    uint32_t count = 0U;
+    for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
+        count += MetadataWriterIntentCount(task_id) != 0U ? 1U : 0U;
+    }
+    return count;
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint64_t MetadataInsertContractForTask(uint32_t task_id) {
+    const uint32_t writer_count = MetadataWriterIntentCount(task_id);
+    if (writer_count == 0U || writer_count > kWriterHistoryMaxPerTask) {
+        return 0U;
+    }
+    const uint32_t predecessor = PreviousMetadataWriterTask(task_id);
+    const uint64_t predecessor_code = predecessor == UINT32_MAX ? 0U : static_cast<uint64_t>(predecessor) + 1U;
+    return kMetadataInsertContractPresent | writer_count |
+           (predecessor_code << kMetadataInsertPredecessorShift);
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE bool MetadataInsertContractPresent(uint64_t contract) {
+    return (contract & kMetadataInsertContractPresent) != 0U;
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t MetadataInsertWriterCount(uint64_t contract) {
+    return static_cast<uint32_t>(contract & kMetadataInsertWriterCountMask);
+}
+
+SIMT_CROSS_CORE_G0_ABI_INLINE uint32_t MetadataInsertPredecessorTask(uint64_t contract) {
+    const uint64_t code = (contract >> kMetadataInsertPredecessorShift) & kMetadataInsertPredecessorMask;
+    return code == 0U ? UINT32_MAX : static_cast<uint32_t>(code - 1U);
 }
 
 SIMT_CROSS_CORE_G0_ABI_INLINE bool

@@ -1546,6 +1546,128 @@ SimtTensorOutputSlot(uint32_t task_id, uint32_t tensor_index) {
     return 5U - tensor_index;
 }
 
+// 以下两个 helper 是 full-PA 测试 workload 的 schema adapter，只负责给出
+// tensor 数和 access tag。调度优化从 SimtTensorIsSharedWriterIntent 开始，
+// 只消费 access tag 和 SharedOutputRef，不按算子/TaskKind 设置快捷路径。
+// CCEC 要求 __simt_vf__ 的调用链全部显式标注 __simt_callee__。
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t
+SimtTaskTensorCount(uint32_t task_id) {
+    const uint32_t kind = task_id % kTasksPerBatch;
+    return kind == static_cast<uint32_t>(TaskKind::Up) ? 7U :
+           (kind == static_cast<uint32_t>(TaskKind::Alloc) ? 0U : 4U);
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline TensorAccess
+SimtTaskTensorAccessAt(uint32_t task_id, uint32_t tensor_index) {
+    const uint32_t kind = task_id % kTasksPerBatch;
+    if (kind == static_cast<uint32_t>(TaskKind::Qk)) {
+        return tensor_index == 3U ? TensorAccess::Output : TensorAccess::Input;
+    }
+    if (kind == static_cast<uint32_t>(TaskKind::Sf)) {
+        return tensor_index == 0U ? TensorAccess::Input : TensorAccess::Output;
+    }
+    if (kind == static_cast<uint32_t>(TaskKind::Pv)) {
+        return tensor_index == 3U ? TensorAccess::Output : TensorAccess::Input;
+    }
+    if (kind == static_cast<uint32_t>(TaskKind::Up)) {
+        return tensor_index >= 3U ? TensorAccess::Inout : TensorAccess::Input;
+    }
+    return TensorAccess::NoDependency;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtTensorIsSharedWriterIntent(uint32_t task_id, uint32_t tensor_index) {
+    const TensorAccess access = SimtTaskTensorAccessAt(task_id, tensor_index);
+    return (access == TensorAccess::Inout || access == TensorAccess::OutputExisting) &&
+           SimtTensorSourceTask(task_id, tensor_index) != UINT32_MAX;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t
+SimtMetadataWriterIntentCount(uint32_t task_id) {
+    const uint32_t tensor_count = SimtTaskTensorCount(task_id);
+    uint32_t count = 0U;
+    for (uint32_t tensor = 0U; tensor < tensor_count; ++tensor) {
+        count += SimtTensorIsSharedWriterIntent(task_id, tensor) ? 1U : 0U;
+    }
+    return count;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtMetadataWriterIntentAt(
+    uint32_t task_id, uint32_t writer_index, uint32_t *producer_task, uint32_t *output_slot
+) {
+    const uint32_t tensor_count = SimtTaskTensorCount(task_id);
+    uint32_t current = 0U;
+    for (uint32_t tensor = 0U; tensor < tensor_count; ++tensor) {
+        if (!SimtTensorIsSharedWriterIntent(task_id, tensor)) {
+            continue;
+        }
+        if (current++ == writer_index) {
+            *producer_task = SimtTensorSourceTask(task_id, tensor);
+            *output_slot = SimtTensorOutputSlot(task_id, tensor);
+            return true;
+        }
+    }
+    return false;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t
+SimtPreviousMetadataWriterTask(uint32_t task_id) {
+    if (SimtMetadataWriterIntentCount(task_id) == 0U) {
+        return UINT32_MAX;
+    }
+    while (task_id != 0U) {
+        --task_id;
+        if (SimtMetadataWriterIntentCount(task_id) != 0U) {
+            return task_id;
+        }
+    }
+    return UINT32_MAX;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
+SimtMetadataInsertContractForTask(uint32_t task_id) {
+    const uint32_t writer_count = SimtMetadataWriterIntentCount(task_id);
+    if (writer_count == 0U || writer_count > kWriterHistoryMaxPerTask) {
+        return 0U;
+    }
+    const uint32_t predecessor = SimtPreviousMetadataWriterTask(task_id);
+    const uint64_t predecessor_code = predecessor == UINT32_MAX ? 0U : static_cast<uint64_t>(predecessor) + 1U;
+    return kMetadataInsertContractPresent | writer_count |
+           (predecessor_code << kMetadataInsertPredecessorShift);
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtMetadataInsertContractPresent(uint64_t contract) {
+    return (contract & kMetadataInsertContractPresent) != 0U;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t
+SimtMetadataInsertWriterCount(uint64_t contract) {
+    return static_cast<uint32_t>(contract & kMetadataInsertWriterCountMask);
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t
+SimtMetadataInsertPredecessorTask(uint64_t contract) {
+    const uint64_t code = (contract >> kMetadataInsertPredecessorShift) & kMetadataInsertPredecessorMask;
+    return code == 0U ? UINT32_MAX : static_cast<uint32_t>(code - 1U);
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t
+SimtSharedSymbolKey(uint32_t producer_task, uint32_t output_slot) {
+    return producer_task * kOutputsPerTask + output_slot + 1U;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtDecodeSharedSymbolKey(uint32_t symbol_key, uint32_t *producer_task, uint32_t *output_slot) {
+    if (symbol_key == 0U) {
+        return false;
+    }
+    --symbol_key;
+    *producer_task = symbol_key / kOutputsPerTask;
+    *output_slot = symbol_key % kOutputsPerTask;
+    return *producer_task < kMaxTasks && *output_slot < kOutputsPerTask;
+}
+
 #if defined(SIMT_CROSS_CORE_U2)
 __simt_callee__ __aicore__ __attribute__((noinline)) bool SimtPrepareTask(
 #else
@@ -1570,6 +1692,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
         kOutputsOffsetWords + offsetof(SharedOutputCell, published) / sizeof(uint64_t);
     constexpr uint32_t kLastWriterOffsetWords =
         kOutputsOffsetWords + offsetof(SharedOutputCell, last_writer) / sizeof(uint64_t);
+    constexpr uint32_t kHistoryOffsetWords = offsetof(FullPaTask, writer_history) / sizeof(uint64_t);
     constexpr uint32_t kExecOffsetWords = offsetof(FullPaTask, exec) / sizeof(uint64_t);
     constexpr uint32_t kExecPayloadOffsetWords =
         kExecOffsetWords + offsetof(SharedExecCell, payload) / sizeof(uint64_t);
@@ -1680,7 +1803,28 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
               (static_cast<uint64_t>(build_owner) << 16U);
     plan[5] = reserve;
     plan[6] = nonce;
-    plan[7] = 0U;
+    const uint64_t metadata_insert_contract = SimtMetadataInsertContractForTask(task_id);
+    plan[7] = metadata_insert_contract;
+
+    if (SimtMetadataInsertContractPresent(metadata_insert_contract)) {
+        const uint32_t writer_count = SimtMetadataInsertWriterCount(metadata_insert_contract);
+        __gm__ uint64_t *history = task + kHistoryOffsetWords;
+        history[0] = static_cast<uint64_t>(kWriterHistoryMagic) | (static_cast<uint64_t>(task_id) << 32U);
+        history[1] = writer_count;
+        for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+            uint32_t producer = 0U;
+            uint32_t output_slot = 0U;
+            if (!SimtMetadataWriterIntentAt(task_id, writer, &producer, &output_slot) || producer >= task_id ||
+                output_slot >= kOutputsPerTask) {
+                SimtPublishFatal(
+                    fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+                );
+                return false;
+            }
+            history[2U + writer] = static_cast<uint64_t>(SimtSharedSymbolKey(producer, output_slot)) |
+                                   (static_cast<uint64_t>(UINT32_MAX) << 32U);
+        }
+    }
 
     __gm__ uint64_t *output_tensors = task + kOutputTensorOffsetWords;
     for (uint32_t output = 0U; output < output_count; ++output) {
@@ -1697,7 +1841,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
     }
     // Fresh outputs are independent across tasks.  Publish each descriptor as
     // soon as this warp leader has completed it; do not pull this work into the
-    // strict task[N-1] insert chain below.
+    // ordered metadata-writer predecessor chain below.
     asc_threadfence();
     for (uint32_t output = 0U; output < output_count; ++output) {
         __gm__ uint64_t *published = task + kPublishedOffsetWords + output * kAtomicStrideWords;
@@ -1907,30 +2051,48 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
     constexpr uint32_t kCompletionOffsetWords = offsetof(FullPaTask, completion) / sizeof(uint64_t);
     constexpr uint32_t kInsertOffsetWords = offsetof(FullPaTask, insert_completion) / sizeof(uint64_t);
+    constexpr uint32_t kPlanOffsetWords = offsetof(FullPaTask, plan) / sizeof(uint64_t);
     constexpr uint32_t kOutputsOffsetWords = offsetof(FullPaTask, outputs) / sizeof(uint64_t);
     constexpr uint32_t kLastWriterOffsetWords =
         kOutputsOffsetWords + offsetof(SharedOutputCell, last_writer) / sizeof(uint64_t);
     constexpr uint32_t kHistoryOffsetWords = offsetof(FullPaTask, writer_history) / sizeof(uint64_t);
     constexpr uint32_t kExecOffsetWords = offsetof(FullPaTask, exec) / sizeof(uint64_t);
+    constexpr uint32_t kAtomicStrideWords = sizeof(AtomicLine) / sizeof(uint64_t);
     __gm__ uint64_t *task = task_words + task_id * kTaskStrideWords;
     const uint32_t kind = task_id % kTasksPerBatch;
-
-#if defined(SIMT_CROSS_CORE_U2)
-    const bool publishes_metadata = true;
-    const bool has_metadata_predecessor = task_id != 0U;
-    const uint32_t predecessor_task = task_id - 1U;
-#else
-    const bool publishes_metadata = kind == static_cast<uint32_t>(TaskKind::Up);
-    const bool has_metadata_predecessor =
-        publishes_metadata && task_id >= kTasksPerBatch + static_cast<uint32_t>(TaskKind::Up);
-    const uint32_t predecessor_task =
-        has_metadata_predecessor ? task_id - kTasksPerBatch : UINT32_MAX;
-    if (publishes_metadata) {
-        const uint32_t alloc = (task_id / kTasksPerBatch) * kTasksPerBatch;
-        __gm__ uint64_t *alloc_published =
-            task_words + alloc * kTaskStrideWords + kOutputsOffsetWords;
+    const uint64_t metadata_insert_contract = task[kPlanOffsetWords + 7U];
+    const bool publishes_metadata = SimtMetadataInsertContractPresent(metadata_insert_contract);
+    const uint32_t writer_count = SimtMetadataInsertWriterCount(metadata_insert_contract);
+    const uint32_t predecessor_task = SimtMetadataInsertPredecessorTask(metadata_insert_contract);
+    const bool has_metadata_predecessor = predecessor_task != UINT32_MAX;
+    __gm__ uint64_t *history = task + kHistoryOffsetWords;
+    if ((!publishes_metadata && (writer_count != 0U || predecessor_task != UINT32_MAX)) ||
+        (publishes_metadata &&
+         (writer_count == 0U || writer_count > kWriterHistoryMaxPerTask ||
+          history[0] != (static_cast<uint64_t>(kWriterHistoryMagic) | (static_cast<uint64_t>(task_id) << 32U)) ||
+          static_cast<uint32_t>(history[1]) != writer_count || static_cast<uint32_t>(history[1] >> 32U) != 0U ||
+          (predecessor_task != UINT32_MAX && predecessor_task >= task_id)))) {
+        SimtPublishFatal(
+            fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+        );
+        return false;
+    }
+    for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+        uint32_t producer = 0U;
+        uint32_t output_slot = 0U;
+        if (!SimtDecodeSharedSymbolKey(
+                static_cast<uint32_t>(history[2U + writer]), &producer, &output_slot
+            ) ||
+            producer >= task_id) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
+        __gm__ uint64_t *published = task_words + producer * kTaskStrideWords + kOutputsOffsetWords +
+                                     output_slot * kAtomicStrideWords;
         if (!SimtWaitOutputPublished(
-                alloc_published, static_cast<uint64_t>(alloc), fatal, timeout_ticks,
+                published, static_cast<uint64_t>(producer), fatal, timeout_ticks,
                 task_id, build_owner G0_SIMT_TRACE_ARGUMENT
             )) {
             SimtPublishFatal(
@@ -1939,7 +2101,6 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
             return false;
         }
     }
-#endif
     if (has_metadata_predecessor) {
         __gm__ uint64_t *predecessor = task_words + predecessor_task * kTaskStrideWords + kInsertOffsetWords;
         uint32_t polls = 0U;
@@ -1959,24 +2120,50 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
         *predecessor_observed = -1;
     }
 
-    if (kind == static_cast<uint32_t>(TaskKind::Up)) {
-        const uint32_t alloc = (task_id / kTasksPerBatch) * kTasksPerBatch;
-        __gm__ uint64_t *history = task + kHistoryOffsetWords;
-        history[0] = static_cast<uint64_t>(kWriterHistoryMagic) | (static_cast<uint64_t>(task_id) << 32U);
-        history[1] = 3U;
-        history[2] = static_cast<uint64_t>(alloc * kOutputsPerTask + 3U) | (static_cast<uint64_t>(alloc) << 32U);
-        history[3] = static_cast<uint64_t>(alloc * kOutputsPerTask + 2U) | (static_cast<uint64_t>(alloc) << 32U);
-        history[4] = static_cast<uint64_t>(alloc * kOutputsPerTask + 1U) | (static_cast<uint64_t>(alloc) << 32U);
+    for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+        const uint32_t symbol_key = static_cast<uint32_t>(history[2U + writer]);
+        uint32_t producer = 0U;
+        uint32_t output_slot = 0U;
+        if (!SimtDecodeSharedSymbolKey(symbol_key, &producer, &output_slot)) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
+        __gm__ uint64_t *last_writer = task_words + producer * kTaskStrideWords + kLastWriterOffsetWords +
+                                       output_slot * kAtomicStrideWords;
+        const uint64_t previous = G0_TRACE_SIMT_ADD(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtMetadataLastWriterLoad,
+            last_writer, static_cast<uint64_t>(0U), true
+        );
+        if (previous < producer || previous >= task_id) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
+        history[2U + writer] = static_cast<uint64_t>(symbol_key) | (previous << 32U);
+    }
+    if (publishes_metadata) {
         asc_threadfence();
     }
-
-    if (kind == static_cast<uint32_t>(TaskKind::Up)) {
-        const uint32_t alloc = (task_id / kTasksPerBatch) * kTasksPerBatch;
-        __gm__ uint64_t *alloc_last_writer = task_words + alloc * kTaskStrideWords + kLastWriterOffsetWords;
+    for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+        const uint32_t symbol_key = static_cast<uint32_t>(history[2U + writer]);
+        const uint64_t previous = history[2U + writer] >> 32U;
+        uint32_t producer = 0U;
+        uint32_t output_slot = 0U;
+        if (!SimtDecodeSharedSymbolKey(symbol_key, &producer, &output_slot)) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
+        __gm__ uint64_t *last_writer = task_words + producer * kTaskStrideWords + kLastWriterOffsetWords +
+                                       output_slot * kAtomicStrideWords;
         if (G0_TRACE_SIMT_CAS(
-                simt_trace, task_id, g0_swimlane::AtomicSite::SimtAllocLastWriterCommit,
-                alloc_last_writer, alloc, task_id, true
-            ) != alloc) {
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtMetadataLastWriterCommit,
+                last_writer, previous, task_id, true
+            ) != previous) {
             SimtPublishFatal(
                 fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
             );
@@ -1985,11 +2172,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
     }
 
     if (publishes_metadata) {
-#if defined(SIMT_CROSS_CORE_U2)
-        const uint64_t expected_insert = task_id == 0U ? UINT64_MAX : static_cast<uint64_t>(task_id - 1U);
-#else
         const uint64_t expected_insert = static_cast<uint64_t>(task_id - 1U);
-#endif
         const uint64_t insert_observed = G0_TRACE_SIMT_ADD(
             simt_trace, task_id, g0_swimlane::AtomicSite::SimtInsertCompletionPublish,
             task + kInsertOffsetWords, static_cast<uint64_t>(1U), true
@@ -2223,14 +2406,7 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
                 }
             }
 #endif
-#if defined(SIMT_CROSS_CORE_U2)
-            insert_waits += task_id == 0U ? 0U : 1U;
-#else
-            insert_waits += kind == static_cast<uint32_t>(TaskKind::Up) && task_id >=
-                                kTasksPerBatch + static_cast<uint32_t>(TaskKind::Up) ?
-                                1U :
-                                0U;
-#endif
+            insert_waits += SimtPreviousMetadataWriterTask(task_id) == UINT32_MAX ? 0U : 1U;
             ++committed;
             ++tasks_built;
             if (tasks_built == 1U) {
