@@ -2020,8 +2020,8 @@ BUILT-only 或伪 ready 队列；优先缩短严格 Register 完成传播和随�
 
 当前 `0.8 ms` 目标仍受 real-compute 的 AIC 算术 service 下界约束。后续方案
 不能靠删减 kernel、截断 FinalDrain 或改变任务数达标；仍以 startup 起点到
-FinalDrain 结束的完整周期裁决。离线工具及逐 task 分解见
-`cross_core/analyze_pa_exec_release_bound.py` 和过程记录 S6.82。
+FinalDrain 结束的完整周期裁决。一次性离线取证的逐 task 分解结果见
+过程记录 S6.82；固定 PA DAG 的可执行脚本已移除。
 
 ### 2026-08-06：已采用“稀疏 metadata writer 严格链”
 

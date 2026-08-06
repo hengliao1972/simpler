@@ -5718,13 +5718,8 @@ S6.80 与 S6.81 分别否决了 BUILT-only 全局队列和 AIC Execute-only 角�
 两次反例都说明“更早尝试 Execute”不等于“任务更早 ready”，但仅凭端到端结果
 仍无法回答：如果 Execute 发现完全理想，当前还能回收多少时间。
 
-本阶段新增只读工具：
-
-```text
-cross_core/analyze_pa_exec_release_bound.py
-```
-
-它只解析既有 `merged_swimlane.json`，不修改设备代码、不增加 raw 字段，也不把
+本阶段曾使用一次性的 PA 离线取证脚本解析既有
+`merged_swimlane.json`；它不修改设备代码、不增加 raw 字段，也不把
 泳道观察构建与 trace-free 绝对时间相减。工具按当前 standalone PA 的固定
 `Alloc/QK/SF/PV/UP` task-id 合同重建 `QK -> SF -> PV` 与
 `QK/SF/PV -> UP` 依赖，并明确区分两个完成边界：
@@ -5739,15 +5734,9 @@ cross_core/analyze_pa_exec_release_bound.py
 2. 再把所有 BUILT 发布时间理想化为 0，只保留泳道测得的 kernel、completion
    flag 与 DONE 工作量。
 
-复现命令：
-
-```bash
-.venv/bin/python \
-  tests/atomic_probe/pa_scheduler/cross_core/analyze_pa_exec_release_bound.py \
-  tests/atomic_probe/pa_scheduler/outputs/\
-pa_scheduler_cross_core_shared_swimlane_20260806_005546_3225536/\
-ccec/merged_swimlane.json
-```
+该脚本依赖 PA 固定的 `task_id % 5` 布局和 DAG，不是通用调度器机制。
+取证结论已完整保留在本节，可执行脚本不再保留，避免被误当成
+可迁移到其他算子的通用分析工具。
 
 ### B256 取证结果
 
