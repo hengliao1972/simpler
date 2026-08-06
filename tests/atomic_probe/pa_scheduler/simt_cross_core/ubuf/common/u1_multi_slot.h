@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "../../common/full_pa_exec_protocol.h"
+#include "ubuf_staging_protocol.h"
 
 namespace pa_scheduler::simt_cross_core::u1 {
 
@@ -32,6 +33,14 @@ using g0::ExecEngineClass;
 using g0::ExecPhase;
 using g0::kCacheLineBytes;
 using g0::kUnboundOwner;
+using ubuf_staging::DecodedSlotState;
+using ubuf_staging::SlotBusyState;
+using ubuf_staging::SlotFreeState;
+using ubuf_staging::SlotStateGeneration;
+using ubuf_staging::SlotStateIsFree;
+using ubuf_staging::SlotStateTaskId;
+using ubuf_staging::SlotStateTaskPlusOne;
+using ubuf_staging::TransportKind;
 
 constexpr uint64_t kProbeMagic = 0x53494D5455314135ULL;
 constexpr uint64_t kProbeVersion = 1U;
@@ -48,19 +57,19 @@ constexpr uint32_t kThreadCount = kWarpSize * kWarpCount;
 constexpr uint32_t kTaskCount = 128U;
 constexpr uint32_t kTasksPerWarp = kTaskCount / kWarpCount;
 constexpr uint32_t kPayloadClassCount = 4U;
-constexpr uint32_t kMaxPayloadLines = 16U;
-constexpr uint32_t kWordsPerLine = kCacheLineBytes / sizeof(uint64_t);
-constexpr uint32_t kMaxPayloadWords = kMaxPayloadLines * kWordsPerLine;
-constexpr uint32_t kUbufAlignmentBytes = kCacheLineBytes;
-constexpr uint32_t kUbufGuardLines = 1U;
-constexpr uint32_t kUbufSlotCount = 4U;
-constexpr uint32_t kUbufPayloadOffsetBytes = kUbufGuardLines * kCacheLineBytes;
-constexpr uint32_t kUbufSlotStrideBytes = (kUbufGuardLines + kMaxPayloadLines + kUbufGuardLines) * kCacheLineBytes;
-constexpr uint32_t kUbufRegionBytes = kUbufSlotCount * kUbufSlotStrideBytes;
-constexpr uint32_t kUbufPayloadOffsetWords = kUbufPayloadOffsetBytes / sizeof(uint64_t);
-constexpr uint32_t kUbufSlotStrideWords = kUbufSlotStrideBytes / sizeof(uint64_t);
-constexpr uint32_t kUbufRegionWords = kUbufRegionBytes / sizeof(uint64_t);
-constexpr uint32_t kUbufGuardAfterOffsetWords = kUbufPayloadOffsetWords + kMaxPayloadWords;
+constexpr uint32_t kMaxPayloadLines = ubuf_staging::kMaxPayloadLines;
+constexpr uint32_t kWordsPerLine = ubuf_staging::kWordsPerLine;
+constexpr uint32_t kMaxPayloadWords = ubuf_staging::kMaxPayloadWords;
+constexpr uint32_t kUbufAlignmentBytes = ubuf_staging::kAlignmentBytes;
+constexpr uint32_t kUbufGuardLines = ubuf_staging::kGuardLines;
+constexpr uint32_t kUbufSlotCount = ubuf_staging::kSlotCount;
+constexpr uint32_t kUbufPayloadOffsetBytes = ubuf_staging::kPayloadOffsetBytes;
+constexpr uint32_t kUbufSlotStrideBytes = ubuf_staging::kSlotStrideBytes;
+constexpr uint32_t kUbufRegionBytes = ubuf_staging::kRegionBytes;
+constexpr uint32_t kUbufPayloadOffsetWords = ubuf_staging::kPayloadOffsetWords;
+constexpr uint32_t kUbufSlotStrideWords = ubuf_staging::kSlotStrideWords;
+constexpr uint32_t kUbufRegionWords = ubuf_staging::kRegionWords;
+constexpr uint32_t kUbufGuardAfterOffsetWords = ubuf_staging::kGuardAfterOffsetWords;
 constexpr uint32_t kSlotReuseCount = kTaskCount / kUbufSlotCount;
 constexpr uint32_t kAnchorTaskCount = kUbufSlotCount;
 constexpr uint64_t kAnchorStagedMask = (uint64_t{1U} << kAnchorTaskCount) - 1U;
@@ -78,10 +87,6 @@ constexpr uint32_t kGuardAfterRoles = 3U;
 constexpr uint32_t kGuardBeforeBuilderThreads = 4U;
 constexpr uint32_t kGuardAfterBuilderThreads = 5U;
 constexpr uint32_t kGuardBeforeStagingSlots = 6U;
-
-enum class TransportKind : uint16_t {
-    SimtUbufReadToGmWordStore = 1U,
-};
 
 enum class ProbeRole : uint32_t {
     AicObserver = 0U,
@@ -110,13 +115,6 @@ struct DecodedU1Fatal {
     U1FatalReason reason;
     uint32_t reporter_owner;
     uint32_t task_id;
-    bool valid;
-};
-
-struct DecodedSlotState {
-    uint32_t generation;
-    uint32_t task_id;
-    bool busy;
     bool valid;
 };
 
@@ -187,37 +185,8 @@ SIMT_CROSS_CORE_U1_INLINE uint32_t UbufGuardBeforeId(uint32_t slot_id) {
 
 SIMT_CROSS_CORE_U1_INLINE uint32_t UbufGuardAfterId(uint32_t slot_id) { return UbufGuardBeforeId(slot_id) + 1U; }
 
-SIMT_CROSS_CORE_U1_INLINE uint64_t SlotFreeState(uint32_t generation) {
-    return static_cast<uint64_t>(generation) << 32U;
-}
-
-SIMT_CROSS_CORE_U1_INLINE uint64_t SlotBusyState(uint32_t generation, uint32_t task_id) {
-    return (static_cast<uint64_t>(generation) << 32U) | (static_cast<uint64_t>(task_id) + 1U);
-}
-
-SIMT_CROSS_CORE_U1_INLINE uint32_t SlotStateGeneration(uint64_t raw_state) {
-    return static_cast<uint32_t>(raw_state >> 32U);
-}
-
-SIMT_CROSS_CORE_U1_INLINE uint32_t SlotStateTaskPlusOne(uint64_t raw_state) { return static_cast<uint32_t>(raw_state); }
-
-SIMT_CROSS_CORE_U1_INLINE bool SlotStateIsFree(uint64_t raw_state) { return SlotStateTaskPlusOne(raw_state) == 0U; }
-
-SIMT_CROSS_CORE_U1_INLINE uint32_t SlotStateTaskId(uint64_t raw_state) {
-    const uint32_t task_plus_one = SlotStateTaskPlusOne(raw_state);
-    return task_plus_one == 0U ? kInvalidTaskId : task_plus_one - 1U;
-}
-
 SIMT_CROSS_CORE_U1_INLINE DecodedSlotState DecodeSlotState(int64_t raw_state) {
-    const uint64_t raw = static_cast<uint64_t>(raw_state);
-    const uint32_t task_plus_one = SlotStateTaskPlusOne(raw);
-    const bool busy = task_plus_one != 0U;
-    return DecodedSlotState{
-        SlotStateGeneration(raw),
-        busy ? task_plus_one - 1U : kInvalidTaskId,
-        busy,
-        !busy || task_plus_one <= kTaskCount,
-    };
+    return ubuf_staging::DecodeSlotState(raw_state, kTaskCount);
 }
 
 SIMT_CROSS_CORE_U1_INLINE bool SlotStateValidForSlot(uint64_t raw_state, uint32_t slot_id) {

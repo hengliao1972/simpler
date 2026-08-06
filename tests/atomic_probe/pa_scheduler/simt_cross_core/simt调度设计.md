@@ -561,7 +561,119 @@ AIV1 executor 同样必须在每次 `BUILT->CLAIMED` 之前检查 fatal，并在
 claim 成功后、读取 payload 前再次检查。第二个窗口若观察到首错，owner33
 必须用精确 CAS 将自己的 `CLAIMED` 恢复为 `BUILT`，不得增加 claim/done
 计数；payload 校验完成到 `DONE` 之前再做一次同样的 fatal 边界检查。
-### 3.11 Direct-GM 多 builder 性能扩展
+
+### 3.11 U2 完整 PA 的 UBUF payload sink 合同
+
+U2 不复制 G0 调度器，也不改变五类 task、DAG、heap、output descriptor、
+writer history、last-writer、严格 insert、executor、token、completion 或
+drain 规则。同一份完整 PA 实现通过编译期 transport policy 长期保留两条
+路径：G0 继续直接构造 GM payload；U2 只把可执行 task 的 payload sink
+替换为“四槽 UBUF staging，再由同一 SIMT leader 逐有效 word 直接写 GM”。
+AIV0 Main Scalar 仍只负责 VF invoke/join/drain，不参与 task 构建或严格
+insert；Alloc task 没有 exec payload，因此既不申请也不占用 UBUF 槽。
+U2 control 必须拒绝 `builder_count!=1`：G1 的 AIV0/AIV1 各有一份私有
+UBUF，不能把两个物理地址空间伪装成一套全局四槽；双 builder 继续只由
+Direct-GM G1 覆盖。
+
+真实 PA 四类 payload 的口径固定如下。`payload_bytes` 是协议语义长度，
+`written_words` 是实际必须写入和搬运的 64-bit word 数；二者在末尾含
+32-bit fanin 时不一定相等：
+
+| task | payload_bytes | written_words | 实际写入字节 | payload_lines |
+| ---- | ------------: | ------------: | -----------: | ------------: |
+| QK | 592 | 74 | 592 | 10 |
+| SF | 604 | 76 | 608 | 10 |
+| PV | 596 | 75 | 600 | 10 |
+| UP | 988 | 124 | 992 | 16 |
+
+U2 复用 U1 已由 A5 验证的四槽物理布局：每槽前 guard 64 B、payload
+1024 B、后 guard 64 B，stride 1152 B，总计 4608 B。builder 只能搬运
+`written_words`，不得按 `payload_lines` 或 16 行整槽覆盖 GM；host 继续用
+逐 task tail poison 排除 SF/PV 的向上取整覆盖和所有长尾覆盖。
+
+严格 insert chain 对 slot generation 产生了 U1 没有的额外约束。U2 固定：
+
+```text
+slot_id(task)             = task_id % 4          # 只适用于 QK/SF/PV/UP
+expected_generation(task) = TaskBatch(task)
+acquire                   = FREE(batch) -> BUSY(batch, task)
+release                   = BUSY(batch, task) -> FREE(batch + 1)
+```
+
+每个 batch 的 QK/SF/PV/UP 恰好占四个不同槽，Alloc 不占槽。不能沿用
+U1 的“见到任意 FREE(g) 就取得”规则：例如 batch1 的 UP task9 与 batch0
+的 QK task1 都映射 slot1；若 task9 能提前占到 generation0 并在严格
+insert 上等待 task8，task1 会反过来等待同一 slot，形成后继占槽、前驱
+无法推进的死锁。ordered generation 使 task9 只能等待 task1 释放出
+`FREE(1)`。因此 B1 成功终态必须是每槽 `FREE(1)`、acquire/release
+各 1 次；B256 必须是每槽 `FREE(256)`、各 256 次。
+
+winner 的顺序固定为：SIMT claim；完成 plan、heap reservation 和 output
+descriptor 发布；按 batch generation 取得目标槽；在槽内完整生成 payload；
+检查前后 guard；同 leader 仅复制 `written_words` 到 GM；fence；执行 G0
+原有严格 predecessor wait、history/last-writer/insert-completion 和
+`BUILDING->BUILT`；最后 exact-release 并推进 generation。第一批的
+task1..4 是四个 anchor：各自 staging/guard 完成后，在持槽状态下同时等到
+`count=4 && mask=0xf`，其中身份位固定为 `1 << (task_id - 1)`，不能直接
+使用 `1 << task_id` 得到 `0x1e`。开门后才允许进入 GM copy/commit，用 `maxbusy=4` 证明
+四类真实 payload 曾同时驻留。
+
+slot CAS 成功后仍沿用 U1 的 busy-depth 计数顺序、固定 CAS 尝试上限、
+跨 cacheline count/mask 合法偏差重试和首错保留。prepare 或 commit 任一步
+在持槽期间失败，必须先 exact-release，再让 global fatal 收口；完整 PA
+的 heap/output publication 是不可逆诊断副作用，失败路径不伪装成事务回滚，
+也不得在 fatal 后重新使用已推进的 slot generation。
+
+U2 的 builder transport 静态门槛只检查 payload sink 作用域没有
+MTE3/UBTOOUT。完整 PA 的 AIC/AIV workload 本来就合法使用 MTE3，因此禁止
+把“整个 mixed ELF 不含 MTE3”作为 U2 条件。验证顺序为：同源 CPU 模型
+分别运行 G0 与 U2 的 B1/B256；U2 额外覆盖 ordered-generation 反死锁、
+四 anchor、SF/PV tail 和故障 exact-release；再构建独立 U2 CCEC/ELF/ACL
+产物并跑真实 A5 B1/B256，最后回归 G0/G1/U0/U1。
+
+### 3.12 ACL 初始化栈配置与 GM profiling 隔离
+
+SIMT 栈容量调整必须走经过查证的 ACL 初始化配置，不把初始化完成后的
+runtime limit 实验当作同一接口。host 接收显式配置文件路径，并在第一次
+ACL 调用中执行 `aclInit(configPath)`。独立最小栈探针使用：
+
+```json
+{
+  "StackSize": {
+    "simt_stack_size": 1024,
+    "simt_divergence_stack_size": 512
+  }
+}
+```
+
+该探针已经在目标 A5 连续 20/20 PASS，只证明 ACL 初始化配置入口和
+1024/512 B 探针本身成立，不能代替完整 U2 的栈需求。完整 U2 的最终配置为：
+
+```json
+{
+  "StackSize": {
+    "simt_stack_size": 1536,
+    "simt_divergence_stack_size": 1536
+  }
+}
+```
+
+两项为 byte 且按 128 B 对齐。完整 U2 的 AIV metadata 为 SU 808 B、
+SIMT 456 B、DVG 1280 B，但 metadata 不能单独证明动态调用链不会溢出。
+真实 A5 对照中，1024/1536 B 和 1024/4608 B 都得到 AIV0 错误码 354
+`VEC SIMT stack overflows`；1536/1536 B 和 1536/4608 B 均通过 B1，且
+1536/1536 B 继续通过 B256。因此最终值只增大 SIMT stack，DVG 保持满足
+metadata 的 1536 B。配置成功仍不等于 U2 功能成功，必须保留完整 host
+oracle。
+
+G0 性能与泳道长期保持两个产物：生产 G0 不写 task trace，只由 ACL event
+测 mixed-kernel 时间；泳道变体在 `FullPaState` 后追加固定容量 sidecar，
+builder/executor 对同一 task 使用不同 cache line。Scalar 使用
+`get_sys_cnt()`；SIMT `CLOCK64` 只保留 raw tick。两者 epoch 不同时，只允许
+把 CLOCK64 仿射映射到 Scalar VF invoke/join 包络用于展示，并在 JSON 中显式
+标识，禁止把映射后的 SIMT 子阶段当作 ns 或拿 trace-on/off 相减估算开销。
+
+### 3.13 Direct-GM 多 builder 性能扩展
 
 G1 的“两份完整 VF 竞争同一 task”是双 builder 正确性阶段，不是最终性能
 拓扑。性能路径在已经验证角色互斥、严格 insert 和完整 PA oracle 后采用静态
@@ -652,6 +764,7 @@ simt_cross_core/
     test/
     simt_atomic/          # GM uint64 CAS/add 多 warp 同地址独立探针
     warp_concurrency/     # 同 warp 分歧串行与跨 warp 独立推进探针
+    simt_stack/           # ACL-init SIMT/DVG 栈配置与 2048-thread 独立探针
   gm/
     common/
     cpu/

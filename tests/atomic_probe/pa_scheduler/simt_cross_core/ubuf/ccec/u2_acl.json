@@ -1,0 +1,6 @@
+{
+  "StackSize": {
+    "simt_stack_size": 1536,
+    "simt_divergence_stack_size": 1536
+  }
+}

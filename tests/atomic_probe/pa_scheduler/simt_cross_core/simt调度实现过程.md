@@ -2221,7 +2221,75 @@ SIMT-native MTE3，transport 仍是 UBUF volatile load 后的普通 GM word stor
 `max_busy=4` 只证明四个 anchor staging 区间曾同时存在，不声称
 64 个 warp 的所有指令都同周期并行，也不把 unlocked 运行写成性能数据。
 
-## 14. 2026-08-06：暂停 U2，补齐 Direct-GM 性能与泳道图
+## 14. U2：四槽 UBUF 迁移到完整 PA
+
+### 14.1 开始前复用审计
+
+U2 的第一原则是复用 G0，而不是在 `ubuf/` 下复制一套完整 PA 调度器。
+已确认可直接保留的存量包括：
+
+- `common/full_pa_exec_protocol.h` 的 exec state、payload layout、token、
+  completion 和 fatal ABI；
+- `common/full_pa_model.h` 的五类 task、每 batch 五 task/四 kernel task、
+  DAG、heap、fanin、engine route 和 drain 映射；
+- `gm/common/g0_full_pa.h` 的完整 host/device state、task plan、build report、
+  writer history 和 execution witness；
+- `gm/ccec/g0_full_pa_kernel.cpp` 的纯 SIMT claim/prepare/strict commit，以及
+  AIC/AIV executor/workload；
+- 同一份 G0 CPU model、ACL host 和 oracle。
+
+因此实现采用同源编译期 transport policy：Direct-GM 继续生成 G0/G1，
+Ubuf-Staged 生成独立 U2 产物。差异只能进入 payload sink、四槽状态/报告、
+guard 和对应 oracle，不允许分叉 task/DAG/insert/executor 主逻辑。
+
+### 14.2 已冻结的死锁规避规则
+
+U1 可以让任意 task 抢当前 FREE generation，因为 128 个诊断 task 相互
+独立；完整 PA 不可以。U2 的后继 task 会在持槽时进入严格
+`task[N-1].insert_completion` 等待。若后继抢走前驱所需的旧 generation，
+会形成真环：例如 task6 若抢到 slot2 的 `FREE(0)` 并等待 task5，严格链
+最终依赖 task2，而 task2 又在等待同一 slot2。
+
+因此只允许 executable task 使用：
+
+```text
+slot = task_id % 4
+generation = TaskBatch(task_id)
+FREE(generation) -> BUSY(generation, task_id) -> FREE(generation + 1)
+```
+
+Alloc 不占槽；同 batch 的 QK/SF/PV/UP 分别占四个不同槽。U2 首版只能
+使用一个 AIV0 builder：G1 的 AIV0/AIV1 各有私有 UBUF，不能拿一份 GM
+slot state 假装两份物理 UBUF 是同一四槽。双 builder 仍只保留在 Direct-GM
+G1 回归中。
+
+### 14.3 Payload 精确搬运口径
+
+实际 layout 为 QK `592 B/74 words/10 lines`、SF
+`604 B/76 words/10 lines`、PV `596 B/75 words/10 lines`、UP
+`988 B/124 words/16 lines`。SF/PV 的最后一个 64-bit word 只部分承载
+语义字节，但仍必须作为完整 word 写入；其后所有 GM word 保持 task 专属
+poison。U2 只复制 `written_words`，不能用 payload_bytes、payload_lines
+或固定 16 行代替。
+
+第一 batch 的 task1..4 作为四类真实 payload anchor，在各自槽内完成
+staging/guard 后同时持槽，等 `count=4 && mask=0xf` 才进入 GM copy 和
+原有 strict commit；四个 identity bit 使用 `1 << (task_id - 1)`，避免
+误写成 task-id bit 后得到 `0x1e`。B1 每槽只允许 generation0，终态 `FREE(1)`；B256
+每槽必须完整经历 generation `0..255`，终态 `FREE(256)`。
+
+### 14.4 实施顺序
+
+1. 抽取 U1/U2 共用的四槽几何和 64-bit slot state 编解码；先回归 U1。
+2. 给同一 CPU full-PA model 注入 Direct-GM/Ubuf-Staged payload sink，
+   先完成 B1/B256、anchor、tail、ordered-generation 和故障 release。
+3. 参数化同一 CCEC kernel/host，生成独立 U2 mixed ELF；静态检查只限定
+   builder payload transport 不含 MTE3，不误伤真实 workload 的 MTE3。
+4. 跑真实 A5 U2 B1/B256，再回归 G0/G1/U0/U1并阶段性本地提交。
+
+本节当前只记录冻结设计，没有提前填写性能或设备 PASS。
+
+## 15. 2026-08-06：暂停 U2，补齐 Direct-GM 性能与泳道图
 
 ### 15.1 工作切换、GM/UB 边界与栈配置
 
@@ -2336,7 +2404,7 @@ raw word，避免把记录损坏误判成调度协议失败。修复后 B256 同
 raw 汇总既保存 event 数，也保存被合并后的真实调用次数：
 
 | 执行域 | atomic 调用 | 其中 poll 调用 | raw record | poll record | DCCI 调用/行 |
-| ------ | ----------: | -------------: | ---------: | ----------: | -------------: |
+| ------ | ----------: | -------------: | ---------: | ----------: | -----------: |
 | SIMT | 253,345 | 226,975 | 29,761 | 3,391 | 0 / 0 |
 | Scalar | 5,053,126 | 5,039,569 | 17,589 | 1,793 | 14,988 / 14,988 |
 
@@ -2369,7 +2437,7 @@ SIMT writer 泳道。每个 executor task 保留 lifecycle、wait、fanin 和 ex
 可定量的 Scalar task 区间分布为：
 
 | 区间 | 最小/us | 中位/us | 平均/us | 最大/us | 1024 task 累加/us |
-| ---- | ------: | ------: | ------: | ------: | -----------------: |
+| ---- | ------: | ------: | ------: | ------: | ----------------: |
 | 完整 lifecycle | 646.868 | 5376.107 | 6623.095 | 11374.393 | 6782049.322 |
 | wait_built + claim | 631.044 | 5360.574 | 6608.172 | 11358.546 | 6766768.503 |
 | bind + fanin wait | 4.293 | 6.674 | 7.327 | 14.379 | 7502.523 |
@@ -2499,7 +2567,7 @@ CPU oracle、host oracle 和 build-time source gate 都按同一公式验证
 协议常量。
 
 | 每侧 warp | 每侧 SIMT thread | 总 leader | task 分布 | insert poll 典型总数/最大值 | B256 median/us | 相对 64-warp |
-| --------: | ---------------: | ----------: | --------- | --------------------------: | -------------: | -------------: |
+| --------: | ---------------: | --------: | --------- | --------------------------: | -------------: | -----------: |
 | 64 | 2048 | 128 | 640 / 640 | 约 31.3 万～32.2 万 / 994 | 7443.780 | 基准 |
 | 32 | 1024 | 64 | 640 / 640 | 约 13.8 万 / 400 | 3944.306 | -47.01% |
 | **16** | **512** | **32** | **640 / 640** | **约 6.0 万 / 171** | **3636.886** | **-51.14%** |
@@ -2698,7 +2766,7 @@ Scalar DCCI、Vector add/multiply、Cube matmul、drain atomic，最后检查静
 多轮输出的典型总量，只用于解释趋势，不冒充稳定常量。
 
 | Builder 数 B | AIV executor | builder_wins | insert poll 典型值 | min/us | median/us | avg/us | max/us | 相对 B1 |
-| ------------: | -----------: | ------------ | -------------------: | -----: | --------: | -----: | -----: | -------: |
+| -----------: | -----------: | ------------ | -----------------: | -----: | --------: | -----: | -----: | ------: |
 | 1 | 63 | 1280 | 约 4.08 万 | 6814.707 | 6871.043 | 6937.757 | 7583.894 | 基线 |
 | 2 | 62 | 640/640 | 约 6.4 万 | 3709.292 | 3747.599 | 3796.482 | 4383.371 | -45.46% |
 | 3 | 61 | 432/432/416 | 约 6.5 万 | 2419.847 | 2435.067 | 2493.910 | 3091.143 | -64.56% |
@@ -2719,8 +2787,8 @@ executor。B≥4 后第一项基本饱和，跨 AIV 的前驱轮询和 executor 
 本身会显著扰动运行，只能对图内事件负责；DCCI 随 builder 增加每次少 20，
 是因为被占作 builder 的 AIV 不再执行 terminal-token 等 Scalar DCCI。
 
-| B | trace-on device span/us | SIMT atomic call | Scalar atomic call | Scalar DCCI call |
-| -: | ----------------------: | ---------------: | -----------------: | ---------------: |
+| Builder B | trace-on device span/us | SIMT atomic call | Scalar atomic call | Scalar DCCI call |
+| --------: | ----------------------: | ---------------: | -----------------: | ---------------: |
 | 1 | 约 9226 | 58,649 | 2,166,119 | 14,988 |
 | 2 | 约 4986 | 95,647 | 1,098,082 | 14,968 |
 | 3 | 约 4969 | 257,221 | 1,073,236 | 14,948 |
@@ -2736,7 +2804,7 @@ executor。B≥4 后第一项基本饱和，跨 AIV 的前驱轮询和 executor 
 因此固定 B=4，再对 W=8/12/16/24 做有界扫描；每个点同样 11/11 PASS：
 
 | 每 builder warp W | 每 builder thread | 总 leader | builder_wins | insert poll 典型值 | min/us | median/us | avg/us | max/us | 相对 W16 |
-| -----------------: | ------------------: | ----------: | ------------ | -------------------: | -----: | --------: | -----: | -----: | ---------: |
+| ----------------: | ----------------: | --------: | ------------ | -----------------: | -----: | --------: | -----: | -----: | -------: |
 | 8 | 256 | 32 | 320/320/320/320 | 约 4.6 万 | 2181.513 | 2239.565 | 2286.970 | 2890.144 | +7.86% |
 | 12 | 384 | 48 | 324/324/320/312 | 约 6.95 万 | 2216.341 | 2230.759 | 2286.503 | 2853.491 | +7.43% |
 | **16** | **512** | **64** | **320/320/320/320** | **约 10.3 万** | **2060.366** | **2076.408** | **2135.426** | **2727.320** | **最优** |
@@ -2837,7 +2905,7 @@ UBUF/U2 功能开发，U2 继续保留原有全 task 严格插入链。
 两个局部构建优化先确认了非串行部分的上限：
 
 | Direct-GM B4/W16 阶段 | B256 样本 | trace-off median/us | 说明 |
-| --------------------------- | ---------: | -------------------: | ---- |
+| --------------------- | --------: | ------------------: | ---- |
 | 上一阶段已提交基线 | 21 | 2067.660 | 全部 1280 task 参与 strict insert |
 | 相邻 producer base 复用 | 11 | 1809.952 | producer-base atomic load 由 2048 次降为 1280 次 |
 | descriptor 单次解码 | 11 | 1622.330 | type/shape/address 只计算一次，再写 16 words |
@@ -2903,7 +2971,7 @@ PASS（B4 额外执行 11 轮），1280 个 task 的 winner 分布与静态映�
 一致：
 
 | Builder B | AIV executor | trace-off median/us | 相对 0.8 ms | 结论 |
-| --------: | -----------: | -------------------: | ------------: | ---- |
+| --------: | -----------: | ------------------: | ----------: | ---- |
 | 2 | 62 | 1357.270 | +557.270 | builder 构建仍在关键路径 |
 | 3 | 61 | 1054.585 | +254.585 | 仍未达标 |
 | 4 | 60 | 818.473 | +18.473 | 接近目标，11 轮 min/avg/max=805.078/875.354/1453.989 |
@@ -2934,7 +3002,7 @@ publication 的等待记录为独立站点
 `simt_metadata_output_published_poll`，不把它混入 predecessor poll。
 
 | trace-on 证据 | B4/W16 旧全 task 链 | B5/W16 稀疏 UP 链 |
-| ------------- | --------------------: | -------------------: |
+| ------------- | ------------------: | ----------------: |
 | schema | v4 | v5 |
 | device span/us | 5220.165 | 1068.623 |
 | SIMT atomic calls | 565,148 | 28,056 |
@@ -2997,7 +3065,123 @@ tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
 中位 0.710 ms，已达到 0.8 ms 目标。** 不能将 trace-on 1.069 ms 当作
 生产性能；首轮冷启动也单独保留在 max 中，没有从统计中删除。
 
-## 19. 阶段状态索引
+## 19. 2026-08-06：U2 四槽 UBUF 完整 PA 功能闭合
+
+### 19.1 同源实现边界
+
+U2 没有复制第二套 PA 调度器。最终实现继续复用 G0 的五类 task、DAG、
+heap/output publication、writer metadata、全 task 严格 insert、AIC/AIV
+executor、token、completion 和 drain；同一份 kernel、CPU model 和 ACL host
+通过编译期 transport policy 生成独立 U2 产物。新增内容只包括：
+
+- U1/U2 共用的四槽几何与 64-bit generation 状态编解码；
+- U2 control、四槽状态、前后 guard、逐 task staging report 和 host oracle；
+- 可执行 task 的 UBUF payload sink，以及同一 SIMT leader 的 UBUF 读取到
+  普通 GM 逐 word store；
+- `build-u2`、`run-u2` 和独立 ACL 初始化配置。
+
+Alloc 不占槽。QK/SF/PV/UP 固定使用 `task_id % 4`，generation 固定为
+`TaskBatch(task_id)`；第一 batch 的 task1..4 同时持有四个槽，等
+`count=4 && mask=0xf` 后才继续。每个 payload 只搬运精确的 74/76/75/124
+个 64-bit word，SF/PV 尾部和其余 GM tail poison 都由 host 独立检查。
+payload transport 本身不使用 MTE3；完整 PA workload 原有的合法 MTE3 不受
+这个局部门槛影响。
+
+### 19.2 真机栈溢出的定位与修复
+
+初版正式配置为 SIMT 1024 B、DVG 1536 B。CPU、CCEC、bitcode、mixed ELF
+和 host 都通过，但真实 A5 在第一次 B1 launch 的
+`aclrtSynchronizeStream` 返回 507015。debug plog 中只有 AIV0 给出非零
+硬件错误码 354，运行时原文为 `The VEC SIMT stack overflows`；其余 AIC/AIV
+停在等待 BUILT 或 drain 的位置，是 builder 未完成后的连带超时，不是多个
+独立根因。
+
+保持同一个 U2 ELF，只改变第一次 `aclInit(configPath)` 的两项容量，得到：
+
+| SIMT stack/B | DVG stack/B | A5 B1 | 结论 |
+| -----------: | ----------: | ----- | ---- |
+| 1024 | 1536 | 507015，AIV0 error 354 | 初版失败 |
+| 1024 | 4608 | 507015，AIV0 error 354 | 增大 DVG 无效 |
+| 1536 | 1536 | PASS | SIMT 容量修复根因 |
+| 1536 | 4608 | PASS | DVG 不是本次瓶颈 |
+
+CCEC metadata 同时报告 SU 808 B、SIMT 456 B、DVG 1280 B。456 B 是产物记录
+值，但没有覆盖本次动态调用链的真机容量结论，不能用它反推 1024 B 一定够。
+独立最小 stack probe 的 1024/512 B 已在 A5 20/20 PASS，也只证明配置入口和
+那个最小 kernel 成立。最终 U2 因此使用 SIMT 1536 B、DVG 1536 B；没有沿用
+GM profiling 的 1536/4608 B，也没有恢复初始化后的 `rtDeviceSetLimit`。
+
+### 19.3 CPU、编译产物与静态门槛
+
+正式 `build-u2` 已重新完整通过：
+
+- CPU optimized：B1/B256、四槽 ordered generation、四 anchor、精确 payload
+  word/tail、严格 insert、完整 PA oracle、持槽故障 cleanup 和同地址复用四轮；
+- CPU ASan+UBSan：B1/B256 与同地址复用两轮；
+- CPU TSan：B1/B256 与同地址复用两轮；
+- CCEC AIC/AIV、optimized bitcode、transport-only bitcode、静态 1:2 mixed
+  ELF、metadata 和 GCC15 ACL host；
+- transport-only bitcode 保留 AS6 volatile UBUF load/store 和普通 GM store，
+  且不含 MTE3/UBTOOUT；完整 bitcode 保留合法 workload MTE3；
+- 4608 B staging、16 KiB compiler UB、192+16/224 KiB AIV local budget，以及
+  ACL 1536/1536 B 配置均由构建门槛检查。
+
+### 19.4 真实 A5 完整 PA 结果
+
+正式 `run-u2` 在 `Ascend950PR_958b` device0 上得到：
+
+| 配置 | PASS | kernel event/us | insert polls | max insert polls |
+| ---- | ---: | --------------- | -----------: | ---------------: |
+| B1 run1 | 1/1 | 906.693 | 18 | 8 |
+| B1 run2 | 1/1 | 247.425 | 16 | 7 |
+| B1 run3 | 1/1 | 234.634 | 18 | 8 |
+| **B1 汇总** | **3/3** | **median 247.425** | - | - |
+| B256 run1 | 1/1 | 42564.777 | 100227 | 549 |
+| B256 run2 | 1/1 | 41966.263 | 100473 | 531 |
+| B256 run3 | 1/1 | 41911.259 | 100328 | 529 |
+| **B256 汇总** | **3/3** | **median 41966.263** | - | - |
+
+每轮均通过 5/1280 task、4/1024 executable task、完整 DAG/golden、四槽
+最终 `FREE(1/256)`、每槽 acquire/release `1/256`、anchor `4/0xf`、
+`maxbusy=4`、guard、report checksum、SF/PV 尾部和同地址复用检查。这里的
+约 42 ms 是 U2 首版全 task 严格链的功能数据，不作为 Direct-GM 的性能替代，
+也不声称 UBUF 已完成性能优化。
+提交前在最终 host 产物上再次补跑 B1 1/1，功能校验全部通过，
+`[SUMMARY] U2` 标签与独立 U2 产物一致；该次 unlocked event 为 886.081 us，
+只用于确认最终产物，不替换上表的三轮数据。
+
+### 19.5 既有路径回归与复现
+
+重新构建后，真实 A5 的回归结果为：
+
+| 路径 | 配置 | 结果 | kernel event/us 或关键终态 |
+| ---- | ---- | ---- | -------------------------- |
+| G0 | B1/1 builder | 1/1 PASS | 774.073 us |
+| G0 | B256/1 builder | 1/1 PASS | 3013.275 us |
+| G1 | B1/2 builders | 1/1 PASS | 769.413 us，wins `5/0` |
+| G1 | B256/2 builders | 1/1 PASS | 1974.994 us，wins `640/640` |
+| U0 | 64 task/单槽/3 runs | 3/3 PASS | acquire/release `64/64`，mte3=0 |
+| U1 | 128 task/四槽/3 runs | 3/3 PASS | generation32，maxbusy4，mte3=0 |
+
+设备环境没有 `task-submit`，`npu-smi` 也不在 PATH，因此这些功能回归按已授权
+方式在 device0 unlocked 运行；host 实际识别到的 SoC 为
+`Ascend950PR_958b`。性能数字只用于记录本次功能运行，不当作隔离 benchmark。
+
+复现命令：
+
+```bash
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-u2
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-u2 --device 0 --batches 1 --runs 3
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-u2 --device 0 --batches 256 --runs 3
+```
+
+阶段结论：U2 已完成与 G0 同 task/DAG/golden 的四槽 UBUF 完整 PA 功能迁移；
+Direct-GM 与 UBUF 两条路径继续独立共存。后续若优化 U2 性能，应以当前
+全 task 严格链和单 AIV0 私有 UBUF 为明确基线，不能回退已经闭合的功能合同。
+
+## 20. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -3013,5 +3197,5 @@ tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
 | G1 双 builder GM | 完成 | 双 VF 各 512-thread/16-warp/lane0 静态唯一分片；B256 trace-off 中位 3.637 ms；五组独立 v4 atomic/DCCI 泳道已保存。 |
 | GN 多 builder GM 扫描 | 完成 | 先完成 B=1..8 与 warp 扫描；随后以真实 writer 集合将 Direct-GM strict insert 收缩为 256 个 UP，重新扫描后 B5/W16 最优，B256 trace-off 21 轮中位 0.710 ms；独立 v5 atomic/DCCI 泳道已保存并校验。 |
 | U0 UBUF 单槽 | 完成 | 64-warp/lane0 纯 SIMT 单槽；CPU 三套、CCEC/ELF 门槛和 A5 同地址 100/100 全部 PASS；G0/G1 四组真机回归 PASS。 |
-| U1 UBUF 多槽/多 task | 完成 | 本提交；CPU 三套、CCEC/bitcode/mixed ELF 门槛全部 PASS；A5 smoke 1/1 与同地址复用 100/100，四槽 `maxbusy=4`、每槽 generation `0..31`精确闭合。 |
-| U2 UBUF 完整 PA | 未开始 | - |
+| U1 UBUF 多槽/多 task | 完成 | `a20a29e2`；CPU 三套、CCEC/bitcode/mixed ELF 门槛全部 PASS；A5 smoke 1/1 与同地址复用 100/100，四槽 `maxbusy=4`、每槽 generation `0..31`精确闭合。 |
+| U2 UBUF 完整 PA | 完成 | 同源 transport policy、四槽 ordered generation、真实 payload word/tail 与完整 PA oracle 已闭合；CPU 三套和 CCEC/bitcode/mixed ELF 全部 PASS；修正 ACL-init SIMT/DVG 栈为 1536/1536 B 后，A5 B1/B256 各 3/3 PASS，G0/G1/U0/U1 回归 PASS。 |

@@ -31,6 +31,7 @@ AIV_ENTRY="simt_cross_core_u1_0_mix_aiv"
 U1_BUILD_INPUTS=(
     run.sh
     common/full_pa_exec_protocol.h
+    ubuf/common/ubuf_staging_protocol.h
     ubuf/common/u1_multi_slot.h
     ubuf/ccec/u1_multi_slot_kernel.cpp
     ubuf/ccec/u1_multi_slot_host.cpp

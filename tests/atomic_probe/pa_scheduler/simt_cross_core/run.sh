@@ -18,6 +18,10 @@ ATOMIC_ROOT="$S0_ROOT/simt_atomic"
 ATOMIC_BUILD="$ATOMIC_ROOT/build/ccec"
 WARP_ROOT="$S0_ROOT/warp_concurrency"
 WARP_BUILD="$WARP_ROOT/build/ccec"
+STACK_ROOT="$S0_ROOT/simt_stack"
+STACK_BUILD="$STACK_ROOT/build/ccec"
+STACK_BUILD_MANIFEST="$STACK_BUILD/simt_stack_build_manifest.sha256"
+STACK_ACL_CONFIG="$STACK_ROOT/ccec/simt_stack_acl.json"
 GM_ROOT="$SCRIPT_DIR/gm"
 GM_BUILD="$GM_ROOT/build/ccec"
 G0_BUILD_MANIFEST="$GM_BUILD/g0_build_manifest.sha256"
@@ -28,6 +32,9 @@ U0_BUILD="$UBUF_ROOT/build/ccec"
 U0_BUILD_MANIFEST="$U0_BUILD/u0_build_manifest.sha256"
 U1_BUILD="$UBUF_ROOT/build/ccec"
 U1_BUILD_MANIFEST="$U1_BUILD/u1_build_manifest.sha256"
+U2_BUILD="$UBUF_ROOT/build/ccec"
+U2_BUILD_MANIFEST="$U2_BUILD/u2_build_manifest.sha256"
+U2_ACL_CONFIG="$UBUF_ROOT/ccec/u2_acl.json"
 
 usage() {
     cat <<'EOF'
@@ -38,6 +45,8 @@ Usage:
   ./run.sh run-atomic --device N [--runs N]
   ./run.sh build-warp
   ./run.sh run-warp --device N [--runs N]
+  ./run.sh build-stack
+  ./run.sh run-stack [--device N] [--runs N]
   ./run.sh build-s1
   ./run.sh run-s1 --device N [--runs N]
   ./run.sh build-s2
@@ -62,6 +71,8 @@ Usage:
   ./run.sh run-u0 [--device N] [--runs N]
   ./run.sh build-u1
   ./run.sh run-u1 [--device N] [--runs N]
+  ./run.sh build-u2
+  ./run.sh run-u2 [--device N] [--batches 1|256] [--runs N]
 
 build-s0 运行 CPU optimized/ASan/UBSan/TSan，并构建、静态检查 CCEC/ELF。
 run-s0 只运行已构建的真实 A5 探针；调用前仍需按仓库规则执行 A5 precheck。
@@ -69,6 +80,8 @@ build-atomic 运行 SIMT atomic CPU 三套测试，并构建、静态检查 CCEC
 run-atomic 在真实 A5 上验证 32/64/1024/2048 线程的 GM uint64 CAS/add 同地址竞争。
 build-warp 运行同 warp 串行/跨 warp 独立推进的 CPU 三套测试，并构建、静态检查 CCEC/ELF。
 run-warp 在真实 A5 上用 bounded handshake 和 CLOCK64 区间区分同 warp 与跨 warp 执行。
+build-stack 构建并静态检查 2048-thread SIMT 栈与分歧控制流独立探针。
+run-stack 通过第一次 aclInit 注入固定栈配置，在真实 A5 上验证全部 thread/warp checksum。
 build-s1 运行单 Vector 的 CPU 三套测试，并构建、静态检查 1:2 mixed CCEC/ELF。
 run-s1 运行 AIV0 SIMT builder -> AIV1 Vector executor 的真实 A5 四模式探针。
 build-s2 运行单 Cube 的 CPU 三套测试，并构建、静态检查 1:2 mixed CCEC/ELF。
@@ -96,8 +109,12 @@ run-u0 在真实 A5 上验证 AIV0 的 64 个 lane0 leader 竞争单个 UBUF slo
 SIMT leader 读回 UBUF 并直接写 GM；AIV1 Scalar 只执行，mte3_count 必须为 0。
 build-u1 运行 UBUF 四槽/128 task CPU 三套测试，并构建、静态检查 U1 CCEC/bitcode/mixed ELF/ACL host。
 run-u1 在真实 A5 上验证 4×1152 B UBUF slot 的并发驻留、generation 复用和 128 task 全量收口。
+build-u2 复用 G0 完整 PA 源码，运行 ordered 四槽 UBUF transport 的 CPU 三套测试，
+并构建、静态检查 U2 CCEC/bitcode/mixed ELF/ACL host。
+run-u2 在真实 A5 上验证单 builder 的完整 PA DAG、四槽按 batch generation 复用、
+精确 written-word UBUF→GM copy、AIC/AIV 执行与最终 drain。
 环境提供 task-submit 时，必须先在锁外做 A5 precheck，再从其 --run 命令内调用；run-g0 会把
-$TASK_DEVICE 自动注入 host，锁内调用不得再传 --device。run-g1/run-u0/run-u1 遵循同一规则。
+$TASK_DEVICE 自动注入 host，锁内调用不得再传 --device。run-g1/run-u0/run-u1/run-u2 遵循同一规则。
 EOF
 }
 
@@ -193,6 +210,47 @@ case "$ACTION" in
         fi
         "$WARP_BUILD/simt_cross_core_warp_concurrency_host" \
             --kernel "$WARP_BUILD/simt_cross_core_warp_concurrency_kernel.o" "$@"
+        ;;
+    build-stack)
+        if [[ $# -ne 0 ]]; then
+            echo "build-stack does not accept additional arguments." >&2
+            exit 1
+        fi
+        "$STACK_ROOT/ccec/build.sh"
+        ;;
+    run-stack)
+        if [[ ! -x "$STACK_BUILD/simt_cross_core_simt_stack_host" ||
+              ! -s "$STACK_BUILD/simt_cross_core_simt_stack_kernel.o" ||
+              ! -s "$STACK_BUILD_MANIFEST" ]]; then
+            echo "SIMT stack artifacts are missing; run: $0 build-stack" >&2
+            exit 1
+        fi
+        if ! (cd "$SCRIPT_DIR" && sha256sum --check --status "$STACK_BUILD_MANIFEST"); then
+            echo "SIMT stack sources and runtime artifacts do not match the successful-build manifest; rebuild it." >&2
+            exit 1
+        fi
+        require_a5_access "SIMT stack"
+        stack_device_args=()
+        for argument in "$@"; do
+            case "$argument" in
+                --kernel|--kernel=*|--acl-config|--acl-config=*)
+                    echo "run-stack fixes its kernel and ACL initialization config; do not override them." >&2
+                    exit 1
+                    ;;
+                --device|--device=*)
+                    if [[ -n "${TASK_DEVICE:-}" ]]; then
+                        echo "run-stack injects --device from TASK_DEVICE; do not pass it explicitly." >&2
+                        exit 1
+                    fi
+                    ;;
+            esac
+        done
+        if [[ -n "${TASK_DEVICE:-}" ]]; then
+            stack_device_args=(--device "$TASK_DEVICE")
+        fi
+        timeout --foreground 300s "$STACK_BUILD/simt_cross_core_simt_stack_host" \
+            --kernel "$STACK_BUILD/simt_cross_core_simt_stack_kernel.o" \
+            --acl-config "$STACK_ACL_CONFIG" "${stack_device_args[@]}" "$@"
         ;;
     build-s1)
         if [[ $# -ne 0 ]]; then
@@ -293,6 +351,14 @@ case "$ACTION" in
         fi
         "$UBUF_ROOT/cpu/build_u1.sh"
         "$UBUF_ROOT/ccec/build_u1.sh"
+        ;;
+    build-u2)
+        if [[ $# -ne 0 ]]; then
+            echo "build-u2 does not accept additional arguments." >&2
+            exit 1
+        fi
+        "$UBUF_ROOT/cpu/build_u2.sh"
+        "$UBUF_ROOT/ccec/build_u2.sh"
         ;;
     run-g0|run-g1|run-gm)
         full_pa_stage="${ACTION#run-}"
@@ -410,13 +476,20 @@ case "$ACTION" in
             --acl-config "$G0_SWIMLANE_ACL_CONFIG" \
             "${full_pa_device_args[@]}" "$@"
         ;;
-    run-u0|run-u1)
+    run-u0|run-u1|run-u2)
         ubuf_stage="${ACTION#run-}"
         ubuf_build="$U0_BUILD"
         ubuf_manifest="$U0_BUILD_MANIFEST"
+        ubuf_timeout=300s
+        ubuf_fixed_args=()
         if [[ "$ACTION" == "run-u1" ]]; then
             ubuf_build="$U1_BUILD"
             ubuf_manifest="$U1_BUILD_MANIFEST"
+        elif [[ "$ACTION" == "run-u2" ]]; then
+            ubuf_build="$U2_BUILD"
+            ubuf_manifest="$U2_BUILD_MANIFEST"
+            ubuf_timeout=600s
+            ubuf_fixed_args=(--builders 1 --acl-config "$U2_ACL_CONFIG")
         fi
         ubuf_host="$ubuf_build/simt_cross_core_${ubuf_stage}_host"
         ubuf_kernel="$ubuf_build/simt_cross_core_${ubuf_stage}_kernel.o"
@@ -436,6 +509,18 @@ case "$ACTION" in
                     echo "$ACTION uses the kernel covered by its successful-build manifest; do not override --kernel." >&2
                     exit 1
                     ;;
+                --builders|--builders=*)
+                    if [[ "$ACTION" == "run-u2" ]]; then
+                        echo "$ACTION fixes --builders=1; do not override the stage topology." >&2
+                        exit 1
+                    fi
+                    ;;
+                --acl-config|--acl-config=*)
+                    if [[ "$ACTION" == "run-u2" ]]; then
+                        echo "$ACTION uses the U2 ACL-init stack config covered by its build manifest; do not override it." >&2
+                        exit 1
+                    fi
+                    ;;
                 --device|--device=*)
                     if [[ -n "${TASK_DEVICE:-}" ]]; then
                         echo "$ACTION injects --device from TASK_DEVICE inside task-submit; do not pass --device explicitly." >&2
@@ -447,7 +532,8 @@ case "$ACTION" in
         if [[ -n "${TASK_DEVICE:-}" ]]; then
             ubuf_device_args=(--device "$TASK_DEVICE")
         fi
-        timeout --foreground 300s "$ubuf_host" --kernel "$ubuf_kernel" "${ubuf_device_args[@]}" "$@"
+        timeout --foreground "$ubuf_timeout" "$ubuf_host" --kernel "$ubuf_kernel" \
+            "${ubuf_fixed_args[@]}" "${ubuf_device_args[@]}" "$@"
         ;;
     *)
         usage >&2

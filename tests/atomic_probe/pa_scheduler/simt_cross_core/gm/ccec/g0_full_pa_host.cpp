@@ -12,6 +12,8 @@
 #include "../common/g0_full_pa.h"
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
 #include "../common/g0_swimlane.h"
+#elif defined(SIMT_CROSS_CORE_U2)
+#include "../../ubuf/common/u2_full_pa.h"
 #endif
 
 #include "acl/acl.h"
@@ -37,11 +39,16 @@ namespace {
 namespace g0 = pa_scheduler::simt_cross_core::g0;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
 namespace g0_swimlane = pa_scheduler::simt_cross_core::g0_swimlane;
+#elif defined(SIMT_CROSS_CORE_U2)
+namespace u2 = pa_scheduler::simt_cross_core::u2;
+namespace ubuf_staging = pa_scheduler::simt_cross_core::ubuf_staging;
 #endif
 using pa_scheduler::simt_cross_core::g0::FullPaState;
 using pa_scheduler::simt_cross_core::g0::kWorkloadBytes;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
 using LaunchState = pa_scheduler::simt_cross_core::g0_swimlane::G0SwimlaneState;
+#elif defined(SIMT_CROSS_CORE_U2)
+using LaunchState = pa_scheduler::simt_cross_core::u2::U2FullPaState;
 #else
 using LaunchState = FullPaState;
 #endif
@@ -54,6 +61,8 @@ struct Options {
     uint32_t builder_count = g0::kDefaultBuilderCount;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     std::string swimlane_json;
+#endif
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
     std::string acl_config;
 #endif
 };
@@ -564,6 +573,51 @@ void InitializeState(
     }
 }
 
+#if defined(SIMT_CROSS_CORE_U2)
+void InitializeU2Guard(u2::U2Guard *guard, uint64_t nonce, uint32_t guard_id) {
+    for (uint32_t word = 0U; word < ubuf_staging::kWordsPerLine; ++word) {
+        guard->words[word] = u2::ExpectedGuardWord(nonce, guard_id, word);
+    }
+}
+
+void InitializeU2Staging(u2::U2StagingState *staging, uint64_t nonce, uint32_t batches) {
+    std::memset(staging, 0xA5, sizeof(*staging));
+    staging->control.magic = u2::kProbeMagic;
+    staging->control.version = u2::kProbeVersion;
+    staging->control.launch_nonce = nonce;
+    staging->control.batch_count = batches;
+    staging->control.task_count = g0::TaskCount(batches);
+    staging->control.kernel_task_count = g0::KernelTaskCount(batches);
+    staging->control.builder_count = u2::kBuilderCount;
+    staging->control.slot_count = ubuf_staging::kSlotCount;
+    staging->control.max_payload_lines = ubuf_staging::kMaxPayloadLines;
+    staging->control.words_per_line = ubuf_staging::kWordsPerLine;
+    staging->control.alignment_bytes = ubuf_staging::kAlignmentBytes;
+    staging->control.transport_kind = ubuf_staging::TransportKind::SimtUbufReadToGmWordStore;
+    staging->control.reserved16 = 0U;
+    staging->control.slot_stride_bytes = ubuf_staging::kSlotStrideBytes;
+    staging->control.region_bytes = ubuf_staging::kRegionBytes;
+    staging->control.payload_offset_bytes = ubuf_staging::kPayloadOffsetBytes;
+
+    InitializeU2Guard(&staging->guard_before_slots, nonce, u2::kGuardBeforeSlots);
+    InitializeU2Guard(&staging->guard_after_slots, nonce, u2::kGuardAfterSlots);
+    InitializeU2Guard(&staging->guard_before_reports, nonce, u2::kGuardBeforeReports);
+    InitializeU2Guard(&staging->guard_after_reports, nonce, u2::kGuardAfterReports);
+    for (uint32_t slot = 0U; slot < ubuf_staging::kSlotCount; ++slot) {
+        InitializeAtomic(&staging->slot_states[slot], static_cast<int64_t>(ubuf_staging::SlotFreeState(0U)));
+        InitializeAtomic(&staging->slot_acquire_count[slot], 0);
+        InitializeAtomic(&staging->slot_release_count[slot], 0);
+    }
+    InitializeAtomic(&staging->global_busy_depth, 0);
+    InitializeAtomic(&staging->global_max_busy_depth, 0);
+    InitializeAtomic(&staging->anchor_staged_count, 0);
+    InitializeAtomic(&staging->anchor_staged_mask, 0);
+    InitializeAtomic(&staging->guard_check_count, 0);
+    InitializeAtomic(&staging->ubuf_words_written, 0);
+    InitializeAtomic(&staging->gm_words_stored, 0);
+    std::memset(staging->reports, 0xD3, sizeof(staging->reports));
+}
+#endif
 
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
 void InitializeSwimlaneTrace(g0_swimlane::TraceState *trace, uint64_t nonce, uint32_t batches, uint32_t builder_count) {
@@ -587,7 +641,7 @@ void InitializeSwimlaneTrace(g0_swimlane::TraceState *trace, uint64_t nonce, uin
 #endif
 
 FullPaState &FullPaView(LaunchState &state) {
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
     return state.full_pa;
 #else
     return state;
@@ -595,7 +649,7 @@ FullPaState &FullPaView(LaunchState &state) {
 }
 
 const FullPaState &FullPaView(const LaunchState &state) {
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
     return state.full_pa;
 #else
     return state;
@@ -608,6 +662,8 @@ void InitializeLaunchState(
     InitializeState(&FullPaView(*state), nonce, batches, builder_count, workspace_address);
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     InitializeSwimlaneTrace(&state->trace, nonce, batches, builder_count);
+#elif defined(SIMT_CROSS_CORE_U2)
+    InitializeU2Staging(&state->staging, nonce, batches);
 #endif
 }
 
@@ -749,6 +805,172 @@ bool AtomicPaddingMatches(const g0::AtomicLine &actual, const g0::AtomicLine &in
     return std::memcmp(actual.padding, initial.padding, sizeof(actual.padding)) == 0;
 }
 
+#if defined(SIMT_CROSS_CORE_U2)
+bool ValidateU2Atomic(
+    const g0::AtomicLine &actual, const g0::AtomicLine &initial, int64_t expected_value, const char *value_reason,
+    const char *padding_reason, uint32_t index, ValidationFailure *failure
+) {
+    return RecordCheck(
+               actual.value == expected_value, failure, value_reason, UINT32_MAX, UINT32_MAX, index,
+               static_cast<uint64_t>(expected_value), static_cast<uint64_t>(actual.value)
+           ) &&
+           RecordCheck(AtomicPaddingMatches(actual, initial), failure, padding_reason, UINT32_MAX, UINT32_MAX, index);
+}
+
+bool ValidateU2Guard(const u2::U2Guard &actual, uint64_t nonce, uint32_t guard_id, ValidationFailure *failure) {
+    for (uint32_t word = 0U; word < ubuf_staging::kWordsPerLine; ++word) {
+        const uint64_t expected = u2::ExpectedGuardWord(nonce, guard_id, word);
+        if (!RecordCheck(
+                actual.words[word] == expected, failure, "u2-guard-mutated", UINT32_MAX, UINT32_MAX,
+                guard_id * ubuf_staging::kWordsPerLine + word, expected, actual.words[word]
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint64_t ExpectedU2PayloadChecksum(const FullPaState &state, uint64_t nonce, uint32_t task_id, uint32_t words) {
+    uint64_t checksum = u2::PayloadChecksumSeed(nonce, task_id, words);
+    for (uint32_t word = 0U; word < words; ++word) {
+        checksum = u2::FoldPayloadChecksum(checksum, state.tasks[task_id].exec.payload.words[word]);
+    }
+    return checksum;
+}
+
+bool ValidateU2Staging(
+    const LaunchState &state, const LaunchState &initial, uint64_t nonce, uint32_t batches, ValidationFailure *failure
+) {
+    const u2::U2StagingState &staging = state.staging;
+    const u2::U2StagingState &initial_staging = initial.staging;
+    if (!RecordCheck(
+            std::memcmp(&staging.control, &initial_staging.control, sizeof(staging.control)) == 0, failure,
+            "u2-control-mutated"
+        ) ||
+        !ValidateU2Guard(staging.guard_before_slots, nonce, u2::kGuardBeforeSlots, failure) ||
+        !ValidateU2Guard(staging.guard_after_slots, nonce, u2::kGuardAfterSlots, failure) ||
+        !ValidateU2Guard(staging.guard_before_reports, nonce, u2::kGuardBeforeReports, failure) ||
+        !ValidateU2Guard(staging.guard_after_reports, nonce, u2::kGuardAfterReports, failure)) {
+        return false;
+    }
+
+    for (uint32_t slot = 0U; slot < ubuf_staging::kSlotCount; ++slot) {
+        if (!ValidateU2Atomic(
+                staging.slot_states[slot], initial_staging.slot_states[slot],
+                static_cast<int64_t>(ubuf_staging::SlotFreeState(batches)), "u2-slot-final-state",
+                "u2-slot-padding-mutated", slot, failure
+            ) ||
+            !ValidateU2Atomic(
+                staging.slot_acquire_count[slot], initial_staging.slot_acquire_count[slot], batches,
+                "u2-slot-acquire-count", "u2-slot-acquire-padding-mutated", slot, failure
+            ) ||
+            !ValidateU2Atomic(
+                staging.slot_release_count[slot], initial_staging.slot_release_count[slot], batches,
+                "u2-slot-release-count", "u2-slot-release-padding-mutated", slot, failure
+            )) {
+            return false;
+        }
+    }
+
+    const uint64_t kernel_tasks = g0::KernelTaskCount(batches);
+    const uint64_t expected_words = u2::ExpectedWordsPerBatch() * batches;
+    struct AtomicExpectation {
+        const g0::AtomicLine *actual;
+        const g0::AtomicLine *initial;
+        int64_t expected;
+        const char *reason;
+    };
+    const AtomicExpectation atomics[] = {
+        {&staging.global_busy_depth, &initial_staging.global_busy_depth, 0, "u2-global-busy-depth"},
+        {&staging.global_max_busy_depth, &initial_staging.global_max_busy_depth,
+         static_cast<int64_t>(ubuf_staging::kSlotCount), "u2-global-max-busy-depth"},
+        {&staging.anchor_staged_count, &initial_staging.anchor_staged_count, static_cast<int64_t>(u2::kAnchorTaskCount),
+         "u2-anchor-count"},
+        {&staging.anchor_staged_mask, &initial_staging.anchor_staged_mask, static_cast<int64_t>(u2::kAnchorMask),
+         "u2-anchor-mask"},
+        {&staging.guard_check_count, &initial_staging.guard_check_count, static_cast<int64_t>(kernel_tasks),
+         "u2-guard-check-count"},
+        {&staging.ubuf_words_written, &initial_staging.ubuf_words_written, static_cast<int64_t>(expected_words),
+         "u2-ubuf-words-written"},
+        {&staging.gm_words_stored, &initial_staging.gm_words_stored, static_cast<int64_t>(expected_words),
+         "u2-gm-words-stored"},
+    };
+    for (uint32_t index = 0U; index < sizeof(atomics) / sizeof(atomics[0]); ++index) {
+        if (!ValidateU2Atomic(
+                *atomics[index].actual, *atomics[index].initial, atomics[index].expected, atomics[index].reason,
+                "u2-counter-padding-mutated", index, failure
+            )) {
+            return false;
+        }
+    }
+
+    const uint32_t report_count = g0::KernelTaskCount(batches);
+    for (uint32_t report_index = 0U; report_index < report_count; ++report_index) {
+        const uint32_t task_id =
+            (report_index / g0::kKernelsPerBatch) * g0::kTasksPerBatch + report_index % g0::kKernelsPerBatch + 1U;
+        const uint32_t expected_words_for_task = u2::PayloadWrittenWords(g0::TaskKindAt(task_id));
+        const u2::U2TaskStagingReport &report = staging.reports[report_index];
+        const uint64_t expected_checksum =
+            ExpectedU2PayloadChecksum(state.full_pa, nonce, task_id, expected_words_for_task);
+        if (!RecordCheck(
+                report.task_id == task_id, failure, "u2-report-task", task_id, UINT32_MAX, report_index, task_id,
+                report.task_id
+            ) ||
+            !RecordCheck(
+                report.slot_id == u2::SlotForTask(task_id), failure, "u2-report-slot", task_id, UINT32_MAX,
+                report_index, u2::SlotForTask(task_id), report.slot_id
+            ) ||
+            !RecordCheck(
+                report.generation == u2::ExpectedGeneration(task_id), failure, "u2-report-generation", task_id,
+                UINT32_MAX, report_index, u2::ExpectedGeneration(task_id), report.generation
+            ) ||
+            !RecordCheck(
+                report.phase_bits == u2::kExpectedTransportPhaseBits, failure, "u2-report-phase", task_id, UINT32_MAX,
+                report_index, u2::kExpectedTransportPhaseBits, report.phase_bits
+            ) ||
+            !RecordCheck(
+                report.ubuf_words_written == expected_words_for_task, failure, "u2-report-ubuf-words", task_id,
+                UINT32_MAX, report_index, expected_words_for_task, report.ubuf_words_written
+            ) ||
+            !RecordCheck(
+                report.gm_words_stored == expected_words_for_task, failure, "u2-report-gm-words", task_id, UINT32_MAX,
+                report_index, expected_words_for_task, report.gm_words_stored
+            ) ||
+            !RecordCheck(
+                report.guard_check_count == 1U && report.acquire_count == 1U && report.release_count == 1U, failure,
+                "u2-report-exact-counts", task_id, UINT32_MAX, report_index, UINT64_C(0x0000000100010001),
+                (static_cast<uint64_t>(report.guard_check_count) << 32U) |
+                    (static_cast<uint64_t>(report.acquire_count) << 16U) | report.release_count
+            ) ||
+            !RecordCheck(
+                report.reserved32[0] == 0U && report.reserved32[1] == 0U && report.reserved32[2] == 0U, failure,
+                "u2-report-reserved", task_id, UINT32_MAX, report_index
+            ) ||
+            !RecordCheck(
+                report.launch_nonce == nonce, failure, "u2-report-nonce", task_id, UINT32_MAX, report_index, nonce,
+                report.launch_nonce
+            ) ||
+            !RecordCheck(
+                report.payload_checksum == expected_checksum, failure, "u2-report-payload-checksum", task_id,
+                UINT32_MAX, report_index, expected_checksum, report.payload_checksum
+            )) {
+            return false;
+        }
+    }
+    for (uint32_t report_index = report_count; report_index < u2::kMaxTransportReports; ++report_index) {
+        if (!RecordCheck(
+                std::memcmp(
+                    &staging.reports[report_index], &initial_staging.reports[report_index],
+                    sizeof(staging.reports[report_index])
+                ) == 0,
+                failure, "u2-inactive-report-mutated", UINT32_MAX, UINT32_MAX, report_index
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
 
 bool ValidateFixedRegions(
     const FullPaState &state, const FullPaState &initial, uint64_t nonce, uint32_t batches, ValidationFailure *failure
@@ -1061,10 +1283,18 @@ bool ValidateTask(
         ) ||
         !RecordCheck(
             task.insert_completion.value ==
+#if defined(SIMT_CROSS_CORE_U2)
+                static_cast<int64_t>(task_id),
+#else
                 (expected.kind == HostTaskKind::Up ? static_cast<int64_t>(task_id) :
                                                      static_cast<int64_t>(task_id) - 1),
+#endif
             failure, "insert-completion", task_id, UINT32_MAX, UINT32_MAX,
+#if defined(SIMT_CROSS_CORE_U2)
+            task_id,
+#else
             expected.kind == HostTaskKind::Up ? task_id : static_cast<uint64_t>(static_cast<int64_t>(task_id) - 1),
+#endif
             static_cast<uint64_t>(task.insert_completion.value)
         ) ||
         !RecordCheck(
@@ -1209,19 +1439,31 @@ bool ValidateTask(
             UINT32_MAX, expected.written_words, report.payload_words
         ) ||
         !RecordCheck(
+#if defined(SIMT_CROSS_CORE_U2)
+            task_id == 0U ? report.insert_poll_count == 0U : report.insert_poll_count >= 1U,
+#else
             expected.kind == HostTaskKind::Up && expected.batch != 0U ? report.insert_poll_count >= 1U :
                                                                            report.insert_poll_count == 0U,
+#endif
             failure, "build-report-insert-poll", task_id
         ) ||
         !RecordCheck(
             report.predecessor_observed ==
+#if defined(SIMT_CROSS_CORE_U2)
+                static_cast<int64_t>(task_id) - 1,
+#else
                 (expected.kind == HostTaskKind::Up && expected.batch != 0U ?
                      static_cast<int64_t>(task_id - kHostTasksPerBatch) :
                      -1),
+#endif
             failure, "build-report-predecessor", task_id, UINT32_MAX, UINT32_MAX,
+#if defined(SIMT_CROSS_CORE_U2)
+            static_cast<uint64_t>(static_cast<int64_t>(task_id) - 1),
+#else
             static_cast<uint64_t>(expected.kind == HostTaskKind::Up && expected.batch != 0U ?
                                       static_cast<int64_t>(task_id - kHostTasksPerBatch) :
                                       -1),
+#endif
             static_cast<uint64_t>(report.predecessor_observed)
         ) ||
         !RecordCheck(
@@ -1419,8 +1661,12 @@ bool ValidateBuilderThreads(
             expected_first[thread_id] = task_id;
         }
         expected_last[thread_id] = task_id;
+#if defined(SIMT_CROSS_CORE_U2)
+        expected_waits[thread_id] += task_id == 0U ? 0U : 1U;
+#else
         const HostTaskOracle task = BuildHostTaskOracle(task_id);
         expected_waits[thread_id] += task.kind == HostTaskKind::Up && task.batch != 0U ? 1U : 0U;
+#endif
     }
 
     uint64_t win_sum = 0U;
@@ -3031,6 +3277,8 @@ bool ValidateLaunchRun(
     }
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     return ValidateSwimlaneTrace(state, initial, nonce, batches, builder_count, failure);
+#elif defined(SIMT_CROSS_CORE_U2)
+    return ValidateU2Staging(state, initial, nonce, batches, failure);
 #else
     return true;
 #endif
@@ -3074,6 +3322,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
             options->runs = static_cast<uint32_t>(value);
         } else if (std::strcmp(argv[index], "--builders") == 0 && index + 1 < argc) {
             uint64_t value = 0U;
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
             if (!ParseUnsigned(argv[++index], g0::kMaxBuilderCount, &value) ||
                 !g0::BuilderCountValid(static_cast<uint32_t>(value))) {
                 std::fprintf(
@@ -3081,6 +3330,20 @@ bool ParseOptions(int argc, char **argv, Options *options) {
                 );
                 return false;
             }
+#elif defined(SIMT_CROSS_CORE_U2)
+            if (!ParseUnsigned(argv[++index], u2::kBuilderCount, &value) || value != u2::kBuilderCount) {
+                std::fprintf(stderr, "invalid --builders value: %s (U2 requires 1)\n", argv[index]);
+                return false;
+            }
+#else
+            if (!ParseUnsigned(argv[++index], g0::kMaxBuilderCount, &value) ||
+                !g0::BuilderCountValid(static_cast<uint32_t>(value))) {
+                std::fprintf(
+                    stderr, "invalid --builders value: %s (expected 1..%u)\n", argv[index], g0::kMaxBuilderCount
+                );
+                return false;
+            }
+#endif
             options->builder_count = static_cast<uint32_t>(value);
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
         } else if (std::strcmp(argv[index], "--swimlane-json") == 0 && index + 1 < argc) {
@@ -3089,6 +3352,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
                 std::fprintf(stderr, "--swimlane-json requires a non-empty path\n");
                 return false;
             }
+#endif
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
         } else if (std::strcmp(argv[index], "--acl-config") == 0 && index + 1 < argc) {
             options->acl_config = argv[++index];
             if (options->acl_config.empty()) {
@@ -3097,12 +3362,19 @@ bool ParseOptions(int argc, char **argv, Options *options) {
             }
 #endif
         } else {
+#if defined(SIMT_CROSS_CORE_U2)
+            const std::string builder_usage = "1";
+#else
             const std::string builder_usage = "1.." + std::to_string(g0::kMaxBuilderCount);
+#endif
             std::fprintf(
                 stderr,
                 "usage: %s --kernel FILE [--device N] [--batches 1|256] [--runs N] [--builders %s]"
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-                " [--swimlane-json FILE] --acl-config FILE"
+                " [--swimlane-json FILE]"
+#endif
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
+                " --acl-config FILE"
 #endif
                 "\n",
                 argv[0], builder_usage.c_str()
@@ -3114,11 +3386,17 @@ bool ParseOptions(int argc, char **argv, Options *options) {
         std::fprintf(stderr, "--kernel FILE is required\n");
         return false;
     }
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
     if (options->acl_config.empty()) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
         std::fprintf(stderr, "G0 swimlane requires --acl-config FILE for its measured SIMT/DVG stack sizes\n");
+#else
+        std::fprintf(stderr, "U2 requires --acl-config FILE for its measured SIMT/DVG stack sizes\n");
+#endif
         return false;
     }
+#endif
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     if (!options->swimlane_json.empty() && options->runs != 1U) {
         std::fprintf(stderr, "--swimlane-json requires --runs 1 so one file maps to one launch\n");
         return false;
@@ -3190,9 +3468,7 @@ public:
         }
     }
 
-    bool Initialize(
-        int32_t device, const std::vector<char> &binary_data, const char *acl_config
-    ) {
+    bool Initialize(int32_t device, const std::vector<char> &binary_data, const char *acl_config) {
         device_ = device;
         if (!CheckAcl(aclInit(acl_config), "aclInit")) {
             return false;
@@ -3319,7 +3595,7 @@ int main(int argc, char **argv) {
     AclSession session;
     if (!session.Initialize(
             options.device, binary_data,
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
             options.acl_config.c_str()
 #else
             nullptr
@@ -3500,7 +3776,11 @@ int main(int argc, char **argv) {
         );
     }
     std::printf(
+#if defined(SIMT_CROSS_CORE_U2)
+        "[SUMMARY] U2 builders=%u B%u passes=%u/%u fresh_initialization=yes same_address_reuse=%s\n",
+#else
         "[SUMMARY] GM builders=%u B%u passes=%u/%u fresh_initialization=yes same_address_reuse=%s\n",
+#endif
         options.builder_count, options.batches, passes, options.runs,
         options.runs > 1U ? "validated" : "not-requested"
     );

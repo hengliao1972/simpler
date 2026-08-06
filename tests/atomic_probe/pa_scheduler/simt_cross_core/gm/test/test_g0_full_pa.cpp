@@ -11,6 +11,10 @@
 
 #include "../common/g0_full_pa.h"
 
+#if defined(SIMT_CROSS_CORE_U2)
+#include "../../ubuf/common/u2_full_pa.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -28,10 +32,18 @@
 namespace {
 
 using namespace pa_scheduler::simt_cross_core::g0;
+#if defined(SIMT_CROSS_CORE_U2)
+namespace u2 = pa_scheduler::simt_cross_core::u2;
+namespace ubuf_staging = pa_scheduler::simt_cross_core::ubuf_staging;
+#endif
 
 constexpr uint32_t kNoTask = UINT32_MAX;
 constexpr auto kCpuWaitLimit = std::chrono::seconds(10);
 constexpr uint64_t kFaninWitnessPresent = uint64_t{1} << 63U;
+#if defined(SIMT_CROSS_CORE_U2)
+constexpr uint64_t kU2StagingPoisonWord = UINT64_C(0xC6C6C6C6C6C6C6C6);
+constexpr uint32_t kU2CpuCasAttemptLimit = 1024U;
+#endif
 
 struct CpuTask {
     std::atomic<uint64_t> exec_state{0U};
@@ -82,6 +94,62 @@ enum class BuildAttemptResult : uint32_t {
     Lost = 1,
     Error = 2,
 };
+
+#if defined(SIMT_CROSS_CORE_U2)
+enum class U2SlotAcquireResult : uint32_t {
+    Acquired = 0U,
+    Wait = 1U,
+    Invalid = 2U,
+};
+
+struct U2PayloadLease {
+    uint32_t task_id = kNoTask;
+    uint32_t slot_id = kNoTask;
+    uint32_t generation = kNoTask;
+    uint32_t phase_bits = 0U;
+    uint32_t ubuf_words_written = 0U;
+    uint32_t gm_words_stored = 0U;
+    bool owns_slot = false;
+};
+
+struct alignas(kCacheLineBytes) CpuU2StagingSlot {
+    u2::U2Guard guard_before{};
+    alignas(kCacheLineBytes) std::array<uint64_t, ubuf_staging::kMaxPayloadWords> payload{};
+    u2::U2Guard guard_after{};
+};
+
+static_assert(sizeof(CpuU2StagingSlot) == ubuf_staging::kSlotStrideBytes, "U2 CPU slot ABI changed");
+
+U2SlotAcquireResult
+TryAcquireOrderedU2Slot(std::atomic<uint64_t> &state, uint32_t task_id, uint32_t batches, U2PayloadLease *lease) {
+    if (!u2::TaskUsesSlot(task_id)) {
+        return U2SlotAcquireResult::Invalid;
+    }
+    const uint32_t slot_id = u2::SlotForTask(task_id);
+    const uint32_t expected_generation = u2::ExpectedGeneration(task_id);
+    uint64_t observed = state.load(std::memory_order_acquire);
+    if (!u2::SlotStateValid(observed, slot_id, batches)) {
+        return U2SlotAcquireResult::Invalid;
+    }
+    const ubuf_staging::DecodedSlotState decoded =
+        ubuf_staging::DecodeSlotState(static_cast<int64_t>(observed), TaskCount(batches));
+    if (decoded.generation > expected_generation || (decoded.busy && decoded.generation == expected_generation)) {
+        return U2SlotAcquireResult::Invalid;
+    }
+    if (decoded.busy || decoded.generation < expected_generation) {
+        return U2SlotAcquireResult::Wait;
+    }
+    const uint64_t desired = ubuf_staging::SlotBusyState(expected_generation, task_id);
+    if (!state.compare_exchange_strong(observed, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return U2SlotAcquireResult::Wait;
+    }
+    lease->task_id = task_id;
+    lease->slot_id = slot_id;
+    lease->generation = expected_generation;
+    lease->owns_slot = true;
+    return U2SlotAcquireResult::Acquired;
+}
+#endif
 
 struct HeapInterval {
     uint64_t begin;
@@ -185,9 +253,7 @@ ExecPayloadHeader DecodeCpuHeader(const std::array<uint64_t, kMaxPayloadWords> &
     };
 }
 
-bool CompetingKernelClaimValid(
-    uint32_t task_id, uint32_t current_owner, uint32_t builder_count, uint64_t raw_state
-) {
+bool CompetingKernelClaimValid(uint32_t task_id, uint32_t current_owner, uint32_t builder_count, uint64_t raw_state) {
     const DecodedExecState decoded = DecodeExecState(static_cast<int64_t>(raw_state));
     if (!decoded.valid || decoded.task_id != task_id || !TaskExecutable(TaskKindAt(task_id)) ||
         !IsBuilderOwner(decoded.build_owner, builder_count) || decoded.build_owner == current_owner) {
@@ -221,8 +287,7 @@ bool CompetingAllocClaimValid(
     }
     for (uint32_t builder = 0U; builder < builder_count; ++builder) {
         const uint32_t owner = BuilderOwnerForInstance(builder);
-        if (owner != current_owner &&
-            static_cast<uint64_t>(raw_state) == AllocBuildingState(nonce, task_id, owner)) {
+        if (owner != current_owner && static_cast<uint64_t>(raw_state) == AllocBuildingState(nonce, task_id, owner)) {
             return true;
         }
     }
@@ -284,6 +349,9 @@ public:
             arrival.store(0, std::memory_order_relaxed);
         }
         root_finished_.store(0U, std::memory_order_relaxed);
+#if defined(SIMT_CROSS_CORE_U2)
+        InitializeU2Transport();
+#endif
         for (uint32_t task_id = 0U; task_id < task_count_; ++task_id) {
             InitializeTask(task_id);
             const TaskKind kind = TaskKindAt(task_id);
@@ -391,20 +459,139 @@ public:
     }
 
     bool Validate() const {
-        return ValidateCounts() && ValidateBuilderMapping() && ValidateHeapAndOutputs() && ValidatePayloads() &&
-               ValidateCompletionAndWitnesses() && ValidateRolesAndDrain();
+        const bool full_pa_valid = ValidateCounts() && ValidateBuilderMapping() && ValidateHeapAndOutputs() &&
+                                   ValidatePayloads() && ValidateCompletionAndWitnesses() && ValidateRolesAndDrain();
+#if defined(SIMT_CROSS_CORE_U2)
+        return full_pa_valid && ValidateU2Transport();
+#else
+        return full_pa_valid;
+#endif
     }
 
+#if defined(SIMT_CROSS_CORE_U2)
+    bool MaterializeAndValidate(u2::U2FullPaState *state) const {
+        InitializeAbiState(&state->full_pa);
+        MaterializeActiveTasks(&state->full_pa);
+        MaterializeGlobalState(&state->full_pa);
+        MaterializeU2State(&state->staging);
+        return ValidateAbiState(state->full_pa) && ValidateMaterializedU2State(state->staging);
+    }
+#else
     bool MaterializeAndValidate(FullPaState *state) const {
         InitializeAbiState(state);
         MaterializeActiveTasks(state);
         MaterializeGlobalState(state);
         return ValidateAbiState(*state);
     }
+#endif
 
     uint32_t Batches() const { return batches_; }
     uint32_t TaskCountValue() const { return task_count_; }
     uint64_t Nonce() const { return nonce_; }
+
+#if defined(SIMT_CROSS_CORE_U2)
+    bool ExerciseHeldSlotCleanupForTest(uint32_t task_id) {
+        if (!u2::TaskUsesSlot(task_id) || u2::ExpectedGeneration(task_id) != 0U) {
+            return false;
+        }
+        CpuTask &task = tasks_[task_id];
+        uint64_t empty = 0U;
+        if (!task.exec_state.compare_exchange_strong(
+                empty, BuildingState(task_id), std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            return false;
+        }
+        U2PayloadLease lease{};
+        if (!AcquireU2Slot(task_id, &lease)) {
+            return false;
+        }
+        u2_staging_slots_[lease.slot_id].payload[0] = UINT64_C(0x123456789ABCDEF0);
+        lease.ubuf_words_written = 1U;
+        PublishFatal(ExecFatalReason::ClaimedPayloadInvalid, task_id, kFirstAivExecutorOwner);
+        return AbortU2Build(task_id, &lease) && !lease.owns_slot &&
+               task.exec_state.load(std::memory_order_acquire) == 0U &&
+               u2_slot_states_[lease.slot_id].load(std::memory_order_acquire) == ubuf_staging::SlotFreeState(1U) &&
+               u2_slot_acquire_count_[lease.slot_id].load(std::memory_order_acquire) == 1U &&
+               u2_slot_release_count_[lease.slot_id].load(std::memory_order_acquire) == 1U &&
+               u2_global_busy_depth_.load(std::memory_order_acquire) == 0U &&
+               fatal_.load(std::memory_order_acquire) ==
+                   EncodeExecFatal(ExecFatalReason::ClaimedPayloadInvalid, kFirstAivExecutorOwner, task_id);
+    }
+
+    bool ExerciseGuardFailureForTest(uint32_t task_id) {
+        if (!u2::TaskUsesSlot(task_id) || u2::ExpectedGeneration(task_id) != 0U) {
+            return false;
+        }
+        CpuTask &task = tasks_[task_id];
+        uint64_t empty = 0U;
+        if (!task.exec_state.compare_exchange_strong(
+                empty, BuildingState(task_id), std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            return false;
+        }
+        task.task_base_plus_one.store(UINT64_C(0x2001), std::memory_order_release);
+        U2PayloadLease lease{};
+        ExecPayloadLayout layout{};
+        if (!u2::TaskPayloadLayout(task_id, layout) || !AcquireU2Slot(task_id, &lease)) {
+            return false;
+        }
+        std::array<uint64_t, ubuf_staging::kMaxPayloadWords> &staging = u2_staging_slots_[lease.slot_id].payload;
+        if (!PackPayloadInto(task_id, UINT64_C(0xC0FFEE), layout, staging.data())) {
+            return false;
+        }
+        lease.ubuf_words_written = layout.written_words;
+        lease.phase_bits |= u2::kTransportUbufComplete;
+        u2_staging_slots_[lease.slot_id].guard_after.words[3] ^= 1U;
+        if (U2StagingGuardsValid(lease.slot_id)) {
+            return false;
+        }
+        const bool aborted = AbortU2Build(task_id, &lease);
+        PublishFatal(ExecFatalReason::BuildPackFailed, task_id, kBuilderOwner);
+        return aborted && !lease.owns_slot && (lease.phase_bits & u2::kTransportGmComplete) == 0U &&
+               (lease.phase_bits & u2::kTransportBuiltPublished) == 0U &&
+               task.exec_state.load(std::memory_order_acquire) == 0U &&
+               u2_slot_states_[lease.slot_id].load(std::memory_order_acquire) == ubuf_staging::SlotFreeState(1U) &&
+               u2_slot_acquire_count_[lease.slot_id].load(std::memory_order_acquire) == 1U &&
+               u2_slot_release_count_[lease.slot_id].load(std::memory_order_acquire) == 1U &&
+               u2_global_busy_depth_.load(std::memory_order_acquire) == 0U && U2ReportIsPoison(u2_reports_[0]) &&
+               fatal_.load(std::memory_order_acquire) ==
+                   EncodeExecFatal(ExecFatalReason::BuildPackFailed, kBuilderOwner, task_id);
+    }
+
+    bool ExerciseGmCompletePreBuiltFatalForTest(uint32_t task_id) {
+        if (!u2::TaskUsesSlot(task_id) || u2::ExpectedGeneration(task_id) != 1U) {
+            return false;
+        }
+        const uint32_t slot_id = task_id % ubuf_staging::kSlotCount;
+        u2_slot_states_[slot_id].store(ubuf_staging::SlotFreeState(1U), std::memory_order_relaxed);
+        CpuTask &task = tasks_[task_id];
+        uint64_t empty = 0U;
+        if (!task.exec_state.compare_exchange_strong(
+                empty, BuildingState(task_id), std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            return false;
+        }
+        task.task_base_plus_one.store(UINT64_C(0x3001), std::memory_order_release);
+        U2PayloadLease lease{};
+        ExecPayloadLayout layout{};
+        if (!StageAndCopyU2Payload(task_id, UINT64_C(0x12345678), &layout, &lease) || !lease.owns_slot ||
+            (lease.phase_bits & u2::kTransportGmComplete) == 0U ||
+            (lease.phase_bits & u2::kTransportBuiltPublished) != 0U) {
+            return false;
+        }
+        PublishFatal(ExecFatalReason::ClaimedPayloadInvalid, task_id, kFirstAivExecutorOwner);
+        const bool aborted = AbortU2Build(task_id, &lease);
+        return aborted && !lease.owns_slot && task.exec_state.load(std::memory_order_acquire) == 0U &&
+               task.payload[0] == task_id &&
+               task.payload[layout.written_words] == ExpectedPayloadPoisonWord(nonce_, task_id, layout.written_words) &&
+               u2_slot_states_[slot_id].load(std::memory_order_acquire) == ubuf_staging::SlotFreeState(2U) &&
+               u2_slot_acquire_count_[slot_id].load(std::memory_order_acquire) == 1U &&
+               u2_slot_release_count_[slot_id].load(std::memory_order_acquire) == 1U &&
+               u2_global_busy_depth_.load(std::memory_order_acquire) == 0U && U2ReportIsPoison(u2_reports_[4]) &&
+               fatal_.load(std::memory_order_acquire) ==
+                   EncodeExecFatal(ExecFatalReason::ClaimedPayloadInvalid, kFirstAivExecutorOwner, task_id);
+    }
+#endif
 
 private:
     void InitializeTask(uint32_t task_id) {
@@ -499,6 +686,198 @@ private:
         SignalProgress();
     }
 
+#if defined(SIMT_CROSS_CORE_U2)
+    void InitializeU2Guard(u2::U2Guard *guard, uint32_t guard_id) const {
+        for (uint32_t word = 0U; word < ubuf_staging::kWordsPerLine; ++word) {
+            guard->words[word] = u2::ExpectedGuardWord(nonce_, guard_id, word);
+        }
+    }
+
+    bool U2GuardValid(const u2::U2Guard &guard, uint32_t guard_id) const {
+        for (uint32_t word = 0U; word < ubuf_staging::kWordsPerLine; ++word) {
+            if (guard.words[word] != u2::ExpectedGuardWord(nonce_, guard_id, word)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void InitializeU2Transport() {
+        for (uint32_t slot = 0U; slot < ubuf_staging::kSlotCount; ++slot) {
+            u2_slot_states_[slot].store(ubuf_staging::SlotFreeState(0U), std::memory_order_relaxed);
+            u2_slot_acquire_count_[slot].store(0U, std::memory_order_relaxed);
+            u2_slot_release_count_[slot].store(0U, std::memory_order_relaxed);
+            u2_staging_slots_[slot].payload.fill(kU2StagingPoisonWord);
+            InitializeU2Guard(&u2_staging_slots_[slot].guard_before, 2U * slot);
+            InitializeU2Guard(&u2_staging_slots_[slot].guard_after, 2U * slot + 1U);
+        }
+        u2_global_busy_depth_.store(0U, std::memory_order_relaxed);
+        u2_global_max_busy_depth_.store(0U, std::memory_order_relaxed);
+        u2_anchor_staged_count_.store(0U, std::memory_order_relaxed);
+        u2_anchor_staged_mask_.store(0U, std::memory_order_relaxed);
+        u2_guard_check_count_.store(0U, std::memory_order_relaxed);
+        u2_ubuf_words_written_.store(0U, std::memory_order_relaxed);
+        u2_gm_words_stored_.store(0U, std::memory_order_relaxed);
+        std::memset(u2_reports_.data(), 0xD3, sizeof(u2_reports_));
+    }
+
+    bool UpdateU2Maximum(uint64_t value) {
+        uint64_t observed = u2_global_max_busy_depth_.load(std::memory_order_relaxed);
+        for (uint32_t attempt = 0U; observed < value && attempt < kU2CpuCasAttemptLimit; ++attempt) {
+            if (u2_global_max_busy_depth_.compare_exchange_weak(
+                    observed, value, std::memory_order_relaxed, std::memory_order_relaxed
+                )) {
+                return true;
+            }
+        }
+        return observed >= value;
+    }
+
+    bool AcquireU2Slot(uint32_t task_id, U2PayloadLease *lease) {
+        const uint32_t slot_id = u2::SlotForTask(task_id);
+        const auto deadline = std::chrono::steady_clock::now() + kCpuWaitLimit;
+        while (true) {
+            const uint64_t observed_epoch = SnapshotProgressEpoch();
+            const U2SlotAcquireResult result =
+                TryAcquireOrderedU2Slot(u2_slot_states_[slot_id], task_id, batches_, lease);
+            if (result == U2SlotAcquireResult::Acquired) {
+                u2_slot_acquire_count_[slot_id].fetch_add(1U, std::memory_order_relaxed);
+                const uint64_t depth = u2_global_busy_depth_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+                lease->phase_bits |= u2::kTransportSlotAcquired;
+                if (depth > ubuf_staging::kSlotCount || !UpdateU2Maximum(depth)) {
+                    return false;
+                }
+                SignalProgress();
+                return true;
+            }
+            if (result == U2SlotAcquireResult::Invalid || fatal_.load(std::memory_order_acquire) != 0U) {
+                return false;
+            }
+            if (!WaitForProgress(observed_epoch, deadline)) {
+                return false;
+            }
+        }
+    }
+
+    bool ReleaseU2Slot(U2PayloadLease *lease) {
+        if (!lease->owns_slot || lease->slot_id >= ubuf_staging::kSlotCount || lease->task_id >= task_count_) {
+            return false;
+        }
+        const uint64_t owned = ubuf_staging::SlotBusyState(lease->generation, lease->task_id);
+        if (u2_slot_states_[lease->slot_id].load(std::memory_order_acquire) != owned) {
+            return false;
+        }
+        const uint64_t busy_before = u2_global_busy_depth_.fetch_sub(1U, std::memory_order_acq_rel);
+        if (busy_before == 0U || busy_before > ubuf_staging::kSlotCount) {
+            u2_global_busy_depth_.fetch_add(1U, std::memory_order_relaxed);
+            return false;
+        }
+        uint64_t expected = owned;
+        if (!u2_slot_states_[lease->slot_id].compare_exchange_strong(
+                expected, ubuf_staging::SlotFreeState(lease->generation + 1U), std::memory_order_release,
+                std::memory_order_acquire
+            )) {
+            u2_global_busy_depth_.fetch_add(1U, std::memory_order_relaxed);
+            return false;
+        }
+        u2_slot_release_count_[lease->slot_id].fetch_add(1U, std::memory_order_relaxed);
+        lease->owns_slot = false;
+        lease->phase_bits |= u2::kTransportSlotReleased;
+        SignalProgress();
+        return true;
+    }
+
+    bool WaitForU2Anchor(uint32_t task_id) {
+        const uint64_t bit = u2::AnchorBit(task_id);
+        const uint64_t previous_mask = u2_anchor_staged_mask_.fetch_or(bit, std::memory_order_acq_rel);
+        if (bit == 0U || (previous_mask & bit) != 0U) {
+            return false;
+        }
+        const uint64_t count = u2_anchor_staged_count_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+        if (count > u2::kAnchorTaskCount) {
+            return false;
+        }
+        SignalProgress();
+        uint32_t polls = 0U;
+        return WaitFor(
+            [this] {
+                return u2_anchor_staged_count_.load(std::memory_order_acquire) == u2::kAnchorTaskCount &&
+                       u2_anchor_staged_mask_.load(std::memory_order_acquire) == u2::kAnchorMask;
+            },
+            &polls
+        );
+    }
+
+    bool U2StagingGuardsValid(uint32_t slot_id) const {
+        return U2GuardValid(u2_staging_slots_[slot_id].guard_before, 2U * slot_id) &&
+               U2GuardValid(u2_staging_slots_[slot_id].guard_after, 2U * slot_id + 1U);
+    }
+
+    bool StageAndCopyU2Payload(uint32_t task_id, uint64_t vend, ExecPayloadLayout *layout, U2PayloadLease *lease) {
+        if (!u2::TaskPayloadLayout(task_id, *layout) || layout->written_words > ubuf_staging::kMaxPayloadWords ||
+            !AcquireU2Slot(task_id, lease)) {
+            return false;
+        }
+        std::array<uint64_t, ubuf_staging::kMaxPayloadWords> &staging = u2_staging_slots_[lease->slot_id].payload;
+        if (!PackPayloadInto(task_id, vend, *layout, staging.data())) {
+            return false;
+        }
+        lease->ubuf_words_written = layout->written_words;
+        lease->phase_bits |= u2::kTransportUbufComplete;
+        u2_ubuf_words_written_.fetch_add(layout->written_words, std::memory_order_relaxed);
+        if (!U2StagingGuardsValid(lease->slot_id)) {
+            return false;
+        }
+        lease->phase_bits |= u2::kTransportGuardsValid;
+        u2_guard_check_count_.fetch_add(1U, std::memory_order_relaxed);
+        if (u2::IsAnchorTask(task_id) && !WaitForU2Anchor(task_id)) {
+            return false;
+        }
+        CpuTask &task = tasks_[task_id];
+        for (uint32_t word = 0U; word < layout->written_words; ++word) {
+            task.payload[word] = staging[word];
+            ++lease->gm_words_stored;
+        }
+        lease->phase_bits |= u2::kTransportGmComplete;
+        u2_gm_words_stored_.fetch_add(layout->written_words, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool AbortU2Build(uint32_t task_id, U2PayloadLease *lease) {
+        if (lease->owns_slot && !ReleaseU2Slot(lease)) {
+            return false;
+        }
+        uint64_t expected = BuildingState(task_id);
+        return tasks_[task_id].exec_state.compare_exchange_strong(
+            expected, 0U, std::memory_order_release, std::memory_order_acquire
+        );
+    }
+
+    uint64_t U2PayloadChecksum(uint32_t task_id, const uint64_t *payload, uint32_t words) const {
+        uint64_t checksum = u2::PayloadChecksumSeed(nonce_, task_id, words);
+        for (uint32_t word = 0U; word < words; ++word) {
+            checksum = u2::FoldPayloadChecksum(checksum, payload[word]);
+        }
+        return checksum;
+    }
+
+    void PublishU2Report(uint32_t task_id, const ExecPayloadLayout &layout, const U2PayloadLease &lease) {
+        u2::U2TaskStagingReport report{};
+        report.task_id = task_id;
+        report.slot_id = lease.slot_id;
+        report.generation = lease.generation;
+        report.phase_bits = lease.phase_bits;
+        report.ubuf_words_written = lease.ubuf_words_written;
+        report.gm_words_stored = lease.gm_words_stored;
+        report.guard_check_count = 1U;
+        report.acquire_count = 1U;
+        report.release_count = 1U;
+        report.launch_nonce = nonce_;
+        report.payload_checksum = U2PayloadChecksum(task_id, tasks_[task_id].payload.data(), layout.written_words);
+        u2_reports_[u2::TransportReportIndex(task_id)] = report;
+    }
+#endif
+
     bool EnterBuilderGate(uint32_t thread_id) {
         if (BuilderLocalThread(thread_id) == 0U) {
             const uint64_t observed = builder_started_.fetch_add(1U, std::memory_order_acq_rel);
@@ -548,8 +927,12 @@ private:
             report.last_task = task_id;
             ++report.prepare_count;
             ++report.commit_count;
+#if defined(SIMT_CROSS_CORE_U2)
+            report.insert_wait_count += task_id == 0U ? 0U : 1U;
+#else
             report.insert_wait_count +=
                 TaskKindAt(task_id) == TaskKind::Up && TaskBatch(task_id) != 0U ? 1U : 0U;
+#endif
         }
         report.checksum = BuilderReportChecksum(
             nonce_, thread_id, task_count_, report.task_count, report.first_task, report.last_task,
@@ -639,23 +1022,18 @@ private:
         return true;
     }
 
-    bool PackPayload(uint32_t task_id, uint64_t vend, ExecPayloadLayout *layout) {
-        CpuTask &task = tasks_[task_id];
+    bool PackPayloadInto(uint32_t task_id, uint64_t vend, const ExecPayloadLayout &layout, uint64_t *payload) {
         const TaskKind kind = TaskKindAt(task_id);
         const TaskExecShape shape = TaskShape(kind);
-        if (!ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, *layout)) {
-            return false;
-        }
-        task.payload[0] = task_id;
-        task.payload[1] = 0U;
-        task.payload[2] = vend;
-        task.payload[3] = PackHeaderWord3(TaskFunctionId(kind), layout->payload_bytes);
-        task.payload[4] =
-            PackHeaderWord4(shape.tensor_count, shape.scalar_count, shape.fanin_count, shape.engine_class);
-        task.payload[5] = uint64_t{1} << 48U;
-        task.payload[6] = 0U;
-        task.payload[7] = 0U;
-        uint32_t destination = layout->tensor_word_offset;
+        payload[0] = task_id;
+        payload[1] = 0U;
+        payload[2] = vend;
+        payload[3] = PackHeaderWord3(TaskFunctionId(kind), layout.payload_bytes);
+        payload[4] = PackHeaderWord4(shape.tensor_count, shape.scalar_count, shape.fanin_count, shape.engine_class);
+        payload[5] = uint64_t{1} << 48U;
+        payload[6] = 0U;
+        payload[7] = 0U;
+        uint32_t destination = layout.tensor_word_offset;
         for (uint32_t tensor_index = 0U; tensor_index < shape.tensor_count; ++tensor_index) {
             TensorDesc tensor{};
             uint32_t producer = 0U;
@@ -672,25 +1050,37 @@ private:
             std::array<uint64_t, kTensorDescWords> words{};
             std::memcpy(words.data(), &tensor, sizeof(tensor));
             for (uint64_t word : words) {
-                task.payload[destination++] = word;
+                payload[destination++] = word;
             }
         }
         for (uint32_t scalar = 0U; scalar < shape.scalar_count; ++scalar) {
-            task.payload[destination++] = TaskScalar(task_id, scalar);
+            payload[destination++] = TaskScalar(task_id, scalar);
         }
         for (uint32_t edge = 0U; edge < shape.fanin_count; edge += 2U) {
             const uint64_t low = static_cast<uint32_t>(TaskFanin(task_id, edge));
             const uint64_t high =
                 edge + 1U < shape.fanin_count ? static_cast<uint32_t>(TaskFanin(task_id, edge + 1U)) : 0U;
-            task.payload[destination++] = low | (high << 32U);
+            payload[destination++] = low | (high << 32U);
         }
-        return destination == layout->written_words;
+        return destination == layout.written_words;
+    }
+
+    bool PackPayload(uint32_t task_id, uint64_t vend, ExecPayloadLayout *layout) {
+        const TaskExecShape shape = TaskShape(TaskKindAt(task_id));
+        return ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, *layout) &&
+               PackPayloadInto(task_id, vend, *layout, tasks_[task_id].payload.data());
     }
 
     BuildAttemptResult BuildTask(uint32_t task_id, uint32_t thread_id) {
         CpuTask &task = tasks_[task_id];
         const TaskKind kind = TaskKindAt(task_id);
         const uint32_t build_owner = BuilderOwnerForThread(thread_id);
+#if defined(SIMT_CROSS_CORE_U2)
+        U2PayloadLease u2_lease{};
+        const auto abort_u2_payload = [this, task_id, kind, &u2_lease] {
+            return !TaskExecutable(kind) || AbortU2Build(task_id, &u2_lease);
+        };
+#endif
         task.build_attempt_count.fetch_add(1U, std::memory_order_acq_rel);
         uint64_t expected_state = 0U;
         int64_t alloc_claim = 0;
@@ -725,11 +1115,39 @@ private:
             task.last_writer[slot].store(task_id, std::memory_order_release);
         }
         ExecPayloadLayout layout{};
+#if defined(SIMT_CROSS_CORE_U2)
+        if (TaskExecutable(kind) && !StageAndCopyU2Payload(task_id, vend, &layout, &u2_lease)) {
+            (void)abort_u2_payload();
+            return BuildAttemptResult::Error;
+        }
+        if (TaskExecutable(kind) && fatal_.load(std::memory_order_acquire) != 0U) {
+            (void)abort_u2_payload();
+            return BuildAttemptResult::Error;
+        }
+#else
         if (TaskExecutable(kind) && !PackPayload(task_id, vend, &layout)) {
             return BuildAttemptResult::Error;
         }
+#endif
         uint32_t insert_polls = 0U;
         int64_t predecessor_observed = -1;
+#if defined(SIMT_CROSS_CORE_U2)
+        if (task_id != 0U) {
+            if (!WaitFor(
+                    [this, task_id] {
+                        return tasks_[task_id - 1U].insert_completion.load(std::memory_order_acquire) ==
+                               static_cast<int64_t>(task_id - 1U);
+                    },
+                    &insert_polls
+                )) {
+#if defined(SIMT_CROSS_CORE_U2)
+                (void)abort_u2_payload();
+#endif
+                return BuildAttemptResult::Error;
+            }
+            predecessor_observed = tasks_[task_id - 1U].insert_completion.load(std::memory_order_acquire);
+        }
+#else
         if (kind == TaskKind::Up) {
             const uint32_t alloc_task = BatchTaskId(TaskBatch(task_id), TaskKind::Alloc);
             uint32_t output_polls = 0U;
@@ -757,6 +1175,13 @@ private:
                     tasks_[predecessor_task].insert_completion.load(std::memory_order_acquire);
             }
         }
+#endif
+#if defined(SIMT_CROSS_CORE_U2)
+        if (TaskExecutable(kind) && fatal_.load(std::memory_order_acquire) != 0U) {
+            (void)abort_u2_payload();
+            return BuildAttemptResult::Error;
+        }
+#endif
         if (kind == TaskKind::Up) {
             task.history.magic = kWriterHistoryMagic;
             task.history.writer_task = static_cast<int32_t>(task_id);
@@ -772,6 +1197,17 @@ private:
             }
             tasks_[BatchTaskId(batch, TaskKind::Alloc)].last_writer[0].store(task_id, std::memory_order_release);
         }
+#if defined(SIMT_CROSS_CORE_U2)
+        uint32_t expected_prefix = task_id;
+        if (!committed_prefix_.compare_exchange_strong(
+                expected_prefix, task_id + 1U, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+#if defined(SIMT_CROSS_CORE_U2)
+            (void)abort_u2_payload();
+#endif
+            return BuildAttemptResult::Error;
+        }
+#else
         if (kind == TaskKind::Up) {
             uint32_t expected_prefix = TaskBatch(task_id);
             if (!committed_prefix_.compare_exchange_strong(
@@ -781,12 +1217,21 @@ private:
                 return BuildAttemptResult::Error;
             }
         }
+#endif
+#if defined(SIMT_CROSS_CORE_U2)
+        const int64_t previous_insert = task.insert_completion.fetch_add(1, std::memory_order_acq_rel);
+        if (previous_insert != InsertCompletionInitialValue(task_id)) {
+            (void)abort_u2_payload();
+            return BuildAttemptResult::Error;
+        }
+#else
         if (kind == TaskKind::Up) {
             const int64_t previous_insert = task.insert_completion.fetch_add(1, std::memory_order_acq_rel);
             if (previous_insert != InsertCompletionInitialValue(task_id)) {
                 return BuildAttemptResult::Error;
             }
         }
+#endif
         if (kind == TaskKind::Alloc) {
             task.completion_vend.store(vend, std::memory_order_relaxed);
             if (!task.completion_flag.compare_exchange_strong(
@@ -796,13 +1241,29 @@ private:
             }
             alloc_done_.fetch_add(1U, std::memory_order_acq_rel);
         } else {
+#if defined(SIMT_CROSS_CORE_U2)
+            if (fatal_.load(std::memory_order_acquire) != 0U) {
+                (void)abort_u2_payload();
+                return BuildAttemptResult::Error;
+            }
+#endif
             expected_state = BuildingState(task_id, build_owner);
             if (!task.exec_state.compare_exchange_strong(
                     expected_state, BuiltState(task_id, build_owner), std::memory_order_release,
                     std::memory_order_acquire
                 )) {
+#if defined(SIMT_CROSS_CORE_U2)
+                (void)abort_u2_payload();
+#endif
                 return BuildAttemptResult::Error;
             }
+#if defined(SIMT_CROSS_CORE_U2)
+            u2_lease.phase_bits |= u2::kTransportBuiltPublished;
+            if (!ReleaseU2Slot(&u2_lease)) {
+                return BuildAttemptResult::Error;
+            }
+            PublishU2Report(task_id, layout, u2_lease);
+#endif
         }
         task.plan = FullPaTaskPlan{
             task_id,
@@ -1220,7 +1681,12 @@ private:
             alloc_done_.load(std::memory_order_acquire) != batches_ ||
             aic_done_.load(std::memory_order_acquire) != 2U * batches_ ||
             aiv_done_.load(std::memory_order_acquire) != 2U * batches_ ||
-            committed_prefix_.load(std::memory_order_acquire) != batches_ ||
+            committed_prefix_.load(std::memory_order_acquire) !=
+#if defined(SIMT_CROSS_CORE_U2)
+                task_count_ ||
+#else
+                batches_ ||
+#endif
             aic_cursor_.load(std::memory_order_acquire) != 2U * batches_ + kAicOwnerCount ||
             aiv_cursor_.load(std::memory_order_acquire) != 2U * batches_ + AivExecutorCount(builder_count_)) {
             return false;
@@ -1284,9 +1750,23 @@ private:
                 task.build_report.build_attempt_count != 1U || task.build_report.build_win_count != 1U ||
                 task.build_report.prepare_count != 1U || task.build_report.commit_count != 1U ||
                 task.insert_completion.load(std::memory_order_acquire) !=
+#if defined(SIMT_CROSS_CORE_U2)
+                    static_cast<int64_t>(task_id)) {
+#else
                     (kind == TaskKind::Up ? static_cast<int64_t>(task_id) : InsertCompletionInitialValue(task_id))) {
+#endif
                 return false;
             }
+#if defined(SIMT_CROSS_CORE_U2)
+            if (task_id == 0U) {
+                if (task.build_report.predecessor_observed != -1 || task.build_report.insert_poll_count != 0U) {
+                    return false;
+                }
+            } else if (task.build_report.predecessor_observed != static_cast<int64_t>(task_id - 1U) ||
+                       task.build_report.insert_poll_count == 0U) {
+                return false;
+            }
+#else
             if (kind == TaskKind::Up && TaskBatch(task_id) != 0U) {
                 if (task.build_report.predecessor_observed != static_cast<int64_t>(task_id - kTasksPerBatch) ||
                     task.build_report.insert_poll_count == 0U) {
@@ -1295,12 +1775,17 @@ private:
             } else if (task.build_report.predecessor_observed != -1 || task.build_report.insert_poll_count != 0U) {
                 return false;
             }
+#endif
             ++expected_wins[builder_thread];
             if (expected_first[builder_thread] == kNoTask) {
                 expected_first[builder_thread] = task_id;
             }
             expected_last[builder_thread] = task_id;
+#if defined(SIMT_CROSS_CORE_U2)
+            expected_waits[builder_thread] += task_id == 0U ? 0U : 1U;
+#else
             expected_waits[builder_thread] += kind == TaskKind::Up && TaskBatch(task_id) != 0U ? 1U : 0U;
+#endif
         }
 
         uint64_t total_attempts = 0U;
@@ -1497,6 +1982,151 @@ private:
         }
         return true;
     }
+
+#if defined(SIMT_CROSS_CORE_U2)
+    bool U2ReportIsPoison(const u2::U2TaskStagingReport &report) const {
+        u2::U2TaskStagingReport poison{};
+        std::memset(&poison, 0xD3, sizeof(poison));
+        return std::memcmp(&report, &poison, sizeof(report)) == 0;
+    }
+
+    bool ValidateU2Transport() const {
+        if (builder_count_ != u2::kBuilderCount || u2_global_busy_depth_.load(std::memory_order_acquire) != 0U ||
+            u2_global_max_busy_depth_.load(std::memory_order_acquire) != ubuf_staging::kSlotCount ||
+            u2_anchor_staged_count_.load(std::memory_order_acquire) != u2::kAnchorTaskCount ||
+            u2_anchor_staged_mask_.load(std::memory_order_acquire) != u2::kAnchorMask ||
+            u2_guard_check_count_.load(std::memory_order_acquire) != kernel_task_count_ ||
+            u2_ubuf_words_written_.load(std::memory_order_acquire) != u2::ExpectedWordsPerBatch() * batches_ ||
+            u2_gm_words_stored_.load(std::memory_order_acquire) != u2::ExpectedWordsPerBatch() * batches_) {
+            return false;
+        }
+        for (uint32_t slot = 0U; slot < ubuf_staging::kSlotCount; ++slot) {
+            if (!U2StagingGuardsValid(slot) ||
+                u2_slot_states_[slot].load(std::memory_order_acquire) != ubuf_staging::SlotFreeState(batches_) ||
+                u2_slot_acquire_count_[slot].load(std::memory_order_acquire) != batches_ ||
+                u2_slot_release_count_[slot].load(std::memory_order_acquire) != batches_) {
+                return false;
+            }
+        }
+        for (uint32_t task_id = 0U; task_id < task_count_; ++task_id) {
+            const uint32_t kind_ordinal = task_id % kTasksPerBatch;
+            if (kind_ordinal == static_cast<uint32_t>(TaskKind::Alloc)) {
+                continue;
+            }
+            const uint32_t expected_generation = task_id / kTasksPerBatch;
+            const uint32_t expected_slot = (expected_generation + kind_ordinal) % ubuf_staging::kSlotCount;
+            const uint32_t expected_report =
+                expected_generation * kKernelsPerBatch + kind_ordinal - static_cast<uint32_t>(TaskKind::Qk);
+            ExecPayloadLayout layout{};
+            if (!u2::TaskPayloadLayout(task_id, layout)) {
+                return false;
+            }
+            const u2::U2TaskStagingReport &report = u2_reports_[expected_report];
+            const std::array<uint32_t, 3> zero_reserved{};
+            if (report.task_id != task_id || report.slot_id != expected_slot ||
+                report.generation != expected_generation || report.phase_bits != u2::kExpectedTransportPhaseBits ||
+                report.ubuf_words_written != layout.written_words || report.gm_words_stored != layout.written_words ||
+                report.guard_check_count != 1U || report.acquire_count != 1U || report.release_count != 1U ||
+                std::memcmp(report.reserved32, zero_reserved.data(), sizeof(report.reserved32)) != 0 ||
+                report.launch_nonce != nonce_ ||
+                report.payload_checksum !=
+                    U2PayloadChecksum(task_id, tasks_[task_id].payload.data(), layout.written_words)) {
+                return false;
+            }
+        }
+        for (uint32_t report = kernel_task_count_; report < u2::kMaxTransportReports; ++report) {
+            if (!U2ReportIsPoison(u2_reports_[report])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void MaterializeU2State(u2::U2StagingState *state) const {
+        std::memset(state, 0, sizeof(*state));
+        state->control.magic = u2::kProbeMagic;
+        state->control.version = u2::kProbeVersion;
+        state->control.launch_nonce = nonce_;
+        state->control.batch_count = batches_;
+        state->control.task_count = task_count_;
+        state->control.kernel_task_count = kernel_task_count_;
+        state->control.builder_count = builder_count_;
+        state->control.slot_count = ubuf_staging::kSlotCount;
+        state->control.max_payload_lines = ubuf_staging::kMaxPayloadLines;
+        state->control.words_per_line = ubuf_staging::kWordsPerLine;
+        state->control.alignment_bytes = ubuf_staging::kAlignmentBytes;
+        state->control.transport_kind = ubuf_staging::TransportKind::SimtUbufReadToGmWordStore;
+        state->control.slot_stride_bytes = ubuf_staging::kSlotStrideBytes;
+        state->control.region_bytes = ubuf_staging::kRegionBytes;
+        state->control.payload_offset_bytes = ubuf_staging::kPayloadOffsetBytes;
+        InitializeU2Guard(&state->guard_before_slots, u2::kGuardBeforeSlots);
+        InitializeU2Guard(&state->guard_after_slots, u2::kGuardAfterSlots);
+        InitializeU2Guard(&state->guard_before_reports, u2::kGuardBeforeReports);
+        InitializeU2Guard(&state->guard_after_reports, u2::kGuardAfterReports);
+        for (uint32_t slot = 0U; slot < ubuf_staging::kSlotCount; ++slot) {
+            state->slot_states[slot].value =
+                static_cast<int64_t>(u2_slot_states_[slot].load(std::memory_order_acquire));
+            state->slot_acquire_count[slot].value =
+                static_cast<int64_t>(u2_slot_acquire_count_[slot].load(std::memory_order_acquire));
+            state->slot_release_count[slot].value =
+                static_cast<int64_t>(u2_slot_release_count_[slot].load(std::memory_order_acquire));
+        }
+        state->global_busy_depth.value = static_cast<int64_t>(u2_global_busy_depth_.load(std::memory_order_acquire));
+        state->global_max_busy_depth.value =
+            static_cast<int64_t>(u2_global_max_busy_depth_.load(std::memory_order_acquire));
+        state->anchor_staged_count.value =
+            static_cast<int64_t>(u2_anchor_staged_count_.load(std::memory_order_acquire));
+        state->anchor_staged_mask.value = static_cast<int64_t>(u2_anchor_staged_mask_.load(std::memory_order_acquire));
+        state->guard_check_count.value = static_cast<int64_t>(u2_guard_check_count_.load(std::memory_order_acquire));
+        state->ubuf_words_written.value = static_cast<int64_t>(u2_ubuf_words_written_.load(std::memory_order_acquire));
+        state->gm_words_stored.value = static_cast<int64_t>(u2_gm_words_stored_.load(std::memory_order_acquire));
+        std::copy(u2_reports_.begin(), u2_reports_.end(), state->reports);
+    }
+
+    bool ValidateMaterializedU2State(const u2::U2StagingState &state) const {
+        if (state.control.magic != u2::kProbeMagic || state.control.version != u2::kProbeVersion ||
+            state.control.launch_nonce != nonce_ || state.control.batch_count != batches_ ||
+            state.control.task_count != task_count_ || state.control.kernel_task_count != kernel_task_count_ ||
+            state.control.builder_count != u2::kBuilderCount || state.control.slot_count != ubuf_staging::kSlotCount ||
+            state.control.max_payload_lines != ubuf_staging::kMaxPayloadLines ||
+            state.control.words_per_line != ubuf_staging::kWordsPerLine ||
+            state.control.alignment_bytes != ubuf_staging::kAlignmentBytes ||
+            state.control.transport_kind != ubuf_staging::TransportKind::SimtUbufReadToGmWordStore ||
+            state.control.reserved16 != 0U || state.control.slot_stride_bytes != ubuf_staging::kSlotStrideBytes ||
+            state.control.region_bytes != ubuf_staging::kRegionBytes ||
+            state.control.payload_offset_bytes != ubuf_staging::kPayloadOffsetBytes ||
+            !U2GuardValid(state.guard_before_slots, u2::kGuardBeforeSlots) ||
+            !U2GuardValid(state.guard_after_slots, u2::kGuardAfterSlots) ||
+            !U2GuardValid(state.guard_before_reports, u2::kGuardBeforeReports) ||
+            !U2GuardValid(state.guard_after_reports, u2::kGuardAfterReports) ||
+            std::memcmp(state.reports, u2_reports_.data(), sizeof(state.reports)) != 0) {
+            return false;
+        }
+        for (uint32_t slot = 0U; slot < ubuf_staging::kSlotCount; ++slot) {
+            if (state.slot_states[slot].value !=
+                    static_cast<int64_t>(u2_slot_states_[slot].load(std::memory_order_acquire)) ||
+                state.slot_acquire_count[slot].value !=
+                    static_cast<int64_t>(u2_slot_acquire_count_[slot].load(std::memory_order_acquire)) ||
+                state.slot_release_count[slot].value !=
+                    static_cast<int64_t>(u2_slot_release_count_[slot].load(std::memory_order_acquire))) {
+                return false;
+            }
+        }
+        return state.global_busy_depth.value ==
+                   static_cast<int64_t>(u2_global_busy_depth_.load(std::memory_order_acquire)) &&
+               state.global_max_busy_depth.value ==
+                   static_cast<int64_t>(u2_global_max_busy_depth_.load(std::memory_order_acquire)) &&
+               state.anchor_staged_count.value ==
+                   static_cast<int64_t>(u2_anchor_staged_count_.load(std::memory_order_acquire)) &&
+               state.anchor_staged_mask.value ==
+                   static_cast<int64_t>(u2_anchor_staged_mask_.load(std::memory_order_acquire)) &&
+               state.guard_check_count.value ==
+                   static_cast<int64_t>(u2_guard_check_count_.load(std::memory_order_acquire)) &&
+               state.ubuf_words_written.value ==
+                   static_cast<int64_t>(u2_ubuf_words_written_.load(std::memory_order_acquire)) &&
+               state.gm_words_stored.value == static_cast<int64_t>(u2_gm_words_stored_.load(std::memory_order_acquire));
+    }
+#endif
 
     bool ValidateCompletionAndWitnesses() const {
         for (uint32_t task_id = 0U; task_id < task_count_; ++task_id) {
@@ -2167,10 +2797,84 @@ private:
     std::array<std::array<std::array<float, 2>, 2>, kOwnerCount> owner_workload_{};
     std::array<std::atomic<int64_t>, kDrainGroupCount> drain_arrivals_{};
     std::atomic<uint32_t> root_finished_{0U};
+#if defined(SIMT_CROSS_CORE_U2)
+    std::array<CpuU2StagingSlot, ubuf_staging::kSlotCount> u2_staging_slots_{};
+    std::array<std::atomic<uint64_t>, ubuf_staging::kSlotCount> u2_slot_states_{};
+    std::array<std::atomic<uint64_t>, ubuf_staging::kSlotCount> u2_slot_acquire_count_{};
+    std::array<std::atomic<uint64_t>, ubuf_staging::kSlotCount> u2_slot_release_count_{};
+    std::atomic<uint64_t> u2_global_busy_depth_{0U};
+    std::atomic<uint64_t> u2_global_max_busy_depth_{0U};
+    std::atomic<uint64_t> u2_anchor_staged_count_{0U};
+    std::atomic<uint64_t> u2_anchor_staged_mask_{0U};
+    std::atomic<uint64_t> u2_guard_check_count_{0U};
+    std::atomic<uint64_t> u2_ubuf_words_written_{0U};
+    std::atomic<uint64_t> u2_gm_words_stored_{0U};
+    std::array<u2::U2TaskStagingReport, u2::kMaxTransportReports> u2_reports_{};
+#endif
     std::mutex progress_mutex_;
     std::condition_variable progress_condition_;
     uint64_t progress_epoch_ = 0U;
 };
+
+#if defined(SIMT_CROSS_CORE_U2)
+bool TestU2OrderedGenerationAndHeldCleanup() {
+    constexpr uint32_t kTask1 = 1U;
+    constexpr uint32_t kTask9 = 9U;
+    std::atomic<uint64_t> slot_state{ubuf_staging::SlotFreeState(0U)};
+    U2PayloadLease task9_early{};
+    if (TryAcquireOrderedU2Slot(slot_state, kTask9, 2U, &task9_early) != U2SlotAcquireResult::Wait ||
+        task9_early.owns_slot || slot_state.load(std::memory_order_acquire) != ubuf_staging::SlotFreeState(0U)) {
+        return false;
+    }
+
+    U2PayloadLease task1{};
+    if (TryAcquireOrderedU2Slot(slot_state, kTask1, 2U, &task1) != U2SlotAcquireResult::Acquired || !task1.owns_slot ||
+        task1.slot_id != 1U || task1.generation != 0U) {
+        return false;
+    }
+    U2PayloadLease duplicate_task1{};
+    if (TryAcquireOrderedU2Slot(slot_state, kTask1, 2U, &duplicate_task1) != U2SlotAcquireResult::Invalid ||
+        duplicate_task1.owns_slot) {
+        return false;
+    }
+    uint64_t expected = ubuf_staging::SlotBusyState(0U, kTask1);
+    if (!slot_state.compare_exchange_strong(
+            expected, ubuf_staging::SlotFreeState(1U), std::memory_order_release, std::memory_order_acquire
+        )) {
+        return false;
+    }
+    if (TryAcquireOrderedU2Slot(slot_state, kTask9, 2U, &task9_early) != U2SlotAcquireResult::Acquired ||
+        !task9_early.owns_slot || task9_early.slot_id != 1U || task9_early.generation != 1U) {
+        return false;
+    }
+    expected = ubuf_staging::SlotBusyState(0U, kTask1);
+    if (slot_state.compare_exchange_strong(
+            expected, ubuf_staging::SlotFreeState(1U), std::memory_order_release, std::memory_order_acquire
+        )) {
+        return false;
+    }
+    expected = ubuf_staging::SlotBusyState(1U, kTask9);
+    if (!slot_state.compare_exchange_strong(
+            expected, ubuf_staging::SlotFreeState(2U), std::memory_order_release, std::memory_order_acquire
+        )) {
+        return false;
+    }
+
+    CpuFullPaModel cleanup_model(1U, UINT64_C(0xA5000000C1EA0001), u2::kBuilderCount);
+    CpuFullPaModel guard_model(1U, UINT64_C(0xA50000006A4D0001), u2::kBuilderCount);
+    CpuFullPaModel prebuilt_fatal_model(2U, UINT64_C(0xA5000000FA7A0002), u2::kBuilderCount);
+    const bool cleanup_ok = cleanup_model.ExerciseHeldSlotCleanupForTest(kTask1);
+    const bool guard_ok = guard_model.ExerciseGuardFailureForTest(kTask1);
+    const bool prebuilt_fatal_ok = prebuilt_fatal_model.ExerciseGmCompletePreBuiltFatalForTest(6U);
+    if (!cleanup_ok || !guard_ok || !prebuilt_fatal_ok) {
+        std::fprintf(
+            stderr, "[FAIL] U2 cleanup injection: held=%u guard=%u gm-complete-pre-built=%u\n", cleanup_ok, guard_ok,
+            prebuilt_fatal_ok
+        );
+    }
+    return cleanup_ok && guard_ok && prebuilt_fatal_ok;
+}
+#endif
 
 bool TestResetPreservesDispatch() {
     ExecutionToken token{};
@@ -2211,9 +2915,7 @@ bool TestCompetingBuilderClaimValidation() {
     const TaskExecShape up_shape = TaskShape(TaskKind::Up);
     ExecPayloadLayout qk_layout{};
     ExecPayloadLayout up_layout{};
-    if (!ComputeExecPayloadLayout(
-            qk_shape.tensor_count, qk_shape.scalar_count, qk_shape.fanin_count, qk_layout
-        ) ||
+    if (!ComputeExecPayloadLayout(qk_shape.tensor_count, qk_shape.scalar_count, qk_shape.fanin_count, qk_layout) ||
         !ComputeExecPayloadLayout(up_shape.tensor_count, up_shape.scalar_count, up_shape.fanin_count, up_layout)) {
         return false;
     }
@@ -2221,16 +2923,11 @@ bool TestCompetingBuilderClaimValidation() {
     const bool legal_kernel_states =
         CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, BuildingState(kQkTask, kOtherBuilder)) &&
         CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, BuiltState(kQkTask, kOtherBuilder)) &&
-        CompetingKernelClaimValid(
-            kQkTask, kCurrentBuilder, kBuilderCount, ClaimedState(kQkTask, kOtherBuilder, 0U)
-        ) &&
-        CompetingKernelClaimValid(
-            kQkTask, kCurrentBuilder, kBuilderCount, DoneState(kQkTask, kOtherBuilder, 0U)
-        ) &&
+        CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, ClaimedState(kQkTask, kOtherBuilder, 0U)) &&
+        CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, DoneState(kQkTask, kOtherBuilder, 0U)) &&
         CompetingKernelClaimValid(kUpTask, kCurrentBuilder, kBuilderCount, BuiltState(kUpTask, kOtherBuilder)) &&
         CompetingKernelClaimValid(
-            kUpTask, kCurrentBuilder, kBuilderCount,
-            ClaimedState(kUpTask, kOtherBuilder, kBuilderOwner + kBuilderCount)
+            kUpTask, kCurrentBuilder, kBuilderCount, ClaimedState(kUpTask, kOtherBuilder, kBuilderOwner + kBuilderCount)
         );
 
     const uint64_t wrong_qk_engine = EncodeExecState(
@@ -2239,23 +2936,23 @@ bool TestCompetingBuilderClaimValidation() {
     const uint64_t wrong_qk_lines = EncodeExecState(
         ExecPhase::Built, kOtherBuilder, kUnboundOwner, ExecEngineClass::Aic, qk_layout.payload_lines + 1U, kQkTask
     );
-    const uint64_t bound_built = EncodeExecState(
-        ExecPhase::Built, kOtherBuilder, 0U, ExecEngineClass::Aic, qk_layout.payload_lines, kQkTask
-    );
+    const uint64_t bound_built =
+        EncodeExecState(ExecPhase::Built, kOtherBuilder, 0U, ExecEngineClass::Aic, qk_layout.payload_lines, kQkTask);
     const uint64_t wrong_qk_route = EncodeExecState(
-        ExecPhase::Claimed, kOtherBuilder, kBuilderOwner + kBuilderCount, ExecEngineClass::Aic,
-        qk_layout.payload_lines, kQkTask
+        ExecPhase::Claimed, kOtherBuilder, kBuilderOwner + kBuilderCount, ExecEngineClass::Aic, qk_layout.payload_lines,
+        kQkTask
     );
-    const uint64_t wrong_up_route = EncodeExecState(
-        ExecPhase::Done, kOtherBuilder, 0U, ExecEngineClass::Aiv, up_layout.payload_lines, kUpTask
-    );
+    const uint64_t wrong_up_route =
+        EncodeExecState(ExecPhase::Done, kOtherBuilder, 0U, ExecEngineClass::Aiv, up_layout.payload_lines, kUpTask);
     const uint64_t builder_as_executor = EncodeExecState(
         ExecPhase::Claimed, kOtherBuilder, kOtherBuilder, ExecEngineClass::Aiv, up_layout.payload_lines, kUpTask
     );
     const bool illegal_kernel_states =
         !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, 0U) &&
         !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, BuildingState(kQkTask, kCurrentBuilder)) &&
-        !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, BuildingState(kQkTask + 5U, kOtherBuilder)) &&
+        !CompetingKernelClaimValid(
+            kQkTask, kCurrentBuilder, kBuilderCount, BuildingState(kQkTask + 5U, kOtherBuilder)
+        ) &&
         !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, wrong_qk_engine) &&
         !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, wrong_qk_lines) &&
         !CompetingKernelClaimValid(kQkTask, kCurrentBuilder, kBuilderCount, bound_built) &&
@@ -2267,9 +2964,8 @@ bool TestCompetingBuilderClaimValidation() {
         );
 
     const int64_t other_alloc = static_cast<int64_t>(AllocBuildingState(kNonce, 0U, kOtherBuilder));
-    const bool legal_alloc_states =
-        CompetingAllocClaimValid(kNonce, 0U, kCurrentBuilder, kBuilderCount, 1) &&
-        CompetingAllocClaimValid(kNonce, 0U, kCurrentBuilder, kBuilderCount, other_alloc);
+    const bool legal_alloc_states = CompetingAllocClaimValid(kNonce, 0U, kCurrentBuilder, kBuilderCount, 1) &&
+                                    CompetingAllocClaimValid(kNonce, 0U, kCurrentBuilder, kBuilderCount, other_alloc);
     const bool illegal_alloc_states =
         !CompetingAllocClaimValid(
             kNonce, 0U, kCurrentBuilder, kBuilderCount,
@@ -2436,26 +3132,35 @@ bool TestBuildExecuteOverlap() {
            task2_state.load(std::memory_order_acquire) == BuiltState(2U);
 }
 
-bool RunCase(uint32_t batches, uint64_t nonce, uint32_t builder_count, FullPaState *state) {
+#if defined(SIMT_CROSS_CORE_U2)
+using CpuMaterializedState = u2::U2FullPaState;
+constexpr const char *kCpuProbeName = "U2";
+#else
+using CpuMaterializedState = FullPaState;
+constexpr const char *kCpuProbeName = "G0";
+#endif
+
+bool RunCase(uint32_t batches, uint64_t nonce, uint32_t builder_count, CpuMaterializedState *state) {
     CpuFullPaModel model(batches, nonce, builder_count);
     if (!model.RunConcurrent()) {
         std::fprintf(
-            stderr, "[FAIL] G0 CPU concurrent build/execute builders=%u batches=%u nonce=%llu\n", builder_count,
-            batches, static_cast<unsigned long long>(nonce)
+            stderr, "[FAIL] %s CPU concurrent build/execute builders=%u batches=%u nonce=%llu\n", kCpuProbeName,
+            builder_count, batches, static_cast<unsigned long long>(nonce)
         );
         return false;
     }
     if (!model.Validate() || !model.MaterializeAndValidate(state)) {
         std::fprintf(
-            stderr, "[FAIL] G0 CPU oracle builders=%u batches=%u nonce=%llu\n", builder_count, batches,
+            stderr, "[FAIL] %s CPU oracle builders=%u batches=%u nonce=%llu\n", kCpuProbeName, builder_count, batches,
             static_cast<unsigned long long>(nonce)
         );
         return false;
     }
     std::printf(
-        "[PASS] G0 CPU builders=%u batches=%u tasks=%u kernels=%u nonce=%llu cursor=%u/%u\n", builder_count, batches,
-        model.TaskCountValue(), KernelTaskCount(batches), static_cast<unsigned long long>(nonce),
-        2U * batches + kAicOwnerCount, 2U * batches + AivExecutorCount(builder_count)
+        "[PASS] %s CPU builders=%u batches=%u tasks=%u kernels=%u nonce=%llu cursor=%u/%u\n", kCpuProbeName,
+        builder_count, batches, model.TaskCountValue(), KernelTaskCount(batches),
+        static_cast<unsigned long long>(nonce), 2U * batches + kAicOwnerCount,
+        2U * batches + AivExecutorCount(builder_count)
     );
     return true;
 }
@@ -2482,14 +3187,24 @@ bool ParseRounds(int argc, char **argv, uint32_t *rounds) {
 
 int main(int argc, char **argv) {
     uint32_t rounds = 0U;
-    if (!ParseRounds(argc, argv, &rounds) || !TestResetPreservesDispatch() ||
-        !TestCompetingBuilderClaimValidation() || !TestHalfPacketAndUniqueClaim() ||
-        !TestFourTokenWaitingBuilt() || !TestBuildExecuteOverlap()) {
-        std::fprintf(stderr, "[FAIL] G0 controlled interleaving\n");
+    if (!ParseRounds(argc, argv, &rounds) || !TestResetPreservesDispatch() || !TestCompetingBuilderClaimValidation() ||
+        !TestHalfPacketAndUniqueClaim() || !TestFourTokenWaitingBuilt() || !TestBuildExecuteOverlap()
+#if defined(SIMT_CROSS_CORE_U2)
+        || !TestU2OrderedGenerationAndHeldCleanup()
+#endif
+    ) {
+        std::fprintf(stderr, "[FAIL] %s controlled interleaving\n", kCpuProbeName);
         return EXIT_FAILURE;
     }
-    auto state = std::make_unique<FullPaState>();
-    for (uint32_t builder_count = kDefaultBuilderCount; builder_count <= kMaxBuilderCount; ++builder_count) {
+    auto state = std::make_unique<CpuMaterializedState>();
+#if defined(SIMT_CROSS_CORE_U2)
+    constexpr uint32_t kFirstBuilderCount = u2::kBuilderCount;
+    constexpr uint32_t kLastBuilderCount = u2::kBuilderCount;
+#else
+    constexpr uint32_t kFirstBuilderCount = kDefaultBuilderCount;
+    constexpr uint32_t kLastBuilderCount = kMaxBuilderCount;
+#endif
+    for (uint32_t builder_count = kFirstBuilderCount; builder_count <= kLastBuilderCount; ++builder_count) {
         if (!RunCase(
                 1U, 0xA500000000000000ULL | (static_cast<uint64_t>(builder_count) << 8U) | 1U, builder_count,
                 state.get()
@@ -2504,11 +3219,20 @@ int main(int argc, char **argv) {
             }
         }
     }
+#if defined(SIMT_CROSS_CORE_U2)
+    std::printf(
+        "[PASS] U2 CPU complete: builder=1, B1/B256, ordered four-slot UBUF, task1..4 anchors, "
+        "exact written-word GM copy/tail, strict insert/full PA oracle, held-slot cleanup, "
+        "same-address reuse rounds=%u\n",
+        rounds
+    );
+#else
     std::printf(
         "[PASS] GM CPU complete: builders=1..8, B1/B256, leaders/builder=%u, unique build claim, "
         "8-shard heap, exact DAG/payload, 4-token tickets, fanin/completion/drain/tail, "
         "same-address reuse rounds=%u\n",
         kBuilderLeaderCount, rounds
     );
+#endif
     return EXIT_SUCCESS;
 }
