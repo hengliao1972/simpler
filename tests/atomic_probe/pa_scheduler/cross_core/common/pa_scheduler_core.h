@@ -1656,10 +1656,12 @@ PA_DEVICE bool AddCollectedSharedOwner(
     );
 }
 
-template <typename Ops>
+template <typename Ops, bool ObserveAtomics = false>
 PA_DEVICE bool WaitForSharedOutputPublished(
     PA_GM SharedTensorMapSidecar &map, const FdwicOutputRef &output_ref,
-    PA_GM volatile int32_t *fatal
+    PA_GM volatile int32_t *fatal, LocalStats *stats = nullptr,
+    int32_t task_id = -1,
+    AtomicSite site = AtomicSite::SharedFaninOutputPublishedLoad
 ) {
     // 前置条件：调用者已经用 IsPlainSharedOutputRef 校验 producer/slot/view
     // 范围，并确认 producer_task_id 严格早于当前 consumer task。
@@ -1669,15 +1671,56 @@ PA_DEVICE bool WaitForSharedOutputPublished(
          ].published[output_ref.output_slot].value;
     const int64_t expected =
         static_cast<int64_t>(output_ref.producer_task_id);
-    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待仅由隔离测试使用；正式 ordered Submit 走带观察的单次校验
+    if constexpr (ObserveAtomics) {
+        if (stats == nullptr ||
+            (site != AtomicSite::SharedFaninOutputPublishedLoad &&
+             site != AtomicSite::SharedMetadataOutputPublishedLoad)) {
+            return false;
+        }
+    }
+#if !PA_BUILD_TRACE_FREE
+    uint64_t trace_begin = 0;
+    if constexpr (ObserveAtomics) {
+        if (stats != nullptr && AtomicSwimlaneEnabled(stats->trace)) {
+            trace_begin = Ops::Now();
+        }
+    }
+#else
+    (void)stats;
+#endif
+#if !PA_BUILD_TRACE_FREE
+    uint64_t load_count = 1;
+#endif
+    // 观察构建以调用者指定的 output-published site 聚合整个等待 episode。
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: aggregate - 等待结束后统一记录精确 load 数
     int64_t observed = Ops::Load(published);
     if (observed == expected) {
+#if !PA_BUILD_TRACE_FREE
+        if constexpr (ObserveAtomics) {
+            if (trace_begin != 0 && stats != nullptr) {
+                const uint64_t trace_end =
+                    Ops::NowAfterAtomicResult(observed);
+                (void)WriteAggregateAtomicPollBatch(
+                    stats->trace, stats->result,
+                    site,
+                    trace_begin, trace_end, load_count,
+                    Ops::kAtomicReturnReadyObserved
+                );
+            }
+        }
+#endif
         return true;
     }
     if (observed != -1) {
         if (fatal != nullptr) {
-            // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待的隔离测试失败出口
-            (void)Ops::Exchange(fatal, static_cast<int32_t>(1));
+            (void)TraceConfiguredAtomicExchange<
+                Ops, ObserveAtomics
+            >(
+                stats == nullptr ? nullptr : &stats->trace,
+                stats == nullptr ? nullptr : &stats->result,
+                task_id, AtomicSite::FatalSet, fatal,
+                static_cast<int32_t>(1), false
+            );
         }
         return false;
     }
@@ -1689,15 +1732,38 @@ PA_DEVICE bool WaitForSharedOutputPublished(
     uint32_t polls = 0;
     while (true) {
         Ops::SpinHint();
-        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待的隔离测试轮询
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: aggregate - 循环结束后以一条 PollBatch 精确保留 load_count
         observed = Ops::Load(published);
+#if !PA_BUILD_TRACE_FREE
+        ++load_count;
+#endif
         if (observed == expected) {
+#if !PA_BUILD_TRACE_FREE
+            if constexpr (ObserveAtomics) {
+                if (trace_begin != 0 && stats != nullptr) {
+                    const uint64_t trace_end =
+                        Ops::NowAfterAtomicResult(observed);
+                    (void)WriteAggregateAtomicPollBatch(
+                        stats->trace, stats->result,
+                        site,
+                        trace_begin, trace_end, load_count,
+                        Ops::kAtomicReturnReadyObserved
+                    );
+                }
+            }
+#endif
             return true;
         }
         if (observed != -1) {
             if (fatal != nullptr) {
-                // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待的隔离测试失败出口
-                (void)Ops::Exchange(fatal, static_cast<int32_t>(1));
+                (void)TraceConfiguredAtomicExchange<
+                    Ops, ObserveAtomics
+                >(
+                    stats == nullptr ? nullptr : &stats->trace,
+                    stats == nullptr ? nullptr : &stats->result,
+                    task_id, AtomicSite::FatalSet, fatal,
+                    static_cast<int32_t>(1), false
+                );
             }
             return false;
         }
@@ -1705,14 +1771,28 @@ PA_DEVICE bool WaitForSharedOutputPublished(
         if ((polls & 1023U) != 0) {
             continue;
         }
-        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待的隔离测试 watchdog
-        if (fatal != nullptr && Ops::Load(fatal) != 0) {
+        if (fatal != nullptr &&
+            TraceConfiguredAtomicLoad<Ops, ObserveAtomics>(
+                stats == nullptr ? nullptr : &stats->trace,
+                stats == nullptr ? nullptr : &stats->result,
+                task_id, AtomicSite::FatalPoll, fatal
+            ) != 0) {
             return false;
         }
-        if (Ops::Now() - begin > kWatchdogTicks) {
+        // 这与 metadata predecessor 同属 cross-core owner 进度：
+        // 不能用启动屏障的 2 s 门槛把尚未获得运行机会的
+        // producer 误判为故障，因此与稀疏 writer 链共用 60 s
+        // terminal watchdog。
+        if (Ops::Now() - begin > kSharedInsertWatchdogTicks) {
             if (fatal != nullptr) {
-                // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - 旧通用 output 等待的隔离测试超时出口
-                (void)Ops::Exchange(fatal, static_cast<int32_t>(1));
+                (void)TraceConfiguredAtomicExchange<
+                    Ops, ObserveAtomics
+                >(
+                    stats == nullptr ? nullptr : &stats->trace,
+                    stats == nullptr ? nullptr : &stats->result,
+                    task_id, AtomicSite::FatalSet, fatal,
+                    static_cast<int32_t>(1), false
+                );
             }
             return false;
         }
@@ -1909,7 +1989,8 @@ template <
     bool AcceptLatestWriter = false,
     bool UsePaAccumulatorGroupWriter = false,
     bool NoOrdinaryReclaim = false,
-    bool TrustOutputPublishedFromInsertChain = false
+    bool TrustOutputPublishedFromInsertChain = false,
+    bool WaitOutputPublished = false
 >
 PA_DEVICE uint32_t CollectSharedFanin(
     PA_GM SharedTensorMapSidecar &map, const TaskArgs &args,
@@ -1932,6 +2013,10 @@ PA_DEVICE uint32_t CollectSharedFanin(
     static_assert(
         !TrustOutputPublishedFromInsertChain || AcceptLatestWriter,
         "output-publication proof requires the ordered latest-writer path"
+    );
+    static_assert(
+        !WaitOutputPublished || !TrustOutputPublishedFromInsertChain,
+        "direct output wait and insert-chain publication proof are exclusive"
     );
     protocol_ok = true;
     ordinary_lookup_count = 0;
@@ -2014,7 +2099,16 @@ PA_DEVICE uint32_t CollectSharedFanin(
             }
             if constexpr (!TrustOutputPublishedFromInsertChain) {
                 bool output_published = false;
-                if constexpr (AcceptLatestWriter) {
+                if constexpr (WaitOutputPublished) {
+                    // 稀疏 metadata-writer 链不再证明所有前序
+                    // fresh output 都已发布；每个 consumer 直接观察
+                    // 自己实际使用的 (producer, slot) 独占完成字。
+                    output_published =
+                        WaitForSharedOutputPublished<Ops, true>(
+                            map, output_ref, fatal,
+                            &stats, task_id
+                        );
+                } else if constexpr (AcceptLatestWriter) {
                     // 旧 ordered 调用者只证明“不必等待”，仍保留一次
                     // published 权威校验；完整 completion-chain 证明由
                     // 独立 template 身份在编译期删除这枚 load。

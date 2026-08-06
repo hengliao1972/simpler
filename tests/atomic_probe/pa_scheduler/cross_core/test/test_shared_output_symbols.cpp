@@ -294,7 +294,9 @@ struct ExpiredWaitOps : SymbolTestOps {
 
     static uint64_t Now() {
         const uint64_t call = calls.fetch_add(1, std::memory_order_relaxed);
-        return call == 0 ? 0 : kWatchdogTicks + 1;
+        return call == 0
+            ? 0
+            : kSharedInsertWatchdogTicks + 1;
     }
 
     static void SpinHint() {}

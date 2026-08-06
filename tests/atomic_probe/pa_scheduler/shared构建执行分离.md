@@ -7,13 +7,13 @@
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 当前代码 | 96 Scalar 通过中央 Build ticket 恰好一次 Build；32 AIC 与 64 AIV 分别通过各自中央 Execute ticket 动态领取同角色 task；每核四个 token 可在 payload 尚未发布时保存 `WAITING_BUILT`，但单次调度边界遇到首个未 `BUILT` 的新 token 后不再连续预领；Build/Execute owner 独立且允许同核 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
-| 正式实现 | S0–S6.79 已形成三条独立发放流：一条全 96 Scalar Build ticket、两条 AIC/AIV Execute ticket；严格 TensorMap 插入链、task-indexed immutable payload、跨核 DCCI publish/acquire、四个 owner-local token 和 16 组 FinalDrain 收口均保持；严格插入完成字已按 task 隔离到独占 128B atomic 冲突单元；新领 token 未 `BUILT` 时结束本次边界的继续预领；fresh output descriptor 在预留 writer 后直接构造到最终 `shared_outputs`，不再经 worker payload 二次搬运 |
-| CPU 正确性用例 | 双角色 Execute ticket、同核/跨核 owner、单边界只保留一个新 `WAITING_BUILT`、跨多个边界仍可逐步用满四 token、严格插入与乱序 Build、原位 SharedOutput 发布/重复预留拒绝、1024 kernel exactly-once 和 FinalDrain 完整回归均已通过 |
+| 正式实现 | S0–S6.84-b 已形成三条独立发放流：一条全 96 Scalar Build ticket、两条 AIC/AIV Execute ticket；task-indexed immutable payload、跨核 DCCI publish/acquire、四个 owner-local token 和 16 组 FinalDrain 收口均保持；TensorMap 严格链只串行 host/operator 声明且 device delta 再确认的真实 metadata writer，完成字仍按 task 隔离到独占 128B atomic 冲突单元；fresh output descriptor 在预留 writer 后直接构造到最终 `shared_outputs`，consumer 与 metadata writer 分别直接等待实际使用的 output `published` |
+| CPU 正确性用例 | 双角色 Execute ticket、同核/跨核 owner、单边界只保留一个新 `WAITING_BUILT`、跨多个边界仍可逐步用满四 token、稀疏 metadata writer 严格插入与乱序 Build、direct-output 发布证明、原位 SharedOutput 发布/重复预留拒绝、1024 kernel exactly-once 和 FinalDrain 完整回归均已通过 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束。S6.79 相对冻结旧 ELF 的 12 对交错 A/B 中，中位从 `1.000814 ms` 降至 `0.989253 ms`，改善 `1.155%`，候选胜 `8/12` 对；B1/B256、完整泳道和终态全部 PASS |
+| A5 PA 功能/性能 | 唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束。S6.84-b 相对冻结逐 task writer 链的 12 对交错 A/B 中，中位从 `992.746 us` 降至 `967.078 us`，改善 `25.669 us / 2.586%`，候选胜 `12/12` 对；最终源码单跑为 `909.567 us`，但不以单点替代 A/B；B1/B256、完整泳道和终态全部 PASS |
 | 历史 S4 Execute election | K2 首版曾通过 CPU B1/B256 和 A5 B1/B256，现已被 S6.68-b 的角色中央 ticket 替代，仅作为历史证据保留 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前验证缺口 | 四 token、per-task 128B 插入完成字、单边界停止无效预领和原位 SharedOutput descriptor 的 CPU、CCEC、A5 B1/B256、完整泳道与冻结 A/B 均已完成；当前中位距 `0.6 ms` 目标仍约 `0.389 ms`。严格 Register 链的经典替代都需要新增有序提交 payload/DCCI，未经独立探针和冻结 A/B 不进入生产路径 |
+| 当前验证缺口 | 稀疏 writer 链、direct-output 证明、四 token、单边界停止无效预领和原位 SharedOutput descriptor 的 CPU、CCEC、A5 B1/B256、完整泳道与冻结 A/B 均已完成；当前权威中位距 `0.8 ms` 目标仍约 `0.167 ms`。后续候选仍需保持真实 metadata writer 的严格 task-id 顺序，并经独立门槛和冻结 A/B 后才能保留 |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
@@ -91,7 +91,7 @@ owner 与 Execute owner 是合法且无需绕开的结果。
 `same_core` 只表示“Build 和 Execute 由同一个 worker 完成”，不表示它的整套内存模型都是本核私有的。现有 shared TensorMap 路径已经有三类真实跨核发布：
 
 1. Materialize 先预留 output writer，再把 fresh output `TensorDesc` 直接构造并发布到 task-indexed `shared_outputs`；不再先写 worker payload 后做第二次 128B 搬运；
-2. Register 通过 `task[N-1].deps_prepared -> metadata(N) -> task[N].deps_prepared` 严格保序插入 TensorMap；
+2. Register 通过 `previous_metadata_writer(N).completion -> metadata(N) -> writer_completion(N)` 严格保序插入 TensorMap；空 writer task 不发布完成字，实际 writer 仍按 task-id 形成唯一全序；
 3. Execute/Complete 通过 task `vend/flag` 向其他核发布 kernel 完成，fanin reader 跨核读取。
 
 `cross_core` 不应重做这三套协议。它真正新增的是第四类对象：**已构建执行包的跨核发布、唯一领取和生命周期**。因此实现边界应是“保留现有 TensorMap/SharedOutput/completion 合同，扩展 dispatch payload 合同”，而不是重写整个 shared 调度器。
@@ -103,7 +103,7 @@ owner 与 Execute owner 是合法且无需绕开的结果。
 | Build owner | 现有中央 Build ticket 保证每个 task 唯一 Build owner | 原样保留；96 个 Scalar 都可领取 Build task |
 | output 内存 | shared heap 为 task 保留 GM 区域；`TensorDesc` 指向该共享内存 | executor 直接写该 GM 地址，不再发明一套 output “转移所有权”协议 |
 | SharedOutput 发布 | writer reserve -> descriptor 在最终 cell 原位构造 -> `FlushRegion()` -> atomic `published` | 发布顺序与 Atomic/DCCI 数量不变；`published` 仍只表示 descriptor 可读，不表示 kernel 完成 |
-| TensorMap 有序插入 | 等 `deps_prepared[N-1]`，发布 N 的 metadata/history，再 CAS 发布 `deps_prepared[N]` | 原样保留；跨核 Execute 不参与该串行链 |
+| TensorMap 有序插入 | 等严格早于 N 的最后一个真实 metadata writer，发布 N 的 metadata/history；N 有实际 writer 时再发布独占 completion | 原样保留真实 writer 的 task-id 全序；空 writer 不制造 baton，跨核 Execute 不参与该串行链 |
 | fanin lookup | Build 阶段只接受 `producer < N`，再把 fanin 保存到执行包 | 过滤边界和 TensorMap 语义不变 |
 | fanin ready | consumer 以 task completion `flag` 的返回型 atomic load 判断 producer 完成 | 原样保留，只是读取它的 worker 可能换了 |
 | kernel 完成 | engine 真正完成后先发布 vend，再发布 completion flag | 顺序和语义不变，由 Execute owner 完成 |
@@ -813,14 +813,15 @@ token 全字段复位。因而 96 个 worker 全部
 
 ```text
 task N Materialize + publish fresh SharedOutput descriptor
--> wait deps_prepared[N-1]
--> publish metadata(N)
--> publish deps_prepared[N]
+-> prepare writer delta and verify writer_bit[N]
+-> wait previous_metadata_writer(N).completion
+-> writer task: publish metadata(N) and writer_completion(N)
+-> non-writer task: no TensorMap side effect and no completion handoff
 -> Fanin/Build
 -> publish execution payload(N)
 ```
 
-fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布不需占住 TensorMap 有序链；本 task 最终的 `deps_prepared[N]` 仍在 metadata 发布后封口。严格顺序只约束 TensorMap metadata side effect，不约束 Build 包发布或 kernel 执行顺序。执行顺序由 fanin 决定：
+fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布不需占住 TensorMap 有序链。失去完整 task 前缀的间接证明后，Fanin 必须直接等待每个实际消费的 `(producer, slot).published`；symbol metadata writer 也必须在进入严格串行段前等待自己将要改写的 output target。严格顺序只约束真实 TensorMap metadata side effect，不约束空 writer、Build 包发布或 kernel 执行顺序。执行顺序由 fanin 决定：
 
 - 无依赖 task 可以乱序并发执行；
 - 有依赖 task 必须等 producer completion flag；
@@ -1548,11 +1549,16 @@ cell 同地址竞争，而是用 AIC/AIV 两条中央 ticket 唯一发放 task�
 14. DCache preload 默认关闭；hint 的任何候选都单独 A/B，不参与正确性合同；
 15. token 容量当前为编译期常量 4；若后续参数化或再扩容，必须重做 state size、容量背压、FinalDrain 和 A5 冻结 A/B。
 16. S6.70 的 grouped ordered Register drainer 已否决且未进入 device 路径；
-     现行逐 task `insert_completion[N-1] -> metadata(N) ->
-     insert_completion[N]` 仍是权威实现。每 task insert-completion 独占
-     A5 的 128B atomic 冲突单元，并复用旧 Claim root 的空闲第二条 cache
-     line，不增加 SchedulerState 大小。双 Execute cursor 的 128B 隔离未量出
-     稳定收益且后续不再属于热路径，因此不作为现行代码合同保留。
+     S6.84-b 的稀疏 writer 链是现行权威实现。host/operator 用紧凑 bitset
+     声明真实 metadata writer，device delta 再确认；每个 task 等待严格早于
+     自己的最后一个 writer，但只有真实 writer 才发布自身 completion。完成字
+     继续独占 A5 的 128B atomic 冲突单元，并复用旧 Claim root 的空闲第二条
+     cache line，不增加 SchedulerState 大小；空 writer completion 保持初值。
+17. 稀疏链不再证明完整 task 前缀的 output 已发布；Fanin 直接等待实际消费的
+     `(producer, slot).published`，symbol writer 在进入 metadata 串行段前直接
+     等待实际改写目标。两类等待都用 aggregate PollBatch 观察，不增加逐次 raw。
+18. 双 Execute cursor 的 128B 隔离未量出稳定收益且后续不再属于热路径，
+     因此不作为现行代码合同保留。
 
 这一版不是最终高性能形态。它的价值是把三个未知量拆开：
 
@@ -2002,7 +2008,7 @@ BUILT-only 或伪 ready 队列；优先缩短严格 Register 完成传播和随�
 FinalDrain 结束的完整周期裁决。离线工具及逐 task 分解见
 `cross_core/analyze_pa_exec_release_bound.py` 和过程记录 S6.82。
 
-### 2026-08-06：下一候选为“稀疏 metadata writer 严格链”
+### 2026-08-06：已采用“稀疏 metadata writer 严格链”
 
 现行逐 task 完成链同时承担了两个不同职责：
 
@@ -2015,10 +2021,10 @@ FinalDrain 结束的完整周期裁决。离线工具及逐 task 分解见
 B256/PA-G1 中 1,280 个 task 只有 256 个 task 产生 symbol writer
 metadata，ordinary writer 为零；其余 1,024 个空 writer task 仅为维持
 “所有 task 前缀”而执行 predecessor load 和 completion handoff。S6.83 又已
-证明不能靠 `ld_dev` 换掉这些等待，下一候选因此直接减少必须
+证明不能靠 `ld_dev` 换掉这些等待，本阶段因此直接减少必须
 串行的 handoff 数量。
 
-候选合同是：
+现行合同是：
 
 ```text
 host/operator 不可变计划：
@@ -2042,19 +2048,26 @@ device Build owner：
 bitset 是算子无关调度合同，公共协议不读取 PA `TaskKind`、batch 或
 UP 形状；PA host adapter 只是本轮的一个计划生成者。
 
-该候选必须同时恢复 direct output 发布证明。不能在删掉完整
+该实现同时恢复 direct output 发布证明。不能在删掉完整
 task 前缀后继续使用 `TrustOutputPublishedFromInsertChain=true`；否则前序
 producer 可能尚未 Materialize，consumer 就会读未发布 descriptor。这些
 published 等待只针对真实 fanin，不恢复全局 task 前缀。
 
-保留门槛为：
+已完成的保留证据为：
 
-- CPU 证明 bitset/delta 不一致立即终止，writer 完成严格单调，空
-  writer 不被误发布，乱序 Build 与 direct-output 等待可闭合；
-- CCEC 保留 A5 无 cache coherence 合同：descriptor 仍是
-  `DCCI + DSB -> published Atomic`，metadata 仍是 payload DCCI 后再发布 completion；
-- A5 先用 trace-free 交错 A/B 判定完整周期，再用 full-swimlane 确认
-  writer completion 数、direct-output poll 数、TensorMap/history 终态和首个
-  AIC/last BUILT 同向改善；
-- 如 direct-output 并发等待反而放大 GM/Atomic 压力，则整个候选撤回，
-  不以减少 completion 计数代替端到端收益。
+- CPU 全量门槛证明 bitset/delta 不一致立即终止、writer 完成严格单调、空
+  writer 不被误发布、乱序 Build 与 direct-output 等待闭合；96-thread
+  动态 Build 精确完成 256 个 metadata writer；
+- CCEC perf-clock/full-swimlane 均通过 AIC/AIV 编译、混合 ELF 与 manifest
+  门槛；descriptor 仍是 `DCCI + DSB -> published Atomic`，metadata 仍是
+  payload DCCI 后再发布 completion；
+- 冻结逐 task writer 链与候选交错运行 12 对 A5 B256，startup 到 FinalDrain
+  中位从 `992.746 us` 降至 `967.078 us`，改善 `25.669 us / 2.586%`，
+  候选 `12/12` 获胜；
+- B256 full-swimlane 中 metadata writer 列表精确为 `4,9,...,1279` 共 256 个，
+  predecessor PollBatch 记录 1,275 条、writer completion 256 条、空 writer
+  epilogue 1,024 条；Fanin/output 与 metadata/output 发布等待分别为 2,048
+  和 768 个 episode；1,280 task、1,024 kernel、TensorMap/history、DCCI 与
+  FinalDrain 终态全部闭合，raw 无丢记录；
+- 当前权威中位仍为 `967.078 us`，距 `0.8 ms` 约 `167.078 us`；后续不能
+  以单次 `909.567 us` 代替冻结 A/B，也不能通过放宽真实 writer 顺序达标。

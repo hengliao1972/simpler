@@ -82,10 +82,10 @@ struct TaskEvidence {
 struct RunEvidence {
     std::atomic<uint32_t> failures{0};
     std::atomic<uint32_t> prepared_tasks{0};
-    std::atomic<uint32_t> inserted_tasks{0};
+    std::atomic<uint32_t> published_metadata_writers{0};
     std::atomic<uint32_t> built_tasks{0};
     std::atomic<uint32_t> executed_tasks{0};
-    std::atomic<uint32_t> insert_order{0};
+    std::atomic<uint32_t> metadata_writer_order{0};
     std::atomic<uint32_t> ticket_fetch_adds{0};
     std::atomic<uint32_t> exec_ticket_fetch_adds{0};
     std::atomic<uint32_t> retire_fetch_adds{0};
@@ -93,6 +93,19 @@ struct RunEvidence {
     std::atomic<uint32_t> later_built_before_task0{0};
     std::atomic<bool> abort{false};
 };
+
+uint32_t MetadataWriterCountBefore(
+    const SharedBuildDispatchState &dispatch, uint32_t task_id
+) {
+    uint32_t count = 0;
+    for (uint32_t task = 0; task < task_id; ++task) {
+        count += static_cast<uint32_t>(
+            (dispatch.metadata_writer_bits[task / 64U] >>
+             (task % 64U)) & uint64_t{1}
+        );
+    }
+    return count;
+}
 
 void RecordFailure(RunEvidence &evidence);
 bool DecodeDispatchIdentity(
@@ -385,7 +398,8 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
         task_evidence[task].build_count.store(0, std::memory_order_relaxed);
         task_evidence[task].execute_owner.store(-1, std::memory_order_relaxed);
         task_evidence[task].execute_count.store(0, std::memory_order_relaxed);
-        insert_completion[task].value = -1;
+        insert_completion[task].value =
+            SharedInsertCompletionInitialValue(task);
     }
     for (uint32_t worker = 0; worker < kDispatchWorkers; ++worker) {
         tasks_by_worker[worker].store(0, std::memory_order_relaxed);
@@ -428,21 +442,42 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
                 }
                 evidence.prepared_tasks.fetch_add(1, std::memory_order_release);
 
-                // 首个 owner 暂停到其余 95 个 worker 都拿到并完成一个 task
-                // 的构参。这样可以稳定证明准备工作允许乱序，而不是偶然依赖
-                // 单线程调度得到顺序结果。
+                // 首个 owner 暂停到全局已经完成 96 个 task 的构参。这里验证
+                // 准备工作可以越过 task 0 乱序推进；中央 ticket 不承诺 host
+                // OS 会公平地让 96 个线程各抢到一个 Build task。
                 if (task_id == 0 && !WaitForAtLeast(evidence.prepared_tasks, kDispatchWorkers, evidence)) {
                     break;
                 }
 
-                if (task_id != 0) {
+                bool publishes_metadata = false;
+                int32_t previous_metadata_writer = -1;
+                if (!DecodeSharedMetadataWriterPlan(
+                        state.build_dispatch, task_id,
+                        publishes_metadata,
+                        previous_metadata_writer
+                    )) {
+                    RecordFailure(evidence);
+                    break;
+                }
+                if (previous_metadata_writer >= 0) {
                     while (!evidence.abort.load(std::memory_order_acquire)) {
                         evidence.predecessor_loads.fetch_add(1, std::memory_order_relaxed);
-                        const int64_t predecessor = TestOps::Load(&insert_completion[task_id - 1U].value);
-                        if (predecessor == static_cast<int64_t>(task_id - 1U)) {
+                        const int64_t predecessor = TestOps::Load(
+                            &insert_completion[
+                                 static_cast<uint32_t>(
+                                     previous_metadata_writer
+                                 )
+                             ].value
+                        );
+                        if (predecessor == previous_metadata_writer) {
                             break;
                         }
-                        if (predecessor != -1) {
+                        if (predecessor !=
+                            SharedInsertCompletionInitialValue(
+                                static_cast<uint32_t>(
+                                    previous_metadata_writer
+                                )
+                            )) {
                             RecordFailure(evidence);
                             break;
                         }
@@ -453,18 +488,34 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
                     }
                 }
 
-                const uint32_t order = evidence.insert_order.fetch_add(1, std::memory_order_acq_rel);
-                if (order != task_id ||
-                    TestOps::CompareExchange(&insert_completion[task_id].value, -1, static_cast<int64_t>(task_id)) !=
-                        -1) {
-                    RecordFailure(evidence);
-                    break;
+                if (publishes_metadata) {
+                    const uint32_t order =
+                        evidence.metadata_writer_order.fetch_add(
+                            1, std::memory_order_acq_rel
+                        );
+                    if (order != MetadataWriterCountBefore(
+                                     state.build_dispatch, task_id
+                                 ) ||
+                        TestOps::CompareExchange(
+                            &insert_completion[task_id].value,
+                            SharedInsertCompletionInitialValue(
+                                task_id
+                            ),
+                            static_cast<int64_t>(task_id)
+                        ) != SharedInsertCompletionInitialValue(
+                            task_id
+                        )) {
+                        RecordFailure(evidence);
+                        break;
+                    }
+                    evidence.published_metadata_writers.fetch_add(
+                        1, std::memory_order_release
+                    );
                 }
-                evidence.inserted_tasks.fetch_add(1, std::memory_order_release);
 
-                // task 0 已交出插入 baton 后继续延迟 Build 完成。后续 task
-                // 必须能继续 Build，从而证明串行边界止于 deps_prepared，
-                // 没有错误扩张到 Fanin/Build。
+                // task 0 已完成本 task 的 metadata 计划处理后继续延迟
+                // Build。后续 task 必须能继续发布 writer 并完成 Build，
+                // 证明严格 writer 链没有错误扩张到按 task-id 保序 Build。
                 if (task_id == 0 && !WaitForAtLeast(evidence.built_tasks, kDelayedBuildEvidence, evidence)) {
                     break;
                 }
@@ -486,7 +537,12 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
             }
             if (prior + 1 == static_cast<int64_t>(kDispatchWorkers)) {
                 if (evidence.prepared_tasks.load(std::memory_order_acquire) != plan.size() ||
-                    evidence.inserted_tasks.load(std::memory_order_acquire) != plan.size() ||
+                    evidence.published_metadata_writers.load(
+                        std::memory_order_acquire
+                    ) != MetadataWriterCountBefore(
+                        state.build_dispatch,
+                        static_cast<uint32_t>(plan.size())
+                    ) ||
                     evidence.built_tasks.load(std::memory_order_acquire) != plan.size()) {
                     RecordFailure(evidence);
                 }
@@ -516,10 +572,20 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
 
     bool ok = evidence.failures.load(std::memory_order_acquire) == 0 &&
               evidence.prepared_tasks.load(std::memory_order_acquire) == plan.size() &&
-              evidence.inserted_tasks.load(std::memory_order_acquire) == plan.size() &&
+              evidence.published_metadata_writers.load(
+                  std::memory_order_acquire
+              ) == MetadataWriterCountBefore(
+                  state.build_dispatch,
+                  static_cast<uint32_t>(plan.size())
+              ) &&
               evidence.built_tasks.load(std::memory_order_acquire) == plan.size() &&
               evidence.executed_tasks.load(std::memory_order_acquire) == plan.size() - kDispatchBatches &&
-              evidence.insert_order.load(std::memory_order_acquire) == plan.size() &&
+              evidence.metadata_writer_order.load(
+                  std::memory_order_acquire
+              ) == MetadataWriterCountBefore(
+                  state.build_dispatch,
+                  static_cast<uint32_t>(plan.size())
+              ) &&
               evidence.later_built_before_task0.load(std::memory_order_acquire) >= kDelayedBuildEvidence &&
               TestOps::Load(&control.retired_workers.value) == static_cast<int64_t>(kDispatchWorkers) &&
               TestOps::Load(&control.production_closed.value) == 1;
@@ -527,12 +593,21 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
     for (uint32_t worker = 0; worker < kDispatchWorkers; ++worker) {
         active_workers += tasks_by_worker[worker].load(std::memory_order_acquire) != 0 ? 1U : 0U;
     }
-    ok &= active_workers == kDispatchWorkers;
+    // active_workers 仅作为调度分布诊断量输出。协议要求 96 个 worker 都
+    // 启动、退休并参与有限 ticket 收敛，但不要求一个无公平性保证的中央
+    // FetchAdd 在 host OS 上恰好向每个线程至少分发一个 Build task。
     for (uint32_t task = 0; task < plan.size(); ++task) {
         ok &= task_evidence[task].owner.load(std::memory_order_acquire) >= 0;
         ok &= task_evidence[task].prepare_count.load(std::memory_order_acquire) == 1;
         ok &= task_evidence[task].build_count.load(std::memory_order_acquire) == 1;
-        ok &= TestOps::Load(&insert_completion[task].value) == static_cast<int64_t>(task);
+        const bool publishes_metadata =
+            ((state.build_dispatch.metadata_writer_bits[
+                  task / 64U
+              ] >> (task % 64U)) & uint64_t{1}) != 0;
+        ok &= TestOps::Load(&insert_completion[task].value) ==
+            (publishes_metadata
+                 ? static_cast<int64_t>(task)
+                 : SharedInsertCompletionInitialValue(task));
         SharedPaTaskMeta meta{};
         ok &= DecodeDispatchIdentity(plan[task], task, static_cast<uint32_t>(plan.size()), meta);
         const int32_t build_owner = task_evidence[task].owner.load(std::memory_order_acquire);
@@ -575,11 +650,13 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
 
     std::printf(
         "[BUILD_DISPATCH] run=%u status=%s active_workers=%u tickets=%u "
-        "exec_tickets=%u insert_cas=%zu executes=%u "
+        "exec_tickets=%u metadata_writer_cas=%u executes=%u "
         "later_before_task0=%u predecessor_loads=%u\n",
         run, ok ? "PASS" : "FAIL", active_workers, evidence.ticket_fetch_adds.load(std::memory_order_relaxed),
         evidence.exec_ticket_fetch_adds.load(std::memory_order_relaxed),
-        plan.size(), evidence.executed_tasks.load(std::memory_order_relaxed),
+        evidence.published_metadata_writers.load(
+            std::memory_order_relaxed
+        ), evidence.executed_tasks.load(std::memory_order_relaxed),
         evidence.later_built_before_task0.load(std::memory_order_relaxed),
         evidence.predecessor_loads.load(std::memory_order_relaxed)
     );
@@ -644,7 +721,7 @@ int main() {
         call_reduction
     );
     std::printf(
-        "[BUILD_DISPATCH] immutable-plan/unique-ticket/ordered-insert/"
+        "[BUILD_DISPATCH] immutable-plan/unique-ticket/sparse-writer-insert/"
         "out-of-order-build/final-closure status=%s\n",
         ok ? "PASS" : "FAIL"
     );

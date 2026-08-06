@@ -390,11 +390,16 @@ struct OrderedSubmitTestOps {
     }
 
     static uint64_t Now() {
+        // 该门槛用 96 个 host thread 模拟 96 个物理 Scalar。普通 CPU
+        // 可能把尚未获得调度时间的 thread 阻塞超过 A5 的 2 s 启动
+        // watchdog；把测试时钟按固定比例缩放，只避免把 host 调度延迟
+        // 误判成设备协议超时。真实死锁仍由 build.sh 外层 timeout 收口。
+        constexpr uint64_t kHostWatchdogClockScale = 64;
         return static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()
             ).count()
-        );
+        ) / kHostWatchdogClockScale;
     }
 
     template <typename T>
@@ -928,6 +933,14 @@ bool DispatchAndInsertEvidenceMatches(
                     ) == 0;
             const SharedClaimTournamentTask &tournament =
                 state.claim_tournament[task_id];
+            const bool publishes_metadata =
+                ((state.build_dispatch.metadata_writer_bits[
+                      task_id / 64U
+                  ] >> (task_id % 64U)) & uint64_t{1}) != 0;
+            // PA host plan 在这个生产组合中只标记 UP；
+            // 通用 device 热路只消费 immutable bit，不解码 kind。
+            exact &= publishes_metadata ==
+                (task.kind == TaskKind::Up);
             exact &= tournament.root.owner.value == -1;
             for (uint32_t group = 0;
                  group < kSharedClaimTournamentMaxGroups;
@@ -937,24 +950,30 @@ bool DispatchAndInsertEvidenceMatches(
             }
             exact &=
                 tournament.root.insert_completion.value ==
-                static_cast<int64_t>(task_id);
+                (publishes_metadata
+                     ? static_cast<int64_t>(task_id)
+                     : SharedInsertCompletionInitialValue(task_id));
             exact &= state.tasks[task_id].deps_prepared ==
                 SharedInsertCompletionInitialValue(task_id);
             exact &=
                 OrderedSubmitTestOps::
                     completion_atomic_writes_by_task[task_id]
-                        .load(std::memory_order_relaxed) == 1;
+                        .load(std::memory_order_relaxed) ==
+                    (publishes_metadata ? 1U : 0U);
             exact &=
                 OrderedSubmitTestOps::
                     completion_publish_by_task[task_id]
-                        .load(std::memory_order_relaxed) == 1;
+                        .load(std::memory_order_relaxed) ==
+                    (publishes_metadata ? 1U : 0U);
             const uint32_t completion_loads =
                 OrderedSubmitTestOps::
                     completion_loads_by_cell[task_id]
                         .load(std::memory_order_relaxed);
-            exact &= task_id + 1U < task_count
-                ? completion_loads != 0
-                : completion_loads == 0;
+            exact &=
+                (publishes_metadata &&
+                 task_id + 1U < task_count)
+                    ? completion_loads != 0
+                    : completion_loads == 0;
         }
         planned_tasks += plan.task_count;
     }
@@ -1628,10 +1647,16 @@ bool RunInsertReleaseBeforeBuildTest() {
     bool claim_cells_match = true;
     for (uint32_t task = 0; task < kTaskCount; ++task) {
         all_tasks_ready &= state->tasks[task].flag == 1;
+        const bool publishes_metadata =
+            ((state->build_dispatch.metadata_writer_bits[
+                  task / 64U
+              ] >> (task % 64U)) & uint64_t{1}) != 0;
         claim_cells_match &=
             state->claim_tournament[task]
                     .root.insert_completion.value ==
-            static_cast<int64_t>(task);
+            (publishes_metadata
+                 ? static_cast<int64_t>(task)
+                 : SharedInsertCompletionInitialValue(task));
         claim_cells_match &= state->tasks[task].deps_prepared ==
             SharedInsertCompletionInitialValue(task);
     }
@@ -1808,7 +1833,9 @@ bool RunIndependentKernelExecutionTest() {
     std::printf(
         "[ORDERED_SUBMIT] independent_kernel_overlap=%s "
         "completed=%u legacy_turn0=%lld "
-        "fatal=%d exec_fatal=%lld/%u/%u/%u "
+        "fatal=%d overlap=%u hooks=%u hook_timeout=%u "
+        "workers=%u ready=%u submits=%llu dispatch=%u/%u "
+        "exec_fatal=%lld/%u/%u/%u "
         "kernels=%llu,%llu,%llu,%llu\n",
         ok ? "PASS" : "FAIL",
         kTaskCount,
@@ -1816,6 +1843,22 @@ bool RunIndependentKernelExecutionTest() {
             state->shared_map.committed_tasks.value
         ),
         state->fatal.value,
+        execution_overlap ? 1U : 0U,
+        OrderedSubmitTestOps::independent_insert_hook_calls.load(
+            std::memory_order_relaxed
+        ),
+        OrderedSubmitTestOps::hook_timed_out.load(
+            std::memory_order_relaxed
+        ) ? 1U : 0U,
+        worker_results_ok ? 1U : 0U,
+        all_tasks_ready ? 1U : 0U,
+        static_cast<unsigned long long>(completed_submits),
+        OrderedSubmitTestOps::bound_dispatch_calls.load(
+            std::memory_order_relaxed
+        ),
+        OrderedSubmitTestOps::bad_bound_dispatch_calls.load(
+            std::memory_order_relaxed
+        ),
         static_cast<long long>(state->exec_fatal.state),
         static_cast<uint32_t>(exec_fatal.reason),
         exec_fatal.task_id, exec_fatal.reporter_owner,

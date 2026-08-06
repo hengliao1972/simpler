@@ -102,11 +102,11 @@ echo "[TEST] atomic PollBatch boundary self-test"
 # shared ring 是当前 ordered writer-delta 的 ordinary-region 原语，隔离
 # 覆盖 seq/ABA、回收与容量预检。PA Case1 当前 ordinary entry 为零，
 # 因此这些门槛仍不能代替后面的完整 96-worker Submit 测试。
-    # shared writer 插入完成链位于每 task 独占的 128B atomic 冲突单元：
-    # task 0 无前驱，task N 只等 N-1，发布时只 FetchAdd 自己的完成字。
-    # 旧 TaskCell 完成字和 sidecar turn 均作为 canary 要求零触碰；另覆盖
-    # 空写、损坏值与重复发布 fatal。
-    echo "[BUILD] shared per-task insert-completion self-test"
+    # 独占 128B completion 既覆盖旧的逐 task 链，也覆盖正式热路
+    # 只串行实际 metadata writer 的稀疏链：空 writer 只等最近
+    # writer，不发布自己的 completion。旧 TaskCell 和 sidecar turn
+    # 均作为 canary，另覆盖 pending、损坏值与重复发布。
+    echo "[BUILD] shared sparse metadata-writer completion self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$SHARED_INSERT_TURN_GROUPS" \
@@ -115,7 +115,7 @@ echo "[TEST] atomic PollBatch boundary self-test"
         "$ROOT_DIR/test/test_shared_insert_turn.cpp" \
         -o "$BUILD_DIR/test_shared_insert_completion"
 
-    echo "[TEST] shared per-task insert-completion self-test"
+    echo "[TEST] shared sparse metadata-writer completion self-test"
     "$BUILD_DIR/test_shared_insert_completion"
 
     # host 必须从最终 SchedulerState.context_lens 独立重建 shared task
@@ -147,10 +147,9 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] shared random-access PA args self-test"
     "$BUILD_DIR/test_shared_random_access_args"
 
-    # 中央单调 ticket 是替换 96 份完整 replay 的候选，不先接生产热路。
-    # 独立 96-thread 门槛证明 exactly-once 发放、乱序构参/Build、严格
-    # per-task 完成字插入顺序和最终停产闭合；CPU 结果不冒充 A5 atomic
-    # 性能。
+    # 独立 96-thread 门槛证明中央 ticket exactly-once 发放、乱序
+    # 构参/Build、稀疏 metadata writer 严格顺序和最终停产闭合；
+    # CPU 结果只是协议正确性证据，不冒充 A5 atomic 性能。
     echo "[BUILD] shared dynamic Build dispatch protocol self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
@@ -310,9 +309,9 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] PA cross-core execution scan/drain self-test"
     "$BUILD_DIR/test_cross_core_exec_scan"
 
-    # 完整 96-worker Submit 逐 task 计数 cursor Claim、前驱 completion
-    # load 和本 task completion FetchAdd；同时锁定 loser 零 map 访问、旧
-    # sidecar turn 零触碰，以及 lookup/Build/执行仍可跨前任 Build。
+    # 完整 96-worker Submit 精确校验稀疏 writer completion、空 task
+    # pending canary 与 direct-output wait；同时锁定 loser 零 map 访问、
+    # 旧 sidecar turn 零触碰，以及 lookup/Build/执行仍可跨前任 Build。
     echo "[BUILD] shared ordered-insert Submit self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \

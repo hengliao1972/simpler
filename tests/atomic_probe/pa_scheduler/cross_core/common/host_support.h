@@ -951,8 +951,8 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     // 不对 task_id 取模，避免在本阶段提前引入 generation 语义。
     for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
         // production TaskCell 的旧 deps_prepared 保持 task-specific pending
-        // 值并充当未触碰 canary；正式插入完成字在下面的 per-task atomic
-        // sidecar 中另行初始化。
+        // 值并充当未触碰 canary；正式稀疏 writer completion
+        // 在下面的 task-indexed atomic sidecar 中另行初始化。
         state->tasks[task_id].deps_prepared =
             SharedInsertCompletionInitialValue(task_id);
         for (uint32_t slot = 0; slot < kSharedOutputMaxPerTask; ++slot) {
@@ -1693,12 +1693,18 @@ inline bool AtomicRecordSchemaValid(const TraceRecord &record, bool atomic_trace
     if (poll_batch) {
         return AtomicSiteIsPollBatchable(site) && result_used && !value_zero &&
                (!return_ready ||
-                site == AtomicSite::SharedInsertTurnPoll) &&
+                site == AtomicSite::SharedInsertTurnPoll ||
+                site == AtomicSite::SharedFaninOutputPublishedLoad ||
+                site == AtomicSite::SharedMetadataOutputPublishedLoad) &&
                payload > 0 && record.task_id == -1 && record.function_id == -1;
     }
-    // insert-turn 等待只允许每个 Wait episode 一条聚合 PollBatch，禁止
-    // 损坏 raw 把它伪装成逐 Load direct 记录。
-    if (site == AtomicSite::SharedInsertTurnPoll) return false;
+    // insert-turn/output-published 等待只允许每个 Wait episode
+    // 一条聚合 PollBatch，禁止损坏 raw 伪装成逐 Load direct 记录。
+    if (site == AtomicSite::SharedInsertTurnPoll ||
+        site == AtomicSite::SharedFaninOutputPublishedLoad ||
+        site == AtomicSite::SharedMetadataOutputPublishedLoad) {
+        return false;
+    }
     if (result_used != AtomicSiteResultUsed(site) || (return_ready && !result_used)) return false;
     if (value_zero && op != static_cast<uint32_t>(AtomicOp::Load)) return false;
     if (payload != 0 && op != static_cast<uint32_t>(AtomicOp::FetchMax)) return false;
@@ -2510,11 +2516,30 @@ inline bool ExportSwimlaneRecords(
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         std::fprintf(output, "%s\"%s\"", worker == 0 ? "" : ",", worker < kAicWorkers ? "aic" : "aiv");
     }
+    std::fprintf(output, "]");
+#if PTO_FDWIC_SHARED_MAP
+    // writer 计划来自与 device build_dispatch 同源、已经独立校验的 host
+    // task plan。它只增加极小的 host JSON 元数据，不增加 device raw 记录，
+    // 供 converter 精确区分“等待上一位真实 writer”和空 writer task。
+    std::fprintf(output, ",\"shared_metadata_writer_tasks\":[");
+    bool first_metadata_writer = true;
+    for (const SharedHostPlannedTask &task : shared_plan.tasks) {
+        if (!task.publishes_metadata) {
+            continue;
+        }
+        std::fprintf(
+            output, "%s%u",
+            first_metadata_writer ? "" : ",", task.task_id
+        );
+        first_metadata_writer = false;
+    }
+    std::fprintf(output, "]");
+#endif
     // schema-v5 无论是否开启 atomic 都导出 producer summary；phase-only 的
     // atomic/clock 字段为零，离线分析仍可独立证明 records 与 dropped 闭合。
     std::fprintf(
         output,
-        "],\"fdwic_summary\":{\"records\":%llu,\"atomic_records\":%llu,"
+        ",\"fdwic_summary\":{\"records\":%llu,\"atomic_records\":%llu,"
         "\"clock_baseline_records\":%llu,\"atomic_calls\":%llu,"
         "\"batched_poll_calls\":%llu,\"poll_batch_records\":%llu,"
         "\"dcci_records\":%llu,\"dcci_calls\":%llu,"
@@ -5338,33 +5363,44 @@ inline Metrics Validate(
     }
 #if PTO_FDWIC_SHARED_MAP
     bool shared_heap_state_ok = shared_heap_capacity_ok;
-    // 每个实际回放 task 的 sidecar 插入完成字最终必须恰好保存自己的
-    // task_id；未使用 sidecar 与全部 production TaskCell canary 必须继续
-    // 保持各自的 task-specific pending 值。
-    bool shared_per_task_insert_completions_ok = true;
+    // 只有实际发布 ordinary/symbol writer metadata 的 task 才将
+    // 独占 completion 字从 task-specific pending 推进为 task_id；
+    // 空 writer task、未使用 sidecar 与 production TaskCell canary
+    // 都必须保持初值。
+    bool shared_metadata_writer_completions_ok = true;
     bool legacy_task_completion_canary_ok = true;
-    uint32_t shared_insert_completed_prefix = 0;
+    uint32_t shared_completed_metadata_writers = 0;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const SharedHostPlannedTask *planned_task =
             shared_plan.TaskAt(task_id);
-        const bool task_insert_completed =
+        const bool planned_writer =
             planned_task != nullptr &&
+            planned_task->publishes_metadata;
+        const bool encoded_writer =
+            ((state.build_dispatch.metadata_writer_bits[
+                  task_id / 64U
+              ] >> (task_id % 64U)) & uint64_t{1}) != 0;
+        const int64_t expected_completion = planned_writer
+            ? static_cast<int64_t>(task_id)
+            : SharedInsertCompletionInitialValue(task_id);
+        const bool task_completion_ok =
+            planned_task != nullptr &&
+            encoded_writer == planned_writer &&
             state.claim_tournament[task_id]
                     .root.insert_completion.value ==
-                static_cast<int64_t>(task_id);
+                expected_completion;
         legacy_task_completion_canary_ok &=
             state.tasks[task_id].deps_prepared ==
                 SharedInsertCompletionInitialValue(task_id);
-        shared_per_task_insert_completions_ok &=
-            task_insert_completed;
-        if (task_insert_completed &&
-            shared_insert_completed_prefix == task_id) {
-            ++shared_insert_completed_prefix;
+        shared_metadata_writer_completions_ok &=
+            task_completion_ok;
+        if (task_completion_ok && planned_writer) {
+            ++shared_completed_metadata_writers;
         }
     }
     for (uint32_t task_id = task_count;
          task_id < kMaxTasks; ++task_id) {
-        shared_per_task_insert_completions_ok &=
+        shared_metadata_writer_completions_ok &=
             state.claim_tournament[task_id]
                     .root.insert_completion.value ==
                 SharedInsertCompletionInitialValue(task_id);
@@ -6126,8 +6162,8 @@ inline Metrics Validate(
         "shared no-wrap frontier remains at its initial value", &metrics
     );
     Expect(
-        shared_per_task_insert_completions_ok,
-        "shared per-task insert-completion words reach exact task ids",
+        shared_metadata_writer_completions_ok,
+        "shared metadata-writer completion words and empty-task pending canaries are exact",
         &metrics
     );
     Expect(
@@ -6321,7 +6357,7 @@ inline Metrics Validate(
             shared_map_validation.physical_entries == 0 &&
             shared_map_validation.logical_entries == 0 &&
             shared_map_validation.logical_signature == 1469598103934665603ULL,
-        "shared per-task insert chain, empty ordinary ring, and writer history are exact",
+        "shared sparse metadata-writer chain, empty ordinary ring, and writer history are exact",
         &metrics
     );
     Expect(
@@ -6340,13 +6376,13 @@ inline Metrics Validate(
         &metrics
     );
     std::printf(
-        "[TENSORMAP] mode=shared insert_order=per_task_128b_completion "
-        "completed_tasks=%u legacy_turns=[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld] "
+        "[TENSORMAP] mode=shared insert_order=metadata_writer_128b_completion "
+        "completed_writers=%u legacy_turns=[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld] "
         "reclaim_upto=%lld "
         "region_appends=%llu region_physical=%llu region_logical=%llu "
         "region_raw_signature=%016llx normalized_writer_signature=%016llx "
         "published_outputs=%llu normalized_projection_floor=%llu\n",
-        shared_insert_completed_prefix,
+        shared_completed_metadata_writers,
         static_cast<long long>(
             SharedInsertTurnValueHost(state.shared_map, 0)
         ),

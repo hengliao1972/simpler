@@ -199,7 +199,9 @@ PA_DEVICE AtomicSite TraceAtomicPollBatchSite(uint32_t index) {
 
 PA_DEVICE bool TraceAtomicSiteIsPollBatchable(AtomicSite site) {
     return TraceAtomicPollBatchIndex(site) >= 0 ||
-           site == AtomicSite::SharedInsertTurnPoll;
+           site == AtomicSite::SharedInsertTurnPoll ||
+           site == AtomicSite::SharedFaninOutputPublishedLoad ||
+           site == AtomicSite::SharedMetadataOutputPublishedLoad;
 }
 
 // kernel.cpp 会先在 host 语境经 winner_workload.h 包含 pa_model.h。
@@ -714,7 +716,9 @@ PA_DEVICE bool WriteAggregateAtomicPollBatch(
         call_count == 0 || call_count > kAtomicPollCountMax ||
         end_cycle < start_cycle ||
         (return_ready_end &&
-         site != AtomicSite::SharedInsertTurnPoll) ||
+         site != AtomicSite::SharedInsertTurnPoll &&
+         site != AtomicSite::SharedFaninOutputPublishedLoad &&
+         site != AtomicSite::SharedMetadataOutputPublishedLoad) ||
         result.atomic_trace_calls > UINT64_MAX - call_count ||
         trace.poll_calls > UINT64_MAX - call_count) {
         trace.atomic_counter_overflow = true;

@@ -266,6 +266,8 @@ POLL_BATCH_SITE_OP_IDS = {
     12: 0,
     14: 0,
     19: 0,
+    23: 0,
+    24: 0,
     54: 0,
     55: 0,
 }
@@ -273,6 +275,11 @@ SHARED_REGISTER_ATOMIC_SITE_IDS = {19, 20}
 SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 57))
 SHARED_INSERT_TURN_POLL_SITE_ID = 19
 SHARED_INSERT_TURN_HANDOFF_SITE_ID = 20
+SHARED_OUTPUT_PUBLISHED_POLL_SITE_IDS = {23, 24}
+AGGREGATE_ONLY_POLL_SITE_IDS = {
+    SHARED_INSERT_TURN_POLL_SITE_ID,
+    *SHARED_OUTPUT_PUBLISHED_POLL_SITE_IDS,
+}
 SHARED_CLAIM_TOURNAMENT_SITE_IDS = {40, 41}
 
 ATOMIC_RESULT_USED = 1 << 4
@@ -535,6 +542,43 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
         raise ValueError(
             "metadata.submit_topology is only valid for trace_schema_version=5"
         )
+    metadata_writer_tasks_raw = metadata.get(
+        "shared_metadata_writer_tasks"
+    )
+    shared_metadata_writer_tasks: tuple[int, ...] = ()
+    if trace_schema_version == 5 and tensormap_mode == "shared":
+        if not isinstance(metadata_writer_tasks_raw, list):
+            raise ValueError(
+                "metadata.shared_metadata_writer_tasks must be an array "
+                "for shared schema-v5"
+            )
+        normalized_writer_tasks = tuple(
+            _integer(
+                task_id,
+                f"metadata.shared_metadata_writer_tasks[{index}]",
+            )
+            for index, task_id in enumerate(metadata_writer_tasks_raw)
+        )
+        if any(task_id < 0 for task_id in normalized_writer_tasks) or any(
+            left >= right
+            for left, right in zip(
+                normalized_writer_tasks,
+                normalized_writer_tasks[1:],
+            )
+        ):
+            raise ValueError(
+                "metadata.shared_metadata_writer_tasks must be strictly "
+                "increasing nonnegative task ids"
+            )
+        shared_metadata_writer_tasks = normalized_writer_tasks
+        metadata["shared_metadata_writer_tasks"] = list(
+            normalized_writer_tasks
+        )
+    elif metadata_writer_tasks_raw is not None:
+        raise ValueError(
+            "metadata.shared_metadata_writer_tasks is only valid for "
+            "shared schema-v5"
+        )
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
         raise ValueError("metadata.num_cores must be positive")
@@ -636,7 +680,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
         for core_id in range(num_cores)
     }
     v3_result_used_direct_rows: list[tuple[int, int, bool]] = []
-    v3_insert_turn_poll_batch_rows: list[tuple[int, int, bool]] = []
+    v3_return_ready_poll_batch_rows: list[tuple[int, int, bool]] = []
     v5_observer_dcci_rows = {core_id: 0 for core_id in range(num_cores)}
     v4_parent_counts: dict[int, dict[str, int]] = {
         core_id: {"OrchestrationReplay": 0, "FinalDrain": 0}
@@ -741,17 +785,15 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     f"site={auxiliary}: shared schema-v5 site requires "
                     "shared schema-v5"
                 )
-            if (
-                auxiliary == SHARED_INSERT_TURN_POLL_SITE_ID
-                and not poll_batch
-            ):
+            if auxiliary in AGGREGATE_ONLY_POLL_SITE_IDS and not poll_batch:
                 raise ValueError(
-                    f"fdwic_events[{index}] SharedInsertTurnPoll must use PollBatch"
+                    f"fdwic_events[{index}] aggregate-only Atomic site "
+                    f"{auxiliary} must use PollBatch"
                 )
             if poll_batch:
                 return_ready_valid = (
                     not return_ready
-                    or auxiliary == SHARED_INSERT_TURN_POLL_SITE_ID
+                    or auxiliary in AGGREGATE_ONLY_POLL_SITE_IDS
                 )
                 if (
                     trace_schema_version not in (3, 5)
@@ -768,8 +810,8 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         f"fdwic_events[{index}] has invalid Atomic PollBatch "
                         f"site={auxiliary} flags=0x{flags:x}"
                     )
-                if auxiliary == SHARED_INSERT_TURN_POLL_SITE_ID:
-                    v3_insert_turn_poll_batch_rows.append(
+                if auxiliary in AGGREGATE_ONLY_POLL_SITE_IDS:
+                    v3_return_ready_poll_batch_rows.append(
                         (index, core_id, return_ready)
                     )
             elif trace_schema_version in (3, 5):
@@ -1137,7 +1179,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     f"does not match core {core_id} ClockBaseline "
                     f"dependency_applied={expected_return_ready}"
                 )
-        for row_index, core_id, return_ready in v3_insert_turn_poll_batch_rows:
+        for row_index, core_id, return_ready in v3_return_ready_poll_batch_rows:
             expected_return_ready = bool(v3_clock_rows[core_id]["return_ready"])
             if return_ready != expected_return_ready:
                 raise ValueError(
@@ -1159,6 +1201,19 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
         task_kind_by_id = _derive_v4_task_kinds(
             v4_submit_semantics, num_cores, str(submit_topology)
         )
+        writer_task_set = set(shared_metadata_writer_tasks)
+        unknown_writer_tasks = writer_task_set - set(task_kind_by_id)
+        if tensormap_mode == "shared" and unknown_writer_tasks:
+            raise ValueError(
+                "metadata.shared_metadata_writer_tasks contains unknown "
+                f"tasks: {sorted(unknown_writer_tasks)[:8]}"
+            )
+        previous_writer_by_task: dict[int, int | None] = {}
+        previous_writer: int | None = None
+        for planned_task_id in sorted(task_kind_by_id):
+            previous_writer_by_task[planned_task_id] = previous_writer
+            if planned_task_id in writer_task_set:
+                previous_writer = planned_task_id
         for task_key, (attempted, won, is_alloc) in v4_claims.items():
             submit_won, submit_alloc = v4_submit_semantics[task_key]
             task_kind = task_kind_by_id[task_key[1]]
@@ -1358,16 +1413,20 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         and int(poll[6]) == parent_start
                         and int(poll[7]) == detail_start
                     ]
-                    # per-task predecessor chain 中 task 0 没有前驱，不执行
-                    # insert-turn Load；其余 task 的 winner 各产生一条聚合
-                    # PollBatch。Register 的前段仍由父/detail 边界表示，
-                    # 不能因为 task 0 没有 atomic 就删掉该闭合区间。
-                    expected_poll_count = 0 if task_key[1] == 0 else 1
+                    # 稀疏链只等待严格早于当前 task 的最近 metadata writer。
+                    # 首个 writer 及其之前的空 writer task 没有前驱；一旦
+                    # 首个 writer 发布，后续每个 winner 都观察该真实前驱。
+                    expected_poll_count = (
+                        1
+                        if previous_writer_by_task[task_key[1]] is not None
+                        else 0
+                    )
                     if len(matching_polls) != expected_poll_count:
                         raise ValueError(
                             "shared schema-v5 level4 requires exactly one "
-                            "SharedInsertTurnPoll PollBatch for every nonzero-task "
-                            "winner and none for task 0 on "
+                            "SharedInsertTurnPoll PollBatch when a previous "
+                            "metadata writer exists and none before the first "
+                            "writer on "
                             "Register.start->metadata.start at "
                             f"{task_key}: count={len(matching_polls)} "
                             f"expected={expected_poll_count}"
@@ -1375,26 +1434,33 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     handoffs = v4_shared_insert_turn_handoffs.get(
                         task_key, []
                     )
-                    if len(handoffs) != 1:
+                    expected_handoff_count = (
+                        1 if task_key[1] in writer_task_set else 0
+                    )
+                    if len(handoffs) != expected_handoff_count:
                         raise ValueError(
                             "shared schema-v5 level4 requires exactly one "
-                            "SharedInsertTurnHandoff direct FetchAdd per winner at "
-                            f"{task_key}: count={len(handoffs)}"
+                            "SharedInsertTurnHandoff direct FetchAdd per "
+                            "metadata writer and none for empty writer tasks at "
+                            f"{task_key}: count={len(handoffs)} "
+                            f"expected={expected_handoff_count}"
                         )
-                    handoff = handoffs[0]
-                    handoff_start = int(handoff[6])
-                    handoff_end = int(handoff[7])
-                    if handoff[:3] != parent[:3] or not (
-                        detail_end
-                        <= handoff_start
-                        <= handoff_end
-                        <= parent_end
-                    ):
-                        raise ValueError(
-                            "shared schema-v5 SharedInsertTurnHandoff identity "
-                            "or boundary is outside metadata.end->Register.end "
-                            f"at {task_key}"
-                        )
+                    if handoffs:
+                        handoff = handoffs[0]
+                        handoff_start = int(handoff[6])
+                        handoff_end = int(handoff[7])
+                        if handoff[:3] != parent[:3] or not (
+                            detail_end
+                            <= handoff_start
+                            <= handoff_end
+                            <= parent_end
+                        ):
+                            raise ValueError(
+                                "shared schema-v5 SharedInsertTurnHandoff "
+                                "identity or boundary is outside "
+                                "metadata.end->Register.end "
+                                f"at {task_key}"
+                            )
 
         if tensormap_mode == "shared":
             orphan_parent_keys = set(v4_registers) - set(v4_claims)
@@ -1470,36 +1536,39 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 winner_count = sum(
                     won for _attempted, won, _is_alloc in v4_claims.values()
                 )
-                nonzero_task_winner_count = sum(
+                predecessor_wait_winner_count = sum(
                     1
                     for (_core_id, task_id), (
                         _attempted,
                         won,
                         _is_alloc,
                     ) in v4_claims.items()
-                    if won and task_id > 0
+                    if won and
+                    previous_writer_by_task[task_id] is not None
                 )
                 if (
                     len(v4_shared_insert_turn_polls)
-                    != nonzero_task_winner_count
+                    != predecessor_wait_winner_count
                 ):
                     raise ValueError(
                         "shared schema-v5 level4 has orphan or duplicate "
                         "SharedInsertTurnPoll records: "
                         f"records={len(v4_shared_insert_turn_polls)} "
-                        "expected_nonzero_task_winners="
-                        f"{nonzero_task_winner_count} "
+                        "expected_predecessor_wait_winners="
+                        f"{predecessor_wait_winner_count} "
                         f"all_winners={winner_count}"
                     )
                 handoff_count = sum(
                     len(items)
                     for items in v4_shared_insert_turn_handoffs.values()
                 )
-                if handoff_count != winner_count:
+                if handoff_count != len(writer_task_set):
                     raise ValueError(
                         "shared schema-v5 level4 has orphan or duplicate "
                         "SharedInsertTurnHandoff records: "
-                        f"records={handoff_count} winners={winner_count}"
+                        f"records={handoff_count} "
+                        f"metadata_writers={len(writer_task_set)} "
+                        f"winners={winner_count}"
                     )
 
     if trace_schema_version >= 3:
@@ -2224,6 +2293,7 @@ def _iter_v5_residual_spans(
 
 def _iter_v5_shared_register_derived_spans(
     rows: list[tuple[Any, ...]],
+    metadata_writer_tasks: set[int],
 ) -> Iterator[tuple[int, int, int, int, int, str]]:
     """用 Register 与 metadata 边界补出非 raw 串行段。
 
@@ -2260,19 +2330,33 @@ def _iter_v5_shared_register_derived_spans(
             int(parent[2]),
             int(parent[3]),
         )
+        has_previous_writer = any(
+            writer_task < task_id
+            for writer_task in metadata_writer_tasks
+        )
+        predecessor_span_name = (
+            "register.wait_predecessor_tensormap_writer"
+            if has_previous_writer
+            else "register.enter_tensormap_writer_chain"
+        )
         yield (
             core_id,
             block_id,
             lane,
             int(parent[6]),
             int(detail[6]),
-            f"register.wait_predecessor_tensormap_insert#{task_id}",
+            f"{predecessor_span_name}#{task_id}",
         )
         ordinary_tensormap_entries = int(parent[9])
+        publishes_metadata = task_id in metadata_writer_tasks
         writer_metadata_name = (
-            "register.publish_writer_metadata"
-            f"[ordinary_tensormap_entries={ordinary_tensormap_entries}]"
-            f"#{task_id}"
+            (
+                "register.publish_writer_metadata"
+                if publishes_metadata
+                else "register.no_writer_metadata"
+            )
+            + f"[ordinary_tensormap_entries={ordinary_tensormap_entries}]"
+            + f"#{task_id}"
         )
         if output_detail[5] == "SharedRegisterPublishTaskOutputs":
             yield (
@@ -2306,7 +2390,11 @@ def _iter_v5_shared_register_derived_spans(
             lane,
             int(detail[7]),
             int(parent[7]),
-            f"register.publish_tensormap_insert_completion#{task_id}",
+            (
+                "register.publish_tensormap_insert_completion"
+                if publishes_metadata
+                else "register.metadata_chain_epilogue"
+            ) + f"#{task_id}",
         )
 
 
@@ -2482,7 +2570,12 @@ def convert(  # noqa: PLR0912, PLR0915
         ordered_items.extend(
             ("derived", *span)
             for span in _iter_v5_shared_register_derived_spans(
-                rows
+                rows,
+                set(
+                    capture_metadata.get(
+                        "shared_metadata_writer_tasks", []
+                    )
+                ),
             )
         )
         ordered_items.extend(
@@ -2710,10 +2803,7 @@ def convert(  # noqa: PLR0912, PLR0915
                         atomic_call_count = (
                             flags >> ATOMIC_PAYLOAD_SHIFT
                         ) & ATOMIC_PAYLOAD_MASK
-                        if (
-                            atomic_site_id
-                            == SHARED_INSERT_TURN_POLL_SITE_ID
-                        ):
+                        if atomic_site_id in AGGREGATE_ONLY_POLL_SITE_IDS:
                             poll_boundary_tag = (
                                 "return_ready"
                                 if flags & ATOMIC_RETURN_READY

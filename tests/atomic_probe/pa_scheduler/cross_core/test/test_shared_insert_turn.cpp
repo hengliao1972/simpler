@@ -331,6 +331,142 @@ void TestPendingOwnerWakesOnPredecessor(SchedulerState &state) {
     );
 }
 
+void TestSparseMetadataWriterCompletionChain(
+    SchedulerState &state
+) {
+    constexpr int32_t kFirstWriter = 4;
+    constexpr int32_t kSecondWriter = 9;
+    ResetCompletionWords(state, 11);
+    const LegacyTurnSnapshot legacy = SeedLegacyTurns(state);
+    bool exact = true;
+
+    LocalStats first_wait_stats{};
+    int64_t ready_observed = INT64_MIN;
+    uint64_t load_count = UINT64_MAX;
+    CompletionTestOps::ResetTrace(state);
+    exact &= WaitForSharedMetadataPredecessor<
+                 CompletionTestOps
+             >(
+                 &state, kFirstWriter, -1,
+                 first_wait_stats, ready_observed, load_count
+             ) &&
+             ready_observed == -1 && load_count == 0 &&
+             CompletionTestOps::load_calls.load(
+                 std::memory_order_relaxed
+             ) == 0;
+    LocalStats first_publish_stats{};
+    exact &= HandoffSharedTaskInsertTurn<CompletionTestOps>(
+                 &state, kFirstWriter, first_publish_stats
+             ) &&
+             CompletionWord(state, kFirstWriter) ==
+                 kFirstWriter;
+
+    // task 5/6 都是空 writer：它们只确认最近的真实
+    // writer 4 已发布，自己的 completion 必须保持 pending。
+    for (int32_t task : {5, 6}) {
+        CompletionTestOps::ResetTrace(state);
+        LocalStats empty_wait_stats{};
+        ready_observed = INT64_MIN;
+        load_count = 0;
+        exact &= WaitForSharedMetadataPredecessor<
+                     CompletionTestOps
+                 >(
+                     &state, task, kFirstWriter,
+                     empty_wait_stats, ready_observed, load_count
+                 ) &&
+                 ready_observed == kFirstWriter &&
+                 load_count == 1 &&
+                 AddressEquals(
+                     CompletionTestOps::last_load_address.load(
+                         std::memory_order_relaxed
+                     ),
+                     &CompletionWord(state, kFirstWriter)
+                 ) &&
+                 CompletionWord(state, task) ==
+                     SharedInsertCompletionInitialValue(task);
+    }
+
+    CompletionTestOps::ResetTrace(state);
+    LocalStats second_wait_stats{};
+    ready_observed = INT64_MIN;
+    load_count = 0;
+    exact &= WaitForSharedMetadataPredecessor<
+                 CompletionTestOps
+             >(
+                 &state, kSecondWriter, kFirstWriter,
+                 second_wait_stats, ready_observed, load_count
+             ) &&
+             ready_observed == kFirstWriter &&
+             load_count == 1;
+    LocalStats second_publish_stats{};
+    exact &= HandoffSharedTaskInsertTurn<CompletionTestOps>(
+                 &state, kSecondWriter, second_publish_stats
+             ) &&
+             CompletionWord(state, kSecondWriter) ==
+                 kSecondWriter;
+
+    LocalStats successor_wait_stats{};
+    ready_observed = INT64_MIN;
+    load_count = 0;
+    exact &= WaitForSharedMetadataPredecessor<
+                 CompletionTestOps
+             >(
+                 &state, 10, kSecondWriter,
+                 successor_wait_stats,
+                 ready_observed, load_count
+             ) &&
+             ready_observed == kSecondWriter &&
+             CompletionWord(state, 10) ==
+                 SharedInsertCompletionInitialValue(10);
+
+    exact &= state.fatal.value == 0 &&
+             CompletionTestOps::legacy_turn_touches.load(
+                 std::memory_order_relaxed
+             ) == 0 &&
+             TaskCellCompletionCanariesMatch(state, 11) &&
+             LegacyTurnsMatch(state, legacy);
+    Check(
+        exact,
+        "sparse metadata chain publishes only actual writers and "
+        "empty tasks wait the latest writer without creating batons"
+    );
+}
+
+void TestSparseMetadataWriterCorruptionFailClosed(
+    SchedulerState &state
+) {
+    constexpr int32_t kPreviousWriter = 4;
+    constexpr int32_t kConsumer = 9;
+    ResetCompletionWords(state, 10);
+    const LegacyTurnSnapshot legacy = SeedLegacyTurns(state);
+    CompletionWord(state, kPreviousWriter) = -9;
+    CompletionTestOps::ResetTrace(state);
+    LocalStats stats{};
+    int64_t ready_observed = INT64_MIN;
+    uint64_t load_count = 0;
+    const bool rejected =
+        !WaitForSharedMetadataPredecessor<
+            CompletionTestOps
+        >(
+            &state, kConsumer, kPreviousWriter,
+            stats, ready_observed, load_count
+        );
+    Check(
+        rejected && state.fatal.value == 1 &&
+            ready_observed == -1 &&
+            CompletionWord(state, kPreviousWriter) == -9 &&
+            CompletionWord(state, kConsumer) ==
+                SharedInsertCompletionInitialValue(kConsumer) &&
+            TaskCellCompletionCanariesMatch(state, 10) &&
+            CompletionTestOps::legacy_turn_touches.load(
+                std::memory_order_relaxed
+            ) == 0 &&
+            LegacyTurnsMatch(state, legacy),
+        "sparse metadata consumer rejects a corrupt previous-writer "
+        "completion without publishing its own word"
+    );
+}
+
 void TestEmptyWriterStillCompletes(SchedulerState &state) {
     ResetCompletionWords(state, 2);
     const LegacyTurnSnapshot legacy = SeedLegacyTurns(state);
@@ -535,6 +671,8 @@ int main() {
 
     TestSequentialCompletionChain(*state);
     TestPendingOwnerWakesOnPredecessor(*state);
+    TestSparseMetadataWriterCompletionChain(*state);
+    TestSparseMetadataWriterCorruptionFailClosed(*state);
     TestEmptyWriterStillCompletes(*state);
     TestOutputsPublishBeforePredecessorWait(*state);
     TestCorruptionAndDuplicateFailClosed(*state);
@@ -549,6 +687,9 @@ int main() {
         );
         return 1;
     }
-    std::printf("[PASS] shared per-task insert completion chain tests\n");
+    std::printf(
+        "[PASS] shared legacy and sparse metadata-writer "
+        "completion chain tests\n"
+    );
     return 0;
 }

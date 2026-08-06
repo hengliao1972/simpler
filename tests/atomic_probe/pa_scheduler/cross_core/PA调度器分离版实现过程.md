@@ -5872,3 +5872,134 @@ relocation 和 artifact manifest 均通过。
 `SharedBuildDispatchTask` 局部解码对象，CCEC 立即把 AIV split Finish 从三个
 role-compatible relocation 折叠为两个。该形态已撤回；仅保留紧凑 bitset，
 后续在真正需要的 Finish 内独立解码，不改现有 ticket 局部 ABI。
+
+## 2026-08-06：S6.84-b 稀疏 metadata writer 严格链上板闭合并保留
+
+### 协议收敛
+
+S6.84-a 只发布 writer bitset，本阶段才把它接入正式 Register 热路。每个
+Build owner 从只读计划解码两项信息：
+
+```text
+publishes_metadata(N)
+previous_metadata_writer(N) = max(writer_task < N)
+```
+
+随后执行：
+
+```text
+Materialize + fresh-output DCCI/published
+-> 构造 writer delta，并断言 delta.writer_intent_required == writer_bit[N]
+-> 在串行区外等待本 writer 实际改写的 output target
+-> 等 previous_metadata_writer(N) 的 completion
+-> 有 metadata：发布 ordinary/symbol metadata，再发布 completion(N)
+-> 无 metadata：不写 TensorMap，也不发布 completion(N)
+-> Fanin 对每个实际消费的 output 直接等待 published
+-> Build portable payload
+```
+
+这仍是严格 TensorMap 顺序：任意两位真实 writer `Wi < Wj` 之间，`Wj` 必须
+观察到 `Wi.completion == Wi` 后才能发布 metadata。改变的是 1,024 个空 writer
+task 不再人为构成 `0 -> 1 -> ... -> 1279` baton；它们可以并行观察最近 writer，
+但没有 TensorMap side effect。公共 device 协议只读取 task-id 与 writer bitset，
+不读取 PA `TaskKind`、batch、UP 或固定五 task 形状。
+
+完整逐 task 链过去还间接证明所有前序 fresh output 已经发布。删掉这层证明后，
+不能继续使用 `TrustOutputPublishedFromInsertChain=true`。本阶段恢复两类精确证明：
+
+- Fanin lookup 只等待实际消费的 `(producer_task, output_slot).published`；
+- symbol metadata writer 在进入严格串行区前等待自己实际改写的 output target。
+
+第一版上板曾暴露真实时序：首个 UP writer 可以在 Alloc output 尚未发布时先进入
+metadata CAS。最终实现把第二类等待放在串行区外，既修复该错误，也不占住 writer
+chain 等 producer Materialize。
+
+### 观测合同同步
+
+两类 output 等待使用既有 aggregate PollBatch，一次等待 episode 只写一条 raw，
+精确保留逻辑 load 次数，不恢复逐次 Atomic 记录。converter 同步完成：
+
+- site 23/24 只允许 PollBatch，不允许伪装成 direct raw；
+- 两者必须带 `return_ready`，并通过 clock-baseline 边界校验；
+- host raw 增加极小的 `shared_metadata_writer_tasks` JSON 元数据，不增加任何
+  device record；
+- converter 由该列表精确校验：有 previous writer 才能出现 site 19，只有真实
+  writer 才能出现 site 20；
+- Register 派生名区分 writer/空 writer、等待前驱/进入首段和 completion/epilogue。
+
+旧 raw 不兼容这一体化采集格式；当前工具链从同一可执行文件完成采集和加工，
+不为过程数据增加推断分支。
+
+### 正确性门槛
+
+本阶段通过：
+
+- pa_scheduler Python 全量 `166` 项；converter 单元覆盖 writer 列表缺失、重复、
+  越界、site 23/24 direct raw 和精确稀疏链形状；
+- cross-core CPU 全构建，包括 atomic/DCCI 源码门槛、稀疏 completion、host plan、
+  random args、96-thread B256 动态 Build、ring、trace、symbol/history、heap、
+  execution adapter/drain 和 ordered Submit；
+- CCEC AIC/AIV generic probe、perf-clock/full-swimlane、split Finish、混合 ELF、
+  relocation 与 manifest；
+- A5 B1/B256 real-compute `6,28,4,1` 的全部业务、payload、fanin、DCCI、
+  TensorMap/history、1280 task、1024 kernel 和 FinalDrain 终态。
+
+CPU 动态 Build 门槛期间出现过 `active_workers=94`。复核发现不是 task 遗漏：
+1280 个 task、256 个 writer、1024 个 Execute 和所有 terminal ticket 都精确闭合；
+错误来自测试把无公平性保证的中央 FetchAdd 误当成“host OS 必须向每个线程至少
+分发一个 Build task”。协议真正要求的是 96 worker 全部启动、退休并参与有限
+收敛，而不是公平分发。该等式改为只读诊断量，逐 task exactly-once 和 96 个
+terminal ticket 断言继续保留。
+
+### 冻结 A/B 性能
+
+基线为 `2cbb77ba` 之后的逐 task writer 链，候选为本阶段最终 device 源码。
+奇偶轮反转 B-C/C-B 顺序，运行 12 对独立 A5 B256 进程，统一统计最早 startup
+起点到最后 FinalDrain 结束：
+
+```text
+                         min        median       max         mean
+逐 task writer 链       981.126     992.746    1012.728     994.080 us
+稀疏 writer 链          929.259     967.078     984.721     960.439 us
+
+逐对 baseline-candidate：
+  median = 33.467 us
+  mean   = 33.641 us
+  候选胜 = 12/12
+
+独立中位改善：25.669 us / 2.586%
+```
+
+最终重建产物另一次单跑为 `909.567 us`，全部断言 PASS；它只证明最终源码没有
+回退，不替代 12 对冻结 A/B 的 `967.078 us` 权威中位。
+
+### Full-swimlane 闭合
+
+B256 产物位于（测试产物不提交）：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260806_060936_3865996/
+```
+
+关键闭合量为：
+
+```text
+metadata writer task ids      4,9,...,1279，共 256 个
+predecessor PollBatch         1275 records / 5870 logical loads
+writer completion             256 records
+fanin output published        2048 episodes / 2057 logical loads
+metadata output published      768 episodes / 1985 logical loads
+空 writer metadata/epilogue   1024 / 1024
+DCCI                           6528 calls / 107736 cache lines
+raw                            52427 physical / 54987 logical / dropped=0
+完整 lifecycle                 1020.684 us
+```
+
+1,275 个 predecessor episode 不等于仍有 1,275 级串行链：每个 task 仍需确认
+自己之前最近 writer 的 metadata 已可见，但同一 writer 后的多个空 task 可以
+并行完成；决定全序的 writer-to-writer handoff 只有 255 条。writer completion
+从逐 task 1,280 次收敛为 256 次，真实 metadata 顺序与 DCCI 数量没有减少。
+
+本阶段判定为有效并保留。当前权威中位距新的 `0.8 ms` 目标仍约
+`167.078 us`；后续继续优化时，禁止用跳过真实 writer、截断 FinalDrain 或
+删减 kernel 工作量达标。

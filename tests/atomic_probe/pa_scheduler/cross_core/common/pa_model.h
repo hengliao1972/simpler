@@ -1051,10 +1051,13 @@ PA_MODEL_INLINE constexpr AtomicSite AtomicPollBatchSite(uint32_t index) {
 }
 
 PA_MODEL_INLINE constexpr bool AtomicSiteIsPollBatchable(AtomicSite site) {
-    // insert-turn 使用 Wait 已有 polls 一次性写聚合记录，不占用
-    // AtomicPollBurst compact slot，也绝不进入逐调用 TraceAtomicLoad。
+    // insert-turn 与 fresh-output wait 使用已有 polls 一次性
+    // 写聚合记录，不占用 AtomicPollBurst compact slot，也绝不
+    // 进入逐调用 TraceAtomicLoad。
     return AtomicPollBatchIndex(site) >= 0 ||
-           site == AtomicSite::SharedInsertTurnPoll;
+           site == AtomicSite::SharedInsertTurnPoll ||
+           site == AtomicSite::SharedFaninOutputPublishedLoad ||
+           site == AtomicSite::SharedMetadataOutputPublishedLoad;
 }
 
 PA_MODEL_INLINE constexpr bool AtomicSiteIsSharedOnly(AtomicSite site) {

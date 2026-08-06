@@ -319,6 +319,24 @@ void TestRawSiteIdNeverBecomesTheEnableMaskBit() {
             ) == 0,
         "aggregate-only insert-turn poll 不得扩张热循环 compact state"
     );
+    Expect(
+        TraceAtomicPollBatchIndex(
+            AtomicSite::SharedFaninOutputPublishedLoad
+        ) == -1 &&
+            TraceAtomicPollBatchMask(
+                AtomicSite::SharedFaninOutputPublishedLoad
+            ) == 0,
+        "aggregate-only output-published poll 不得扩张热循环 compact state"
+    );
+    Expect(
+        TraceAtomicPollBatchIndex(
+            AtomicSite::SharedMetadataOutputPublishedLoad
+        ) == -1 &&
+            TraceAtomicPollBatchMask(
+                AtomicSite::SharedMetadataOutputPublishedLoad
+            ) == 0,
+        "aggregate-only metadata-output poll 不得扩张热循环 compact state"
+    );
 }
 
 void TestAggregateInsertTurnPollBatch() {
@@ -366,6 +384,49 @@ void TestAggregateInsertTurnPollBatch() {
     Expect(
         record.flags >> kAtomicPollCountShift == kCalls,
         "aggregate PollBatch 未编码精确 logical call_count"
+    );
+
+    Fixture output_wait;
+    constexpr uint64_t kOutputCalls = 5;
+    const bool output_written = WriteAggregateAtomicPollBatch(
+        output_wait.trace, output_wait.result,
+        AtomicSite::SharedFaninOutputPublishedLoad,
+        kBegin, kEnd, kOutputCalls, true
+    );
+    Expect(
+        output_written && output_wait.trace.record_count == 1 &&
+            output_wait.result.atomic_trace_calls == kOutputCalls &&
+            output_wait.trace.poll_calls == kOutputCalls,
+        "output-published wait 未以一条 PollBatch 保留精确调用数"
+    );
+    Expect(
+        output_wait.records[0].auxiliary ==
+                static_cast<uint32_t>(
+                    AtomicSite::SharedFaninOutputPublishedLoad
+                ) &&
+            (output_wait.records[0].flags &
+             kAtomicReturnReady) != 0,
+        "output-published PollBatch 的 site/return-ready 语义不正确"
+    );
+
+    Fixture metadata_output_wait;
+    const bool metadata_output_written =
+        WriteAggregateAtomicPollBatch(
+            metadata_output_wait.trace,
+            metadata_output_wait.result,
+            AtomicSite::SharedMetadataOutputPublishedLoad,
+            kBegin, kEnd, kOutputCalls, true
+        );
+    Expect(
+        metadata_output_written &&
+            metadata_output_wait.trace.record_count == 1 &&
+            metadata_output_wait.records[0].auxiliary ==
+                static_cast<uint32_t>(
+                    AtomicSite::SharedMetadataOutputPublishedLoad
+                ) &&
+            (metadata_output_wait.records[0].flags &
+             kAtomicReturnReady) != 0,
+        "metadata-output PollBatch 的 site/return-ready 语义不正确"
     );
 
     Fixture overflow;

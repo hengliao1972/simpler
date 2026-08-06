@@ -124,6 +124,7 @@ def _v5_capture(
     num_cores: int = 1,
     add_parents: bool = True,
     tensormap_mode: str = "private",
+    metadata_writer_tasks: list[int] | None = None,
 ) -> dict[str, object]:
     """构造 phase-only schema-v5 raw；调用者显式提供 Claim/Submit/尾动作。"""
     all_rows = [list(row) for row in rows]
@@ -164,26 +165,42 @@ def _v5_capture(
                     ],
                 ]
             )
+    metadata: dict[str, object] = {
+        "clock_freq_hz": 1_000_000_000,
+        "num_cores": num_cores,
+        "trace_schema_version": 5,
+        "tensormap_mode": tensormap_mode,
+        "core_types": [
+            _standalone_topology(core_id)[2]
+            for core_id in range(num_cores)
+        ],
+        "fdwic_summary": {
+            "records": len(all_rows),
+            "atomic_records": 0,
+            "clock_baseline_records": 0,
+            "atomic_calls": 0,
+            "batched_poll_calls": 0,
+            "poll_batch_records": 0,
+            "dropped_records": 0,
+        },
+    }
+    if tensormap_mode == "shared":
+        if metadata_writer_tasks is None:
+            # 大多数旧 fixture 描述“每个 winner 都发布 metadata”的
+            # 旧协议；显式稀疏链 fixture 会传入准确 writer task 列表。
+            metadata_writer_tasks = sorted(
+                {
+                    int(row[3])
+                    for row in all_rows
+                    if row[5] == "Submit" and int(row[8]) & 0x1
+                }
+            )
+        metadata["shared_metadata_writer_tasks"] = list(
+            metadata_writer_tasks
+        )
     return {
         "l2_swimlane_level": 1,
-        "metadata": {
-            "clock_freq_hz": 1_000_000_000,
-            "num_cores": num_cores,
-            "trace_schema_version": 5,
-            "tensormap_mode": tensormap_mode,
-            "core_types": [
-                _standalone_topology(core_id)[2] for core_id in range(num_cores)
-            ],
-            "fdwic_summary": {
-                "records": len(all_rows),
-                "atomic_records": 0,
-                "clock_baseline_records": 0,
-                "atomic_calls": 0,
-                "batched_poll_calls": 0,
-                "poll_batch_records": 0,
-                "dropped_records": 0,
-            },
-        },
+        "metadata": metadata,
         "fdwic_events": all_rows,
     }
 
@@ -230,10 +247,10 @@ def _v5_shared_register_atomic_capture(
     *,
     dependency_applied: bool = True,
 ) -> dict[str, object]:
-    """构造一批五个 winner 的 per-task predecessor-chain v5 raw。
+    """构造五个 winner、两个真实 metadata writer 的稀疏链 v5 raw。
 
-    task 0 无前驱，因此没有 PollBatch；task 1..4 各有一条聚合
-    PollBatch；五个 task 都各自用一条 completion CAS 发布完成。
+    task 0 是首个 writer，因此没有前驱；task 1..4 各等待 task 0，
+    但只有 task 0/4 发布自己的 completion。
     """
 
     rows: list[list[object]] = []
@@ -388,7 +405,11 @@ def _v5_shared_register_atomic_capture(
             ]
         )
 
-    capture = _v5_capture(rows, tensormap_mode="shared")
+    capture = _v5_capture(
+        rows,
+        tensormap_mode="shared",
+        metadata_writer_tasks=[0, 4],
+    )
     capture["l2_swimlane_level"] = 4
     capture_rows = capture["fdwic_events"]
     assert isinstance(capture_rows, list)
@@ -429,22 +450,23 @@ def _v5_shared_register_atomic_capture(
                     19,
                 ]
             )
-        # FetchAdd(2) source-issue。每个 task 都发布
-        # 自己的 completion，包括没有前驱的 task 0。
-        capture_rows.append(
-            [
-                0,
-                0,
-                0,
-                task_id,
-                -1,
-                "Atomic",
-                base + 34,
-                base + 40,
-                0x02,
-                20,
-            ]
-        )
+        if task_id in (0, 4):
+            # 只有真实 writer 才以 source-issue FetchAdd 发布独占
+            # completion；空 writer task 保持 task-specific pending。
+            capture_rows.append(
+                [
+                    0,
+                    0,
+                    0,
+                    task_id,
+                    -1,
+                    "Atomic",
+                    base + 34,
+                    base + 40,
+                    0x02,
+                    20,
+                ]
+            )
     _refresh_summary(capture)
     return capture
 
@@ -782,7 +804,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
 
         parent = next(event for event in events if event.get("name") == "register#0")
         flat_child_names = (
-            "register.wait_predecessor_tensormap_insert#0",
+            "register.enter_tensormap_writer_chain#0",
             "register.publish_writer_metadata"
             "[ordinary_tensormap_entries=0]#0",
             "register.publish_task_outputs#0",
@@ -824,13 +846,13 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 set(child), {"ph", "name", "pid", "tid", "ts", "dur"}
             )
         self.assertEqual(
-            children["register.wait_predecessor_tensormap_insert#0"]["ts"],
+            children["register.enter_tensormap_writer_chain#0"]["ts"],
             parent["ts"],
         )
         self.assertAlmostEqual(
-            children["register.wait_predecessor_tensormap_insert#0"]["ts"]
+            children["register.enter_tensormap_writer_chain#0"]["ts"]
             + children[
-                "register.wait_predecessor_tensormap_insert#0"
+                "register.enter_tensormap_writer_chain#0"
             ]["dur"],
             children[
                 "register.publish_writer_metadata"
@@ -983,7 +1005,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             names,
         )
         self.assertIn(
-            "register.wait_predecessor_tensormap_insert#0", names
+            "register.enter_tensormap_writer_chain#0", names
         )
         self.assertIn(
             "register.publish_writer_metadata"
@@ -1891,8 +1913,8 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             set(handoff), {"ph", "name", "pid", "tid", "ts", "dur"}
         )
         summary = merged["metadata"]["fdwic_summary"]
-        self.assertEqual(summary["atomic_records"], 9)
-        self.assertEqual(summary["atomic_calls"], 17)
+        self.assertEqual(summary["atomic_records"], 6)
+        self.assertEqual(summary["atomic_calls"], 14)
         self.assertEqual(summary["batched_poll_calls"], 12)
         self.assertEqual(summary["poll_batch_records"], 4)
         thread_names = {
@@ -1902,6 +1924,85 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             and event.get("name") == "thread_name"
         }
         self.assertFalse(any("·atomic" in name for name in thread_names))
+
+    def test_v5_shared_output_publication_waits_are_aggregate_only(
+        self,
+    ) -> None:
+        capture = _v5_shared_register_atomic_capture()
+        rows = capture["fdwic_events"]
+        assert isinstance(rows, list)
+        rows.extend(
+            [
+                # fanin 与 metadata writer 各自等待两个 Load；二者都只
+                # 允许一条 return-ready PollBatch，不允许逐 Load raw。
+                [0, 0, 0, -1, -1, "Atomic", 114, 116, 0x2D0, 23],
+                [0, 0, 0, -1, -1, "Atomic", 116, 118, 0x2D0, 24],
+            ]
+        )
+        _refresh_summary(capture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            names = {
+                event["name"]
+                for event in json.loads(
+                    output_path.read_text(encoding="utf-8")
+                )["traceEvents"]
+            }
+
+        self.assertIn(
+            "atomic.poll_batch.return_ready."
+            "shared_output_ref_fanin_output_published_load.load×2",
+            names,
+        )
+        self.assertIn(
+            "atomic.poll_batch.return_ready."
+            "shared_output_ref_metadata_output_published_load.load×2",
+            names,
+        )
+
+        for site_id in (23, 24):
+            with self.subTest(site_id=site_id), tempfile.TemporaryDirectory() as directory:
+                invalid = _v5_shared_register_atomic_capture()
+                invalid_rows = invalid["fdwic_events"]
+                assert isinstance(invalid_rows, list)
+                invalid_rows.append(
+                    [0, 0, 0, -1, -1, "Atomic", 114, 116, 0x50, site_id]
+                )
+                _refresh_summary(invalid)
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    ValueError, "aggregate-only Atomic site"
+                ):
+                    convert(input_path, output_path)
+
+    def test_v5_shared_metadata_writer_plan_is_required_and_exact(
+        self,
+    ) -> None:
+        cases = (
+            ("missing", None, "must be an array"),
+            ("duplicate", [0, 0, 4], "strictly increasing"),
+            ("unknown", [0, 99], "contains unknown tasks"),
+        )
+        for label, writer_tasks, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                capture = _v5_shared_register_atomic_capture()
+                metadata = capture["metadata"]
+                assert isinstance(metadata, dict)
+                if writer_tasks is None:
+                    metadata.pop("shared_metadata_writer_tasks")
+                else:
+                    metadata["shared_metadata_writer_tasks"] = writer_tasks
+                input_path = Path(directory) / "raw.json"
+                output_path = Path(directory) / "merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, expected):
+                    convert(input_path, output_path)
 
     def test_v5_shared_claim_tournament_atomics_are_named(self) -> None:
         capture = _v5_shared_register_atomic_capture()
@@ -2326,7 +2427,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             input_path.write_text(json.dumps(capture), encoding="utf-8")
             with self.assertRaisesRegex(
                 ValueError,
-                "none for task 0.*expected=0",
+                "none before the first writer.*expected=0",
             ):
                 convert(input_path, output_path)
             self.assertFalse(output_path.exists())
@@ -2367,7 +2468,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 input_path.write_text(json.dumps(capture), encoding="utf-8")
                 with self.assertRaisesRegex(
                     ValueError,
-                    "SharedInsertTurnPoll must use PollBatch|"
+                    "aggregate-only Atomic site|"
                     "invalid Atomic PollBatch|invalid direct Atomic",
                 ):
                     convert(input_path, output_path)

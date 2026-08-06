@@ -469,8 +469,9 @@ def _v4_capture(  # noqa: PLR0912
                         auxiliary=19,
                     )
                 )
-            # 每个 winner（包括 task 0）都用 completion CAS 发布本 task
-            # 的 metadata 已完成，使 Register 后段和父区间保持闭合。
+            # 该旧矩形 fixture 的每个 winner（包括 task 0）都用
+            # source-issue FetchAdd 发布本 task completion，使 Register
+            # 后段和父区间保持闭合。
             rows.append(
                 _row(
                     int(register[0]),
@@ -478,7 +479,7 @@ def _v4_capture(  # noqa: PLR0912
                     "Atomic",
                     publish_end,
                     end,
-                    flags=0x54,
+                    flags=0x02,
                     auxiliary=20,
                 )
             )
@@ -493,6 +494,17 @@ def _v4_capture(  # noqa: PLR0912
             ]
         )
     capture["fdwic_events"] = rows
+    if tensormap_mode == "shared":
+        # 该 analyzer fixture 仍刻画旧的“每个 Register winner 都发布
+        # completion”协议；显式列出与 raw handoff 完全一致的 writer 计划，
+        # 让公共 converter 同时覆盖旧矩形测试与新稀疏生产数据。
+        metadata["shared_metadata_writer_tasks"] = sorted(
+            {
+                int(row[3])
+                for row in rows
+                if row[5] == "Atomic" and int(row[9]) == 20
+            }
+        )
     _refresh_summary(capture)
     return capture
 
