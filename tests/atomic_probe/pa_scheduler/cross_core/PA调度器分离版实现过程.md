@@ -6320,3 +6320,71 @@ kernel 与 TensorMap side effect 数量均未减少；raw 墙钟和 12 对端到
 其他调度及 atomic 波动影响。因此本阶段按“通用非 atomic 局部消冗”保留，
 性能结论限定为“局部有效、端到端未证明改善”。当前约 `0.935~0.938 ms` 的
 独立中位仍距 `0.8 ms` 目标约 `135~138 us`，后续不得用 PA 特例扩大数字。
+
+## 2026-08-06：S6.88 否决逐 task joint 状态写入消减
+
+### 候选依据与泛化审查
+
+cross-core execution payload 当前显式拒绝 `joint/joint_init`，shared Build
+路径也没有任何位置把五个 joint 字段改为有效状态；split runtime 又在每个
+worker 进入调度器时对整份 `SubmitContext` 初始化一次。候选据此删除
+`PrepareSharedWinnerContext()` 每张 Build ticket 对
+`joint/joint_init/joint_block/joint_slot/joint_count` 的五次重复写入，并让非
+split 参考路径同样一次性值初始化 context。
+
+该候选本身不读取 PA `TaskKind`、batch、固定 DAG、核数或输出形状，属于
+cross-core 公共执行 ABI 范围内的通用消冗；如果证据成立，其他算子也可直接
+复用。反过来，源码上“写入更少”不能代替 A5 性能证据，尤其不能因当前 PA
+的单次端到端数字较好就保留。
+
+### 正确性与静态结果
+
+候选通过 cross-core CPU perf-clock 全构建，包括随机任务计划、ordinary
+TensorMap、稀疏 writer 严格插入、96-worker 中央 Build、执行包与 FinalDrain；
+CCEC perf-clock/full-swimlane 的 AIC/AIV、split Finish、mixed ELF、relocation
+和 manifest 也全部通过。A5 B256 保持 1,280 次 Build、1,024 个 kernel、256
+个 metadata writer、2,048 个 published output、6,528 次 DCCI 及全部 host
+终态断言。
+
+机器码确有变化：perf-clock AIC 入口 `.text` 从 `0x1b2b0` 降到
+`0x1b248`（少 104B），最终 kernel `.text` 从 `0x4a438` 降到 `0x4a338`
+（少 256B）；AIV 入口因对齐总大小仍为 `0x1b638`，但后续符号前移 100B。
+这只证明编译器消费了源码修改，不证明运行更快。
+
+### 冻结 A/B 与局部否决证据
+
+冻结提交 `d13d46c0` 的 perf-clock 产物，与候选按 B-C/C-B 顺序交错运行 12
+对完整 `startup begin -> FinalDrain end`：
+
+```text
+                         min        median       max         mean
+S6.87 基线              907.901     949.916     969.319     946.421 us
+joint 写入消减候选      918.663     940.938     977.871     941.308 us
+
+独立中位：候选快 8.978 us / 0.945%
+独立均值：候选快 5.112 us / 0.540%
+逐对差中位：-8.948 us；候选获胜 7/12
+```
+
+端到端方向略好但配对离散很大，不能单独裁决。改动的直接代码位置位于
+`Claim.end -> Materialize.begin`，因此又以 full-swimlane 做固定 1,280 task
+的 aggregate 对照：
+
+```text
+                                      S6.87 基线    joint 候选       变化
+Claim->Materialize aggregate cycles     2481234       2526758      +45524 / +1.835%
+其中 AIC                                 336357        320017      -16340 / -4.858%
+其中 AIV                                2144877       2206741      +61864 / +2.884%
+raw Submit makespan                    746.841 us     754.814 us    +7.973 us
+```
+
+候选泳道仅作取证、不提交：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260806_083859_162230/
+```
+
+主要 AIV 人口的直接非 atomic 区间回退，且按 task 类别也并非同向，说明删除
+store 引起的取指/布局变化已经抵消逻辑消减。结合端到端仅 `7/12` 获胜，本轮
+判定为“协议上通用、性能上不稳”，生产代码完整恢复到 `d13d46c0`。后续不得
+重复该候选，也不得把单次 0.945% 中位改善写成有效收益。

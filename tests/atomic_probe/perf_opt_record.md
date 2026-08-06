@@ -6762,3 +6762,16 @@ completed Submit 均保持 0，96 个 worker 全部返回。Python `168` 项、C
 `Claim->Materialize` 累计 core-work 从 `2697808` 降到 `2481234 cycles`，
 减少 `216574 cycles / 8.03%`。该项按通用非 atomic 局部消冗保留，结论限定
 为“局部有效、端到端未证明改善”；完整证据见实现过程 S6.87。
+
+### 15.63 否决逐 task joint 状态写入消减
+
+cross-core 执行包当前明确拒绝 joint task，候选把每张中央 Build ticket 对五个
+joint 字段的重复写入收敛为每 worker 一次初始化。该改动不依赖 PA task kind、
+固定 DAG、batch、核数或输出形状，CPU/CCEC/A5 全部正确性门槛均通过，AIC
+入口 `.text` 减少 104B，最终 kernel `.text` 减少 256B。
+
+冻结 12 对完整周期中，基线/候选中位为 `949.916/940.938 us`，候选表面改善
+`0.945%`，但仅 `7/12` 对获胜。改动直接所在的 `Claim->Materialize` 区间反而
+从 `2481234` 增到 `2526758 cycles`（`+1.835%`）：AIC 减少 `4.858%`，占主要
+人口的 AIV 增加 `2.884%`；raw Submit 也增加 `7.973 us`。因此源码消冗没有
+形成跨核型一致收益，本轮完整撤回。详细数据见实现过程 S6.88。
