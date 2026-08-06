@@ -45,7 +45,7 @@ constexpr uint32_t kFirstAivExecutorOwner = kBuilderOwner + 1U;
 constexpr uint32_t kAivExecutorCount = kAivOwnerCount - 1U;
 constexpr uint32_t kExecutorCount = kAicOwnerCount + kAivExecutorCount;
 constexpr uint32_t kWarpSize = 32U;
-constexpr uint32_t kBuilderWarpCount = 64U;
+constexpr uint32_t kBuilderWarpCount = 16U;
 constexpr uint32_t kBuilderThreadCount = kBuilderWarpCount * kWarpSize;
 constexpr uint32_t kBuilderLeaderCount = kBuilderWarpCount;
 constexpr uint32_t kMaxBuilderThreadCount = kBuilderThreadCount * kMaxBuilderCount;
@@ -313,23 +313,38 @@ BuilderThreadActive(uint32_t thread_id, uint32_t builder_count = kDefaultBuilder
 
 SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
 BuilderFirstTask(uint32_t thread_id, uint32_t builder_count = kDefaultBuilderCount) {
-    return BuilderThreadActive(thread_id, builder_count) ? BuilderLocalWarp(thread_id) : UINT32_MAX;
+    return BuilderThreadActive(thread_id, builder_count) ?
+               BuilderInstance(thread_id) * kBuilderWarpCount + BuilderLocalWarp(thread_id) :
+               UINT32_MAX;
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t BuilderThreadForTask(uint32_t task_id, uint32_t builder_instance = 0U) {
-    return builder_instance * kBuilderThreadCount + (task_id % kBuilderWarpCount) * kWarpSize;
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
+BuilderThreadForInstanceWarp(uint32_t builder_instance, uint32_t local_warp) {
+    return builder_instance * kBuilderThreadCount + local_warp * kWarpSize;
+}
+
+SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
+BuilderThreadForTask(uint32_t task_id, uint32_t builder_count = kDefaultBuilderCount) {
+    const uint32_t logical_leader = task_id % BuilderLeaderCount(builder_count);
+    const uint32_t builder_instance = logical_leader / kBuilderWarpCount;
+    const uint32_t local_warp = logical_leader % kBuilderWarpCount;
+    return BuilderThreadForInstanceWarp(builder_instance, local_warp);
 }
 
 SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
 BuilderExpectedTaskCount(uint32_t thread_id, uint32_t task_count, uint32_t builder_count = kDefaultBuilderCount) {
     const uint32_t first = BuilderFirstTask(thread_id, builder_count);
-    return first == UINT32_MAX || first >= task_count ? 0U : 1U + (task_count - 1U - first) / kBuilderTaskStride;
+    return first == UINT32_MAX || first >= task_count ?
+               0U :
+               1U + (task_count - 1U - first) / BuilderLeaderCount(builder_count);
 }
 
 SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
 BuilderExpectedLastTask(uint32_t thread_id, uint32_t task_count, uint32_t builder_count = kDefaultBuilderCount) {
     const uint32_t count = BuilderExpectedTaskCount(thread_id, task_count, builder_count);
-    return count == 0U ? UINT32_MAX : BuilderFirstTask(thread_id, builder_count) + (count - 1U) * kBuilderTaskStride;
+    return count == 0U ?
+               UINT32_MAX :
+               BuilderFirstTask(thread_id, builder_count) + (count - 1U) * BuilderLeaderCount(builder_count);
 }
 
 SIMT_CROSS_CORE_G0_MODEL_INLINE uint32_t
@@ -367,9 +382,13 @@ BuilderReportChecksum(uint64_t nonce, uint32_t thread_id, uint32_t task_count) {
     );
 }
 
-SIMT_CROSS_CORE_G0_MODEL_INLINE bool ConsecutiveTasksUseDifferentWarps(uint32_t task_id) {
-    return task_id == 0U ||
-           BuilderLocalWarp(BuilderThreadForTask(task_id)) != BuilderLocalWarp(BuilderThreadForTask(task_id - 1U));
+SIMT_CROSS_CORE_G0_MODEL_INLINE bool
+ConsecutiveTasksHaveSafeBuilderMapping(uint32_t task_id, uint32_t builder_count = kDefaultBuilderCount) {
+    if (task_id == 0U) {
+        return true;
+    }
+    return BuilderWarp(BuilderThreadForTask(task_id, builder_count)) !=
+           BuilderWarp(BuilderThreadForTask(task_id - 1U, builder_count));
 }
 
 SIMT_CROSS_CORE_G0_MODEL_INLINE bool IsBuilderOwner(uint32_t owner, uint32_t builder_count = kDefaultBuilderCount) {
@@ -583,12 +602,12 @@ SIMT_CROSS_CORE_G0_MODEL_INLINE uint64_t ExpectedWorkloadOutputPair(TaskKind kin
 
 static_assert(kMainTaskCount == 1280U && kMainKernelTaskCount == 1024U, "main PA task counts changed");
 static_assert(
-    kBuilderThreadCount == 2048U && kBuilderLeaderCount == 64U && kBuilderTasksPerLeaderMain == 20U,
-    "G0 builder must use 64 warp leaders from a 2048-thread launch"
+    kBuilderThreadCount == 512U && kBuilderLeaderCount == 16U && kBuilderTasksPerLeaderMain == 80U,
+    "G0 builder must use 16 warp leaders from a 512-thread launch"
 );
 static_assert(
-    kMaxBuilderThreadCount == 4096U && kMaxBuilderLeaderCount == 128U,
-    "G1 must retain two independent 64-warp builder instances"
+    kMaxBuilderThreadCount == 1024U && kMaxBuilderLeaderCount == 32U,
+    "G1 must retain two independent 16-warp builder instances"
 );
 static_assert(
     kOwnerCount == 96U && kExecutorCount == 95U && kAicOwnerCount + kAivOwnerCount - kMaxBuilderCount == 94U,

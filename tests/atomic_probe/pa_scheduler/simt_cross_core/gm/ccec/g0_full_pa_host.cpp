@@ -59,7 +59,7 @@ struct Options {
 };
 
 constexpr uint32_t kHostTasksPerBatch = 5U;
-constexpr uint32_t kHostBuilderWarpCount = 64U;
+constexpr uint32_t kHostBuilderWarpCount = 16U;
 constexpr uint32_t kHostWarpThreads = 32U;
 constexpr uint32_t kHostBuilderThreadCount = kHostBuilderWarpCount * kHostWarpThreads;
 constexpr uint32_t kHostMaxBuilderThreadCount = kHostBuilderThreadCount * g0::kMaxBuilderCount;
@@ -576,7 +576,7 @@ void InitializeSwimlaneTrace(g0_swimlane::TraceState *trace, uint64_t nonce, uin
     trace->control.kernel_task_count = g0::KernelTaskCount(batches);
     trace->control.builder_count = builder_count;
     trace->control.role_count = g0::kOwnerCount;
-    trace->control.simt_writer_count = g0_swimlane::kTraceSimtWriterCount;
+    trace->control.simt_writer_count = g0::BuilderLeaderCount(builder_count);
     trace->control.scalar_writer_count = g0_swimlane::kTraceScalarWriterCount;
     trace->control.simt_records_per_writer = g0_swimlane::kTraceSimtRecordsPerWriter;
     trace->control.scalar_records_per_writer = g0_swimlane::kTraceScalarRecordsPerWriter;
@@ -981,11 +981,15 @@ bool ValidateTask(
         )) {
         return false;
     }
-    const uint32_t builder_instance = actual_builder_owner - g0::kBuilderOwner;
-    const uint32_t expected_builder_thread = g0::BuilderThreadForTask(task_id, builder_instance);
+    const uint32_t expected_builder_thread = g0::BuilderThreadForTask(task_id, builder_count);
     const uint32_t expected_builder_warp = expected_builder_thread / kHostWarpThreads;
+    const uint32_t expected_builder_owner = g0::BuilderOwnerForThread(expected_builder_thread);
     if (!RecordCheck(
             plan.task_id == task_id, failure, "task-plan-id", task_id, UINT32_MAX, UINT32_MAX, task_id, plan.task_id
+        ) ||
+        !RecordCheck(
+            actual_builder_owner == expected_builder_owner, failure, "task-plan-builder-owner-mapping", task_id,
+            actual_builder_owner, UINT32_MAX, expected_builder_owner, actual_builder_owner
         ) ||
         !RecordCheck(
             plan.batch == expected.batch, failure, "task-plan-batch", task_id, UINT32_MAX, UINT32_MAX, expected.batch,
@@ -1218,8 +1222,8 @@ bool ValidateTask(
             report.commit_count
         ) ||
         !RecordCheck(
-            report.build_attempt_count == builder_count, failure, "build-report-attempt-count", task_id,
-            actual_builder_owner, UINT32_MAX, builder_count, report.build_attempt_count
+            report.build_attempt_count == 1U, failure, "build-report-attempt-count", task_id,
+            actual_builder_owner, UINT32_MAX, 1U, report.build_attempt_count
         ) ||
         !RecordCheck(
             report.build_win_count == 1U, failure, "build-report-win-count", task_id, actual_builder_owner, UINT32_MAX,
@@ -1434,7 +1438,7 @@ bool ValidateBuilderThreads(
             )) {
             return false;
         }
-        const uint32_t claim_losses = expected_attempts - wins;
+        const uint32_t claim_losses = 0U;
         const uint64_t expected_checksum = ExpectedBuilderChecksum(
             nonce, thread_id, task_count, wins, expected_first[thread_id], expected_last[thread_id], expected_attempts,
             wins, wins, expected_waits[thread_id], claim_losses
@@ -1519,8 +1523,8 @@ bool ValidateBuilderThreads(
                win_sum
            ) &&
            RecordCheck(
-               attempt_sum == static_cast<uint64_t>(builder_count) * task_count, failure, "builder-thread-attempt-sum",
-               UINT32_MAX, UINT32_MAX, UINT32_MAX, static_cast<uint64_t>(builder_count) * task_count, attempt_sum
+               attempt_sum == task_count, failure, "builder-thread-attempt-sum",
+               UINT32_MAX, UINT32_MAX, UINT32_MAX, task_count, attempt_sum
            ) &&
            RecordCheck(
                prepare_sum == task_count, failure, "builder-thread-prepare-sum", UINT32_MAX, UINT32_MAX, UINT32_MAX,
@@ -1531,9 +1535,8 @@ bool ValidateBuilderThreads(
                task_count, commit_sum
            ) &&
            RecordCheck(
-               loss_sum == static_cast<uint64_t>(builder_count - 1U) * task_count, failure,
-               "builder-thread-claim-loss-sum", UINT32_MAX, UINT32_MAX, UINT32_MAX,
-               static_cast<uint64_t>(builder_count - 1U) * task_count, loss_sum
+               loss_sum == 0U, failure, "builder-thread-claim-loss-sum", UINT32_MAX, UINT32_MAX, UINT32_MAX,
+               0U, loss_sum
            );
 }
 
@@ -2239,7 +2242,8 @@ bool ValidateTraceRecord(
 bool ValidateTraceLog(
     const g0_swimlane::TraceLogControl &control, const g0_swimlane::TraceRecord *records,
     const g0_swimlane::TraceRecord *initial_records, g0_swimlane::TraceDomain domain, uint32_t capacity,
-    uint64_t nonce, uint32_t task_count, uint32_t writer, uint64_t role_begin, uint64_t role_end,
+    uint64_t nonce, uint32_t task_count, uint32_t builder_count, uint32_t writer,
+    uint64_t role_begin, uint64_t role_end,
     ValidationFailure *failure
 ) {
     if (!RecordCheck(control.launch_nonce == nonce, failure, "swimlane-log-nonce", UINT32_MAX, writer) ||
@@ -2270,9 +2274,9 @@ bool ValidateTraceLog(
         }
         if (domain == g0_swimlane::TraceDomain::Simt && records[slot].task_id != g0_swimlane::kTraceNoTask &&
             !RecordCheck(
-                g0::BuilderThreadForTask(records[slot].task_id) / g0::kWarpSize == writer, failure,
+                g0::BuilderThreadForTask(records[slot].task_id, builder_count) / g0::kWarpSize == writer, failure,
                 "swimlane-simt-log-writer", records[slot].task_id, writer, slot,
-                g0::BuilderThreadForTask(records[slot].task_id) / g0::kWarpSize, writer
+                g0::BuilderThreadForTask(records[slot].task_id, builder_count) / g0::kWarpSize, writer
             )) {
             return false;
         }
@@ -2352,7 +2356,7 @@ bool ValidateSwimlaneTrace(
 
     for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
         const g0_swimlane::BuilderTaskTrace &builder = trace.builders[task_id];
-        const uint32_t expected_thread = g0::BuilderThreadForTask(task_id);
+        const uint32_t expected_thread = g0::BuilderThreadForTask(task_id, builder_count);
         if (!RecordCheck(builder.launch_nonce == nonce, failure, "swimlane-builder-nonce", task_id) ||
             !RecordCheck(builder.task_id == task_id, failure, "swimlane-builder-task", task_id) ||
             !RecordCheck(
@@ -2424,11 +2428,26 @@ bool ValidateSwimlaneTrace(
             return false;
         }
     }
-    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceSimtWriterCount; ++writer) {
+    const uint32_t active_simt_writers = g0::BuilderLeaderCount(builder_count);
+    for (uint32_t writer = 0U; writer < active_simt_writers; ++writer) {
         if (!ValidateTraceLog(
                 trace.simt_logs[writer], &trace.simt_records[writer][0], &initial_trace.simt_records[writer][0],
                 g0_swimlane::TraceDomain::Simt, g0_swimlane::kTraceSimtRecordsPerWriter, nonce, task_count,
-                writer, 0U, UINT64_MAX, failure
+                builder_count, writer, 0U, UINT64_MAX, failure
+            )) {
+            return false;
+        }
+    }
+    for (uint32_t writer = active_simt_writers; writer < g0_swimlane::kTraceSimtWriterCount; ++writer) {
+        if (!RecordCheck(
+                std::memcmp(&trace.simt_logs[writer], &initial_trace.simt_logs[writer],
+                            sizeof(trace.simt_logs[writer])) == 0,
+                failure, "swimlane-inactive-simt-log-mutated", UINT32_MAX, writer
+            ) ||
+            !RecordCheck(
+                std::memcmp(&trace.simt_records[writer][0], &initial_trace.simt_records[writer][0],
+                            sizeof(trace.simt_records[writer])) == 0,
+                failure, "swimlane-inactive-simt-records-mutated", UINT32_MAX, writer
             )) {
             return false;
         }
@@ -2437,7 +2456,7 @@ bool ValidateSwimlaneTrace(
         if (!ValidateTraceLog(
                 trace.scalar_logs[writer], &trace.scalar_records[writer][0],
                 &initial_trace.scalar_records[writer][0], g0_swimlane::TraceDomain::Scalar,
-                g0_swimlane::kTraceScalarRecordsPerWriter, nonce, task_count, writer,
+                g0_swimlane::kTraceScalarRecordsPerWriter, nonce, task_count, builder_count, writer,
                 trace.roles[writer].entry, trace.roles[writer].exit, failure
             )) {
             return false;
@@ -2771,7 +2790,8 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
         totals->poll_records += control.poll_records;
         totals->dcci_records += control.dcci_records;
     };
-    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceSimtWriterCount; ++writer) {
+    const uint32_t active_simt_writers = trace.control.simt_writer_count;
+    for (uint32_t writer = 0U; writer < active_simt_writers; ++writer) {
         add_control(&simt_totals, trace.simt_logs[writer]);
     }
     for (uint32_t writer = 0U; writer < g0_swimlane::kTraceScalarWriterCount; ++writer) {
@@ -2787,30 +2807,50 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
     if (origin == UINT64_MAX || finish < origin) {
         return false;
     }
-    uint64_t simt_raw_begin = UINT64_MAX;
-    uint64_t simt_raw_end = 0U;
+    const uint32_t builder_count = state.full_pa.control.builder_count;
+    std::array<uint64_t, g0::kMaxBuilderCount> simt_raw_begin{};
+    std::array<uint64_t, g0::kMaxBuilderCount> simt_raw_end{};
+    simt_raw_begin.fill(UINT64_MAX);
     const uint32_t task_count = state.full_pa.control.task_count;
     for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
         const g0_swimlane::BuilderTaskTrace &builder = trace.builders[task_id];
-        simt_raw_begin = std::min(simt_raw_begin, builder.attempt_begin);
-        simt_raw_end = std::max(simt_raw_end, builder.report_end);
+        const uint32_t builder_instance = builder.build_owner - g0::kBuilderOwner;
+        simt_raw_begin[builder_instance] = std::min(simt_raw_begin[builder_instance], builder.attempt_begin);
+        simt_raw_end[builder_instance] = std::max(simt_raw_end[builder_instance], builder.report_end);
     }
-    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceSimtWriterCount; ++writer) {
+    for (uint32_t writer = 0U; writer < active_simt_writers; ++writer) {
+        const uint32_t builder_instance = writer / g0::kBuilderWarpCount;
         const uint32_t record_count = trace.simt_logs[writer].record_count;
         for (uint32_t slot = 0U; slot < record_count; ++slot) {
-            simt_raw_begin = std::min(simt_raw_begin, trace.simt_records[writer][slot].begin);
-            simt_raw_end = std::max(simt_raw_end, trace.simt_records[writer][slot].end);
+            simt_raw_begin[builder_instance] =
+                std::min(simt_raw_begin[builder_instance], trace.simt_records[writer][slot].begin);
+            simt_raw_end[builder_instance] =
+                std::max(simt_raw_end[builder_instance], trace.simt_records[writer][slot].end);
         }
     }
-    const g0_swimlane::RoleTrace &builder_role = trace.roles[g0::kBuilderOwner];
-    if (simt_raw_begin == UINT64_MAX || simt_raw_end <= simt_raw_begin ||
-        builder_role.work_end <= builder_role.work_begin) {
+    uint64_t builder_work_begin = UINT64_MAX;
+    uint64_t builder_work_end = 0U;
+    uint64_t max_simt_raw_span = 0U;
+    for (uint32_t builder = 0U; builder < builder_count; ++builder) {
+        const g0_swimlane::RoleTrace &builder_role = trace.roles[g0::BuilderOwnerForInstance(builder)];
+        builder_work_begin = std::min(builder_work_begin, builder_role.work_begin);
+        builder_work_end = std::max(builder_work_end, builder_role.work_end);
+        if (simt_raw_begin[builder] == UINT64_MAX || simt_raw_end[builder] <= simt_raw_begin[builder] ||
+            builder_role.work_end <= builder_role.work_begin) {
+            return false;
+        }
+        max_simt_raw_span = std::max(max_simt_raw_span, simt_raw_end[builder] - simt_raw_begin[builder]);
+    }
+    if (builder_work_begin == UINT64_MAX || builder_work_end <= builder_work_begin) {
         return false;
     }
-    const auto align_simt_clock = [&](uint64_t raw) {
-        const long double raw_offset = static_cast<long double>(raw - simt_raw_begin);
+    const auto align_simt_clock = [&](uint64_t raw, uint32_t builder_instance) {
+        const g0_swimlane::RoleTrace &builder_role =
+            trace.roles[g0::BuilderOwnerForInstance(builder_instance)];
+        const long double raw_offset = static_cast<long double>(raw - simt_raw_begin[builder_instance]);
         const long double scalar_span = static_cast<long double>(builder_role.work_end - builder_role.work_begin);
-        const long double raw_span = static_cast<long double>(simt_raw_end - simt_raw_begin);
+        const long double raw_span =
+            static_cast<long double>(simt_raw_end[builder_instance] - simt_raw_begin[builder_instance]);
         return builder_role.work_begin + static_cast<uint64_t>(raw_offset * scalar_span / raw_span + 0.5L);
     };
     std::ofstream output(path, std::ios::out | std::ios::trunc);
@@ -2818,14 +2858,18 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
         std::fprintf(stderr, "cannot open swimlane output: %s\n", path.c_str());
         return false;
     }
-    output << "{\"schema\":\"simt_cross_core_g0_swimlane_v2\","
+    output << "{\"schema\":\"simt_cross_core_g0_swimlane_v4\","
               "\"clock\":\"Scalar get_sys_cnt: 1 ns/tick; SIMT CLOCK64: raw ticks\","
-              "\"simt_alignment\":\"affine_to_builder_scalar_vf_envelope_for_display_only\","
+              "\"simt_alignment\":\"per_builder_affine_to_own_scalar_vf_envelope_for_display_only\","
               "\"simt_atomic_boundary\":\"source_issue; CCEC SIMT return-register dependency is not claimed\","
               "\"instrumented\":true,\"batches\":"
            << state.full_pa.control.batch_count << ",\"tasks\":" << state.full_pa.control.task_count
            << ",\"device_span_ns\":" << (finish - origin) << ",\"simt_clock64_span_ticks\":"
-           << (simt_raw_end - simt_raw_begin) << ",\"atomic_dcci_summary\":{"
+           << max_simt_raw_span << ",\"simt_clock64_span_ticks_by_builder\":[";
+    for (uint32_t builder = 0U; builder < builder_count; ++builder) {
+        output << (builder == 0U ? "" : ",") << (simt_raw_end[builder] - simt_raw_begin[builder]);
+    }
+    output << "],\"atomic_dcci_summary\":{"
            << "\"simt\":{\"atomic_calls\":" << simt_totals.atomic_calls << ",\"poll_calls\":"
            << simt_totals.poll_calls << ",\"records\":" << simt_totals.records
            << ",\"poll_records\":" << simt_totals.poll_records << "},\"scalar\":{\"atomic_calls\":"
@@ -2859,22 +2903,26 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
             UINT32_MAX, owner
         );
     }
-    for (uint32_t warp = 0U; warp < g0::kBuilderWarpCount; ++warp) {
+    for (uint32_t writer = 0U; writer < active_simt_writers; ++writer) {
+        const uint32_t builder = writer / g0::kBuilderWarpCount;
+        const uint32_t warp = writer % g0::kBuilderWarpCount;
         WriteTraceMetadata(
-            &output, &first, "thread_name", 2U, warp, "AIV0 SIMT warp " + std::to_string(warp)
+            &output, &first, "thread_name", 2U, writer,
+            "AIV" + std::to_string(builder) + " SIMT warp " + std::to_string(warp)
         );
     }
     for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
         const g0_swimlane::BuilderTaskTrace &builder = trace.builders[task_id];
         const g0::TaskKind kind = g0::TaskKindAt(task_id);
+        const uint32_t builder_instance = builder.build_owner - g0::kBuilderOwner;
         const uint32_t warp = builder.builder_thread / g0::kWarpSize;
         const std::string prefix = "task[" + std::to_string(task_id) + "] " + TraceTaskKindName(kind);
-        const uint64_t attempt_begin = align_simt_clock(builder.attempt_begin);
-        const uint64_t claim_end = align_simt_clock(builder.claim_end);
-        const uint64_t prepare_end = align_simt_clock(builder.prepare_end);
-        const uint64_t commit_begin = align_simt_clock(builder.commit_begin);
-        const uint64_t commit_end = align_simt_clock(builder.commit_end);
-        const uint64_t report_end = align_simt_clock(builder.report_end);
+        const uint64_t attempt_begin = align_simt_clock(builder.attempt_begin, builder_instance);
+        const uint64_t claim_end = align_simt_clock(builder.claim_end, builder_instance);
+        const uint64_t prepare_end = align_simt_clock(builder.prepare_end, builder_instance);
+        const uint64_t commit_begin = align_simt_clock(builder.commit_begin, builder_instance);
+        const uint64_t commit_end = align_simt_clock(builder.commit_end, builder_instance);
+        const uint64_t report_end = align_simt_clock(builder.report_end, builder_instance);
         WriteTraceEvent(
             &output, &first, prefix + " build", "simt_build", 2U, warp, attempt_begin, report_end, origin, task_id,
             builder.build_owner, builder.insert_poll_count
@@ -2916,12 +2964,14 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
             executor.execute_end, origin, task_id, executor.execute_owner
         );
     }
-    for (uint32_t writer = 0U; writer < g0_swimlane::kTraceSimtWriterCount; ++writer) {
+    for (uint32_t writer = 0U; writer < active_simt_writers; ++writer) {
+        const uint32_t builder_instance = writer / g0::kBuilderWarpCount;
         for (uint32_t slot = 0U; slot < trace.simt_logs[writer].record_count; ++slot) {
             const g0_swimlane::TraceRecord &record = trace.simt_records[writer][slot];
             WriteProfileTraceEvent(
                 &output, &first, record, g0_swimlane::TraceDomain::Simt, writer, 2U, writer,
-                align_simt_clock(record.begin), align_simt_clock(record.end), origin
+                align_simt_clock(record.begin, builder_instance),
+                align_simt_clock(record.end, builder_instance), origin
             );
         }
     }
@@ -2944,7 +2994,7 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
         "device_span_us=%.3Lf simt_build_span_us=%.3Lf atomic_calls(simt/scalar)=%llu/%llu "
         "dcci_calls=%llu dcci_lines=%llu\n",
         path.c_str(), static_cast<long double>(finish - origin) / 1000.0L,
-        static_cast<long double>(builder_role.work_end - builder_role.work_begin) / 1000.0L,
+        static_cast<long double>(builder_work_end - builder_work_begin) / 1000.0L,
         static_cast<unsigned long long>(simt_totals.atomic_calls),
         static_cast<unsigned long long>(scalar_totals.atomic_calls),
         static_cast<unsigned long long>(scalar_totals.dcci_calls),
@@ -3009,18 +3059,11 @@ bool ParseOptions(int argc, char **argv, Options *options) {
             options->runs = static_cast<uint32_t>(value);
         } else if (std::strcmp(argv[index], "--builders") == 0 && index + 1 < argc) {
             uint64_t value = 0U;
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-            if (!ParseUnsigned(argv[++index], 1U, &value) || value != 1U) {
-                std::fprintf(stderr, "invalid --builders value: %s (G0 swimlane requires 1)\n", argv[index]);
-                return false;
-            }
-#else
             if (!ParseUnsigned(argv[++index], g0::kMaxBuilderCount, &value) ||
                 !g0::BuilderCountValid(static_cast<uint32_t>(value))) {
                 std::fprintf(stderr, "invalid --builders value: %s (expected 1 or 2)\n", argv[index]);
                 return false;
             }
-#endif
             options->builder_count = static_cast<uint32_t>(value);
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
         } else if (std::strcmp(argv[index], "--swimlane-json") == 0 && index + 1 < argc) {
@@ -3037,11 +3080,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
             }
 #endif
         } else {
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-            constexpr const char *kBuilderUsage = "1";
-#else
             constexpr const char *kBuilderUsage = "1|2";
-#endif
             std::fprintf(
                 stderr,
                 "usage: %s --kernel FILE [--device N] [--batches 1|256] [--runs N] [--builders %s]"
@@ -3397,21 +3436,30 @@ int main(int argc, char **argv) {
         kernel_times_us.push_back(static_cast<double>(kernel_ms) * 1000.0);
         const FullPaState &full_pa = FullPaView(*state);
         std::array<uint32_t, g0::kMaxBuilderCount> builder_wins{};
+        uint64_t insert_poll_sum = 0U;
+        uint32_t insert_poll_max = 0U;
         for (uint32_t task_id = 0U; task_id < options.batches * kHostTasksPerBatch; ++task_id) {
             const uint32_t builder = full_pa.tasks[task_id].plan.builder_owner - g0::kBuilderOwner;
             ++builder_wins[builder];
+            const uint32_t insert_polls = full_pa.tasks[task_id].build_report.insert_poll_count;
+            insert_poll_sum += insert_polls;
+            insert_poll_max = std::max(insert_poll_max, insert_polls);
         }
         std::printf(
             "[PASS] run=%u nonce=0x%llx active_tasks=%u kernel_tasks=%u heap_bytes=%llu "
             "builder_attempts_per_task=%u builder_wins=%u",
             run + 1U, static_cast<unsigned long long>(nonce), options.batches * kHostTasksPerBatch,
             options.batches * 4U, static_cast<unsigned long long>(ExpectedHeapBytes(options.batches)),
-            options.builder_count, builder_wins[0]
+            1U, builder_wins[0]
         );
         if (options.builder_count == g0::kMaxBuilderCount) {
             std::printf("/%u", builder_wins[1]);
         }
-        std::printf(" same_device_addresses=yes kernel_event_us=%.3f\n", static_cast<double>(kernel_ms) * 1000.0);
+        std::printf(
+            " insert_polls=%llu max_insert_polls=%u same_device_addresses=yes kernel_event_us=%.3f\n",
+            static_cast<unsigned long long>(insert_poll_sum), insert_poll_max,
+            static_cast<double>(kernel_ms) * 1000.0
+        );
     }
     if (!kernel_times_us.empty()) {
         std::sort(kernel_times_us.begin(), kernel_times_us.end());

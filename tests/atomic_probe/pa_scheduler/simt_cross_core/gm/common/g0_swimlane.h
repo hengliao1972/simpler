@@ -22,22 +22,22 @@ namespace pa_scheduler::simt_cross_core::g0_swimlane {
 using namespace pa_scheduler::simt_cross_core::g0;
 
 constexpr uint64_t kTraceMagic = UINT64_C(0x47305357494D4C4E);
-constexpr uint64_t kTraceVersion = 2U;
+constexpr uint64_t kTraceVersion = 4U;
 constexpr uint64_t kTracePoison = UINT64_C(0xD3D3D3D3D3D3D3D3);
 constexpr uint32_t kTraceTaskCapacity = kDefaultBatches * kTasksPerBatch;
-constexpr uint32_t kTraceSimtWriterCount = kBuilderWarpCount;
+constexpr uint32_t kTraceSimtWriterCount = kMaxBuilderLeaderCount;
 constexpr uint32_t kTraceScalarWriterCount = kOwnerCount;
-// G0 profiling 变体只支持单 builder。B256 时每个 warp 最多构建 20 个
-// task；1024 条记录足以逐条保存固定 atomic，并把任意长度的 poll episode
-// 合成一条。Scalar owner 的任务数更少，512 条同样保留充足余量。
-constexpr uint32_t kTraceSimtRecordsPerWriter = 1024U;
+// profiling 变体同时覆盖单/双 builder。数组按两个 builder 的最大 writer
+// 数预留；control.simt_writer_count 只记录本次启动的活跃 writer。8192 条
+// 可覆盖每 builder 低至 8 warp 的性能扫描，任意长度 poll 仍合成一条。
+constexpr uint32_t kTraceSimtRecordsPerWriter = 8192U;
 constexpr uint32_t kTraceScalarRecordsPerWriter = 512U;
 constexpr uint32_t kTraceNoTask = UINT32_MAX;
-// 每个 warp 在 B256 最多处理 20 个 task。当前协议每 task 最多
+// 单 builder 是每个 writer 的最坏任务数。当前协议每 task 最多
 // 40 条非 poll/poll-episode 记录，再给 builder 启停/异常保留 16 条；
 // 这个静态上界允许 SIMT writer 去掉每条 raw 路径上的分歧容量检查。
 constexpr uint32_t kTraceSimtMaxTasksPerWriter =
-    (kTraceTaskCapacity + kTraceSimtWriterCount - 1U) / kTraceSimtWriterCount;
+    (kTraceTaskCapacity + kBuilderWarpCount - 1U) / kBuilderWarpCount;
 constexpr uint32_t kTraceSimtMaxRecordsPerTask = 40U;
 constexpr uint32_t kTraceSimtFixedRecordsPerWriter = 16U;
 static_assert(

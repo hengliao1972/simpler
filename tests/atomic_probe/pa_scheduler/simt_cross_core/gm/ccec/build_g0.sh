@@ -155,21 +155,23 @@ COMMON_DEVICE_FLAGS=(
     -I"$SIMT_ROOT/common"
 )
 
-echo "[CHECK] G0/G1 source closure, one/two 64-warp builders and publication order (variant=$G0_VARIANT)"
+echo "[CHECK] G0/G1 source closure, one/two 16-warp builders and publication order (variant=$G0_VARIANT)"
 if rg -n '#include.*(cross_core|ops-nn)' "$SIMT_ROOT" -g '*.h' -g '*.cpp'; then
     echo "G0 must not include cross_core or ops-nn source files." >&2
     exit 1
 fi
-if ! grep -Fq 'constexpr uint32_t kBuilderWarpCount = 64U;' "$MODEL_SOURCE" ||
+if ! grep -Fq 'constexpr uint32_t kBuilderWarpCount = 16U;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kBuilderThreadCount = kBuilderWarpCount * kWarpSize;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kMaxBuilderCount = 2U;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kMaxBuilderThreadCount = kBuilderThreadCount * kMaxBuilderCount;' "$MODEL_SOURCE" ||
    ! grep -Fq 'constexpr uint32_t kBuilderTaskStride = kBuilderWarpCount;' "$MODEL_SOURCE" ||
-   ! rg -q -U 'static_assert\(\s*kBuilderThreadCount == 2048U && kBuilderLeaderCount == 64U' "$MODEL_SOURCE" ||
+   ! rg -q -U 'static_assert\(\s*kBuilderThreadCount == 512U && kBuilderLeaderCount == 16U' "$MODEL_SOURCE" ||
    ! grep -Fq 'const bool active = lane == 0U && warp < kBuilderWarpCount;' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'task_id = warp; task_id < task_count; task_id += kBuilderTaskStride' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'const uint32_t first_assigned_task = builder_instance * kBuilderWarpCount + warp;' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'const uint32_t task_stride = builder_count * kBuilderWarpCount;' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'task_id = first_assigned_task; task_id < task_count; task_id += task_stride' "$KERNEL_SOURCE" ||
    ! grep -Fq 'cce::dim3{kBuilderThreadCount, 1U, 1U}' "$KERNEL_SOURCE"; then
-    echo "G0/G1 must launch 2048 SIMT threads per builder and let only lane 0 of each of 64 warps attempt tasks." >&2
+    echo "G0/G1 must launch 512 SIMT threads per builder and statically shard tasks across lane 0 of every builder warp." >&2
     exit 1
 fi
 if ! grep -Fq 'BuilderCountValid(state->control.builder_count)' "$KERNEL_SOURCE" ||
@@ -178,7 +180,7 @@ if ! grep -Fq 'BuilderCountValid(state->control.builder_count)' "$KERNEL_SOURCE"
    ! grep -Fq 'const uint32_t global_warp = builder_instance * kBuilderWarpCount + warp;' "$KERNEL_SOURCE" ||
    ! grep -Fq 'if (aiv_id >= state->control.builder_count)' "$KERNEL_SOURCE" ||
    ! grep -Fq 'state->control.builder_count, owner' "$KERNEL_SOURCE"; then
-    echo "G0/G1 must keep 2048 threads per VF while selecting one or two fixed builder AIVs at runtime." >&2
+    echo "G0/G1 must keep 512 threads per VF while selecting one or two fixed builder AIVs at runtime." >&2
     exit 1
 fi
 if ! grep -Fq 'if (thread == 0U)' "$KERNEL_SOURCE" ||
@@ -210,32 +212,33 @@ vf_start_line="$(grep -nF 'void G0SimtBuildTasks(' "$KERNEL_SOURCE" | cut -d: -f
 vf_end_line="$(grep -nF '#endif  // defined(__DAV_VEC__)' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
 builder_publish_line="$(grep -nF 'g0_swimlane::AtomicSite::SimtBuilderFinishedPublish' "$KERNEL_SOURCE" | cut -d: -f1)"
 builder_gate_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /const bool start_ready/ {print NR; exit}' "$KERNEL_SOURCE")"
-attempt_line="$(grep -nF 'g0_swimlane::AtomicSite::SimtTaskBuildAttemptIncrement' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
 claim_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /const uint32_t claim = SimtTryClaimTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
-win_line="$(grep -nF 'g0_swimlane::AtomicSite::SimtTaskBuildPreparedIncrement' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
 prepare_call_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /if \(!SimtPrepareTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
 commit_call_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /if \(!SimtCommitTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
+report_direct_line="$(grep -nF 'asc_stcg(report + 6U' "$KERNEL_SOURCE" | cut -d: -f1)"
 async_line="$(grep -nF 'cce::async_invoke<G0SimtBuildTasks>' "$KERNEL_SOURCE" | cut -d: -f1)"
 builder_wait_line="$(awk '/cce::async_invoke<G0SimtBuildTasks>/ {inside=1} inside && /wait_flag\(PIPE_V, PIPE_S, EVENT_ID0\)/ {print NR; exit}' "$KERNEL_SOURCE")"
 leader_report_guard_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /^[[:space:]]*if \(active\) \{$/ {print NR; exit}' "$KERNEL_SOURCE")"
 thread_report_line="$(grep -nF 'thread_report_words + global_thread * kThreadReportStrideWords' "$KERNEL_SOURCE" | cut -d: -f1)"
 if [[ -z "$vf_start_line" || -z "$vf_end_line" || -z "$builder_publish_line" || -z "$builder_gate_line" ||
-      -z "$attempt_line" || -z "$claim_line" || -z "$win_line" || -z "$prepare_call_line" ||
-      -z "$commit_call_line" || -z "$async_line" || -z "$builder_wait_line" ||
+      -z "$claim_line" || -z "$prepare_call_line" || -z "$commit_call_line" || -z "$report_direct_line" ||
+      -z "$async_line" || -z "$builder_wait_line" ||
       -z "$leader_report_guard_line" || -z "$thread_report_line" ]] ||
-   ! (( vf_start_line < builder_gate_line && builder_gate_line < attempt_line && attempt_line < claim_line &&
-         claim_line < win_line && win_line < prepare_call_line && prepare_call_line < commit_call_line &&
-         commit_call_line < builder_publish_line && builder_publish_line < leader_report_guard_line &&
+   ! (( vf_start_line < builder_gate_line && builder_gate_line < claim_line && claim_line < prepare_call_line &&
+         prepare_call_line < commit_call_line && commit_call_line < report_direct_line &&
+         report_direct_line < builder_publish_line && builder_publish_line < leader_report_guard_line &&
          leader_report_guard_line < thread_report_line && thread_report_line < vf_end_line &&
          vf_end_line < async_line && async_line < builder_wait_line )); then
-    echo "G0/G1 must gate both VFs, record attempt/win, claim before task writes, and publish builder_finished in SIMT." >&2
+    echo "G0/G1 must gate both VFs, claim before task writes, publish direct diagnostic evidence, and finish in SIMT." >&2
     exit 1
 fi
 if grep -Eq '^[[:space:]]*report\[[0-7](U)?\][[:space:]]*=' "$KERNEL_SOURCE" ||
    ! grep -Fq 'SimtPublishBuildReportWord(' "$KERNEL_SOURCE" ||
    ! grep -Fq 'g0_swimlane::AtomicSite::SimtBuildReportPublish' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'kReportPoisonWord, value, true' "$KERNEL_SOURCE"; then
-    echo "G0/G1 task build-report cacheline must use atomics only; ordinary SIMT stores may race with word-6 evidence." >&2
+   ! grep -Fq 'kReportPoisonWord, value, true' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'asc_stcg(report + 6U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U));' \
+       "$KERNEL_SOURCE"; then
+    echo "G0/G1 statically owned build reports must use non-cacheable stores; U2 keeps its separate atomic evidence path." >&2
     exit 1
 fi
 if ! grep -Fq 'plan[4] = static_cast<uint64_t>(encoded_meta)' "$KERNEL_SOURCE" ||
@@ -373,7 +376,7 @@ echo "[BUILD] CCEC G0 AIC Cube executors (dav-c310-cube)"
 "$CCEC" "${COMMON_DEVICE_FLAGS[@]}" "${DEVICE_VARIANT_FLAGS[@]}" --cce-aicore-arch=dav-c310-cube \
     -o "$AIC_OBJECT" "$KERNEL_SOURCE"
 
-echo "[BUILD] CCEC G0 AIV 64-warp SIMT builder/Vector executors (dav-c310-vec)"
+echo "[BUILD] CCEC G0 AIV SIMT builder/Vector executors (dav-c310-vec)"
 "$CCEC" "${COMMON_DEVICE_FLAGS[@]}" "${DEVICE_VARIANT_FLAGS[@]}" "${AIV_VARIANT_FLAGS[@]}" \
     --cce-aicore-arch=dav-c310-vec \
     -o "$AIV_OBJECT" "$KERNEL_SOURCE"

@@ -1587,7 +1587,9 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             active G0_SIMT_TRACE_ARGUMENT
         );
     if (active && start_ready) {
-        for (uint32_t task_id = warp; task_id < task_count; task_id += kBuilderTaskStride) {
+        const uint32_t first_assigned_task = builder_instance * kBuilderWarpCount + warp;
+        const uint32_t task_stride = builder_count * kBuilderWarpCount;
+        for (uint32_t task_id = first_assigned_task; task_id < task_count; task_id += task_stride) {
             if (G0_TRACE_SIMT_ADD(
                     simt_trace, task_id, g0_swimlane::AtomicSite::FatalLoad, fatal,
                     static_cast<uint64_t>(0U), true
@@ -1599,10 +1601,6 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             const uint64_t trace_attempt_begin = clock();
 #endif
             __gm__ uint64_t *report = task_words + task_id * kTaskStrideWords + kBuildReportOffsetWords;
-            (void)G0_TRACE_SIMT_ADD(
-                simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBuildAttemptIncrement,
-                report + 6U, static_cast<uint64_t>(1U), false
-            );
             const uint32_t claim = SimtTryClaimTask(
                 task_words, fatal, nonce, task_id, build_owner, builder_count G0_SIMT_TRACE_ARGUMENT
             );
@@ -1621,10 +1619,6 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             builder_trace->builder_thread = global_thread;
             builder_trace->build_owner = build_owner;
 #endif
-            (void)G0_TRACE_SIMT_ADD(
-                simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBuildPreparedIncrement,
-                report + 6U, static_cast<uint64_t>(1U) << 32U, false
-            );
             uint64_t completion_vend = 0U;
             uint32_t payload_words = 0U;
             if (!SimtPrepareTask(
@@ -1641,7 +1635,7 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             ++prepared;
             uint32_t task_insert_polls = 0U;
             int64_t predecessor_observed = -1;
-                if (!SimtCommitTask(
+            if (!SimtCommitTask(
                     task_words, alloc_done, fatal, nonce, timeout_ticks, task_id, build_owner, completion_vend,
                     &task_insert_polls, &predecessor_observed G0_SIMT_TRACE_ARGUMENT
                 )) {
@@ -1667,35 +1661,23 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
                                                                                                                   0U);
             uint32_t phases = kBuildPreparedBit | kBuildOutputsPublishedBit | kBuildInsertCommittedBit;
             phases |= kind == static_cast<uint32_t>(TaskKind::Alloc) ? kBuildAllocCompletedBit : kBuildExecPublishedBit;
-            if (!SimtPublishBuildReportWord(
-                    report, static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(global_thread) << 32U),
-                    task_id G0_SIMT_TRACE_ARGUMENT
-                ) ||
-                !SimtPublishBuildReportWord(
-                    report + 1U, static_cast<uint64_t>(global_warp), task_id G0_SIMT_TRACE_ARGUMENT
-                ) ||
-                !SimtPublishBuildReportWord(
-                    report + 2U, static_cast<uint64_t>(phases) | (static_cast<uint64_t>(output_count) << 32U),
-                    task_id G0_SIMT_TRACE_ARGUMENT
-                ) ||
-                !SimtPublishBuildReportWord(
-                    report + 3U,
-                    static_cast<uint64_t>(payload_words) | (static_cast<uint64_t>(task_insert_polls) << 32U),
-                    task_id G0_SIMT_TRACE_ARGUMENT
-                ) ||
-                !SimtPublishBuildReportWord(
-                    report + 4U, static_cast<uint64_t>(predecessor_observed), task_id G0_SIMT_TRACE_ARGUMENT
-                ) ||
-                !SimtPublishBuildReportWord(
-                    report + 5U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U),
-                    task_id G0_SIMT_TRACE_ARGUMENT
-                ) ||
-                !SimtPublishBuildReportWord(report + 7U, nonce, task_id G0_SIMT_TRACE_ARGUMENT)) {
-                SimtPublishFatal(
-                    fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
-                );
-                break;
-            }
+            asc_stcg(
+                report,
+                static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(global_thread) << 32U)
+            );
+            asc_stcg(report + 1U, static_cast<uint64_t>(global_warp));
+            asc_stcg(
+                report + 2U,
+                static_cast<uint64_t>(phases) | (static_cast<uint64_t>(output_count) << 32U)
+            );
+            asc_stcg(
+                report + 3U,
+                static_cast<uint64_t>(payload_words) | (static_cast<uint64_t>(task_insert_polls) << 32U)
+            );
+            asc_stcg(report + 4U, static_cast<uint64_t>(predecessor_observed));
+            asc_stcg(report + 5U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U));
+            asc_stcg(report + 6U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U));
+            asc_stcg(report + 7U, nonce);
             asc_threadfence();
             if (task_id + 1U == task_count) {
                 if (G0_TRACE_SIMT_CAS(

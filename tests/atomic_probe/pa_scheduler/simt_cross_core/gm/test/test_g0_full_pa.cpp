@@ -331,7 +331,7 @@ public:
         for (uint32_t builder = 0U; builder < builder_count_; ++builder) {
             for (uint32_t warp = 0U; warp < kBuilderWarpCount; ++warp) {
                 const uint32_t leader = builder * kBuilderLeaderCount + warp;
-                const uint32_t thread_id = BuilderThreadForTask(warp, builder);
+                const uint32_t thread_id = BuilderThreadForInstanceWarp(builder, warp);
                 leaders.emplace_back([this, leader, thread_id, &start_gate, &builder_ok] {
                     start_gate.ArriveAndWait();
                     builder_ok[leader].store(
@@ -529,7 +529,8 @@ private:
         FullPaBuilderThreadReport &report = builder_threads_[thread_id];
         const uint32_t owner = BuilderOwnerForThread(thread_id);
         const uint32_t first_attempt = BuilderFirstTask(thread_id, builder_count_);
-        for (uint32_t task_id = first_attempt; task_id < task_count_; task_id += kBuilderTaskStride) {
+        for (uint32_t task_id = first_attempt; task_id < task_count_;
+             task_id += BuilderLeaderCount(builder_count_)) {
             ++report.task_state_access_count;
             const BuildAttemptResult result = BuildTask(task_id, thread_id);
             if (result == BuildAttemptResult::Error) {
@@ -562,7 +563,7 @@ private:
             CpuTask &task = tasks_[task_id];
             const uint32_t attempts = task.build_attempt_count.load(std::memory_order_acquire);
             const uint32_t wins = task.build_win_count.load(std::memory_order_acquire);
-            if (attempts != builder_count_ || wins != 1U) {
+            if (attempts != 1U || wins != 1U) {
                 PublishFatal(ExecFatalReason::ControlPublishConflict, task_id, kBuilderOwner);
                 return false;
             }
@@ -1230,9 +1231,8 @@ private:
                 !BuilderThreadActive(builder_thread, builder_count_)) {
                 return false;
             }
-            const uint32_t builder_instance = BuilderInstance(builder_thread);
             const uint32_t build_owner = BuilderOwnerForThread(builder_thread);
-            if (builder_thread != BuilderThreadForTask(task_id, builder_instance) ||
+            if (builder_thread != BuilderThreadForTask(task_id, builder_count_) ||
                 !IsBuilderOwner(build_owner, builder_count_)) {
                 return false;
             }
@@ -1245,7 +1245,7 @@ private:
             } else if (task.completion_flag.load(std::memory_order_acquire) != 1) {
                 return false;
             }
-            if (!ConsecutiveTasksUseDifferentWarps(task_id) || task.plan.task_id != task_id ||
+            if (!ConsecutiveTasksHaveSafeBuilderMapping(task_id, builder_count_) || task.plan.task_id != task_id ||
                 task.plan.batch != TaskBatch(task_id) || task.plan.kind != TaskKindAt(task_id) ||
                 task.plan.engine_class != TaskEngine(TaskKindAt(task_id)) ||
                 task.plan.output_count != TaskOutputCount(kind) || task.plan.payload_lines != layout.payload_lines ||
@@ -1260,7 +1260,7 @@ private:
                 task.build_report.phase_bits != expected_phase_bits ||
                 task.build_report.output_count != TaskOutputCount(kind) ||
                 task.build_report.payload_words != layout.written_words || task.build_report.launch_nonce != nonce_ ||
-                task.build_report.build_attempt_count != builder_count_ || task.build_report.build_win_count != 1U ||
+                task.build_report.build_attempt_count != 1U || task.build_report.build_win_count != 1U ||
                 task.build_report.prepare_count != 1U || task.build_report.commit_count != 1U ||
                 task.insert_completion.load(std::memory_order_acquire) != static_cast<int64_t>(task_id)) {
                 return false;
@@ -1299,7 +1299,7 @@ private:
             if (wins > attempts) {
                 return false;
             }
-            const uint32_t losses = attempts - wins;
+            const uint32_t losses = 0U;
             const uint64_t checksum = BuilderReportChecksum(
                 nonce_, thread, task_count_, wins, expected_first[thread], expected_last[thread], attempts, wins, wins,
                 expected_waits[thread], losses
@@ -1318,8 +1318,7 @@ private:
             total_wins += wins;
             total_losses += losses;
         }
-        return total_attempts == static_cast<uint64_t>(builder_count_) * task_count_ && total_wins == task_count_ &&
-               total_losses == static_cast<uint64_t>(builder_count_ - 1U) * task_count_;
+        return total_attempts == task_count_ && total_wins == task_count_ && total_losses == 0U;
     }
 
     bool ValidateHeapAndOutputs() const {
@@ -2484,7 +2483,7 @@ int main(int argc, char **argv) {
         }
     }
     std::printf(
-        "[PASS] G0 CPU complete: builders=1/2, B1/B256, 64 leaders/builder, unique build claim, "
+        "[PASS] G0 CPU complete: builders=1/2, B1/B256, 16 leaders/builder, unique build claim, "
         "8-shard heap, exact DAG/payload, 4-token tickets, fanin/completion/drain/tail, "
         "same-address reuse rounds=%u\n",
         rounds
