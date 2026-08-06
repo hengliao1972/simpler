@@ -1060,8 +1060,12 @@ bool ValidateTask(
             failure, "completion-padding-mutated", task_id
         ) ||
         !RecordCheck(
-            task.insert_completion.value == static_cast<int64_t>(task_id), failure, "insert-completion", task_id,
-            UINT32_MAX, UINT32_MAX, task_id, static_cast<uint64_t>(task.insert_completion.value)
+            task.insert_completion.value ==
+                (expected.kind == HostTaskKind::Up ? static_cast<int64_t>(task_id) :
+                                                     static_cast<int64_t>(task_id) - 1),
+            failure, "insert-completion", task_id, UINT32_MAX, UINT32_MAX,
+            expected.kind == HostTaskKind::Up ? task_id : static_cast<uint64_t>(static_cast<int64_t>(task_id) - 1),
+            static_cast<uint64_t>(task.insert_completion.value)
         ) ||
         !RecordCheck(
             AtomicPaddingMatches(task.insert_completion, initial_task.insert_completion), failure,
@@ -1205,12 +1209,19 @@ bool ValidateTask(
             UINT32_MAX, expected.written_words, report.payload_words
         ) ||
         !RecordCheck(
-            task_id == 0U ? report.insert_poll_count == 0U : report.insert_poll_count >= 1U, failure,
-            "build-report-insert-poll", task_id
+            expected.kind == HostTaskKind::Up && expected.batch != 0U ? report.insert_poll_count >= 1U :
+                                                                           report.insert_poll_count == 0U,
+            failure, "build-report-insert-poll", task_id
         ) ||
         !RecordCheck(
-            report.predecessor_observed == static_cast<int64_t>(task_id) - 1, failure, "build-report-predecessor",
-            task_id, UINT32_MAX, UINT32_MAX, static_cast<uint64_t>(static_cast<int64_t>(task_id) - 1),
+            report.predecessor_observed ==
+                (expected.kind == HostTaskKind::Up && expected.batch != 0U ?
+                     static_cast<int64_t>(task_id - kHostTasksPerBatch) :
+                     -1),
+            failure, "build-report-predecessor", task_id, UINT32_MAX, UINT32_MAX,
+            static_cast<uint64_t>(expected.kind == HostTaskKind::Up && expected.batch != 0U ?
+                                      static_cast<int64_t>(task_id - kHostTasksPerBatch) :
+                                      -1),
             static_cast<uint64_t>(report.predecessor_observed)
         ) ||
         !RecordCheck(
@@ -1408,7 +1419,8 @@ bool ValidateBuilderThreads(
             expected_first[thread_id] = task_id;
         }
         expected_last[thread_id] = task_id;
-        expected_waits[thread_id] += task_id == 0U ? 0U : 1U;
+        const HostTaskOracle task = BuildHostTaskOracle(task_id);
+        expected_waits[thread_id] += task.kind == HostTaskKind::Up && task.batch != 0U ? 1U : 0U;
     }
 
     uint64_t win_sum = 0U;
@@ -2113,8 +2125,9 @@ bool TraceAtomicSiteAllowed(g0_swimlane::TraceDomain domain, g0_swimlane::Atomic
     }
     const uint32_t site_id = static_cast<uint32_t>(site);
     return domain == g0_swimlane::TraceDomain::Simt ?
-               site_id >= static_cast<uint32_t>(g0_swimlane::AtomicSite::SimtBuilderStartedIncrement) &&
-                   site_id <= static_cast<uint32_t>(g0_swimlane::AtomicSite::SimtBuilderFinishedPublish) :
+               (site_id >= static_cast<uint32_t>(g0_swimlane::AtomicSite::SimtBuilderStartedIncrement) &&
+                    site_id <= static_cast<uint32_t>(g0_swimlane::AtomicSite::SimtBuilderFinishedPublish)) ||
+                   site == g0_swimlane::AtomicSite::SimtMetadataOutputPublishedPoll :
                site_id >= static_cast<uint32_t>(g0_swimlane::AtomicSite::ScalarDispatchTicket) &&
                    site_id <= static_cast<uint32_t>(g0_swimlane::AtomicSite::ScalarRootFinishedPublish);
 }
@@ -2595,6 +2608,8 @@ const char *TraceAtomicSiteName(g0_swimlane::AtomicSite site) {
         return "scalar_drain_verify_load";
     case g0_swimlane::AtomicSite::ScalarRootFinishedPublish:
         return "scalar_root_finished_publish";
+    case g0_swimlane::AtomicSite::SimtMetadataOutputPublishedPoll:
+        return "simt_metadata_output_published_poll";
     case g0_swimlane::AtomicSite::Count:
         return "count";
     }
@@ -2858,7 +2873,7 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
         std::fprintf(stderr, "cannot open swimlane output: %s\n", path.c_str());
         return false;
     }
-    output << "{\"schema\":\"simt_cross_core_g0_swimlane_v4\","
+    output << "{\"schema\":\"simt_cross_core_g0_swimlane_v5\","
               "\"clock\":\"Scalar get_sys_cnt: 1 ns/tick; SIMT CLOCK64: raw ticks\","
               "\"simt_alignment\":\"per_builder_affine_to_own_scalar_vf_envelope_for_display_only\","
               "\"simt_atomic_boundary\":\"source_issue; CCEC SIMT return-register dependency is not claimed\","

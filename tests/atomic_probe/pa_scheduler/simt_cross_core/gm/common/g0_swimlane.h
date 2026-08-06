@@ -22,7 +22,7 @@ namespace pa_scheduler::simt_cross_core::g0_swimlane {
 using namespace pa_scheduler::simt_cross_core::g0;
 
 constexpr uint64_t kTraceMagic = UINT64_C(0x47305357494D4C4E);
-constexpr uint64_t kTraceVersion = 4U;
+constexpr uint64_t kTraceVersion = 5U;
 constexpr uint64_t kTracePoison = UINT64_C(0xD3D3D3D3D3D3D3D3);
 constexpr uint32_t kTraceTaskCapacity = kDefaultBatches * kTasksPerBatch;
 constexpr uint32_t kTraceSimtWriterCount = kMaxBuilderLeaderCount;
@@ -110,7 +110,8 @@ enum class AtomicSite : uint16_t {
     ScalarDrainArrivalPoll = 36U,
     ScalarDrainVerifyLoad = 37U,
     ScalarRootFinishedPublish = 38U,
-    Count = 39U,
+    SimtMetadataOutputPublishedPoll = 39U,
+    Count = 40U,
 };
 
 enum class DcciOp : uint8_t {
@@ -148,6 +149,7 @@ SIMT_CROSS_CORE_G0_TRACE_INLINE AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
     case AtomicSite::SimtHeapVendLoad:
     case AtomicSite::SimtProducerTaskBasePoll:
     case AtomicSite::SimtInsertPredecessorPoll:
+    case AtomicSite::SimtMetadataOutputPublishedPoll:
     case AtomicSite::ScalarProducerTaskBaseLoad:
     case AtomicSite::ScalarExecStatePoll:
     case AtomicSite::ScalarFaninFlagPoll:
@@ -178,6 +180,7 @@ SIMT_CROSS_CORE_G0_TRACE_INLINE bool AtomicSiteIsPoll(AtomicSite site) {
     return site == AtomicSite::SimtBuilderStartedPoll ||
            site == AtomicSite::SimtProducerTaskBasePoll ||
            site == AtomicSite::SimtInsertPredecessorPoll ||
+           site == AtomicSite::SimtMetadataOutputPublishedPoll ||
            site == AtomicSite::ScalarExecStatePoll ||
            site == AtomicSite::ScalarFaninFlagPoll ||
            site == AtomicSite::ScalarDrainArrivalPoll;

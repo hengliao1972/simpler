@@ -824,6 +824,119 @@ SimtExternalDescriptorWord(uint32_t batch_count, uint32_t task_id, uint32_t tens
     );
 }
 
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtStoreDescriptor(
+    __gm__ uint64_t *destination, uint64_t address, uint64_t buffer_size, uint64_t owner_task,
+    uint64_t start_offset, uint32_t ndims, uint32_t dtype, bool manual_dep, uint32_t shape0,
+    uint32_t shape1
+) {
+    destination[0] = address;
+    destination[1] = buffer_size;
+    destination[2] = owner_task;
+    destination[3] = start_offset;
+    destination[4] = static_cast<uint64_t>(ndims) << 32U;
+    destination[5] = static_cast<uint64_t>(dtype) |
+                     (static_cast<uint64_t>(manual_dep ? 1U : 0U) << 8U) |
+                     (static_cast<uint64_t>(1U) << 16U) |
+                     (static_cast<uint64_t>(shape0) << 32U);
+    destination[6] = shape1;
+    destination[7] = 0U;
+    destination[8] = ndims == 1U ? shape0 : static_cast<uint64_t>(shape0) * shape1;
+    const uint32_t stride0 = ndims == 1U ? 1U : shape1;
+    const uint32_t stride1 = ndims == 1U ? 0U : 1U;
+    destination[9] = static_cast<uint64_t>(stride0) | (static_cast<uint64_t>(stride1) << 32U);
+    destination[10] = 0U;
+    destination[11] = 0U;
+    destination[12] = 0U;
+    destination[13] = 0U;
+    destination[14] = 0U;
+    destination[15] = 0U;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtStoreOutputDescriptor(
+    __gm__ uint64_t *destination, uint32_t task_id, uint32_t output_slot, uint64_t task_base
+) {
+    const uint32_t kind = task_id % kTasksPerBatch;
+    uint64_t output_offset = 0U;
+    uint32_t ndims = 0U;
+    uint32_t dtype = static_cast<uint32_t>(DataType::Float32);
+    uint32_t shape0 = 0U;
+    uint32_t shape1 = 0U;
+    if (kind == static_cast<uint32_t>(TaskKind::Alloc)) {
+        ndims = output_slot == 0U ? 2U : 1U;
+        shape0 = kPaHeads;
+        shape1 = output_slot == 0U ? kPaHeadDim : 0U;
+        output_offset = output_slot == 0U ? 0U : (output_slot == 1U ? 8192U : 9216U);
+    } else if (kind == static_cast<uint32_t>(TaskKind::Qk)) {
+        ndims = 2U;
+        shape0 = kPaHeads;
+        shape1 = kPaBlocksPerRequest * kPaBlockSize;
+    } else if (kind == static_cast<uint32_t>(TaskKind::Sf)) {
+        ndims = output_slot == 0U ? 2U : 1U;
+        dtype = output_slot == 0U ? static_cast<uint32_t>(DataType::Bfloat16) :
+                                   static_cast<uint32_t>(DataType::Float32);
+        shape0 = kPaHeads;
+        shape1 = output_slot == 0U ? kPaBlocksPerRequest * kPaBlockSize : 0U;
+        output_offset = output_slot == 0U ? 0U : (output_slot == 1U ? 262144U : 263168U);
+    } else if (kind == static_cast<uint32_t>(TaskKind::Pv)) {
+        ndims = 2U;
+        shape0 = kPaHeads;
+        shape1 = kPaHeadDim;
+    }
+    const uint64_t elements = ndims == 1U ? shape0 : static_cast<uint64_t>(shape0) * shape1;
+    const uint64_t element_bytes = dtype == static_cast<uint32_t>(DataType::Bfloat16) ? 2U : 4U;
+    SimtStoreDescriptor(
+        destination, kSyntheticHeapBase + task_base + output_offset, elements * element_bytes,
+        task_id, 0U, ndims, dtype, false, shape0, shape1
+    );
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtStoreExternalDescriptor(
+    __gm__ uint64_t *destination, uint32_t batch_count, uint32_t task_id, uint32_t tensor_index
+) {
+    const uint32_t kind = task_id % kTasksPerBatch;
+    const uint32_t batch = task_id / kTasksPerBatch;
+    uint64_t address = 0U;
+    uint64_t buffer_size = 0U;
+    uint64_t start_offset = 0U;
+    uint32_t dtype = static_cast<uint32_t>(DataType::Float32);
+    bool manual_dep = false;
+    uint32_t shape0 = 0U;
+    uint32_t shape1 = 0U;
+    if (kind == static_cast<uint32_t>(TaskKind::Qk) && tensor_index == 0U) {
+        address = kSyntheticQueryBase;
+        buffer_size = static_cast<uint64_t>(batch_count) * kPaHeads * kPaHeadDim * 2U;
+        start_offset = static_cast<uint64_t>(batch) * kPaHeads * kPaHeadDim;
+        dtype = static_cast<uint32_t>(DataType::Bfloat16);
+        shape0 = kPaHeads;
+        shape1 = kPaHeadDim;
+    } else if ((kind == static_cast<uint32_t>(TaskKind::Qk) && tensor_index == 1U) ||
+               (kind == static_cast<uint32_t>(TaskKind::Pv) && tensor_index == 1U)) {
+        address = kind == static_cast<uint32_t>(TaskKind::Qk) ? kSyntheticKeyBase : kSyntheticValueBase;
+        shape0 = batch_count * kPaBlocksPerRequest * kPaBlockSize;
+        shape1 = kPaHeadDim;
+        dtype = static_cast<uint32_t>(DataType::Bfloat16);
+        buffer_size = static_cast<uint64_t>(shape0) * shape1 * 2U;
+    } else if ((kind == static_cast<uint32_t>(TaskKind::Qk) || kind == static_cast<uint32_t>(TaskKind::Pv)) &&
+               tensor_index == 2U) {
+        address = kSyntheticBlockTableBase;
+        shape0 = batch_count;
+        shape1 = kPaMaxBlocksPerRequest;
+        dtype = static_cast<uint32_t>(DataType::Int32);
+        buffer_size = static_cast<uint64_t>(shape0) * shape1 * 4U;
+    } else {
+        address = kSyntheticOutputBase;
+        buffer_size = static_cast<uint64_t>(batch_count) * kPaHeads * kPaHeadDim * 4U;
+        start_offset = static_cast<uint64_t>(batch) * kPaHeads * kPaHeadDim;
+        manual_dep = true;
+        shape0 = kPaHeads;
+        shape1 = kPaHeadDim;
+    }
+    SimtStoreDescriptor(
+        destination, address, buffer_size, kInvalidTaskId, start_offset, 2U, dtype, manual_dep,
+        shape0, shape1
+    );
+}
+
 constexpr uint32_t kSimtClaimFatal = 0U;
 constexpr uint32_t kSimtClaimWinner = 1U;
 constexpr uint32_t kSimtClaimLost = 2U;
@@ -1017,8 +1130,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitAt
 #if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
             SimtTracePollRecord(
                 simt_records, simt_counters, task_id,
-                g0_swimlane::AtomicSite::SimtInsertPredecessorPoll,
-                begin, polls
+                g0_swimlane::AtomicSite::SimtInsertPredecessorPoll, begin, polls
             );
 #endif
             return true;
@@ -1031,8 +1143,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitAt
 #if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
             SimtTracePollRecord(
                 simt_records, simt_counters, task_id,
-                g0_swimlane::AtomicSite::SimtInsertPredecessorPoll,
-                begin, polls
+                g0_swimlane::AtomicSite::SimtInsertPredecessorPoll, begin, polls
             );
 #endif
             SimtPublishFatal(
@@ -1049,8 +1160,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitAt
 #if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
             SimtTracePollRecord(
                 simt_records, simt_counters, task_id,
-                g0_swimlane::AtomicSite::SimtInsertPredecessorPoll,
-                begin, polls
+                g0_swimlane::AtomicSite::SimtInsertPredecessorPoll, begin, polls
             );
 #endif
             return false;
@@ -1059,8 +1169,61 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitAt
     *poll_count += polls;
 #if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
     SimtTracePollRecord(
-        simt_records, simt_counters, task_id, g0_swimlane::AtomicSite::SimtInsertPredecessorPoll,
-        begin, polls
+        simt_records, simt_counters, task_id,
+        g0_swimlane::AtomicSite::SimtInsertPredecessorPoll, begin, polls
+    );
+#endif
+    return false;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitOutputPublished(
+    __gm__ uint64_t *address, uint64_t expected, __gm__ uint64_t *fatal, uint64_t timeout_ticks,
+    uint32_t task_id, uint32_t build_owner G0_SIMT_TRACE_PARAMETER
+) {
+    const uint64_t begin = clock();
+    uint32_t polls = 0U;
+    while (clock() - begin <= timeout_ticks) {
+        const uint64_t observed = asc_atomic_add(address, static_cast<uint64_t>(0U));
+        ++polls;
+        if (observed == expected) {
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, task_id,
+                g0_swimlane::AtomicSite::SimtMetadataOutputPublishedPoll, begin, polls
+            );
+#endif
+            return true;
+        }
+        if (observed != UINT64_MAX) {
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, task_id,
+                g0_swimlane::AtomicSite::SimtMetadataOutputPublishedPoll, begin, polls
+            );
+#endif
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
+        if ((polls & kWatchdogMask) == 0U &&
+            G0_TRACE_SIMT_ADD(
+                simt_trace, task_id, g0_swimlane::AtomicSite::FatalLoad, fatal,
+                static_cast<uint64_t>(0U), true
+            ) != 0U) {
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+            SimtTracePollRecord(
+                simt_records, simt_counters, task_id,
+                g0_swimlane::AtomicSite::SimtMetadataOutputPublishedPoll, begin, polls
+            );
+#endif
+            return false;
+        }
+    }
+#if defined(SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED)
+    SimtTracePollRecord(
+        simt_records, simt_counters, task_id,
+        g0_swimlane::AtomicSite::SimtMetadataOutputPublishedPoll, begin, polls
     );
 #endif
     return false;
@@ -1297,10 +1460,9 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
 
     __gm__ uint64_t *output_tensors = task + kOutputTensorOffsetWords;
     for (uint32_t output = 0U; output < output_count; ++output) {
-        for (uint32_t word = 0U; word < kTensorDescWords; ++word) {
-            output_tensors[output * kTensorDescWords + word] =
-                SimtOutputDescriptorWord(task_id, output, task_base, word);
-        }
+        SimtStoreOutputDescriptor(
+            output_tensors + output * kTensorDescWords, task_id, output, task_base
+        );
     }
     // Fresh outputs are independent across tasks.  Publish each descriptor as
     // soon as this warp leader has completed it; do not pull this work into the
@@ -1337,13 +1499,22 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
         payload[7] = 0U;
 
         uint32_t destination = kPayloadHeaderWords;
+        // PA-UP 的 producer 顺序为 PV,PV,SF,Alloc,Alloc,Alloc。相邻 tensor
+        // 引用同一 producer 时复用刚取得的 task base，避免对同一只读发布字
+        // 重复发起 GM atomic-load；producer 切换后仍重新观察其权威发布值。
+        uint32_t cached_producer = UINT32_MAX;
+        uint64_t cached_producer_base = 0U;
         for (uint32_t tensor = 0U; tensor < tensor_count; ++tensor) {
             const uint32_t producer = SimtTensorSourceTask(task_id, tensor);
             uint64_t producer_base = 0U;
             if (producer != UINT32_MAX) {
                 if (producer == task_id) {
                     producer_base = task_base;
-                } else if (!SimtLoadTaskBase(
+                }
+                else if (producer == cached_producer) {
+                    producer_base = cached_producer_base;
+                }
+                else if (!SimtLoadTaskBase(
                                task_words, producer, fatal, timeout_ticks, task_id, build_owner,
                                &producer_base, state_access_count G0_SIMT_TRACE_ARGUMENT
                            )) {
@@ -1352,14 +1523,19 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
                     );
                     return false;
                 }
+                else {
+                    cached_producer = producer;
+                    cached_producer_base = producer_base;
+                }
             }
-            for (uint32_t word = 0U; word < kTensorDescWords; ++word) {
-                const uint64_t value =
-                    producer == UINT32_MAX ?
-                        SimtExternalDescriptorWord(batch_count, task_id, tensor, word) :
-                        SimtOutputDescriptorWord(producer, SimtTensorOutputSlot(task_id, tensor), producer_base, word);
-                payload[destination++] = value;
+            if (producer == UINT32_MAX) {
+                SimtStoreExternalDescriptor(payload + destination, batch_count, task_id, tensor);
+            } else {
+                SimtStoreOutputDescriptor(
+                    payload + destination, producer, SimtTensorOutputSlot(task_id, tensor), producer_base
+                );
             }
+            destination += kTensorDescWords;
         }
         for (uint32_t scalar = 0U; scalar < scalar_count; ++scalar) {
             uint64_t value = 0U;
@@ -1412,11 +1588,30 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
     __gm__ uint64_t *task = task_words + task_id * kTaskStrideWords;
     const uint32_t kind = task_id % kTasksPerBatch;
 
-    if (task_id != 0U) {
-        __gm__ uint64_t *predecessor = task_words + (task_id - 1U) * kTaskStrideWords + kInsertOffsetWords;
+    const bool publishes_metadata = kind == static_cast<uint32_t>(TaskKind::Up);
+    const bool has_metadata_predecessor =
+        publishes_metadata && task_id >= kTasksPerBatch + static_cast<uint32_t>(TaskKind::Up);
+    const uint32_t predecessor_task =
+        has_metadata_predecessor ? task_id - kTasksPerBatch : UINT32_MAX;
+    if (publishes_metadata) {
+        const uint32_t alloc = (task_id / kTasksPerBatch) * kTasksPerBatch;
+        __gm__ uint64_t *alloc_published =
+            task_words + alloc * kTaskStrideWords + kOutputsOffsetWords;
+        if (!SimtWaitOutputPublished(
+                alloc_published, static_cast<uint64_t>(alloc), fatal, timeout_ticks,
+                task_id, build_owner G0_SIMT_TRACE_ARGUMENT
+            )) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::Timeout, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
+    }
+    if (has_metadata_predecessor) {
+        __gm__ uint64_t *predecessor = task_words + predecessor_task * kTaskStrideWords + kInsertOffsetWords;
         uint32_t polls = 0U;
         if (!SimtWaitAtomicValue(
-                predecessor, static_cast<uint64_t>(task_id - 1U), fatal, timeout_ticks, task_id,
+                predecessor, static_cast<uint64_t>(predecessor_task), fatal, timeout_ticks, task_id,
                 build_owner, &polls G0_SIMT_TRACE_ARGUMENT
             )) {
             *insert_poll_count += polls;
@@ -1426,7 +1621,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
             return false;
         }
         *insert_poll_count += polls;
-        *predecessor_observed = static_cast<int64_t>(task_id - 1U);
+        *predecessor_observed = static_cast<int64_t>(predecessor_task);
     } else {
         *predecessor_observed = -1;
     }
@@ -1456,16 +1651,18 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
         }
     }
 
-    const uint64_t expected_insert = task_id == 0U ? UINT64_MAX : static_cast<uint64_t>(task_id - 1U);
-    const uint64_t insert_observed = G0_TRACE_SIMT_ADD(
-        simt_trace, task_id, g0_swimlane::AtomicSite::SimtInsertCompletionPublish,
-        task + kInsertOffsetWords, static_cast<uint64_t>(1U), true
-    );
-    if (insert_observed != expected_insert) {
-        SimtPublishFatal(
-            fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+    if (publishes_metadata) {
+        const uint64_t expected_insert = static_cast<uint64_t>(task_id - 1U);
+        const uint64_t insert_observed = G0_TRACE_SIMT_ADD(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtInsertCompletionPublish,
+            task + kInsertOffsetWords, static_cast<uint64_t>(1U), true
         );
-        return false;
+        if (insert_observed != expected_insert) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
     }
 
     if (kind == static_cast<uint32_t>(TaskKind::Alloc)) {
@@ -1633,6 +1830,7 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             builder_trace->commit_begin = clock();
 #endif
             ++prepared;
+            const uint32_t kind = task_id % kTasksPerBatch;
             uint32_t task_insert_polls = 0U;
             int64_t predecessor_observed = -1;
             if (!SimtCommitTask(
@@ -1645,7 +1843,10 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             builder_trace->commit_end = clock();
             builder_trace->insert_poll_count = task_insert_polls;
 #endif
-            insert_waits += task_id == 0U ? 0U : 1U;
+            insert_waits += kind == static_cast<uint32_t>(TaskKind::Up) && task_id >=
+                                kTasksPerBatch + static_cast<uint32_t>(TaskKind::Up) ?
+                                1U :
+                                0U;
             ++committed;
             ++tasks_built;
             if (tasks_built == 1U) {
@@ -1653,7 +1854,6 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             }
             last_task = task_id;
 
-            const uint32_t kind = task_id % kTasksPerBatch;
             const uint32_t output_count =
                 kind == static_cast<uint32_t>(TaskKind::Alloc) || kind == static_cast<uint32_t>(TaskKind::Sf) ?
                     3U :
@@ -1698,7 +1898,6 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
 #endif
         }
     }
-
     if (active) {
         checksum = SimtBuilderReportChecksum(
             nonce, global_thread, task_count, tasks_built, first_task, last_task, attempts, prepared, committed,

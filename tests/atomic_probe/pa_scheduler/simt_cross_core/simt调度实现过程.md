@@ -2825,7 +2825,179 @@ tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
 内部最优点，不是搜索边界；这是一份有真实 A5 功能 oracle、完整构建门槛和
 独立泳道支撑的当前结论。U2 仍保持进行中，本阶段没有把它写成完成。
 
-## 18. 阶段状态索引
+## 18. 2026-08-06：Direct-GM 稀疏 metadata writer 链降至 0.710 ms
+
+### 18.1 性能目标与实际瓶颈
+
+本阶段的目标是将已经功能闭合的 Direct-GM B256 生产路径降到
+0.8 ms 以内。性能口径仍是 trace-off ACL kernel event 多轮中位数；
+trace-on 只用于解释事件数和因果关系。本轮只修改 Direct-GM，没有继续
+UBUF/U2 功能开发，U2 继续保留原有全 task 严格插入链。
+
+两个局部构建优化先确认了非串行部分的上限：
+
+| Direct-GM B4/W16 阶段 | B256 样本 | trace-off median/us | 说明 |
+| --------------------------- | ---------: | -------------------: | ---- |
+| 上一阶段已提交基线 | 21 | 2067.660 | 全部 1280 task 参与 strict insert |
+| 相邻 producer base 复用 | 11 | 1809.952 | producer-base atomic load 由 2048 次降为 1280 次 |
+| descriptor 单次解码 | 11 | 1622.330 | type/shape/address 只计算一次，再写 16 words |
+| 同源复测 | 7 | 1629.391 | 作为修改 strict insert 前的直接对照 |
+
+这些改动能从 2.068 ms 降到约 1.63 ms，但仍然无法接近 0.8 ms。
+泳道和 report 都指向同一个瓶颈：1280 个 task 都在等待
+`task[N-1].insert_completion`，本来可并行的 descriptor/payload 构建被
+一条全局串行链重新排队。
+
+曾实现并完整验证“63 个 prepare leader + AIV0 warp0 单一顺序 committer”
+候选，功能 7/7 PASS，但 B256 中位反而为 **4685.685 us**。它把
+1280 次 commit 完全集中到一个 leader，直接丢掉了现有的跨 warp/AIV
+并行性，因此已回退，也没有保留该候选的泳道。
+
+### 18.2 用真实 writer 集合收缩串行链
+
+重新按五类 PA task 的实际写集合审核后，只有每个 batch 的 UP task
+会修改 shared TensorMap writer metadata：
+
+- UP 写自身 `writer_history`，并将同 batch Alloc 的 `last_writer[0]`
+  从 Alloc task id 更新为 UP task id；
+- Alloc/QK/PV/SF 不修改这组 writer metadata，它们没有语义上的
+  metadata 前驱；
+- 因此 Direct-GM 的严格链只需要包含 256 个 UP，而不是 1280 个
+  task。
+
+新协议的次序为：
+
+```text
+所有 task：并行完成 descriptor / output publication / payload
+
+UP[batch]：
+  atomic 等待本 batch Alloc.output[0].published == Alloc task id
+  -> batch>0 时等待 UP[batch-1].insert_completion
+  -> 写 UP.writer_history
+  -> CAS Alloc.last_writer[0]: Alloc task id -> UP task id
+  -> 发布本 UP.insert_completion
+
+Alloc/QK/PV/SF：
+  不进入 metadata predecessor 链
+  不发布自身 insert_completion
+  -> 直接发布 completion 或 BUILT
+```
+
+UP 不能因为稀疏化就在 Alloc descriptor 尚未发布时提前改
+`last_writer`。因此在进入 UP 前驱链之前，新增了对本 batch Alloc
+`published[0]` 的 atomic acquire poll。这个目标等待是真实数据依赖，不是
+用隐式 SIMT DCache 一致性假设代替。首个 UP 没有 metadata 前驱；后续
+UP 的前驱从 `N-1` 变为 `N-5`。
+
+`kBuildInsertCommittedBit` 在 Direct-GM 非 UP task 上现在表示“该 task 的
+commit/metadata 决策阶段已完成”，不再表示该 task 一定写过
+`insert_completion`。host 和 CPU oracle 均按这一最终语义检查：UP 最终
+completion 必须等于自身 id，非 UP 必须保持初始值；稀疏前缀最终必须
+等于 batch 数 256。
+
+### 18.3 重新扫描 builder 数
+
+串行链改变后，旧的 B4 最优结论不再可直接沿用。固定 W=16，重新在
+真实 A5 `Ascend950PR_958b` device0 扫描 B=2..8。各点 B256 均 7/7
+PASS（B4 额外执行 11 轮），1280 个 task 的 winner 分布与静态映射精确
+一致：
+
+| Builder B | AIV executor | trace-off median/us | 相对 0.8 ms | 结论 |
+| --------: | -----------: | -------------------: | ------------: | ---- |
+| 2 | 62 | 1357.270 | +557.270 | builder 构建仍在关键路径 |
+| 3 | 61 | 1054.585 | +254.585 | 仍未达标 |
+| 4 | 60 | 818.473 | +18.473 | 接近目标，11 轮 min/avg/max=805.078/875.354/1453.989 |
+| **5** | **59** | **703.530** | **-96.470** | **扫描最优** |
+| 6 | 58 | 782.534 | -17.466 | 达标，但已开始损失 executor |
+| 7 | 57 | 805.833 | +5.833 | 越过最优点 |
+| 8 | 56 | 825.443 | +25.443 | 继续增加 builder 无收益 |
+
+B=5 不在搜索边界，且同时被 B4/B6 包围。稀疏链取消了大量串行
+poll 后，多一个 builder 能继续分摊 descriptor/payload 构建；超过 B5 后，
+少一个 AIV executor 的代价开始超过构建收益。
+
+最终对 B5/W16 执行 21 轮独立 trace-off 复测：
+
+| 配置 | PASS | min/us | median/us | avg/us | max/us | builder_wins |
+| ---- | ---: | -----: | --------: | -----: | -----: | ------------ |
+| B5/W16，B256 | 21/21 | 698.815 | **709.769** | 741.563 | 1371.725 | 256×5 |
+
+max 来自首轮冷启动；后续 warm 样本稳定在约 0.699～0.722 ms。以中位数
+计，相对稀疏化前的同源 1.629 ms 缩短 **56.4%**，相对上一阶段已
+提交的 2.068 ms 基线缩短 **65.7%**。
+
+### 18.4 atomic 数量和泳道证据
+
+生产 report 中的 predecessor poll 从稀疏化前每轮约 13.3 万次降到
+B5 复测的约 3215～3971 次。新 v5 泳道另外把 UP 获取本 batch Alloc
+publication 的等待记录为独立站点
+`simt_metadata_output_published_poll`，不把它混入 predecessor poll。
+
+| trace-on 证据 | B4/W16 旧全 task 链 | B5/W16 稀疏 UP 链 |
+| ------------- | --------------------: | -------------------: |
+| schema | v4 | v5 |
+| device span/us | 5220.165 | 1068.623 |
+| SIMT atomic calls | 565,148 | 28,056 |
+| SIMT poll calls | 550,295 | 14,226 |
+| predecessor poll records | 1,279 | 255 |
+| predecessor poll calls | 548,951 | 12,038 |
+| metadata-target poll records/calls | 无独立站点 | 256 / 256 |
+| Scalar atomic calls | 1,090,857 | 146,379 |
+| Scalar poll calls | 1,078,644 | 134,474 |
+| Scalar DCCI calls/lines | 14,928 | 14,908 |
+
+两份 trace-on 因 builder 数和协议均不同，上表用于证明 poll 量级和事件
+归因，不用 device span 代替 trace-off 生产性能 A/B。新图保存为：
+
+`test_record/2026-8-6/gm_b5_b256_warp16_traceoff_710us_sparse_metadata_writer_atomic_dcci_per_builder_clock_swimlane.json`
+
+该文件约 18 MiB，没有覆盖任何旧泳道；文件名中 710 us 来自独立
+trace-off 21 轮中位，文件内 1068.623 us 是加上 atomic/DCCI 记录后的
+trace-on device span。
+
+### 18.5 验证和复现
+
+已通过的门槛包括：
+
+- CPU optimized 的 builder=1..8、B1/B256 和同地址复用；
+- CPU ASan+UBSan 和 TSan；
+- AIC/AIV CCEC bitcode、SIMT atomic/fence、Scalar DCCI、Vector/Cube
+  intrinsic、mixed ELF/metadata 以及 host 构建；
+- 真实 A5 B256 的 B2..8 扫描、B5 21/21 复测和完整 host oracle；
+- v5 JSON 可由 `jq` 解析，256 个 metadata target poll 与 255 个前驱
+  poll record 精确闭合。
+
+最后只将无前驱 task 的 `predecessor_task` 明确设为 `UINT32_MAX`，避免
+在未使用路径中依赖无符号回绕；该收尾不改协议。之后重新执行了全量
+CPU optimized/ASan+UBSan/TSan、CCEC/ELF/host 构建以及真机短回归：
+B1 3/3 PASS；B256 7/7 PASS，中位 686.169 us，首轮冷启动
+1328.394 us，其余 warm 样本为 683.158～694.717 us。这个短回归用于
+证明最终源码未回退，正式性能结论仍使用样本更多的 21 轮 709.769 us。
+
+生产复现：
+
+```bash
+SIMT_CROSS_CORE_GM_BUILDER_WARPS=16 \
+  tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-gm
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-gm --builders 5 --device 0 --batches 256 --runs 21
+```
+
+泳道复现（必须使用新文件名，不覆盖旧图）：
+
+```bash
+SIMT_CROSS_CORE_GM_BUILDER_WARPS=16 \
+  tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh build-gm-swimlane
+tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
+  run-gm-swimlane --builders 5 --device 0 --batches 256 --runs 1 \
+  --swimlane-json <新的、不重复的输出文件名>
+```
+
+阶段结论：**Direct-GM 当前最优为 B5/W16，B256 trace-off 21 轮
+中位 0.710 ms，已达到 0.8 ms 目标。** 不能将 trace-on 1.069 ms 当作
+生产性能；首轮冷启动也单独保留在 max 中，没有从统计中删除。
+
+## 19. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -2839,7 +3011,7 @@ tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
 | A1 warp 推进语义 | 完成 | CPU 三套和 CCEC/ELF 门槛 PASS；A5 同地址复用 100/100，SameWarp 始终 T/S+disjoint，CrossWarp 始终 S/S+overlap。 |
 | G0 GM 完整 PA | 完成 | 16-warp/lane0 纯 SIMT 构建；CPU 三套与 CCEC/ELF 门槛 PASS；A5 B1/B256 功能闭合；原始 64-warp B256 trace-off 中位约 15.0 ms。 |
 | G1 双 builder GM | 完成 | 双 VF 各 512-thread/16-warp/lane0 静态唯一分片；B256 trace-off 中位 3.637 ms；五组独立 v4 atomic/DCCI 泳道已保存。 |
-| GN 多 builder GM 扫描 | 完成 | B=1..8 与 B4/W=8/12/16/24 全部通过 CPU 三套、CCEC/ELF、A5 B1/B256 oracle；当前 B4/W16 最优，B256 最终 21 轮中位 2.068 ms；12 份独立 v4 泳道已保存并通过计数/因果校验。 |
+| GN 多 builder GM 扫描 | 完成 | 先完成 B=1..8 与 warp 扫描；随后以真实 writer 集合将 Direct-GM strict insert 收缩为 256 个 UP，重新扫描后 B5/W16 最优，B256 trace-off 21 轮中位 0.710 ms；独立 v5 atomic/DCCI 泳道已保存并校验。 |
 | U0 UBUF 单槽 | 完成 | 64-warp/lane0 纯 SIMT 单槽；CPU 三套、CCEC/ELF 门槛和 A5 同地址 100/100 全部 PASS；G0/G1 四组真机回归 PASS。 |
 | U1 UBUF 多槽/多 task | 完成 | 本提交；CPU 三套、CCEC/bitcode/mixed ELF 门槛全部 PASS；A5 smoke 1/1 与同地址复用 100/100，四槽 `maxbusy=4`、每槽 generation `0..31`精确闭合。 |
 | U2 UBUF 完整 PA | 未开始 | - |

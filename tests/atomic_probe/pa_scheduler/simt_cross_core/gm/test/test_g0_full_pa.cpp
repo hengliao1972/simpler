@@ -548,7 +548,8 @@ private:
             report.last_task = task_id;
             ++report.prepare_count;
             ++report.commit_count;
-            report.insert_wait_count += task_id == 0U ? 0U : 1U;
+            report.insert_wait_count +=
+                TaskKindAt(task_id) == TaskKind::Up && TaskBatch(task_id) != 0U ? 1U : 0U;
         }
         report.checksum = BuilderReportChecksum(
             nonce_, thread_id, task_count_, report.task_count, report.first_task, report.last_task,
@@ -729,17 +730,32 @@ private:
         }
         uint32_t insert_polls = 0U;
         int64_t predecessor_observed = -1;
-        if (task_id != 0U) {
+        if (kind == TaskKind::Up) {
+            const uint32_t alloc_task = BatchTaskId(TaskBatch(task_id), TaskKind::Alloc);
+            uint32_t output_polls = 0U;
             if (!WaitFor(
-                    [this, task_id] {
-                        return tasks_[task_id - 1U].insert_completion.load(std::memory_order_acquire) ==
-                               static_cast<int64_t>(task_id - 1U);
+                    [this, alloc_task] {
+                        return tasks_[alloc_task].published[0].load(std::memory_order_acquire) ==
+                               static_cast<int64_t>(alloc_task);
                     },
-                    &insert_polls
+                    &output_polls
                 )) {
                 return BuildAttemptResult::Error;
             }
-            predecessor_observed = tasks_[task_id - 1U].insert_completion.load(std::memory_order_acquire);
+            if (TaskBatch(task_id) != 0U) {
+                const uint32_t predecessor_task = task_id - kTasksPerBatch;
+                if (!WaitFor(
+                        [this, predecessor_task] {
+                            return tasks_[predecessor_task].insert_completion.load(std::memory_order_acquire) ==
+                                   static_cast<int64_t>(predecessor_task);
+                        },
+                        &insert_polls
+                    )) {
+                    return BuildAttemptResult::Error;
+                }
+                predecessor_observed =
+                    tasks_[predecessor_task].insert_completion.load(std::memory_order_acquire);
+            }
         }
         if (kind == TaskKind::Up) {
             task.history.magic = kWriterHistoryMagic;
@@ -756,15 +772,20 @@ private:
             }
             tasks_[BatchTaskId(batch, TaskKind::Alloc)].last_writer[0].store(task_id, std::memory_order_release);
         }
-        uint32_t expected_prefix = task_id;
-        if (!committed_prefix_.compare_exchange_strong(
-                expected_prefix, task_id + 1U, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            return BuildAttemptResult::Error;
+        if (kind == TaskKind::Up) {
+            uint32_t expected_prefix = TaskBatch(task_id);
+            if (!committed_prefix_.compare_exchange_strong(
+                    expected_prefix, TaskBatch(task_id) + 1U, std::memory_order_acq_rel,
+                    std::memory_order_acquire
+                )) {
+                return BuildAttemptResult::Error;
+            }
         }
-        const int64_t previous_insert = task.insert_completion.fetch_add(1, std::memory_order_acq_rel);
-        if (previous_insert != InsertCompletionInitialValue(task_id)) {
-            return BuildAttemptResult::Error;
+        if (kind == TaskKind::Up) {
+            const int64_t previous_insert = task.insert_completion.fetch_add(1, std::memory_order_acq_rel);
+            if (previous_insert != InsertCompletionInitialValue(task_id)) {
+                return BuildAttemptResult::Error;
+            }
         }
         if (kind == TaskKind::Alloc) {
             task.completion_vend.store(vend, std::memory_order_relaxed);
@@ -1199,7 +1220,7 @@ private:
             alloc_done_.load(std::memory_order_acquire) != batches_ ||
             aic_done_.load(std::memory_order_acquire) != 2U * batches_ ||
             aiv_done_.load(std::memory_order_acquire) != 2U * batches_ ||
-            committed_prefix_.load(std::memory_order_acquire) != task_count_ ||
+            committed_prefix_.load(std::memory_order_acquire) != batches_ ||
             aic_cursor_.load(std::memory_order_acquire) != 2U * batches_ + kAicOwnerCount ||
             aiv_cursor_.load(std::memory_order_acquire) != 2U * batches_ + AivExecutorCount(builder_count_)) {
             return false;
@@ -1262,15 +1283,16 @@ private:
                 task.build_report.payload_words != layout.written_words || task.build_report.launch_nonce != nonce_ ||
                 task.build_report.build_attempt_count != 1U || task.build_report.build_win_count != 1U ||
                 task.build_report.prepare_count != 1U || task.build_report.commit_count != 1U ||
-                task.insert_completion.load(std::memory_order_acquire) != static_cast<int64_t>(task_id)) {
+                task.insert_completion.load(std::memory_order_acquire) !=
+                    (kind == TaskKind::Up ? static_cast<int64_t>(task_id) : InsertCompletionInitialValue(task_id))) {
                 return false;
             }
-            if (task_id == 0U) {
-                if (task.build_report.predecessor_observed != -1 || task.build_report.insert_poll_count != 0U) {
+            if (kind == TaskKind::Up && TaskBatch(task_id) != 0U) {
+                if (task.build_report.predecessor_observed != static_cast<int64_t>(task_id - kTasksPerBatch) ||
+                    task.build_report.insert_poll_count == 0U) {
                     return false;
                 }
-            } else if (task.build_report.predecessor_observed != static_cast<int64_t>(task_id - 1U) ||
-                       task.build_report.insert_poll_count == 0U) {
+            } else if (task.build_report.predecessor_observed != -1 || task.build_report.insert_poll_count != 0U) {
                 return false;
             }
             ++expected_wins[builder_thread];
@@ -1278,7 +1300,7 @@ private:
                 expected_first[builder_thread] = task_id;
             }
             expected_last[builder_thread] = task_id;
-            expected_waits[builder_thread] += task_id == 0U ? 0U : 1U;
+            expected_waits[builder_thread] += kind == TaskKind::Up && TaskBatch(task_id) != 0U ? 1U : 0U;
         }
 
         uint64_t total_attempts = 0U;

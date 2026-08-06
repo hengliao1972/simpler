@@ -288,17 +288,19 @@ if ! grep -Fq '(static_cast<uint64_t>(build_owner) << kStateBuildOwnerShift)' "$
 fi
 
 prepare_start_line="$(grep -nF 'inline bool SimtPrepareTask(' "$KERNEL_SOURCE" | cut -d: -f1)"
-descriptor_line="$(grep -nF 'SimtOutputDescriptorWord(task_id, output, task_base, word)' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
-descriptor_fence_line="$(awk '/SimtOutputDescriptorWord\(task_id, output, task_base, word\)/ {inside=1; next} inside && /asc_threadfence\(\);/ {print NR; exit}' "$KERNEL_SOURCE")"
+descriptor_line="$(awk '/inline bool SimtPrepareTask\(/ {inside=1} inside && /SimtStoreOutputDescriptor\(/ {print NR; exit}' "$KERNEL_SOURCE")"
+descriptor_fence_line="$(awk '/inline bool SimtPrepareTask\(/ {inside=1} inside && /SimtStoreOutputDescriptor\(/ {descriptor=1; next} descriptor && /asc_threadfence\(\);/ {print NR; exit}' "$KERNEL_SOURCE")"
 fresh_publish_line="$(grep -nF 'g0_swimlane::AtomicSite::SimtOutputPublishedPublish' "$KERNEL_SOURCE" | cut -d: -f1)"
 commit_start_line="$(grep -nF 'inline bool SimtCommitTask(' "$KERNEL_SOURCE" | cut -d: -f1)"
-predecessor_wait_line="$(grep -nF 'predecessor, static_cast<uint64_t>(task_id - 1U)' "$KERNEL_SOURCE" | cut -d: -f1)"
+metadata_output_wait_line="$(awk '/inline bool SimtCommitTask\(/ {inside=1} inside && /if \(!SimtWaitOutputPublished\(/ {print NR; exit}' "$KERNEL_SOURCE")"
+predecessor_wait_line="$(awk '/inline bool SimtCommitTask\(/ {inside=1} inside && /if \(!SimtWaitAtomicValue\(/ {print NR; exit}' "$KERNEL_SOURCE")"
 if [[ -z "$prepare_start_line" || -z "$descriptor_line" || -z "$descriptor_fence_line" || -z "$fresh_publish_line" ||
-      -z "$commit_start_line" || -z "$predecessor_wait_line" ]] ||
+      -z "$commit_start_line" || -z "$metadata_output_wait_line" || -z "$predecessor_wait_line" ]] ||
    ! (( prepare_start_line < descriptor_line && descriptor_line < descriptor_fence_line &&
          descriptor_fence_line < fresh_publish_line &&
-         fresh_publish_line < commit_start_line && commit_start_line < predecessor_wait_line )); then
-    echo "G0 fresh outputs must publish after descriptor construction and before the strict predecessor wait." >&2
+         fresh_publish_line < commit_start_line && commit_start_line < metadata_output_wait_line &&
+         metadata_output_wait_line < predecessor_wait_line )); then
+    echo "G0 fresh outputs must publish after descriptor construction; sparse metadata writers must acquire their target before the strict writer-predecessor wait." >&2
     exit 1
 fi
 

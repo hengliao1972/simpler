@@ -610,6 +610,32 @@ W=8/12/16/24 的中位数为 2.240/2.231/2.076/2.192 ms，当前选择 `W=16`。
 若以后改变 strict insert、payload 构造或 executor 协议，必须重新扫描，不能把
 `B=4,W=16` 写成架构常量。
 
+### 3.14 Direct-GM 稀疏 metadata writer 链
+
+3.8 的全 task 严格链是 G0 首次功能闭合时的保守合同，也继续用于
+UBUF/U2。Direct-GM 在完整审核五类 task 的真实 writer 集合后允许使用
+更精确的合同：每 batch 只有 UP 写 `writer_history` 并修改 Alloc
+`last_writer[0]`，因此只有 UP 参与 metadata 插入链。
+
+Direct-GM 的 UP 提交必须依次满足：
+
+1. 用 atomic load 观察到本 batch Alloc `output[0].published` 已等于 Alloc
+   task id；
+2. batch 0 无 metadata 前驱，batch N 等待 batch N-1 的 UP
+   `insert_completion`，在 task id 上即 `UP[N] -> UP[N-5]`；
+3. 写完 history 并 fence，CAS 本 batch Alloc `last_writer[0]`，最后发布
+   本 UP 的 `insert_completion`。
+
+Alloc/QK/PV/SF 不等待 metadata 前驱，也不更新自身
+`insert_completion`；其 descriptor/output/payload 的发布和 executor 原有的
+acquire/DCCI 合同不变。`kBuildInsertCommittedBit` 对这些非 UP task 表示
+“metadata 决策阶段已完成”，不得解读为一定发布过该 task 的
+`insert_completion`。
+
+该优化改变了 3.13 的性能拓扑，所以已重新扫描 builder 数。真实
+A5 B256 的新最优点为 `B=5,W=16`，trace-off 21 轮中位
+0.710 ms；原 `B=4,W=16` 的 2.068 ms 只作为历史全 task 链基线，
+不再是当前最优配置。
 
 ## 4. 目录与分阶段实施
 
