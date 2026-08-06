@@ -500,12 +500,18 @@ dist_shared_pa_load_insert_turn_bypass(__gm__ volatile int64_t &value) {
 #endif
 }
 
+PTO_DEVICE_FUNC inline __attribute__((always_inline)) __gm__ volatile int64_t &
+dist_shared_pa_insert_completion(uint32_t task_id) {
+    return g_dist.shared_pa.insert_completion.cells[task_id].v;
+}
+
 PTO_DEVICE_FUNC bool
 dist_shared_pa_wait_insert_turn(DistSubmitCtx &ctx, int64_t &ready_observed, uint32_t &bypass_load_count) {
     ready_observed = -1;
     bypass_load_count = 0;
     if (ctx.task_id == 0) return true;
-    __gm__ volatile int64_t &predecessor = g_dist.tasks[static_cast<uint32_t>(ctx.task_id - 1)].deps_prepared;
+    __gm__ volatile int64_t &predecessor =
+        dist_shared_pa_insert_completion(static_cast<uint32_t>(ctx.task_id - 1));
     uint32_t polls = 0;
     while (true) {
         const int64_t observed = dist_shared_pa_load_insert_turn_bypass(predecessor);
@@ -563,7 +569,8 @@ PTO_DEVICE_FUNC bool dist_shared_pa_publish_metadata_and_handoff(
     metadata_end = 0;
 #endif
     store_barrier();
-    __gm__ volatile int64_t &completion = g_dist.tasks[static_cast<uint32_t>(ctx.task_id)].deps_prepared;
+    __gm__ volatile int64_t &completion =
+        dist_shared_pa_insert_completion(static_cast<uint32_t>(ctx.task_id));
 #if DIST_TRACE_ENABLED
     if (fdwic_atomic_swimlane_enabled()) {
         handoff_trace.begin = fdwic_swimlane_detail_now();

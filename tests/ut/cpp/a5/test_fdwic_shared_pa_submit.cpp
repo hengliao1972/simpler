@@ -253,7 +253,8 @@ TEST_F(FdwicSharedPaSubmitTest, TwoRolesPublishOneFiveTaskBatchAndOnlyWinnersBui
     EXPECT_EQ(g_dist.fatal, 0);
     EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
     for (int32_t task = 0; task < 5; ++task) {
-        EXPECT_EQ(g_dist.tasks[task].deps_prepared, task);
+        EXPECT_EQ(g_dist.shared_pa.insert_completion.cells[task].v, task);
+        EXPECT_EQ(g_dist.tasks[task].deps_prepared, -1);
         EXPECT_EQ(g_dist.tasks[task].flag, 1);
     }
     const uint32_t output_counts[5] = {3, 1, 3, 1, 0};
@@ -293,7 +294,8 @@ TEST_F(FdwicSharedPaSubmitTest, NinetySixWorkersConvergeWithExactlyFiveWinnerCal
     EXPECT_EQ(g_dist.fatal, 0);
     EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
     for (int32_t task = 0; task < 5; ++task) {
-        EXPECT_EQ(g_dist.tasks[task].deps_prepared, task);
+        EXPECT_EQ(g_dist.shared_pa.insert_completion.cells[task].v, task);
+        EXPECT_EQ(g_dist.tasks[task].deps_prepared, -1);
         EXPECT_EQ(g_dist.tasks[task].flag, 1);
     }
 }
@@ -382,8 +384,9 @@ TEST_F(FdwicSharedPaSubmitTest, NinetySixWorkersConvergeAcrossFullB256TaskSequen
     EXPECT_EQ(g_dist.fatal, 0);
     EXPECT_EQ(g_dist.error_code, PTO2_ERROR_NONE);
     for (uint32_t task = 0; task < kFdwicSharedPaTaskCapacity; ++task) {
-        EXPECT_EQ(g_dist.tasks[task].deps_prepared, static_cast<int64_t>(task))
+        EXPECT_EQ(g_dist.shared_pa.insert_completion.cells[task].v, static_cast<int64_t>(task))
             << "task=" << task;
+        EXPECT_EQ(g_dist.tasks[task].deps_prepared, -1) << "task=" << task;
         EXPECT_EQ(g_dist.tasks[task].flag, 1) << "task=" << task;
     }
     const uint32_t last_up = kFdwicSharedPaTaskCapacity - 1U;

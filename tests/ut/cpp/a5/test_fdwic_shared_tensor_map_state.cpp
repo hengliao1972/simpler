@@ -73,14 +73,19 @@ TEST(FdwicSharedPaTensorMapState, ExactLayoutAppendsAfterTheFrozenPrivateTail) {
     EXPECT_EQ(sizeof(SharedClaimTournamentNode), 512U);
     EXPECT_EQ(sizeof(SharedClaimTournamentTask), 4608U);
     EXPECT_EQ(offsetof(SharedClaimTournamentTask, local), 512U);
+    EXPECT_EQ(sizeof(FdwicSharedAtomicConflictCell), 128U);
 
     EXPECT_EQ(offsetof(SharedPaTensorMapState, shared_outputs), 0U);
     EXPECT_EQ(offsetof(SharedPaTensorMapState, shared_heap_cursor), 2621440U);
-    EXPECT_EQ(offsetof(SharedPaTensorMapState, shared_heap_vend), 2621952U);
-    EXPECT_EQ(offsetof(SharedPaTensorMapState, shared_vector_cursor), 2622016U);
-    EXPECT_EQ(offsetof(SharedPaTensorMapState, writer_history), 2622528U);
-    EXPECT_EQ(offsetof(SharedPaTensorMapState, claim_tournament), 3032128U);
-    EXPECT_EQ(sizeof(SharedPaTensorMapState), 8930368U);
+    EXPECT_EQ(offsetof(SharedPaTensorMapState, shared_heap_cursor) % 128U, 0U);
+    EXPECT_EQ(offsetof(SharedPaTensorMapState, shared_heap_vend), 2622464U);
+    EXPECT_EQ(offsetof(SharedPaTensorMapState, shared_vector_cursor), 2622528U);
+    EXPECT_EQ(offsetof(SharedPaTensorMapState, writer_history), 2623040U);
+    EXPECT_EQ(offsetof(SharedPaTensorMapState, claim_tournament), 3032640U);
+    EXPECT_EQ(offsetof(SharedPaTensorMapState, insert_completion_alignment_pad), 8930880U);
+    EXPECT_EQ(offsetof(SharedPaTensorMapState, insert_completion), 8930944U);
+    EXPECT_EQ(offsetof(SharedPaTensorMapState, insert_completion) % 128U, 0U);
+    EXPECT_EQ(sizeof(SharedPaTensorMapState), 9094784U);
     EXPECT_EQ(alignof(SharedPaTensorMapState), kCacheLine);
 
     EXPECT_EQ(offsetof(DistTaskCell, deps_prepared), 16U);
@@ -113,6 +118,7 @@ TEST(FdwicSharedPaTensorMapState, AicpuResetOnlyReinitializesPublishedControlAnd
             EXPECT_EQ(tournament.local[group].owner.v, -1)
                 << "task=" << task << ", group=" << group;
         }
+        EXPECT_EQ(state->insert_completion.cells[task].v, -1) << "task=" << task;
 
         const SharedWriterHistoryCell &history = state->writer_history[task];
         EXPECT_EQ(history.magic, 0U) << "task=" << task;
@@ -143,6 +149,7 @@ TEST(FdwicSharedPaTensorMapState, AicpuResetOnlyReinitializesPublishedControlAnd
     state->writer_history[kFdwicSharedPaTaskCapacity - 1].count = 3;
     state->claim_tournament[kFdwicSharedPaTaskCapacity - 1].root.owner.v = 1279;
     state->claim_tournament[kFdwicSharedPaTaskCapacity - 1].local[7].owner.v = 1279;
+    state->insert_completion.cells[kFdwicSharedPaTaskCapacity - 1].v = 1279;
 
     dist_shared_pa_tensor_map_reset(*state);
 
@@ -156,6 +163,7 @@ TEST(FdwicSharedPaTensorMapState, AicpuResetOnlyReinitializesPublishedControlAnd
     EXPECT_EQ(state->writer_history[kFdwicSharedPaTaskCapacity - 1].count, 0U);
     EXPECT_EQ(state->claim_tournament[kFdwicSharedPaTaskCapacity - 1].root.owner.v, -1);
     EXPECT_EQ(state->claim_tournament[kFdwicSharedPaTaskCapacity - 1].local[7].owner.v, -1);
+    EXPECT_EQ(state->insert_completion.cells[kFdwicSharedPaTaskCapacity - 1].v, -1);
 }
 
 TEST(FdwicSharedPaOutputRef, PlainAndInvalidFormsAreUnambiguous) {

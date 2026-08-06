@@ -374,6 +374,7 @@ TEST_F(
     ctx.self = aiv0_worker_.get();
     ctx.task_id = 1;
     task_cell(0).deps_prepared = -1;
+    g_dist.shared_pa.insert_completion.cells[0].v = -1;
 
     WorkerThreadResult result;
     bool turn_ready = true;
@@ -405,6 +406,7 @@ TEST_F(
     EXPECT_FALSE(turn_ready);
     EXPECT_EQ(ready_observed, -1);
     EXPECT_EQ(load_count, 0U);
+    EXPECT_EQ(g_dist.shared_pa.insert_completion.cells[0].v, -1);
     EXPECT_EQ(task_cell(0).deps_prepared, -1);
     EXPECT_EQ(g_dist.fatal, 1);
     EXPECT_EQ(g_dist.error_code, PTO2_ERROR_EXPLICIT_ORCH_FATAL);

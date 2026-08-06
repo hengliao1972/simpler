@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "dist_engine/common/shared_pa_atomic_layout.h"
 #include "dist_engine/common/target.h"
 #include "dist_engine/common/swimlane_types.h"
 
@@ -432,19 +433,30 @@ static_assert(
 // the per-task two-level Claim tournament.
 struct alignas(kCacheLine) SharedPaTensorMapState {
     SharedOutputCell shared_outputs[kFdwicSharedPaTaskCapacity];
-    PaddedCursor shared_heap_cursor[kFdwicSharedHeapShards];
+    // Independent heap shards are active concurrently. Give each hot cursor
+    // one measured A5 128-byte conflict unit instead of merely one cache line.
+    FdwicSharedAtomicConflictCell shared_heap_cursor[kFdwicSharedHeapShards];
     PaddedCursor shared_heap_vend;
     PaddedCursor shared_vector_cursor[kFdwicSharedVectorCursorShards];
     SharedWriterHistoryCell writer_history[kFdwicSharedPaTaskCapacity];
     SharedClaimTournamentTask claim_tournament[kFdwicSharedPaTaskCapacity];
+    // TensorMap insertion remains strictly ordered, but adjacent task
+    // completions must not serialize in the same 128-byte atomic unit. This
+    // shared-only tail keeps the production TaskCell prefix unchanged.
+    uint8_t insert_completion_alignment_pad[64];
+    FdwicSharedAtomicConflictTable<kFdwicSharedPaTaskCapacity> insert_completion;
 };
 static_assert(offsetof(SharedPaTensorMapState, shared_outputs) == 0);
 static_assert(offsetof(SharedPaTensorMapState, shared_heap_cursor) == 2621440);
-static_assert(offsetof(SharedPaTensorMapState, shared_heap_vend) == 2621952);
-static_assert(offsetof(SharedPaTensorMapState, shared_vector_cursor) == 2622016);
-static_assert(offsetof(SharedPaTensorMapState, writer_history) == 2622528);
-static_assert(offsetof(SharedPaTensorMapState, claim_tournament) == 3032128);
-static_assert(sizeof(SharedPaTensorMapState) == 8930368, "shared PA TensorMap sidecar size changed");
+static_assert(offsetof(SharedPaTensorMapState, shared_heap_cursor) % kFdwicSharedAtomicConflictBytes == 0);
+static_assert(offsetof(SharedPaTensorMapState, shared_heap_vend) == 2622464);
+static_assert(offsetof(SharedPaTensorMapState, shared_vector_cursor) == 2622528);
+static_assert(offsetof(SharedPaTensorMapState, writer_history) == 2623040);
+static_assert(offsetof(SharedPaTensorMapState, claim_tournament) == 3032640);
+static_assert(offsetof(SharedPaTensorMapState, insert_completion_alignment_pad) == 8930880);
+static_assert(offsetof(SharedPaTensorMapState, insert_completion) == 8930944);
+static_assert(offsetof(SharedPaTensorMapState, insert_completion) % kFdwicSharedAtomicConflictBytes == 0);
+static_assert(sizeof(SharedPaTensorMapState) == 9094784, "shared PA TensorMap sidecar size changed");
 static_assert(alignof(SharedPaTensorMapState) == kCacheLine, "shared PA TensorMap alignment changed");
 
 struct DistTaskCell {
@@ -563,7 +575,7 @@ static_assert(
     "shared PA TensorMap sidecar must append after the frozen DistGlobal tail"
 );
 static_assert(
-    sizeof(DistGlobal) == 1015956416,
+    sizeof(DistGlobal) == 1016120832,
     "shared DistGlobal must contain exactly the phase-1 PA TensorMap and Claim sidecar"
 );
 #else

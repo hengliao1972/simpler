@@ -18,7 +18,7 @@
 | **[设计中]** | 只有经过源码核对的方案，尚无完成提交或性能结论 |
 | **[验证中]** | 候选已落盘并通过部分门禁，但尚未完成真实 A5 正确性或性能裁决 |
 
-记录更新至 2026-07-30。当前分支为 `fdwic-swimlane-exclusive`，跟踪 `origin/fdwic-swimlane-deps`。后续每完成一个合理阶段，都应按第 12 节模板更新本文并形成一条带详细中文说明的本地提交。
+记录更新至 2026-08-06。当前分支为 `fdwic-swimlane-exclusive`，跟踪 `origin/fdwic-swimlane-deps`。后续每完成一个合理阶段，都应按第 12 节模板更新本文并形成一条带详细中文说明的本地提交。
 
 更细的专题资料分别见：
 
@@ -6973,3 +6973,54 @@ DCCI 均不变。冻结 12 对 startup→FinalDrain A/B 中，S6.97/候选中位
 `831.300/815.937 us`，改善 `15.363 us / 1.848%`；均值改善 `1.599%`，
 配对改善中位 `12.578 us`，候选胜 `11/12`。最终 `.text` 增加 512 B，但直接
 归因与端到端同向，正式保留；详细证据见实现过程 S6.98。
+
+## 16. 主 simpler shared same-core 收口
+
+### 16.1 迁移 A5 128B 原子冲突单元布局
+
+**[已保留，2026-08-06]** 本轮停止继续扩展性能协议，只把 standalone
+same-core 已经由 A5 探针和配对性能证明的 128B 原子地址隔离，按主 simpler
+现有状态布局重新实现。它不是复制 standalone 的 sidecar，也没有增加运行时
+编译宏：新增独立的 `shared_pa_atomic_layout.h`，只为 shared PA 定义
+128B 冲突单元；private TensorMap 和通用 64B cache-line ABI 均不改变。
+
+保留两项布局调整：
+
+- 8 个可并发访问的 shared heap shard cursor 从相邻 64B 改为有效地址间隔
+  128B；
+- 严格 TensorMap 插入完成字从生产 `DistTaskCell::deps_prepared` 移到
+  shared-only 尾部表，每个 task 的有效原子地址独占 128B 冲突单元。
+
+严格插入协议没有变化：task N 仍只等待 N-1 的完成字，完整发布 writer
+metadata 后才 CAS 发布 N；Atomic 次数、返回值语义、task 顺序和
+winner/loser 语义均未改变。旧 `DistTaskCell::deps_prepared` 保持 `-1`，用例
+同时检查新表终态和旧字段未被误写。shared host/device ABI 与 layout version
+由 6 提升到 7，避免新旧产物混用。
+
+聚焦 CPU 回归共 8 组全部通过，覆盖 private 布局、shared 状态初始化、heap、
+register、96 worker 的 B256/1280 task 完整 Submit、lifecycle 以及
+private/shared build identity。随后以用户 CANN 9.1、本仓库 `.venv` 和固定
+PTO-ISA `ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8` 重编译 A5 shared
+runtime，5 次独立进程的 A5 Case1 均通过，96 核和每核 1280 Submit 全部闭合。
+
+本轮冻结的未改布局 5 次完整 Submit 样本为：
+
+```text
+1484.997 / 1500.038 / 1470.660 / 1477.907 / 1484.467 us
+```
+
+候选布局 5 次样本为：
+
+```text
+1451.360 / 1456.340 / 1458.520 / 1450.130 / 1473.510 us
+```
+
+基线/候选中位数为 `1484.467/1456.340 us`，改善
+`28.127 us / 1.895%`；候选均值为 `1457.972 us`，范围为
+`1450.130--1473.510 us`。当前环境没有 `task-submit`，这些数据是设备 0
+直跑且不是冻结 ELF 的逐对交错结果，因此只把它解释为“方向与 standalone
+局部原子证据一致、未观察到回退”，不承诺每次固定改善 1.895%。
+
+本次是性能优化阶段的收口项。standalone cross-core 的 `0.815937 ms` 不能
+冒充 same-core 基线；主 simpler same-core 在本轮修改前的实测中位数是
+`1.484467 ms`，本轮修改后是 `1.456340 ms`。

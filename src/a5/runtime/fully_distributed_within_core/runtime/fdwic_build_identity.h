@@ -47,8 +47,8 @@ enum class FdwicTensorMapMode : uint32_t {
 };
 
 inline constexpr uint64_t kFdwicBuildIdentityMagic = 0x46445749434d4150ULL;  // "FDWICMAP"
-inline constexpr uint32_t kFdwicBuildAbiVersion = PTO_FDWIC_SHARED_MAP ? 6U : 4U;
-inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = PTO_FDWIC_SHARED_MAP ? 6U : 4U;
+inline constexpr uint32_t kFdwicBuildAbiVersion = PTO_FDWIC_SHARED_MAP ? 7U : 4U;
+inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = PTO_FDWIC_SHARED_MAP ? 7U : 4U;
 inline constexpr FdwicTensorMapMode kFdwicCompiledTensorMapMode = static_cast<FdwicTensorMapMode>(PTO_FDWIC_SHARED_MAP);
 // The replacement shared PA backend has no address-region ring. Keep the
 // identity field for the stable 64-byte cross-image prefix, but publish zero
