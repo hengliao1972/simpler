@@ -371,6 +371,10 @@ struct SharedHostPlannedTask {
     bool has_following_group;
     bool is_final_up;
     bool is_last_in_batch;
+    // 公共 dispatch 只消费这个明确计划位，不从 PA
+    // TaskKind 反推 writer 资格。device 还会用实际 delta
+    // 与该位交叉校验，不信任 host 声明来跳过写集。
+    bool publishes_metadata;
 };
 
 struct SharedHostTaskPlan {
@@ -531,6 +535,7 @@ inline bool BuildSharedHostTaskPlan(
                     has_following_group,
                     is_final_up,
                     task_offset + 1U == task_count,
+                    kind == TaskKind::Up,
                 }
             );
             plan->canonical_heap_bytes += output_bytes;
@@ -729,6 +734,11 @@ inline bool PopulateSharedBuildDispatchPlan(
         identity.batch = static_cast<uint16_t>(task.batch);
         identity.encoded_meta = encoded;
         identity.exec_route = exec_route;
+        if (task.publishes_metadata) {
+            state->build_dispatch.metadata_writer_bits[
+                task.task_id / 64U
+            ] |= uint64_t{1} << (task.task_id % 64U);
+        }
         if (executable) {
             uint32_t *task_ids = nullptr;
             uint32_t *task_count = nullptr;
@@ -1274,8 +1284,9 @@ static_assert(
     // 96 * sizeof(ExecutionToken) = 55296B。S6.71 四 token 再追加
     // 96 * sizeof(ExecutionToken) = 55296B。未保留无稳定收益的双 Execute
     // cursor 128B 空槽，因此 task-indexed payload 与其 DCCI 发布边界之外
-    // 只增加一个 owner-local token。
-    CrossCoreExecStateBytes() == 19493248,
+    // 只增加一个 owner-local token。稀疏 metadata-writer 计划再追加
+    // 69 个 uint64 word 和 24B 行尾对齐，共 576B。
+    CrossCoreExecStateBytes() == 19493824,
     "cross-core execution state transfer size changed"
 );
 static_assert(

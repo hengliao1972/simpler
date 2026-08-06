@@ -5843,3 +5843,32 @@ GM/互连压力。
 因此设备、CPU 与测试中的 `ld_dev` 候选代码全部撤回，只保留本节反例。后续不再
 通过替换轮询 primitive 优化这条链；必须减少严格链中的 handoff 数量，或把不需要
 全序的发布语义从该链拆开。
+
+## 2026-08-06：S6.84-a 先发布算子无关 metadata-writer 计划
+
+为了在不触碰现行 Register 协议的前提下建立“只串行实际 writer”的
+可验证输入，只读 `SharedBuildDispatchState` 新增一份 task-id
+metadata-writer bitset：
+
+```text
+kMaxTasks = 4352
+writer words = ceil(4352 / 64) = 69
+bitset bytes = 552
+cache-line tail padding = 24
+CrossCoreExecStateBytes 增加 = 576 B
+```
+
+这一阶段只由 host/operator 权威计划填位，device 热路尚未读取，因此
+Register 仍是原有 1,280-task 完整链，性能结论不变。PA host adapter 根据
+自己的 task 合同填写 `publishes_metadata`，公共 bitset 布局与后续
+device 协议均不读 `TaskKind`。
+
+host 定向门槛已覆盖 G0/G1/G2/G4 混合计划，逐 task 验证当前 bit 和
+previous writer，并检查有效 task 尾部的所有 word 仍为零。CPU 全量协议
+回归通过；CCEC AIC/AIV generic probe、split Finish 三调用点、混合 ELF
+relocation 和 artifact manifest 均通过。
+
+实现过程中曾尝试把 `publishes_metadata/previous_writer` 直接扩展进
+`SharedBuildDispatchTask` 局部解码对象，CCEC 立即把 AIV split Finish 从三个
+role-compatible relocation 折叠为两个。该形态已撤回；仅保留紧凑 bitset，
+后续在真正需要的 Finish 内独立解码，不改现有 ticket 局部 ABI。

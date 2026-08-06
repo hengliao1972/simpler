@@ -1443,6 +1443,23 @@ static_assert(
     "shared Build dispatch task identity must remain compact"
 );
 
+// operator/host 在 launch 前明确标注哪些 task 会产生
+// TensorMap ordinary/symbol writer metadata。这是算子无关的只读
+// 计划：公共调度器只消费 task-id bit，不解码 PA kind。
+constexpr uint32_t kSharedMetadataWriterWordCount =
+    (kMaxTasks + 63U) / 64U;
+constexpr uint32_t kSharedBuildDispatchTailPadding =
+    64U - static_cast<uint32_t>(
+        (sizeof(SharedBuildDispatchTaskIdentity) * kMaxTasks +
+         sizeof(uint64_t) * kSharedMetadataWriterWordCount) % 64U
+    );
+static_assert(
+    kSharedMetadataWriterWordCount != 0 &&
+        kSharedBuildDispatchTailPadding >= 1U &&
+        kSharedBuildDispatchTailPadding <= 64U,
+    "shared metadata-writer plan sizing is invalid"
+);
+
 struct alignas(64) SharedBuildDispatchState {
     // next_task 是本结构唯一的 device 可写字段，并独占第一条 cache line。
     // 后续 header/plan 均由 host 在 launch 前一次写定，device 只读。
@@ -1454,6 +1471,12 @@ struct alignas(64) SharedBuildDispatchState {
     uint32_t executable_task_count;
     uint8_t header_padding[64 - 3 * sizeof(uint32_t)];
     SharedBuildDispatchTaskIdentity tasks[kMaxTasks];
+    uint64_t metadata_writer_bits[
+        kSharedMetadataWriterWordCount
+    ];
+    uint8_t plan_tail_padding[
+        kSharedBuildDispatchTailPadding
+    ];
 };
 static_assert(
     offsetof(SharedBuildDispatchState, tasks) == 128,
@@ -1465,7 +1488,9 @@ static_assert(
 );
 static_assert(
     sizeof(SharedBuildDispatchState) ==
-        128 + sizeof(SharedBuildDispatchTaskIdentity) * kMaxTasks,
+        128 + sizeof(SharedBuildDispatchTaskIdentity) * kMaxTasks +
+        sizeof(uint64_t) * kSharedMetadataWriterWordCount +
+        kSharedBuildDispatchTailPadding,
     "shared Build dispatch state size changed"
 );
 static_assert(

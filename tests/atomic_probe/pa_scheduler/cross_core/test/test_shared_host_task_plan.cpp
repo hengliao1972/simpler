@@ -28,6 +28,37 @@ bool Check(bool condition, const char *label) {
     return condition;
 }
 
+bool DecodeMetadataWriterPlanHost(
+    const SharedBuildDispatchState &dispatch, uint32_t task_id,
+    bool &publishes_metadata, int32_t &previous_metadata_writer
+) {
+    publishes_metadata = false;
+    previous_metadata_writer = -1;
+    if (dispatch.task_count == 0 ||
+        dispatch.task_count > kMaxTasks ||
+        task_id >= dispatch.task_count) {
+        return false;
+    }
+    const uint32_t word_index = task_id / 64U;
+    const uint32_t bit_index = task_id % 64U;
+    const uint64_t word =
+        dispatch.metadata_writer_bits[word_index];
+    publishes_metadata =
+        ((word >> bit_index) & uint64_t{1}) != 0;
+    for (int32_t candidate =
+             static_cast<int32_t>(task_id) - 1;
+         candidate >= 0; --candidate) {
+        if (((dispatch.metadata_writer_bits[
+                  static_cast<uint32_t>(candidate) / 64U
+              ] >> (static_cast<uint32_t>(candidate) % 64U)) &
+             uint64_t{1}) != 0) {
+            previous_metadata_writer = candidate;
+            break;
+        }
+    }
+    return true;
+}
+
 bool SetContextsAndBuild(
     SchedulerState *state, const int32_t *contexts,
     uint32_t batches, SharedHostTaskPlan *plan
@@ -700,6 +731,7 @@ int main() {
             ];
     uint32_t expected_aic_tasks = 0;
     uint32_t expected_aiv_tasks = 0;
+    int32_t expected_previous_metadata_writer = -1;
     for (uint32_t task_id = 0;
          task_id < mixed.total_tasks; ++task_id) {
         const SharedBuildDispatchTaskIdentity &identity =
@@ -714,6 +746,22 @@ int main() {
                 EncodeSharedHostExecRoute(
                     mixed.tasks[task_id].kind
                 );
+        bool publishes_metadata = false;
+        int32_t previous_metadata_writer = INT32_MIN;
+        dispatch_plan_ok &= DecodeMetadataWriterPlanHost(
+            state->build_dispatch, task_id,
+            publishes_metadata,
+            previous_metadata_writer
+        );
+        dispatch_plan_ok &=
+            publishes_metadata ==
+                mixed.tasks[task_id].publishes_metadata &&
+            previous_metadata_writer ==
+                expected_previous_metadata_writer;
+        if (mixed.tasks[task_id].publishes_metadata) {
+            expected_previous_metadata_writer =
+                static_cast<int32_t>(task_id);
+        }
         bool executable = false;
         cross_core::ExecEngineClass engine =
             cross_core::ExecEngineClass::None;
@@ -750,9 +798,15 @@ int main() {
             identity.encoded_meta == 0 &&
             identity.exec_route == 0;
     }
+    for (uint32_t word =
+             (mixed.total_tasks + 63U) / 64U;
+         word < kSharedMetadataWriterWordCount; ++word) {
+        dispatch_plan_ok &=
+            state->build_dispatch.metadata_writer_bits[word] == 0;
+    }
     ok &= Check(
         dispatch_plan_ok,
-        "InitializeState publishes one compact immutable identity per task"
+        "InitializeState publishes compact immutable task identities and a generic metadata-writer plan"
     );
 
     SharedHostTaskPlan malformed_dispatch = mixed;

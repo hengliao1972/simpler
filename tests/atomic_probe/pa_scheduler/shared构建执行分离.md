@@ -2001,3 +2001,60 @@ BUILT-only 或伪 ready 队列；优先缩短严格 Register 完成传播和随�
 不能靠删减 kernel、截断 FinalDrain 或改变任务数达标；仍以 startup 起点到
 FinalDrain 结束的完整周期裁决。离线工具及逐 task 分解见
 `cross_core/analyze_pa_exec_release_bound.py` 和过程记录 S6.82。
+
+### 2026-08-06：下一候选为“稀疏 metadata writer 严格链”
+
+现行逐 task 完成链同时承担了两个不同职责：
+
+1. 保证 TensorMap ordinary/symbol writer metadata 按 task id 严格顺序发布；
+2. 用完整的 `0 -> 1 -> ... -> N-1` 前缀间接证明所有旧 task 的
+   fresh output descriptor 已发布，从而在 Fanin 中删掉每个
+   `(producer, slot).published` 返回型读取。
+
+这个合并合同正确，但不是达成严格 TensorMap 顺序的必要条件。
+B256/PA-G1 中 1,280 个 task 只有 256 个 task 产生 symbol writer
+metadata，ordinary writer 为零；其余 1,024 个空 writer task 仅为维持
+“所有 task 前缀”而执行 predecessor load 和 completion handoff。S6.83 又已
+证明不能靠 `ld_dev` 换掉这些等待，下一候选因此直接减少必须
+串行的 handoff 数量。
+
+候选合同是：
+
+```text
+host/operator 不可变计划：
+  以紧凑 writer bitset 明确声明哪些 task 会产生 TensorMap metadata
+  device 从 bitset 求 previous_metadata_writer(N)
+
+device Build owner：
+  Materialize -> descriptor DCCI -> per-output published
+  Prepare writer delta
+  断言 delta.writer_intent_required == writer_bit[N]
+  等待 previous_metadata_writer(N) 的 metadata completion
+  writer task:    发布 metadata -> 发布自己的 metadata completion
+  non-writer task: 不发布 completion
+  Fanin 对实际消费的 fresh output 直接等待 published
+  Fanin/Build 之后仍不进入 metadata 严格链
+```
+
+这不是跳过有效插入：所有 `writer_bit==1` 的 task 仍通过
+`previous_metadata_writer` 按 task id 形成唯一严格链；只有被 host
+权威计划和 device 实际 delta 双重证明为空的 task 才不再充当 baton。
+bitset 是算子无关调度合同，公共协议不读取 PA `TaskKind`、batch 或
+UP 形状；PA host adapter 只是本轮的一个计划生成者。
+
+该候选必须同时恢复 direct output 发布证明。不能在删掉完整
+task 前缀后继续使用 `TrustOutputPublishedFromInsertChain=true`；否则前序
+producer 可能尚未 Materialize，consumer 就会读未发布 descriptor。这些
+published 等待只针对真实 fanin，不恢复全局 task 前缀。
+
+保留门槛为：
+
+- CPU 证明 bitset/delta 不一致立即终止，writer 完成严格单调，空
+  writer 不被误发布，乱序 Build 与 direct-output 等待可闭合；
+- CCEC 保留 A5 无 cache coherence 合同：descriptor 仍是
+  `DCCI + DSB -> published Atomic`，metadata 仍是 payload DCCI 后再发布 completion；
+- A5 先用 trace-free 交错 A/B 判定完整周期，再用 full-swimlane 确认
+  writer completion 数、direct-output poll 数、TensorMap/history 终态和首个
+  AIC/last BUILT 同向改善；
+- 如 direct-output 并发等待反而放大 GM/Atomic 压力，则整个候选撤回，
+  不以减少 completion 计数代替端到端收益。
