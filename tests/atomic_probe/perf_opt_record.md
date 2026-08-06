@@ -6842,3 +6842,28 @@ CPU/CCEC 与 A5 B256 全部正确性终态通过。冻结 12 对完整周期中�
 中位为 `945.650/946.756 us`，候选慢 `0.117%`；均值仅快 `0.035%`，配对差
 中位 `+12.560 us`，候选只在 `5/12` 对获胜。该项通用性合格但性能不合格，
 生产代码完整恢复；不能以局部函数缩短替代最终 ELF 和设备收益证据。
+
+### 15.68 function-striped 双项 Execute ticket
+
+旧 AIC/AIV 中央 Execute cursor 按 task 逐项执行返回型 `FetchAdd(+1)`，B256
+共 1120 次；动态单项领取还使每核 function 组合明显不均。候选由 host 按
+通用 `(task_id, function_id, engine_class)` 对每种 engine 做 function-id
+轮转，同一 function 内保持原顺序；device 在四 token 窗口至少有两个空槽时，
+用一次 `FetchAdd(+2)` 取得最多两个连续 ordinal，并为每项绑定独立 token。
+公共 planner/device 不读取 PA `TaskKind`、固定 DAG、batch、核数或输出形状；
+PA adapter 只提供通用三元组。Build 与 Execute owner 继续解耦，TensorMap
+严格 writer 插入链、payload、DCCI、fanin 与 completion 均未改变。
+
+CPU 全协议（含任意 function-id、奇数尾批和空 engine 计划）、CCEC
+perf-clock/full-swimlane、A5 B1/B256 全部门槛通过。B256
+保持 1280 Build、1024 kernel、256 metadata writer、2048 output 和 6528 DCCI；
+Execute ticket 精确降为 606 次。perf-clock 最终 `.text` 从 `303160 B` 降到
+`249912 B`，减少 `53248 B / 17.56%`。full-swimlane 中 AIC 每核 QK/PV 数量
+由 `4--12/4--11` 收敛到 `7--9/7--9`，AIV 每核 SF/UP 由 `1--6/1--8`
+收敛到 `3--5/3--5`；Execute ticket 累计 core-time 从 `356.164 us` 降到
+`244.044 us`。
+
+冻结 12 对 startup→FinalDrain 交错 A/B 中，基线/候选中位为
+`941.054/842.926 us`，改善 `98.128 us / 10.427%`；均值改善 `10.757%`，
+配对差中位 `-103.762 us`，候选胜 `12/12` 对。该项正确性、泛化边界和性能
+证据均闭合，正式保留；详细协议与数据见实现过程 S6.93。

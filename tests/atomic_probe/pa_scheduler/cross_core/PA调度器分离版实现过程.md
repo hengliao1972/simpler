@@ -6636,3 +6636,158 @@ route 复用候选           903.429     946.756      982.401    946.813 us
 收益。生产源码已完整恢复，后续不得仅凭“少一次 route 解析”恢复本候选；若要
 重做，必须先让 portable adapter 合同本身输出一次性验证对象，并以独立机器码
 和设备证据重新开始。
+
+## 2026-08-06：S6.93 function-striped 双项 Execute ticket
+
+### 问题证据与候选边界
+
+S6.92 仍对 AIC/AIV 两条中央 Execute cursor 逐 task 发放：每个有效 task 一次
+返回型 `FetchAdd(+1)`，每个 worker 在表尾再做一次越界领取。B256 的固定预算
+为 AIC `512+32=544` 次、AIV `512+64=576` 次，合计 1120 次。冻结
+full-swimlane 还显示，动态逐项领取并没有自动形成均匀的 function 组合：
+
+```text
+                                 AIC                         AIV
+每核 kernel 数范围       QK 4--12 / PV 4--11          SF 1--6 / UP 1--8
+每核 kernel 时间范围          458.057--673.147 us          74.020--359.910 us
+```
+
+这不是 TensorMap 插入问题。Build 仍由全 96 Scalar 中央 ticket 唯一取得，只有
+真实 metadata writer 进入严格 task-id 插入链；Execute cursor 只决定已发布执行
+包由哪个同角色 Scalar 消费。候选因此只改 Execute 计划排布与领取粒度，不改
+Build ticket、Materialize、Register、fanin、payload、DCCI、completion 或
+FinalDrain 协议。
+
+### 通用方案，而非 PA task 特例
+
+host 计划器新增通用三元组：
+
+```text
+(task_id, function_id, engine_class)
+```
+
+它先按 AIC/AIV 分流，再按 `function_id` 稳定排序并轮转取一项；同一 function
+内部保持输入 task 顺序。公共 planner 不读取 PA `TaskKind`、batch、固定 DAG、
+核数或 tensor shape。PA adapter 只把既有 QK/SF/PV/UP 计划翻译成上述三元组；
+以后其他算子提供自己的 function/engine 元数据即可复用同一规则。
+
+device 端把一次 Execute ticket 改成固定两项：
+
+1. 至少有两个空 token 时，对本角色 cursor 发射 `FetchAdd(+2)`；
+2. 返回的 ordinal 区间最多含两个 task，每项分别校验 immutable route；
+3. 两项分别绑定独立 owner-local token，cell/payload/Claim/DONE 状态不合并；
+4. 对本核全部已占用 token 做一次推进；新批任一项仍为 `WAITING_BUILT` 时，
+   本调度边界停止继续取下一批；
+5. 最后一个有效批次同时证明本 worker exhausted，其余 worker 各做一次越界
+   领取；空计划则所有 worker 各观察一次越界。
+
+两项上界来自四 token 前视容量，而不是 PA 恰好有两种 AIC 或 AIV function：
+一次最多占一半窗口，避免一个尚未 Build 的四项批次直接填满所有 token。单
+function 算子仍能减少返回型 Atomic，多 function 算子还可避免同一 executor
+连续得到成串的单一 function。TensorMap writer 顺序完全不读取 Execute
+ordinal，因此该变化不会放宽严格插入。
+
+B256 的新物理领取预算为：
+
+```text
+AIC: ceil(512/2) + 32 - 1 = 287
+AIV: ceil(512/2) + 64 - 1 = 319
+合计                            606
+```
+
+### 正确性和真实后端门槛
+
+新增或更新的 CPU 门槛覆盖：
+
+- 任意 function-id/engine 输入的稳定轮转，以及同 function 内顺序保持；
+- 重复 task id、非法 function/engine 在发布前失败并清空 Execute 计划；
+- 两项 ordinal 不重叠、奇数尾批只含一项、尾批 owner 不再做第二次越界 RMW；
+- 空 engine 执行计划没有尾批 owner，每个参与 worker 精确做一次越界确认；
+- 两个尚未 Build 的 task 同边界占用两个 token，且不继续无界前视；
+- 四 token 背压、较早 token 阻塞而后续 token ready、重复消费 fail-closed；
+- 96-thread 动态 Build/Execute 中 1280 Build、1024 Execute、256 metadata
+  writer 与 FinalDrain 完整闭合。
+
+完整 CPU 回归通过；10 轮并发模型每轮都得到 1376 次 Build ticket、606 次
+Execute ticket 和 1024 次 exactly-once kernel。CCEC perf-clock 与
+full-swimlane 的 AIC/AIV generic probe、split Finish、mixed ELF、manifest
+和最终零 relocation 门槛全部通过。候选改变了等价 Finish 尾部合并形状：
+
+```text
+                         perf-clock AIC/AIV    full-swimlane AIC/AIV
+S6.92                              4/4                    3/3
+S6.93                              3/4                    4/3
+```
+
+构建仍逐产物锁定精确值，并继续校验唯一 role finish、block-local state 和 A5
+动态 `finish_calls`；没有放宽成范围或跳过检查。A5 B1 scalar-nop 与 B256
+real-compute `6,28,4,1` 均通过全部业务、payload、fanin、TensorMap、DCCI、
+completion 和 FinalDrain 断言。B256 精确保持：
+
+```text
+Build                       1280
+kernel                      1024
+metadata writer              256
+published output            2048
+DCCI                         6528
+Execute ticket                606
+```
+
+### 机器码和 full-swimlane 归因
+
+双项绑定后，原来“推进新 token 一次、完成后再扫全部 token”的两套模板热路径
+收敛为一次完整 token 扫描。CCEC 对多处实例进一步合并，perf-clock 机器码为：
+
+```text
+AIC entry .text       110360 ->  84056 B   (-26304 B)
+AIV entry .text       112184 ->  85304 B   (-26880 B)
+最终 kernel .text     303160 -> 249912 B   (-53248 B, -17.56%)
+finish AIC/AIV         39872/40360 B        （不变）
+```
+
+冻结 S6.92 与候选 full-swimlane 的直接对照为：
+
+```text
+                                      S6.92        S6.93
+Execute ticket 调用                    1120           606
+Execute ticket 累计 core-time       356.164 us     244.044 us
+AIC 每核 QK/PV 数范围             4--12/4--11       7--9/7--9
+AIC 每核 kernel 时间范围       458.057--673.147 508.558--657.875 us
+AIV 每核 SF/UP 数范围               1--6/1--8       3--5/3--5
+AIV 每核 kernel 时间范围        74.020--359.910 178.097--300.929 us
+```
+
+Atomic 累计值是跨核 core-time，不等同于端到端直接节省；但调用减少与每核
+function 负载收敛都与改动位置一致。full-swimlane 的 raw Submit makespan 为
+`741.571/745.151 us`，不能宣称 Submit 内直接收益；本候选的主要收益落在整个
+startup 到 FinalDrain 的执行负载收口，最终裁决必须使用 trace-free
+perf-clock，而不是用不同观测 ELF 的 Submit 数替代。
+
+候选取证文件（不提交）：
+
+```text
+基线：outputs/pa_exec_plan_header_correct_20260806_092808_333989/
+候选：outputs/pa_scheduler_cross_core_shared_swimlane_20260806_110948_594764/
+```
+
+### 冻结端到端 A/B 与结论
+
+冻结修改前 `/tmp/pa_route_baseline_20260806` 与候选
+`/tmp/pa_function_striped_exec_batch2_candidate_20260806_v1`，按 B-C/C-B
+反转顺序交错执行 12 对独立 B256 进程。唯一口径为最早 startup 起点到最后
+FinalDrain 结束：
+
+```text
+                         min        median       max         mean
+S6.92 基线              898.043     941.054     978.615     945.241 us
+S6.93 候选              832.802     842.926     858.253     843.566 us
+
+独立中位改善：98.128 us / 10.427%
+独立均值改善：101.675 us / 10.757%
+配对差中位：-103.762 us
+候选获胜：12/12
+```
+
+该候选同时通过泛化边界、正确性、真实 CCEC 与冻结性能裁决，正式保留。当前
+权威中位距 `0.8 ms` 目标仍有约 `42.9 us`；后续继续从通用调度协议寻找收益，
+不得新增 PA kind、固定 DAG、固定 batch/核数或输出形状分支。

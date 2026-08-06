@@ -4246,13 +4246,15 @@ enum class SharedExecTicketStatus : uint32_t {
 
 struct SharedExecTicketResult {
     SharedExecTicketStatus status;
-    uint32_t task_id;
+    uint32_t task_ids[cross_core::kExecTicketBatchSize];
+    uint32_t task_count;
 };
 
 // 默认入口继续逐次校验 immutable plan header，供独立协议调用保持
 // fail-closed。正式中央调度只有在 RunSchedulerImpl 已于首张 ticket 前
 // 校验同一 header 后才实例化 PlanHeaderValidated=true；task-id、角色路由、
-// cursor 上界和返回型 Atomic 结果仍逐次检查。
+// cursor 上界和返回型 Atomic 结果仍逐批检查。每批 ordinal 区间由一次
+// FetchAdd 线性化，区间内每个 task 仍分别校验 route 并绑定独立 token。
 template <typename Ops, bool PlanHeaderValidated = false>
 PA_DEVICE SharedExecTicketResult TakeSharedExecTicket(
     PA_GM SchedulerState *state, uint32_t worker_id,
@@ -4263,7 +4265,8 @@ PA_DEVICE SharedExecTicketResult TakeSharedExecTicket(
         !CrossCoreExecWorkerMatchesRole(worker_id, role) ||
         stats.exec_dispatch_exhausted != 0) {
         return SharedExecTicketResult{
-            SharedExecTicketStatus::Invalid, UINT32_MAX
+            SharedExecTicketStatus::Invalid,
+            {UINT32_MAX, UINT32_MAX}, 0
         };
     }
 
@@ -4282,7 +4285,8 @@ PA_DEVICE SharedExecTicketResult TakeSharedExecTicket(
         role_task_count = state->exec_dispatch.aiv_task_count;
     } else {
         return SharedExecTicketResult{
-            SharedExecTicketStatus::Invalid, UINT32_MAX
+            SharedExecTicketStatus::Invalid,
+            {UINT32_MAX, UINT32_MAX}, 0
         };
     }
     if constexpr (!PlanHeaderValidated) {
@@ -4293,7 +4297,8 @@ PA_DEVICE SharedExecTicketResult TakeSharedExecTicket(
                     state->exec_dispatch.aiv_task_count !=
                 state->build_dispatch.executable_task_count) {
             return SharedExecTicketResult{
-                SharedExecTicketStatus::Invalid, UINT32_MAX
+                SharedExecTicketStatus::Invalid,
+                {UINT32_MAX, UINT32_MAX}, 0
             };
         }
     }
@@ -4301,29 +4306,48 @@ PA_DEVICE SharedExecTicketResult TakeSharedExecTicket(
     const int64_t observed = TraceAtomicFetchAdd<Ops>(
         stats.trace, stats.result, -1,
         AtomicSite::SharedExecDispatchTicket,
-        cursor, 1, /*result_used=*/true
+        cursor, cross_core::kExecTicketBatchSize,
+        /*result_used=*/true
     );
     if (observed < 0) {
         return SharedExecTicketResult{
-            SharedExecTicketStatus::Invalid, UINT32_MAX
+            SharedExecTicketStatus::Invalid,
+            {UINT32_MAX, UINT32_MAX}, 0
         };
     }
     if (observed >= static_cast<int64_t>(role_task_count)) {
         stats.exec_dispatch_exhausted = 1;
         return SharedExecTicketResult{
-            SharedExecTicketStatus::Exhausted, UINT32_MAX
+            SharedExecTicketStatus::Exhausted,
+            {UINT32_MAX, UINT32_MAX}, 0
         };
     }
-    const uint32_t task_id =
-        task_ids[static_cast<uint32_t>(observed)];
-    if (task_id >= task_count) {
-        return SharedExecTicketResult{
-            SharedExecTicketStatus::Invalid, UINT32_MAX
-        };
-    }
-    return SharedExecTicketResult{
-        SharedExecTicketStatus::Acquired, task_id
+    const uint32_t first = static_cast<uint32_t>(observed);
+    const uint32_t acquired =
+        role_task_count - first < cross_core::kExecTicketBatchSize
+            ? role_task_count - first
+            : cross_core::kExecTicketBatchSize;
+    SharedExecTicketResult result{
+        SharedExecTicketStatus::Acquired,
+        {UINT32_MAX, UINT32_MAX}, acquired
     };
+    for (uint32_t index = 0; index < acquired; ++index) {
+        const uint32_t task_id = task_ids[first + index];
+        if (task_id >= task_count) {
+            return SharedExecTicketResult{
+                SharedExecTicketStatus::Invalid,
+                {UINT32_MAX, UINT32_MAX}, 0
+            };
+        }
+        result.task_ids[index] = task_id;
+    }
+    if (first + cross_core::kExecTicketBatchSize >=
+        role_task_count) {
+        // 尾批次既取得最后一项，也完成本 worker 的 exhaustion 证明；
+        // 不需要再向同一 cursor 发射一次纯越界 RMW。
+        stats.exec_dispatch_exhausted = 1;
+    }
+    return result;
 }
 
 PA_DEVICE bool BindSharedExecTicketToToken(
@@ -4928,16 +4952,16 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
         )) {
         return 0;
     }
-    if (CrossCoreExecOccupiedTokenCount(state, worker_id) >=
-        cross_core::kExecTokensPerWorker) {
+    if (CrossCoreExecOccupiedTokenCount(state, worker_id) >
+        cross_core::kExecTokensPerWorker -
+            cross_core::kExecTicketBatchSize) {
         return completed_count;
     }
 
     while (stats.exec_dispatch_exhausted == 0) {
-        const uint32_t idle_token_slot =
-            CrossCoreExecFirstIdleTokenSlot(state, worker_id);
-        if (idle_token_slot >=
-            cross_core::kExecTokensPerWorker) {
+        if (CrossCoreExecOccupiedTokenCount(state, worker_id) >
+            cross_core::kExecTokensPerWorker -
+                cross_core::kExecTicketBatchSize) {
             break;
         }
         const SharedExecTicketResult ticket =
@@ -4953,38 +4977,68 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
                 cross_core::ExecFatalReason::InvalidBuiltControl,
-                ticket.task_id, worker_id
+                ticket.task_ids[0], worker_id
             );
             return completed_count;
         }
-
-        SharedExecDispatchRoute planned{};
-        if (!DecodeSharedExecDispatchRoute(
-                state->build_dispatch, ticket.task_id, planned
-            ) ||
-            !planned.executable ||
-            planned.engine_class != role_engine) {
+        if (ticket.task_count == 0 ||
+            ticket.task_count > cross_core::kExecTicketBatchSize) {
             PublishCrossCoreRuntimeFailure<Ops>(
                 state, stats,
                 cross_core::ExecFatalReason::InvalidBuiltControl,
-                ticket.task_id, worker_id
+                ticket.task_ids[0], worker_id
             );
             return completed_count;
         }
 
-        PA_GM cross_core::ExecutionToken &token =
-            state->exec_tokens[worker_id][idle_token_slot];
-        if (!BindSharedExecTicketToToken(
-                token, ticket.task_id, worker_id, role_engine
-            )) {
-            PublishCrossCoreRuntimeFailure<Ops>(
-                state, stats,
-                cross_core::ExecFatalReason::InvalidTokenPayload,
-                ticket.task_id, worker_id
-            );
-            token.control.phase =
-                cross_core::ExecTokenPhase::Faulted;
-            return completed_count;
+        uint32_t bound_slots[cross_core::kExecTicketBatchSize] = {
+            cross_core::kExecTokensPerWorker,
+            cross_core::kExecTokensPerWorker,
+        };
+        for (uint32_t index = 0;
+             index < ticket.task_count; ++index) {
+            const uint32_t task_id = ticket.task_ids[index];
+            SharedExecDispatchRoute planned{};
+            if (!DecodeSharedExecDispatchRoute(
+                    state->build_dispatch, task_id, planned
+                ) ||
+                !planned.executable ||
+                planned.engine_class != role_engine) {
+                PublishCrossCoreRuntimeFailure<Ops>(
+                    state, stats,
+                    cross_core::ExecFatalReason::InvalidBuiltControl,
+                    task_id, worker_id
+                );
+                return completed_count;
+            }
+            const uint32_t idle_token_slot =
+                CrossCoreExecFirstIdleTokenSlot(
+                    state, worker_id
+                );
+            if (idle_token_slot >=
+                cross_core::kExecTokensPerWorker) {
+                PublishCrossCoreRuntimeFailure<Ops>(
+                    state, stats,
+                    cross_core::ExecFatalReason::InvalidTokenPayload,
+                    task_id, worker_id
+                );
+                return completed_count;
+            }
+            PA_GM cross_core::ExecutionToken &token =
+                state->exec_tokens[worker_id][idle_token_slot];
+            if (!BindSharedExecTicketToToken(
+                    token, task_id, worker_id, role_engine
+                )) {
+                PublishCrossCoreRuntimeFailure<Ops>(
+                    state, stats,
+                    cross_core::ExecFatalReason::InvalidTokenPayload,
+                    task_id, worker_id
+                );
+                token.control.phase =
+                    cross_core::ExecTokenPhase::Faulted;
+                return completed_count;
+            }
+            bound_slots[index] = idle_token_slot;
         }
         const uint32_t occupied =
             CrossCoreExecOccupiedTokenCount(state, worker_id);
@@ -4992,34 +5046,25 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             stats.max_occupied = static_cast<uint8_t>(occupied);
         }
 
-        bool completed = false;
-        if (!ProgressCrossCoreActiveToken<Ops>(
-                state, worker, idle_token_slot, place,
-                stats, completed
-            )) {
-            return completed_count;
-        }
-        completed_count += completed ? 1U : 0U;
-        // 新领到的 Execute ticket 只代表未来 task 的唯一消费权，并不
-        // 代表对应 cell 已经 BUILT。若首次观察后仍停在 WaitingBuilt，
-        // 本次执行推进边界没有理由继续用其余空 token 囤积更多未来 ticket：
-        // 它们大概率同样尚未发布，却会在 AIC/AIV 中央 cursor 上叠加
-        // 返回型 Atomic 竞争。保留当前 token，下一次调度边界再推进；
-        // 已经 Claim 到 BUILT、仅在等待 fanin 的 token 不走这条快退，
-        // 仍允许利用其余槽位承接可独立执行的后续任务。
-        if (!completed &&
-            token.control.phase ==
-                cross_core::ExecTokenPhase::WaitingBuilt) {
-            break;
-        }
-        if (completed &&
-            !ProgressCrossCoreOwnedTokens<Ops>(
+        if (!ProgressCrossCoreOwnedTokens<Ops>(
                 state, worker, place, stats, completed_count
             )) {
             return completed_count;
         }
-        if (CrossCoreExecOccupiedTokenCount(state, worker_id) >=
-            cross_core::kExecTokensPerWorker) {
+
+        // 一个批次只预留两个 ordinal。首次观察后只要其中任一项尚未
+        // BUILT，本调度边界就停止继续取下一批；已经绑定的另一项仍由
+        // 上面的完整 token 扫描及时推进。这样既保留函数条带，又不恢复
+        // 历史上“一次占满四槽未来任务”的长前视。
+        bool batch_waiting_built = false;
+        for (uint32_t index = 0;
+             index < ticket.task_count; ++index) {
+            batch_waiting_built |=
+                state->exec_tokens[worker_id]
+                    [bound_slots[index]].control.phase ==
+                cross_core::ExecTokenPhase::WaitingBuilt;
+        }
+        if (batch_waiting_built) {
             break;
         }
     }

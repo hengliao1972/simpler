@@ -616,6 +616,114 @@ void LimitDefaultPlanToBatches(
     state.exec_dispatch.aiv_task_count = batches * 2U;
 }
 
+void TestDualTicketOddTailAndEmptyPlan() {
+    constexpr const char *kOddTailTest =
+        "dual-ticket-odd-tail";
+    MappedSchedulerState odd_tail_mapping;
+    SchedulerState *odd_tail_state = odd_tail_mapping.Get();
+    Check(
+        odd_tail_state != nullptr, kOddTailTest,
+        "state mapping"
+    );
+    if (odd_tail_state == nullptr) return;
+
+    // 使用与 PA 五任务分组无关的稀疏 task-id，直接验证通用执行计划
+    // 为奇数长度时：首批取得两项，尾批只取得一项且尾批 owner 当场
+    // 得到 exhaustion；其他 worker 只需再做一次越界领取。
+    odd_tail_state->build_dispatch.task_count = 7;
+    odd_tail_state->build_dispatch.executable_task_count = 3;
+    odd_tail_state->exec_dispatch.aic_task_count = 3;
+    odd_tail_state->exec_dispatch.aic_task_ids[0] = 1;
+    odd_tail_state->exec_dispatch.aic_task_ids[1] = 4;
+    odd_tail_state->exec_dispatch.aic_task_ids[2] = 6;
+    constexpr uint32_t kFirstWorker = 7;
+    constexpr uint32_t kTailWorker = 1;
+    LocalStats first_stats{};
+    LocalStats tail_stats{};
+    InitLocalStats(first_stats, kFirstWorker, CoreRole::Aic);
+    InitLocalStats(tail_stats, kTailWorker, CoreRole::Aic);
+    const SharedExecTicketResult first =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            odd_tail_state, kFirstWorker, CoreRole::Aic,
+            7, first_stats
+        );
+    const SharedExecTicketResult tail =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            odd_tail_state, kTailWorker, CoreRole::Aic,
+            7, tail_stats
+        );
+    const SharedExecTicketResult terminal =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            odd_tail_state, kFirstWorker, CoreRole::Aic,
+            7, first_stats
+        );
+    Check(
+        first.status == SharedExecTicketStatus::Acquired &&
+            first.task_count == 2 && first.task_ids[0] == 1 &&
+            first.task_ids[1] == 4 &&
+            tail.status == SharedExecTicketStatus::Acquired &&
+            tail.task_count == 1 && tail.task_ids[0] == 6 &&
+            tail.task_ids[1] == UINT32_MAX &&
+            terminal.status == SharedExecTicketStatus::Exhausted &&
+            first_stats.exec_dispatch_exhausted == 1 &&
+            tail_stats.exec_dispatch_exhausted == 1 &&
+            odd_tail_state->exec_dispatch.aic_next.value ==
+                ExecTicketTerminalCursor(3, 2) &&
+            ExecTicketBatchFetchCalls(3, 2) == 3 &&
+            NoFatal(*odd_tail_state),
+        kOddTailTest,
+        "odd generic plan returns a one-item tail and exact terminal cursor"
+    );
+    std::printf("[PASS] %s\n", kOddTailTest);
+
+    constexpr const char *kEmptyPlanTest =
+        "dual-ticket-empty-plan";
+    MappedSchedulerState empty_mapping;
+    SchedulerState *empty_state = empty_mapping.Get();
+    Check(
+        empty_state != nullptr, kEmptyPlanTest,
+        "state mapping"
+    );
+    if (empty_state == nullptr) return;
+    // task_count 表示算子逻辑任务总数，可以非零；该 engine 的执行计划
+    // 允许为空。此时没有尾批 owner，每个参与 worker 各观察一次越界。
+    empty_state->build_dispatch.task_count = 4;
+    empty_state->build_dispatch.executable_task_count = 0;
+    LocalStats empty_first_stats{};
+    LocalStats empty_second_stats{};
+    InitLocalStats(
+        empty_first_stats, kFirstWorker, CoreRole::Aic
+    );
+    InitLocalStats(
+        empty_second_stats, kTailWorker, CoreRole::Aic
+    );
+    const SharedExecTicketResult empty_first =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            empty_state, kFirstWorker, CoreRole::Aic,
+            4, empty_first_stats
+        );
+    const SharedExecTicketResult empty_second =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            empty_state, kTailWorker, CoreRole::Aic,
+            4, empty_second_stats
+        );
+    Check(
+        empty_first.status == SharedExecTicketStatus::Exhausted &&
+            empty_second.status == SharedExecTicketStatus::Exhausted &&
+            empty_first.task_count == 0 &&
+            empty_second.task_count == 0 &&
+            empty_first_stats.exec_dispatch_exhausted == 1 &&
+            empty_second_stats.exec_dispatch_exhausted == 1 &&
+            empty_state->exec_dispatch.aic_next.value ==
+                ExecTicketTerminalCursor(0, 2) &&
+            ExecTicketBatchFetchCalls(0, 2) == 2 &&
+            NoFatal(*empty_state),
+        kEmptyPlanTest,
+        "empty engine plan performs one terminal fetch per worker"
+    );
+    std::printf("[PASS] %s\n", kEmptyPlanTest);
+}
+
 void TestDualTicketRoleDistribution() {
     constexpr const char *kTest = "dual-ticket-role-distribution";
     MappedSchedulerState mapping;
@@ -626,11 +734,17 @@ void TestDualTicketRoleDistribution() {
 
     const std::array<uint32_t, 4> aic_workers{7, 1, 31, 12};
     const std::array<uint32_t, 4> aiv_workers{63, 32, 95, 47};
-    const std::array<uint32_t, 4> expected_aic{1, 3, 6, 8};
-    const std::array<uint32_t, 4> expected_aiv{2, 4, 7, 9};
+    const std::array<std::array<uint32_t, 2>, 2> expected_aic{
+        std::array<uint32_t, 2>{1, 3},
+        std::array<uint32_t, 2>{6, 8},
+    };
+    const std::array<std::array<uint32_t, 2>, 2> expected_aiv{
+        std::array<uint32_t, 2>{2, 4},
+        std::array<uint32_t, 2>{7, 9},
+    };
     std::array<LocalStats, 8> stats{};
     bool exact = true;
-    for (uint32_t index = 0; index < 4; ++index) {
+    for (uint32_t index = 0; index < 2; ++index) {
         InitLocalStats(
             stats[index], aic_workers[index], CoreRole::Aic
         );
@@ -638,10 +752,13 @@ void TestDualTicketRoleDistribution() {
             TakeSharedExecTicket<ExecScanTestOps>(
                 state, aic_workers[index], CoreRole::Aic,
                 10, stats[index]
-            );
+        );
         exact &= ticket.status == SharedExecTicketStatus::Acquired &&
-            ticket.task_id == expected_aic[index] &&
-            stats[index].exec_dispatch_exhausted == 0;
+            ticket.task_count == 2 &&
+            ticket.task_ids[0] == expected_aic[index][0] &&
+            ticket.task_ids[1] == expected_aic[index][1] &&
+            stats[index].exec_dispatch_exhausted ==
+                (index == 1 ? 1 : 0);
 
         InitLocalStats(
             stats[4 + index], aiv_workers[index], CoreRole::Aiv
@@ -650,13 +767,22 @@ void TestDualTicketRoleDistribution() {
             TakeSharedExecTicket<ExecScanTestOps>(
                 state, aiv_workers[index], CoreRole::Aiv,
                 10, stats[4 + index]
-            );
+        );
         exact &=
             aiv_ticket.status == SharedExecTicketStatus::Acquired &&
-            aiv_ticket.task_id == expected_aiv[index] &&
-            stats[4 + index].exec_dispatch_exhausted == 0;
+            aiv_ticket.task_count == 2 &&
+            aiv_ticket.task_ids[0] == expected_aiv[index][0] &&
+            aiv_ticket.task_ids[1] == expected_aiv[index][1] &&
+            stats[4 + index].exec_dispatch_exhausted ==
+                (index == 1 ? 1 : 0);
     }
-    for (uint32_t index = 0; index < 4; ++index) {
+    for (uint32_t index = 2; index < 4; ++index) {
+        InitLocalStats(
+            stats[index], aic_workers[index], CoreRole::Aic
+        );
+        InitLocalStats(
+            stats[4 + index], aiv_workers[index], CoreRole::Aiv
+        );
         const SharedExecTicketResult aic_end =
             TakeSharedExecTicket<ExecScanTestOps>(
                 state, aic_workers[index], CoreRole::Aic,
@@ -672,11 +798,26 @@ void TestDualTicketRoleDistribution() {
             stats[index].exec_dispatch_exhausted == 1 &&
             stats[4 + index].exec_dispatch_exhausted == 1;
     }
-    exact &= state->exec_dispatch.aic_next.value == 8 &&
-        state->exec_dispatch.aiv_next.value == 8 && NoFatal(*state);
+    const SharedExecTicketResult first_aic_end =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            state, aic_workers[0], CoreRole::Aic,
+            10, stats[0]
+        );
+    const SharedExecTicketResult first_aiv_end =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            state, aiv_workers[0], CoreRole::Aiv,
+            10, stats[4]
+        );
+    exact &=
+        first_aic_end.status == SharedExecTicketStatus::Exhausted &&
+        first_aiv_end.status == SharedExecTicketStatus::Exhausted &&
+        stats[0].exec_dispatch_exhausted == 1 &&
+        stats[4].exec_dispatch_exhausted == 1;
+    exact &= state->exec_dispatch.aic_next.value == 10 &&
+        state->exec_dispatch.aiv_next.value == 10 && NoFatal(*state);
     Check(
         exact, kTest,
-        "all same-role workers consume one global ordered task stream"
+        "same-role workers consume disjoint two-task plan stripes and exact tails"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -706,16 +847,17 @@ void TestDualTicketWaitingBuiltAndOwnerIndependence() {
         );
     Check(
         empty_progress == 0 &&
-            state->exec_dispatch.aic_next.value == 1 &&
+            state->exec_dispatch.aic_next.value == 2 &&
             state->exec_tokens[kExecutor][0].control.phase ==
                 ExecTokenPhase::WaitingBuilt &&
             state->exec_tokens[kExecutor][0].control.task_id == 1 &&
             state->exec_tokens[kExecutor][1].control.phase ==
-                ExecTokenPhase::Idle &&
-            stats.max_occupied == 1 &&
-            stats.exec_dispatch_exhausted == 0 && NoFatal(*state),
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][1].control.task_id == 3 &&
+            stats.max_occupied == 2 &&
+            stats.exec_dispatch_exhausted == 1 && NoFatal(*state),
         kTest,
-        "one boundary retains only its first unpublished ticket"
+        "one boundary retains one generic two-task ticket batch"
     );
 
     const uint32_t second_empty_progress =
@@ -735,7 +877,7 @@ void TestDualTicketWaitingBuiltAndOwnerIndependence() {
     Check(
         second_empty_progress == 0 &&
             exhaust_probe_progress == 0 &&
-            state->exec_dispatch.aic_next.value == 3 &&
+            state->exec_dispatch.aic_next.value == 2 &&
             first_wait.phase == ExecTokenPhase::WaitingBuilt &&
             first_wait.task_id == 1 &&
             second_wait.phase == ExecTokenPhase::WaitingBuilt &&
@@ -743,7 +885,7 @@ void TestDualTicketWaitingBuiltAndOwnerIndependence() {
             stats.max_occupied == 2 &&
             stats.exec_dispatch_exhausted == 1 && NoFatal(*state),
         kTest,
-        "later boundaries retain distinct tickets and eventually observe exhaustion"
+        "tail batch proves exhaustion without another cursor operation"
     );
 
     Check(
@@ -767,7 +909,7 @@ void TestDualTicketWaitingBuiltAndOwnerIndependence() {
             qk_done.execute_owner == kExecutor &&
             state->tasks[1].flag == 1 &&
             stats.exec_dispatch_exhausted == 1 &&
-            state->exec_dispatch.aic_next.value == 3 &&
+            state->exec_dispatch.aic_next.value == 2 &&
             NoFatal(*state),
         kTest,
         "same Scalar may independently own Build and Execute"
@@ -829,21 +971,22 @@ void TestBlockedTokenStopsSameBoundaryLookahead() {
         );
     Check(
         first_progress == 0 &&
-            state->exec_dispatch.aic_next.value == 1 &&
-            stats.max_occupied == 1 &&
+            state->exec_dispatch.aic_next.value == 2 &&
+            stats.max_occupied == 2 &&
             stats.exec_dispatch_exhausted == 0 &&
             state->exec_tokens[kExecutor][0].control.phase ==
                 ExecTokenPhase::WaitingBuilt &&
             state->exec_tokens[kExecutor][0].control.task_id == 1 &&
             state->exec_tokens[kExecutor][1].control.phase ==
-                ExecTokenPhase::Idle &&
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][1].control.task_id == 3 &&
             state->exec_tokens[kExecutor][2].control.phase ==
                 ExecTokenPhase::Idle &&
             state->exec_tokens[kExecutor][3].control.phase ==
                 ExecTokenPhase::Idle &&
             NoFatal(*state),
         kTest,
-        "one unpublished task stops further tickets in the same boundary"
+        "one boundary takes one pair and stops when either task is unpublished"
     );
 
     uint32_t later_progress = 0;
@@ -857,7 +1000,7 @@ void TestBlockedTokenStopsSameBoundaryLookahead() {
         later_progress == 0 &&
             state->exec_dispatch.aic_next.value == 4 &&
             stats.max_occupied == 4 &&
-            stats.exec_dispatch_exhausted == 0 &&
+            stats.exec_dispatch_exhausted == 1 &&
             state->exec_tokens[kExecutor][0].control.phase ==
                 ExecTokenPhase::WaitingBuilt &&
             state->exec_tokens[kExecutor][0].control.task_id == 1 &&
@@ -874,7 +1017,7 @@ void TestBlockedTokenStopsSameBoundaryLookahead() {
                 state, worker, 10, stats
             ) && NoFatal(*state),
         kTest,
-        "separate progress boundaries can still fill the four-token capacity"
+        "separate progress boundaries fill two disjoint pairs and prove the tail"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -980,6 +1123,7 @@ void TestDualTicketDuplicateConsumerFailsClosed() {
 }  // namespace
 
 int main() {
+    TestDualTicketOddTailAndEmptyPlan();
     TestDualTicketRoleDistribution();
     TestDualTicketWaitingBuiltAndOwnerIndependence();
     TestBlockedTokenStopsSameBoundaryLookahead();

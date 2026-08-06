@@ -665,6 +665,129 @@ inline uint8_t EncodeSharedHostExecRoute(TaskKind kind) {
     return 0;
 }
 
+inline uint32_t EncodeSharedHostExecFunctionId(TaskKind kind) {
+    if (kind == TaskKind::Alloc || kind == TaskKind::Count) {
+        return cross_core::kExecInvalidFunctionId;
+    }
+    return static_cast<uint32_t>(kind) - 1U;
+}
+
+struct SharedHostExecPlanEntry {
+    uint32_t task_id;
+    uint32_t function_id;
+    cross_core::ExecEngineClass engine_class;
+};
+
+// 将任意算子的通用 (engine, function-id, task-id) 计划按 function-id
+// 轮转排布。同一 function 内保持 task-id 输入顺序；不同 function 之间
+// 逐轮各取一项，使后续固定小批次不会系统性把同一函数堆给一个 executor。
+// PA adapter 只负责提供上述三元组，本 helper 不读取 TaskKind、batch 或 DAG。
+inline bool PopulateFunctionStripedSharedExecPlan(
+    SchedulerState *state,
+    const std::vector<SharedHostExecPlanEntry> &entries,
+    std::string *error = nullptr
+) {
+    if (state == nullptr || entries.size() > kMaxTasks) {
+        if (error != nullptr) {
+            *error = "invalid generic Execute dispatch entries";
+        }
+        return false;
+    }
+    std::memset(
+        &state->exec_dispatch, 0,
+        sizeof(state->exec_dispatch)
+    );
+    struct FunctionGroup {
+        uint32_t function_id;
+        std::vector<uint32_t> task_ids;
+        size_t next = 0;
+    };
+    std::vector<FunctionGroup> groups[2];
+    std::vector<uint8_t> seen(kMaxTasks, 0);
+    for (const SharedHostExecPlanEntry &entry : entries) {
+        uint32_t engine_index = 0;
+        if (entry.engine_class ==
+            cross_core::ExecEngineClass::Aic) {
+            engine_index = 0;
+        } else if (entry.engine_class ==
+                   cross_core::ExecEngineClass::Aiv) {
+            engine_index = 1;
+        } else {
+            if (error != nullptr) {
+                *error = "generic Execute plan contains unsupported engine";
+            }
+            std::memset(
+                &state->exec_dispatch, 0,
+                sizeof(state->exec_dispatch)
+            );
+            return false;
+        }
+        if (entry.task_id >= kMaxTasks ||
+            entry.function_id == cross_core::kExecInvalidFunctionId ||
+            seen[entry.task_id] != 0) {
+            if (error != nullptr) {
+                *error = "generic Execute plan identity is invalid or duplicated";
+            }
+            std::memset(
+                &state->exec_dispatch, 0,
+                sizeof(state->exec_dispatch)
+            );
+            return false;
+        }
+        seen[entry.task_id] = 1;
+        auto group = std::find_if(
+            groups[engine_index].begin(),
+            groups[engine_index].end(),
+            [&](const FunctionGroup &candidate) {
+                return candidate.function_id == entry.function_id;
+            }
+        );
+        if (group == groups[engine_index].end()) {
+            groups[engine_index].push_back(
+                FunctionGroup{entry.function_id, {}, 0}
+            );
+            group = groups[engine_index].end() - 1;
+        }
+        group->task_ids.push_back(entry.task_id);
+    }
+
+    for (uint32_t engine_index = 0;
+         engine_index < 2; ++engine_index) {
+        std::sort(
+            groups[engine_index].begin(),
+            groups[engine_index].end(),
+            [](const FunctionGroup &left,
+               const FunctionGroup &right) {
+                return left.function_id < right.function_id;
+            }
+        );
+        uint32_t *destination = engine_index == 0
+            ? state->exec_dispatch.aic_task_ids
+            : state->exec_dispatch.aiv_task_ids;
+        uint32_t appended = 0;
+        bool made_progress = true;
+        while (made_progress) {
+            made_progress = false;
+            for (FunctionGroup &group : groups[engine_index]) {
+                if (group.next >= group.task_ids.size()) {
+                    continue;
+                }
+                destination[appended++] =
+                    group.task_ids[group.next++];
+                made_progress = true;
+            }
+        }
+        if (engine_index == 0) {
+            state->exec_dispatch.aic_task_count = appended;
+        } else {
+            state->exec_dispatch.aiv_task_count = appended;
+        }
+    }
+    return state->exec_dispatch.aic_task_count +
+               state->exec_dispatch.aiv_task_count ==
+        entries.size();
+}
+
 inline bool PopulateSharedBuildDispatchPlan(
     SchedulerState *state, const SharedHostTaskPlan &plan,
     std::string *error = nullptr
@@ -690,6 +813,8 @@ inline bool PopulateSharedBuildDispatchPlan(
     state->build_dispatch.task_count = plan.total_tasks;
     state->build_dispatch.batch_count = plan.batch_count;
     uint32_t executable_task_count = 0;
+    std::vector<SharedHostExecPlanEntry> exec_plan_entries;
+    exec_plan_entries.reserve(plan.total_tasks);
     for (uint32_t expected_task = 0;
          expected_task < plan.total_tasks; ++expected_task) {
         const SharedHostPlannedTask &task =
@@ -775,19 +900,10 @@ inline bool PopulateSharedBuildDispatchPlan(
                   .symbol_metadata_writer_count;
         }
         if (executable) {
-            uint32_t *task_ids = nullptr;
-            uint32_t *task_count = nullptr;
-            if (engine_class ==
-                cross_core::ExecEngineClass::Aic) {
-                task_ids = state->exec_dispatch.aic_task_ids;
-                task_count =
-                    &state->exec_dispatch.aic_task_count;
-            } else if (engine_class ==
-                       cross_core::ExecEngineClass::Aiv) {
-                task_ids = state->exec_dispatch.aiv_task_ids;
-                task_count =
-                    &state->exec_dispatch.aiv_task_count;
-            } else {
+            const uint32_t function_id =
+                EncodeSharedHostExecFunctionId(task.kind);
+            if (function_id ==
+                cross_core::kExecInvalidFunctionId) {
                 if (error != nullptr) {
                     *error =
                         "shared Execute dispatch route is unsupported";
@@ -802,10 +918,28 @@ inline bool PopulateSharedBuildDispatchPlan(
                 );
                 return false;
             }
-            task_ids[*task_count] = task.task_id;
-            ++*task_count;
+            exec_plan_entries.push_back(
+                SharedHostExecPlanEntry{
+                    task.task_id,
+                    function_id,
+                    engine_class,
+                }
+            );
             ++executable_task_count;
         }
+    }
+    if (!PopulateFunctionStripedSharedExecPlan(
+            state, exec_plan_entries, error
+        )) {
+        std::memset(
+            &state->build_dispatch, 0,
+            sizeof(state->build_dispatch)
+        );
+        std::memset(
+            &state->exec_dispatch, 0,
+            sizeof(state->exec_dispatch)
+        );
+        return false;
     }
     state->build_dispatch.executable_task_count =
         executable_task_count;
@@ -3402,13 +3536,15 @@ inline bool AnalyzeSwimlaneRecords(
         const uint64_t aiv_exec_ticket_events =
             atomic_durations[1][kExecTicketSite].size();
         const uint64_t expected_aic_exec_ticket_events =
-            static_cast<uint64_t>(
-                state.exec_dispatch.aic_task_count
-            ) + kAicWorkers;
+            cross_core::ExecTicketBatchFetchCalls(
+                state.exec_dispatch.aic_task_count,
+                kAicWorkers
+            );
         const uint64_t expected_aiv_exec_ticket_events =
-            static_cast<uint64_t>(
-                state.exec_dispatch.aiv_task_count
-            ) + kAivWorkers;
+            cross_core::ExecTicketBatchFetchCalls(
+                state.exec_dispatch.aiv_task_count,
+                kAivWorkers
+            );
         constexpr uint32_t kDrainReleasePublishSite =
             static_cast<uint32_t>(
                 AtomicSite::SharedExecDrainReleasePublish
@@ -6568,11 +6704,17 @@ inline Metrics Validate(
     );
     const int64_t expected_aic_exec_ticket_calls =
         static_cast<int64_t>(
-            state.exec_dispatch.aic_task_count + kAicWorkers
+            cross_core::ExecTicketTerminalCursor(
+                state.exec_dispatch.aic_task_count,
+                kAicWorkers
+            )
         );
     const int64_t expected_aiv_exec_ticket_calls =
         static_cast<int64_t>(
-            state.exec_dispatch.aiv_task_count + kAivWorkers
+            cross_core::ExecTicketTerminalCursor(
+                state.exec_dispatch.aiv_task_count,
+                kAivWorkers
+            )
         );
     Expect(
         state.exec_dispatch.aic_task_count +
@@ -6582,7 +6724,7 @@ inline Metrics Validate(
             expected_aic_exec_ticket_calls &&
         state.exec_dispatch.aiv_next.value ==
             expected_aiv_exec_ticket_calls,
-        "AIC/AIV Execute plans and one terminal ticket per worker are exact",
+        "AIC/AIV Execute batched plans and terminal cursors are exact",
         &metrics
     );
 #else

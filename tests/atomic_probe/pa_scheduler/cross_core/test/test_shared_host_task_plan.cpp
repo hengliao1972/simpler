@@ -28,6 +28,63 @@ bool Check(bool condition, const char *label) {
     return condition;
 }
 
+bool CheckGenericFunctionStripedExecPlan(SchedulerState *state) {
+    if (state == nullptr) {
+        return false;
+    }
+    const std::vector<SharedHostExecPlanEntry> entries{
+        {9, 20, cross_core::ExecEngineClass::Aic},
+        {4, 10, cross_core::ExecEngineClass::Aic},
+        {8, 3, cross_core::ExecEngineClass::Aiv},
+        {7, 20, cross_core::ExecEngineClass::Aic},
+        {6, 5, cross_core::ExecEngineClass::Aiv},
+        {2, 10, cross_core::ExecEngineClass::Aic},
+        {1, 3, cross_core::ExecEngineClass::Aiv},
+        {12, 10, cross_core::ExecEngineClass::Aic},
+    };
+    std::string error;
+    bool ok = PopulateFunctionStripedSharedExecPlan(
+        state, entries, &error
+    );
+    const uint32_t expected_aic[] = {4, 9, 2, 7, 12};
+    const uint32_t expected_aiv[] = {8, 6, 1};
+    ok &= error.empty() &&
+        state->exec_dispatch.aic_task_count == 5 &&
+        state->exec_dispatch.aiv_task_count == 3;
+    for (uint32_t index = 0; index < 5; ++index) {
+        ok &= state->exec_dispatch.aic_task_ids[index] ==
+            expected_aic[index];
+    }
+    for (uint32_t index = 0; index < 3; ++index) {
+        ok &= state->exec_dispatch.aiv_task_ids[index] ==
+            expected_aiv[index];
+    }
+
+    std::vector<SharedHostExecPlanEntry> duplicate = entries;
+    duplicate.push_back(
+        {4, 30, cross_core::ExecEngineClass::Aiv}
+    );
+    std::string duplicate_error;
+    ok &= !PopulateFunctionStripedSharedExecPlan(
+              state, duplicate, &duplicate_error
+          ) &&
+        !duplicate_error.empty() &&
+        state->exec_dispatch.aic_task_count == 0 &&
+        state->exec_dispatch.aiv_task_count == 0;
+
+    std::vector<SharedHostExecPlanEntry> invalid_engine{
+        {0, 1, cross_core::ExecEngineClass::Joint},
+    };
+    std::string engine_error;
+    ok &= !PopulateFunctionStripedSharedExecPlan(
+              state, invalid_engine, &engine_error
+          ) &&
+        !engine_error.empty() &&
+        state->exec_dispatch.aic_task_count == 0 &&
+        state->exec_dispatch.aiv_task_count == 0;
+    return ok;
+}
+
 bool DecodeMetadataWriterPlanHost(
     const SharedBuildDispatchState &dispatch, uint32_t task_id,
     bool &publishes_metadata, int32_t &previous_metadata_writer
@@ -847,6 +904,12 @@ int main() {
             state->exec_dispatch.aic_task_count == 0 &&
             state->exec_dispatch.aiv_task_count == 0,
         "dispatch-plan publication rejects a non-contiguous task identity"
+    );
+    InitializeState(state.get(), mixed_options);
+
+    ok &= Check(
+        CheckGenericFunctionStripedExecPlan(state.get()),
+        "generic Execute plan stripes function ids and rejects malformed entries"
     );
     InitializeState(state.get(), mixed_options);
 

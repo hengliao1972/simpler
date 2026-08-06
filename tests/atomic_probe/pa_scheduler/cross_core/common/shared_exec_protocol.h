@@ -57,6 +57,36 @@ constexpr uint32_t kExecDispatchGlobalContextIndex = 49;
 // 最新三槽泳道显示 96/96 worker 均达到容量上限，三槽占满时间每核中位
 // 672.945 us；扩容只改变 owner-local 前视深度，不改共享发布或插入合同。
 constexpr uint32_t kExecTokensPerWorker = 4;
+// Execute 发放按固定两项领取：一次返回型 Atomic 取得一段互不重叠的
+// immutable plan ordinal，随后把这两项分别绑定到 owner-local token。
+// 该批次只依赖通用执行计划和 token 容量，不解释算子 task kind/DAG。
+// 两项而不是四项，避免一个尚未 BUILT 的整段一次占满全部前视槽。
+constexpr uint32_t kExecTicketBatchSize = 2;
+static_assert(
+    kExecTicketBatchSize > 0 &&
+        kExecTicketBatchSize <= kExecTokensPerWorker,
+    "Execute ticket batch must fit owner-local tokens"
+);
+
+constexpr uint32_t ExecTicketBatchFetchCalls(
+    uint32_t task_count, uint32_t worker_count
+) {
+    // 非空计划的最后一个有效批次同时向其 owner 证明 exhausted；其余
+    // worker 各执行一次越界领取。空计划没有有效尾批次，所有 worker
+    // 都必须各自观察一次越界。
+    return task_count == 0
+        ? worker_count
+        : (task_count + kExecTicketBatchSize - 1U) /
+                  kExecTicketBatchSize +
+              worker_count - 1U;
+}
+
+constexpr uint32_t ExecTicketTerminalCursor(
+    uint32_t task_count, uint32_t worker_count
+) {
+    return ExecTicketBatchFetchCalls(task_count, worker_count) *
+        kExecTicketBatchSize;
+}
 // execution drain 按物理 block 分成 16 组；96 个 Scalar 在当前
 // 1 AIC + 2 AIV/block 拓扑下每组精确包含 6 个 worker。
 constexpr uint32_t kExecDrainArrivalGroups = 16;

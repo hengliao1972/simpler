@@ -162,7 +162,8 @@ bool ConsumeRoleExecTickets(
             1, std::memory_order_relaxed
         );
         const int64_t ordinal = TestOps::FetchAdd(
-            &cursor->value, 1
+            &cursor->value,
+            cross_core::kExecTicketBatchSize
         );
         if (ordinal < 0) {
             RecordFailure(evidence);
@@ -171,41 +172,52 @@ bool ConsumeRoleExecTickets(
         if (ordinal >= static_cast<int64_t>(task_count)) {
             return true;
         }
-        const uint32_t task_id = task_ids[ordinal];
-        SharedPaTaskMeta meta{};
-        cross_core::PaExecRoute route{};
-        if (task_id >= total_tasks ||
-            !DecodeDispatchIdentity(
-                plan[task_id], task_id, total_tasks, meta
-            ) ||
-            meta.kind == TaskKind::Alloc ||
-            !cross_core::ResolvePaExecRoute(
-                meta.kind, FunctionId(meta.kind), route
-            ) ||
-            route.engine_class != worker_engine ||
-            task_evidence[task_id].build_count.load(
-                std::memory_order_acquire
-            ) != 1) {
-            RecordFailure(evidence);
-            return false;
-        }
-
-        int32_t expected = -1;
-        if (!task_evidence[task_id].execute_owner
-                 .compare_exchange_strong(
-                     expected, static_cast<int32_t>(worker),
-                     std::memory_order_acq_rel,
-                     std::memory_order_acquire
-                 ) ||
-            task_evidence[task_id].execute_count.fetch_add(
-                1, std::memory_order_acq_rel
-            ) != 0) {
-            RecordFailure(evidence);
-            return false;
-        }
-        evidence.executed_tasks.fetch_add(
-            1, std::memory_order_release
+        const uint32_t first = static_cast<uint32_t>(ordinal);
+        const uint32_t acquired = std::min(
+            cross_core::kExecTicketBatchSize,
+            task_count - first
         );
+        for (uint32_t index = 0; index < acquired; ++index) {
+            const uint32_t task_id = task_ids[first + index];
+            SharedPaTaskMeta meta{};
+            cross_core::PaExecRoute route{};
+            if (task_id >= total_tasks ||
+                !DecodeDispatchIdentity(
+                    plan[task_id], task_id, total_tasks, meta
+                ) ||
+                meta.kind == TaskKind::Alloc ||
+                !cross_core::ResolvePaExecRoute(
+                    meta.kind, FunctionId(meta.kind), route
+                ) ||
+                route.engine_class != worker_engine ||
+                task_evidence[task_id].build_count.load(
+                    std::memory_order_acquire
+                ) != 1) {
+                RecordFailure(evidence);
+                return false;
+            }
+
+            int32_t expected = -1;
+            if (!task_evidence[task_id].execute_owner
+                     .compare_exchange_strong(
+                         expected, static_cast<int32_t>(worker),
+                         std::memory_order_acq_rel,
+                         std::memory_order_acquire
+                     ) ||
+                task_evidence[task_id].execute_count.fetch_add(
+                    1, std::memory_order_acq_rel
+                ) != 0) {
+                RecordFailure(evidence);
+                return false;
+            }
+            evidence.executed_tasks.fetch_add(
+                1, std::memory_order_release
+            );
+        }
+        if (first + cross_core::kExecTicketBatchSize >=
+            task_count) {
+            return true;
+        }
     }
     return false;
 }
@@ -644,18 +656,26 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
     ok &= TestOps::Load(&control.next_task.value) == static_cast<int64_t>(expected_ticket_calls);
     ok &= evidence.retire_fetch_adds.load(std::memory_order_acquire) == kDispatchWorkers;
     const uint32_t expected_exec_ticket_calls =
-        state.exec_dispatch.aic_task_count + kAicWorkers +
-        state.exec_dispatch.aiv_task_count + kAivWorkers;
+        cross_core::ExecTicketBatchFetchCalls(
+            state.exec_dispatch.aic_task_count, kAicWorkers
+        ) +
+        cross_core::ExecTicketBatchFetchCalls(
+            state.exec_dispatch.aiv_task_count, kAivWorkers
+        );
     ok &= evidence.exec_ticket_fetch_adds.load(
               std::memory_order_acquire
           ) == expected_exec_ticket_calls;
     ok &= TestOps::Load(&state.exec_dispatch.aic_next.value) ==
         static_cast<int64_t>(
-            state.exec_dispatch.aic_task_count + kAicWorkers
+            cross_core::ExecTicketTerminalCursor(
+                state.exec_dispatch.aic_task_count, kAicWorkers
+            )
         );
     ok &= TestOps::Load(&state.exec_dispatch.aiv_next.value) ==
         static_cast<int64_t>(
-            state.exec_dispatch.aiv_task_count + kAivWorkers
+            cross_core::ExecTicketTerminalCursor(
+                state.exec_dispatch.aiv_task_count, kAivWorkers
+            )
         );
 
     std::printf(
