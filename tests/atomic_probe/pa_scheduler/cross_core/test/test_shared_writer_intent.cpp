@@ -1249,6 +1249,50 @@ void TestWriterDeltaRequiresExactRegisterMask() {
             ),
         "writer delta rejects owner ids with nonzero high 32 bits"
     );
+
+    tensor.owner_task_id = 1;
+    Check(
+        !PrepareSharedTaskWriterDelta(args, context, delta),
+        "writer delta rejects a self owner without a preliminary validation scan"
+    );
+    tensor.owner_task_id = 2;
+    Check(
+        !PrepareSharedTaskWriterDelta(args, context, delta),
+        "writer delta rejects a future owner without a preliminary validation scan"
+    );
+    tensor.owner_task_id = 0;
+    Check(
+        PrepareSharedTaskWriterDelta(args, context, delta),
+        "writer delta accepts a valid preceding owner after fused validation"
+    );
+
+    PA_GM const TensorDesc *saved_gm_tensor =
+        args.tensors[0].pointer.gm_tensor;
+    args.tensors[0].pointer.gm_tensor = nullptr;
+    Check(
+        !PrepareSharedTaskWriterDelta(args, context, delta),
+        "writer delta rejects a null GM writer reference in the fused scan"
+    );
+    args.tensors[0].pointer.gm_tensor = saved_gm_tensor;
+
+    TaskArgs non_predecessor_symbol_args;
+    ConstructTaskArgs(non_predecessor_symbol_args);
+    const FdwicOutputRef self_output{1, 0, 0, 0, 0, 0};
+    AddOutputHandleTensor(
+        non_predecessor_symbol_args, self_output,
+        TensorArgType::Inout
+    );
+    SubmitContext symbol_context{};
+    symbol_context.task_id = 1;
+    symbol_context.won = true;
+    symbol_context.result.task_id = 1;
+    symbol_context.register_mask = 1;
+    Check(
+        !PrepareSharedTaskWriterDelta(
+            non_predecessor_symbol_args, symbol_context, delta
+        ),
+        "writer delta rejects a non-predecessor symbol writer in the fused scan"
+    );
 }
 
 void TestMetadataPrefixRequirementClassification() {

@@ -2473,16 +2473,9 @@ PA_DEVICE bool MakeValidatedSharedWriterRegion(
 }
 
 template <typename TensorReference>
-PA_DEVICE bool ValidateOrdinarySharedWriterReference(
+PA_DEVICE bool ValidateOrdinarySharedWriterOwner(
     const TensorReference &tensor, int32_t task_id
 ) {
-    if (tensor.manual_dep) {
-        return true;
-    }
-    SharedRegionValue unused{};
-    if (!MakeValidatedSharedWriterRegion(tensor, task_id, unused)) {
-        return false;
-    }
     if (tensor.owner_task_id == kInvalidTaskId) {
         return true;
     }
@@ -2494,6 +2487,20 @@ PA_DEVICE bool ValidateOrdinarySharedWriterReference(
         tensor.owner_task_id
     );
     return owner >= 0 && owner < task_id;
+}
+
+template <typename TensorReference>
+PA_DEVICE bool ValidateOrdinarySharedWriterReference(
+    const TensorReference &tensor, int32_t task_id
+) {
+    if (tensor.manual_dep) {
+        return true;
+    }
+    SharedRegionValue unused{};
+    if (!MakeValidatedSharedWriterRegion(tensor, task_id, unused)) {
+        return false;
+    }
+    return ValidateOrdinarySharedWriterOwner(tensor, task_id);
 }
 
 // 在执行任一 atomic/region append 前先完成所有 writer 引用的结构校验。

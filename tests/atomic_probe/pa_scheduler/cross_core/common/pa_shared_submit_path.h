@@ -114,15 +114,12 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
         return false;
     }
 
-    bool writer_required = false;
-    if (!InspectSharedWriterIntent(args, writer_required) ||
-        (writer_required &&
-         !ValidateSharedWriterIntentSet(args, task_id))) {
-        return false;
-    }
-    // delta 构造本来就按全部参数顺序扫描；在同一轮累计 writer tag mask，
-    // 保留 context.register_mask 的完整一致性证明，避免此前紧邻的第二轮
-    // 纯 tag 扫描。该合并不信任 PA kind，也不放宽任一引用检查。
+    // 在同一轮通用参数扫描中完成 prefix 分类、writer 引用校验、唯一性
+    // 校验、register mask 核对和不可变 delta 构造。此前先调用
+    // InspectSharedWriterIntent/ValidateSharedWriterIntentSet，非 writer 会扫描
+    // 两遍参数，真实 writer 最多扫描四遍；这些扫描读取的是同一份 const
+    // TaskArgs，不提供额外同步证明。合并后仍逐项保留原有 fail-closed 条件，
+    // 且只依赖 tag/reference/task-id，不识别任何算子的 TaskKind 或 DAG。
     uint32_t expected_register_mask = 0;
     uint32_t register_mask = context.register_mask;
     for (int32_t index = 0; index < args.tensor_count; ++index) {
@@ -157,7 +154,9 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
             const FdwicOutputRef output_ref =
                 SharedOutputReference(reference);
             uint32_t symbol_key = 0;
-            if (!SharedSymbolHistoryKey(output_ref, symbol_key) ||
+            if (output_ref.producer_task_id < 0 ||
+                output_ref.producer_task_id >= task_id ||
+                !SharedSymbolHistoryKey(output_ref, symbol_key) ||
                 delta.symbol_count >= kMaxTaskTensors) {
                 return false;
             }
@@ -170,6 +169,9 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
             delta.symbol_keys[delta.symbol_count] = symbol_key;
             ++delta.symbol_count;
         } else if (reference.kind == TensorRefKind::GmTensor) {
+            if (reference.pointer.gm_tensor == nullptr) {
+                return false;
+            }
             PA_GM const TensorDesc &tensor =
                 *reference.pointer.gm_tensor;
             if (!tensor.manual_dep) {
@@ -179,6 +181,9 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
                         delta.ordinary_entries[
                             delta.ordinary_count
                         ]
+                    ) ||
+                    !ValidateOrdinarySharedWriterOwner(
+                        tensor, task_id
                     )) {
                     return false;
                 }
@@ -206,6 +211,9 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
             }
         } else if (reference.kind ==
                    TensorRefKind::LocalTensor) {
+            if (reference.pointer.local_tensor == nullptr) {
+                return false;
+            }
             const TensorDesc &tensor =
                 *reference.pointer.local_tensor;
             if (!tensor.manual_dep) {
@@ -215,6 +223,9 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
                         delta.ordinary_entries[
                             delta.ordinary_count
                         ]
+                    ) ||
+                    !ValidateOrdinarySharedWriterOwner(
+                        tensor, task_id
                     )) {
                     return false;
                 }
@@ -249,13 +260,9 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
         context.register_mask != expected_register_mask) {
         return false;
     }
-    // Inspect/Validate 与 delta 构造都只读取同一个 const TaskArgs；两者对
-    // “是否需要自动登记”必须给出相同结论。该同步 Finish 控制流在
-    // Publish 前不会修改 args，delta 也只存在于 winner 的本地栈上。
-    const bool delta_requires_intent =
+    const bool writer_required =
         delta.ordinary_count != 0 || delta.symbol_count != 0;
-    if (writer_required != delta_requires_intent ||
-        delta.ordinary_count + delta.symbol_count >
+    if (delta.ordinary_count + delta.symbol_count >
             kMaxTaskTensors) {
         return false;
     }

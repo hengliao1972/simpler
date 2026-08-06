@@ -6117,3 +6117,99 @@ episode 消减、writer handoff 不变、严格链与完整业务闭合都能独
 减少了无关协议工作。该候选按“小幅端到端收益 + 明确结构性消减”保留，后续
 不得为扩大 PA 数字加入 task-kind 特判；其他算子若存在 ordinary writer，自动
 回退到保守前缀等待。
+
+## 2026-08-06：S6.86 将 writer intent 校验与 delta 构造合并为单遍扫描
+
+### 问题与泛化边界
+
+S6.85 最终仍在每个 Build winner 的 Materialize 中重复读取同一份只读
+`TaskArgs`：
+
+1. `InspectSharedWriterIntent()` 扫描全部参数，判断是否存在自动 writer；
+2. 真实 writer 再进入 `ValidateSharedWriterIntentSet()`，该函数先重复调用一次
+   `InspectSharedWriterIntent()`，随后再次扫描所有 writer 引用；
+3. `PrepareSharedTaskWriterDelta()` 最后又扫描一次参数，构造不可变 delta。
+
+因此非 writer task 扫描两遍，真实 writer 最多扫描四遍。上述扫描之间没有
+atomic、DCCI 或状态发布，只是在同一个 Scalar 栈上重复解码同一份 const 参数，
+不构成额外的内存顺序证明。
+
+本阶段只做算子无关的循环融合。公共热路仍只读取 `TensorArgType`、
+`TensorRefKind`、引用内容、当前 task id 和 register mask；没有新增 PA
+`TaskKind`、固定五 task DAG、batch、固定核拓扑或固定 writer 数分支。
+
+### 单遍校验合同
+
+`PrepareSharedTaskWriterDelta()` 的既有参数循环现在同时完成：
+
+- metadata-prefix 分类；
+- writer tag 与 `context.register_mask` 的逐位精确核对；
+- GM/Local writer 指针非空检查；
+- ordinary region 范围构造，以及显式 owner 必须位于 `[0, task_id)`；
+- symbol 引用必须为 plain ref，producer 必须位于 `[0, task_id)`；
+- 同 task symbol key 去重；
+- ordinary bucket、同 bucket 局部序号和 symbol key 的不可变 delta 构造。
+
+`manual_dep` writer 继续要求 register-mask 位存在，但不产生自动 TensorMap
+delta；纯 Output 与非 writer 输入的原合同不变。为避免先构造 region、随后又为
+owner 校验重复构造一次，ordinary owner 校验拆成通用小函数，并由旧的完整校验
+入口和新单遍路径共同复用。
+
+独立 generic writer-intent 测试新增以下门槛：高 32 位畸形 owner、self owner、
+future owner、合法前任 owner、空 GM writer 指针和非前任 symbol writer。原有
+duplicate symbol、精确 register mask、manual dep、ordinary/symbol 混合及范围
+溢出测试继续保留。
+
+### 正确性与构建结果
+
+最终候选通过：
+
+- pa_scheduler Python 全量 `168` 项；
+- cross-core CPU perf-clock 全构建，包括 generic writer、ordinary ring、
+  96-thread 乱序 Build、严格 metadata writer 链、execution drain 与 ordered
+  Submit；
+- CCEC AIC/AIV generic probe、perf-clock/full-swimlane、mixed ELF、relocation
+  与 manifest 门槛；
+- A5 B1/B256 real-compute `6,28,4,1` 的全部业务、payload、fanin、DCCI、
+  256 个严格 writer、1,280 个 Build、1,024 个 kernel 与 FinalDrain 终态。
+
+writer、atomic、DCCI、kernel 和 TensorMap side effect 数量均未减少。perf-clock
+device `.text` 从 `313540B` 降至 `305220B`，减少 `8320B`；该数据只证明重复
+实例化代码被消除，不单独作为性能收益。
+
+### A5 性能裁决
+
+冻结提交 `42263479` 产物作为基线，候选使用最终 device 产物，按 B-C/C-B
+交错执行 12 对 B256 完整周期：
+
+```text
+                         min        median       max         mean
+S6.85 基线              919.255     934.371     955.419     936.546 us
+单遍扫描候选            921.398     935.214     994.000     944.211 us
+
+独立中位变化：候选慢 0.843 us / 0.090%
+逐对 baseline-candidate：median=-5.903 us，mean=-7.664 us
+候选获胜：4/12
+```
+
+端到端结果只能判定持平，不能宣称性能收益。由于目标明确是消减非 atomic Scalar
+工作，又补跑了 full-swimlane 做局部归因：
+
+```text
+                                      S6.85        单遍扫描       变化
+Materialize 发布前 aggregate cycles   8592643       8101114     -491529 (-5.72%)
+Materialize aggregate cycles          11669925      11323121     -346804 (-2.97%)
+Register aggregate cycles               567288        508852      -58436
+raw Submit makespan                    759.617 us     743.046 us  -16.571 us
+```
+
+候选泳道位于（测试产物不提交）：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260806_075121_19286/
+```
+
+局部变化与删除重复参数扫描的位置一致，但单份泳道仍包含调度与 atomic 波动，
+不能把 `raw Submit` 差值当作权威端到端收益。最终保留依据是：通用非 atomic
+工作量明确下降、device 代码缩小、严格 writer 与完整业务不变；性能结论必须
+继续写成“局部有效、端到端未证明改善”。

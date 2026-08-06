@@ -6722,3 +6722,21 @@ B256 full-swimlane 的 predecessor PollBatch 从 `1275/5870` 条物理/逻辑
 `7/12` 对更快。收益小且存在波动，不把它写成稳定大幅提升；保留依据是严格链
 不变、无关等待确定减少且端到端未回退。完整理论、门槛和原始数据见实现过程
 S6.85。
+
+### 15.61 合并 writer intent 校验与 delta 构造
+
+`PrepareSharedTaskWriterDelta()` 之前对同一份只读参数重复执行 writer 探测、
+完整引用校验和 delta 构造：非 writer 扫描两遍，真实 writer 最多扫描四遍。
+本轮把 pointer、producer/owner 范围、symbol 唯一性、register mask、metadata
+prefix 和 delta 构造合并到原有参数循环；所有 fail-closed 条件保持，公共热路
+不读取 PA task kind、batch、固定 DAG 或固定核拓扑。
+
+Python `168` 项、CPU 全协议、CCEC 两类构建及 A5 B1/B256 完整终态均通过。
+perf-clock device `.text` 从 `313540B` 降至 `305220B`。full-swimlane 中
+Materialize 发布前累计 core-work 从 `8592643` 降至 `8101114 cycles`，减少
+`491529 cycles / 5.72%`；整个 Materialize 减少 `2.97%`。
+
+冻结 12 对端到端 A/B 的基线/候选中位为 `934.371/935.214 us`，候选慢
+`0.090%` 且只在 `4/12` 对获胜，因此不得宣称端到端收益。该项按通用非 atomic
+消冗保留，结论限定为“局部工作量明确下降、端到端持平”。完整数据和正确性
+门槛见实现过程 S6.86。
