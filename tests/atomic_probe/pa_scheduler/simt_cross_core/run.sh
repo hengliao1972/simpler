@@ -60,13 +60,13 @@ Usage:
   ./run.sh build-g1
   ./run.sh run-g1 [--device N] [--batches 1|256] [--runs N]
   ./run.sh build-gm
-  ./run.sh run-gm --builders 1..16 [--device N] [--batches 1|256] [--runs N]
+  ./run.sh run-gm --builders 1..32 [--device N] [--batches 1|256] [--runs N]
   ./run.sh build-g0-swimlane
   ./run.sh run-g0-swimlane [--device N] [--batches 1|256] --runs 1 --swimlane-json FILE
   ./run.sh build-g1-swimlane
   ./run.sh run-g1-swimlane [--device N] [--batches 1|256] --runs 1 --swimlane-json FILE
   ./run.sh build-gm-swimlane
-  ./run.sh run-gm-swimlane --builders 1..16 [--device N] [--batches 1|256] --runs 1 --swimlane-json FILE
+  ./run.sh run-gm-swimlane --builders 1..32 [--device N] [--batches 1|256] --runs 1 --swimlane-json FILE
   ./run.sh build-u0
   ./run.sh run-u0 [--device N] [--runs N]
   ./run.sh build-u1
@@ -96,14 +96,14 @@ run-g0 先做 A5 precheck、构建清单校验和 600 秒有界运行，再由 5
 build-g1 复用同一份参数化源码，验证单/双 builder CPU 模型并重建完整 PA CCEC/ELF/ACL host。
 run-g1 执行 AIV0+AIV1 两个独立 VF：各 512 SIMT thread/16 个 lane0 leader，按 task-id 静态分片，
 每个 task 只有一个固定 builder；其余 94 个 AIC/AIV owner 只执行完整 PA DAG，每个 warp 仍严格只有 lane0 工作。
-build-gm 在同一份源码上验证 1..16 个 builder，并重建通用 GM 产物。
+build-gm 在同一份源码上验证 1..32 个 builder，并重建通用 GM 产物。
 run-gm 显式接收 --builders N；AIV0..AIV(N-1) 只构建，剩余 AIV 只执行，task 在
 N×构建时配置的 warp 数个 lane0 leader 间唯一分片。
 build-g0-swimlane 构建与生产 G0 分离的 profiling 变体；builder/executor 按 task 写独立 cache line。
 run-g0-swimlane 在真实 A5 上导出 Chrome Trace JSON；该数据用于观察时序，性能结论使用关闭埋点的 run-g0。
 build-g1-swimlane 复用同一 profiling 源码并验证双 builder trace 容量与 writer 映射。
 run-g1-swimlane 导出 AIV0+AIV1 双 builder Chrome Trace JSON；性能结论使用关闭埋点的 run-g1。
-build-gm-swimlane 构建覆盖 1..16 builder writer 上界的 profiling 产物。
+build-gm-swimlane 构建覆盖 1..32 builder writer 上界的 profiling 产物。
 run-gm-swimlane 显式接收 --builders N，并为对应 N-builder 配置导出一份不覆盖旧文件的泳道图。
 build-u0 运行 UBUF 单槽 CPU 三套测试，并构建、静态检查 U0 CCEC/bitcode/mixed ELF/ACL host。
 run-u0 在真实 A5 上验证 AIV0 的 64 个 lane0 leader 竞争单个 UBUF slot，由同一
@@ -392,7 +392,7 @@ case "$ACTION" in
                     ;;
                 --builders|--builders=*)
                     if [[ "$full_pa_builder_arg_required" -eq 0 ]]; then
-                        echo "$ACTION fixes its builder count; use run-gm for an explicit 1..16 builder scan." >&2
+                        echo "$ACTION fixes its builder count; use run-gm for an explicit 1..32 builder scan." >&2
                         exit 1
                     fi
                     full_pa_builder_arg_seen=1
@@ -406,7 +406,7 @@ case "$ACTION" in
             esac
         done
         if [[ "$full_pa_builder_arg_required" -eq 1 && "$full_pa_builder_arg_seen" -ne 1 ]]; then
-            echo "run-gm requires an explicit --builders N value in 1..16." >&2
+            echo "run-gm requires an explicit --builders N value in 1..32." >&2
             exit 1
         fi
         if [[ -n "${TASK_DEVICE:-}" ]]; then
@@ -452,7 +452,7 @@ case "$ACTION" in
                     ;;
                 --builders|--builders=*)
                     if [[ "$swimlane_builder_arg_required" -eq 0 ]]; then
-                        echo "$ACTION fixes its builder count; use run-gm-swimlane for an explicit 1..16 builder trace." >&2
+                        echo "$ACTION fixes its builder count; use run-gm-swimlane for an explicit 1..32 builder trace." >&2
                         exit 1
                     fi
                     swimlane_builder_arg_seen=1
@@ -466,7 +466,7 @@ case "$ACTION" in
             esac
         done
         if [[ "$swimlane_builder_arg_required" -eq 1 && "$swimlane_builder_arg_seen" -ne 1 ]]; then
-            echo "run-gm-swimlane requires an explicit --builders N value in 1..16." >&2
+            echo "run-gm-swimlane requires an explicit --builders N value in 1..32." >&2
             exit 1
         fi
         if [[ -n "${TASK_DEVICE:-}" ]]; then

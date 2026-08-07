@@ -3526,7 +3526,119 @@ tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
 **后续停止 UBUF 性能优化**。U0/U1/U2 保留为功能与一致性验证路径；共享协议
 变化时只做必要回归，不再扫描或优化 UBUF 性能。
 
-## 22. 阶段状态索引
+## 22. 2026-08-07：增加 trace-off 构建包络并完成 B32/W4 收尾扫描
+
+### 22.1 为什么需要新的构建时间口径
+
+第 21 章的 B16/W4 trace-off ACL kernel-event 中位为 494.528 us，但该数值
+覆盖整个 mixed kernel；已有泳道中的 `SIMT VF build` 为 trace-on 显示区间，
+又受到逐 atomic/DCCI 记录和跨时钟域展示映射影响。两者都不能直接回答
+“SIMT 构建本身是否低于 0.3 ms”。
+
+本轮没有把逐 task trace 带入生产产物，而是在每个 builder AIV 的 Main
+Scalar 壳中只增加两个 `get_sys_cnt()` 采样：
+
+```text
+reserved[0] = pre_async_invoke
+  -> async_invoke<SIMT VF>
+  -> set_flag / wait_flag
+reserved[1] = post_wait_flag
+```
+
+`get_sys_cnt()` 在本机 A5 上是跨 AIV 共用的 1 ns 时基。host 取所有 builder
+的最早 `reserved[0]` 到最晚 `reserved[1]`，输出
+`BUILD_PERF/BUILD_PERF_SUMMARY`；该包络包含 VF 启动偏斜、完整 SIMT 构建和
+VF join，是 trace-off 下可直接用于判断 0.3 ms 目标的有效墙钟。host 同时
+验证 builder 的两个采样严格递增、非 builder 对应字段保持 0，ABI 大小没有
+变化。共享该 kernel/host 的 U2 已重新通过 CPU optimized、ASan+UBSan、TSan、
+CCEC/bitcode/mixed ELF/host 全套门槛，并在真实 A5 上通过 B1 1/1；该轮构建
+包络为 228.932 us，只作为共享计时代码的功能回归，不重启 UBUF 性能优化。
+
+### 22.2 W4 扩展到 32 个 builder
+
+builder 软件搜索上限由 16 扩到 32，CPU model、device、host 参数、命令行、
+builder report 和泳道 writer 容量使用同一个 `kMaxBuilderCount`。B32 占用
+32 个 AIV builder，每个 builder 仍为 4 warp/128 thread、每个 warp 仍只有
+lane0 工作；总计 128 个活跃 leader，每个 leader 精确构建 10 个 task，并
+保留 32 个 AIV executor 和全部 32 个 AIC executor。
+
+W4 完整产物通过 builder=1..32 的 CPU optimized、ASan+UBSan、TSan，随后
+通过 AIC/AIV CCEC bitcode、1:2 mixed ELF/metadata 和 GCC15 host 构建。真实
+A5 使用用户授权的 unlocked device0；除明确列出的噪声失败外，完整
+task/DAG/payload/history/last-writer/golden oracle 均通过，`insert_polls=0`。
+
+保留的关键 trace-off 数据如下。每组 3 轮的第一轮包含明显 ACL 冷样本，表中
+仍按程序固定口径报告全部有效样本的中位，不擅自删除冷样本：
+
+| 配置 | PASS | kernel event median/us | build envelope median/us | 说明 |
+| ---- | ---: | ---------------------: | -----------------------: | ---- |
+| B16/W4 | 3/3 | 566.337 | 420.559 | 新构建口径下的 B16 端点 |
+| B19/W4 | 3/3 | 459.812 | 382.242 | 构建继续下降 |
+| B21/W4 | 3/3 | 440.432 | 369.842 | 首次低于 0.37 ms |
+| B23/W4 | 3/3 | 441.123 | 361.719 | 接近后段平台 |
+| B29/W4 | 2/3 | 753.159 | 337.802 | 一轮外部噪声触发 global fatal，不作为候选 |
+| B31/W4 | 3/3 | 431.227 | 354.826 | 端到端较快但构建未达 0.3 ms |
+| B32/W4 | 3/3 | **436.673** | **348.332** | 当前可复现端点；稳定两轮为 410.717/436.673 us |
+
+B32/W4 的三轮原始 kernel-event 为
+`1092.371/436.673/410.717 us`，构建包络为
+`353.991/348.332/343.668 us`。因此本轮只能得出：端到端稳定区间约
+0.41～0.44 ms，trace-off SIMT 构建约 0.35 ms；**0.3 ms 构建目标没有
+达到**，不能用较短的总 kernel 样本冒充构建达标。
+
+### 22.3 W8 对照与停止结论
+
+为了区分“总 leader 数”与“占用 builder AIV 数”，另构建了 W8 完整产物，
+同样通过 builder=1..32 的 CPU 三套和完整 CCEC/ELF/host 门槛。每个 warp
+仍只有 lane0 工作，没有引入同 warp 多 lane 协作。真实 A5 对照为：
+
+| 配置 | 总活跃 leader | PASS | kernel event median/us | build envelope median/us |
+| ---- | ------------: | ---: | ---------------------: | -----------------------: |
+| B16/W8 | 128 | 5/5 | 441.221 | 381.533 |
+| B24/W8 | 192 | 5/5 | 451.232 | 377.741 |
+| B32/W8 | 256 | 2/5 | 468.790 | 371.299 |
+
+B16/W8 与 B32/W4 都有 128 个活跃 leader，但构建包络分别为
+381.533 us 和 348.332 us，说明把更多 warp 堆到更少 AIV 上更慢；B32/W8
+还出现 3/5 global fatal，不能作为有效性能候选。W8 路线据此否决，不固化为
+默认配置。
+
+### 22.4 B32/W4 独立泳道
+
+没有覆盖旧图。B32/W4 使用单独的 W4 profiling 产物，真实 A5 1/1 完整
+oracle 通过，JSON 已通过 `jq` 解析：
+
+`test_record/2026-8-6/gm_b32_b256_warp4_traceoff_437us_build348us_atomic_dcci_per_builder_clock_swimlane.json`
+
+文件名中的 437 us 和 348 us 分别来自上一节独立 trace-off 的 kernel-event
+中位 436.673 us 与 build-envelope 中位 348.332 us。泳道本身开启埋点，不能
+与 trace-off 混用；图内数据为：
+
+| 项目 | 数值 |
+| ---- | ---: |
+| trace-on kernel event | 1069.007 us |
+| trace-on device span | 481.350 us |
+| trace-on SIMT build 显示包络 | 404.694 us |
+| trace-on `get_sys_cnt` build envelope | 404.685 us |
+| SIMT / Scalar atomic calls | 30795 / 29272 |
+| Scalar DCCI calls / cache lines | 14368 / 14368 |
+| builder wins | `40×32` |
+| metadata insert poll | 0 |
+
+这份图只用于保存 B32/W4 的 atomic、DCCI、builder/executor 重叠证据；是否达到
+0.3 ms 仍只看 trace-off build-envelope，结论仍是未达到。
+
+用户在此阶段决定性能优化告一段落。本轮保留的是：
+
+- 可复用的 trace-off 构建包络测量与 host 校验；
+- builder=1..32 的统一有界配置能力；
+- B32/W4 与 W8 否决数据，以及“构建仍未低于 0.3 ms”的诚实结论。
+
+不再继续扩展 builder、不再增加 warp、不恢复 PA 特例，也不继续 UBUF 性能
+优化。后续若重新开启性能工作，必须从本节的独立 build-envelope 口径继续，
+不能只凭 ACL kernel-event 猜测构建时间。
+
+## 23. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
 | ---- | ---- | --------- |
@@ -3540,7 +3652,7 @@ tests/atomic_probe/pa_scheduler/simt_cross_core/run.sh \
 | A1 warp 推进语义 | 完成 | CPU 三套和 CCEC/ELF 门槛 PASS；A5 同地址复用 100/100，SameWarp 始终 T/S+disjoint，CrossWarp 始终 S/S+overlap。 |
 | G0 GM 完整 PA | 完成 | 16-warp/lane0 纯 SIMT 构建；CPU 三套与 CCEC/ELF 门槛 PASS；A5 B1/B256 功能闭合；原始 64-warp B256 trace-off 中位约 15.0 ms。 |
 | G1 双 builder GM | 完成 | 双 VF 各 512-thread/16-warp/lane0 静态唯一分片；B256 trace-off 中位 3.637 ms；五组独立 v4 atomic/DCCI 泳道已保存。 |
-| GN 多 builder GM 扫描 | 完成 | B=1..16 与 warp 扫描完成；历史 B5/W16 0.710 ms 单代表地址候选已淘汰。最终通用版按 symbol 建立精确 writer 前驱，保留 768 次真实 CAS、去掉 255 个假等待 episode 和 768 次 atomic load；B16/W4、B256 trace-off 21 轮最终中位 0.495 ms，独立 atomic/DCCI 泳道已保存并校验。 |
+| GN 多 builder GM 扫描 | 完成，性能优化告一段落 | 通用版按 symbol 建立精确 writer 前驱，保留 768 次真实 CAS、去掉 255 个假等待 episode 和 768 次 atomic load；B16/W4 的 21 轮 kernel-event 中位为 0.495 ms。随后用独立 trace-off build-envelope 扩到 B32/W4：总 kernel 三轮中位 0.437 ms、构建中位 0.348 ms，0.3 ms 构建目标未达到；W8 对照已否决。 |
 | U0 UBUF 单槽 | 完成 | 64-warp/lane0 纯 SIMT 单槽；CPU 三套、CCEC/ELF 门槛和 A5 同地址 100/100 全部 PASS；G0/G1 四组真机回归 PASS。 |
 | U1 UBUF 多槽/多 task | 完成 | `a20a29e2`；CPU 三套、CCEC/bitcode/mixed ELF 门槛全部 PASS；A5 smoke 1/1 与同地址复用 100/100，四槽 `maxbusy=4`、每槽 generation `0..31`精确闭合。 |
 | U2 UBUF 完整 PA | 功能完成，停止性能优化 | 同源 transport policy、四槽 ordered generation、真实 payload word/tail 与完整 PA oracle 已闭合；共享的按-symbol writer 协议在最终 B1 令 predecessor poll 为 0；CPU 三套和 CCEC/bitcode/mixed ELF 全部 PASS，真机 B1 3/3。由于 UBUF staging 不能消除最终 GM 写，后续只保留功能与共享协议回归。 |

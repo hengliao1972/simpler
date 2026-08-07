@@ -3432,6 +3432,10 @@ simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
         return;
     }
 #if defined(SIMT_CROSS_CORE_U2)
+    // reserved[0:1] 是 trace-off 也可用的轻量构建墙钟。get_sys_cnt
+    // 在各 AIV 上共用 1 ns 时基；host 取所有 builder 的最早 begin
+    // 到最晚 end，因此同时包含 VF 启动错位和真实 SIMT 构建。
+    result.reserved[0] = static_cast<uint64_t>(get_sys_cnt());
     cce::async_invoke<U2SimtBuildTasks>(
         cce::dim3{kBuilderThreadCount, 1U, 1U}, reinterpret_cast<__gm__ uint64_t *>(&state->tasks[0]),
         reinterpret_cast<__gm__ uint64_t *>(&state->heap),
@@ -3447,6 +3451,7 @@ simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     TraceRoleTimestamp(state, owner, 3U);
 #endif
+    result.reserved[0] = static_cast<uint64_t>(get_sys_cnt());
     cce::async_invoke<G0SimtBuildTasks>(
         cce::dim3{kBuilderThreadCount, 1U, 1U}, reinterpret_cast<__gm__ uint64_t *>(&state->tasks[0]),
         reinterpret_cast<__gm__ uint64_t *>(&state->heap),
@@ -3461,6 +3466,7 @@ simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
 #endif
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+    result.reserved[1] = static_cast<uint64_t>(get_sys_cnt());
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     TraceRoleTimestamp(state, owner, 4U);
 #endif

@@ -40,9 +40,10 @@ constexpr uint32_t kAivOwnerCount = 64U;
 constexpr uint32_t kOwnerCount = kAicOwnerCount + kAivOwnerCount;
 constexpr uint32_t kBuilderOwner = 32U;
 constexpr uint32_t kDefaultBuilderCount = 1U;
-// 多 builder 性能搜索上限，不是协议上限。首轮 1..8 扫描的最优点落在 B8
-// 边界，因此扩到 16 个 builder；B16 仍保留 48 个 AIV executor。
-constexpr uint32_t kMaxBuilderCount = 16U;
+// 多 builder 性能搜索上限，不是协议上限。B16 仍未把 trace-off
+// SIMT 构建区间压到 0.3 ms，因此继续扩到 32 个 builder；B32 仍保留
+// 32 个 AIV executor，并与 32 个 AIC executor 共同执行。
+constexpr uint32_t kMaxBuilderCount = 32U;
 constexpr uint32_t kFirstAivExecutorOwner = kBuilderOwner + 1U;
 constexpr uint32_t kAivExecutorCount = kAivOwnerCount - 1U;
 constexpr uint32_t kExecutorCount = kAicOwnerCount + kAivExecutorCount;
@@ -609,10 +610,10 @@ static_assert(
 static_assert(
     kMaxBuilderThreadCount == kBuilderThreadCount * kMaxBuilderCount &&
         kMaxBuilderLeaderCount == kBuilderLeaderCount * kMaxBuilderCount,
-    "GM builder scaling must retain up to sixteen independent configured-warp instances"
+    "GM builder scaling must retain up to thirty-two independent configured-warp instances"
 );
 static_assert(
-    kOwnerCount == 96U && kExecutorCount == 95U && kAicOwnerCount + kAivOwnerCount - kMaxBuilderCount == 80U,
+    kOwnerCount == 96U && kExecutorCount == 95U && kAicOwnerCount + kAivOwnerCount - kMaxBuilderCount == 64U,
     "mixed owner topology changed"
 );
 static_assert(kWorkloadTileBytes == 65536U && kWorkloadBytes == 12713984U, "workload layout changed");

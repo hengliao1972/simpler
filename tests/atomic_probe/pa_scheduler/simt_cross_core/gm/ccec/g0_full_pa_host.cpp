@@ -2235,7 +2235,17 @@ bool ValidateRolesAndDrain(
             )) {
             return false;
         }
-        for (uint32_t reserved = 0U; reserved < sizeof(role.reserved) / sizeof(role.reserved[0]); ++reserved) {
+        const bool builder_timing_valid =
+            g0::IsBuilderOwner(owner, builder_count) ?
+                (role.reserved[0] != 0U && role.reserved[1] > role.reserved[0]) :
+                (role.reserved[0] == 0U && role.reserved[1] == 0U);
+        if (!RecordCheck(
+                builder_timing_valid, failure, "role-builder-timing", UINT32_MAX, owner, UINT32_MAX,
+                g0::IsBuilderOwner(owner, builder_count) ? 1U : 0U, builder_timing_valid ? 1U : 0U
+            )) {
+            return false;
+        }
+        for (uint32_t reserved = 2U; reserved < sizeof(role.reserved) / sizeof(role.reserved[0]); ++reserved) {
             if (!RecordCheck(
                     role.reserved[reserved] == 0U, failure, "role-reserved", UINT32_MAX, owner, reserved, 0U,
                     role.reserved[reserved]
@@ -3701,6 +3711,8 @@ int main(int argc, char **argv) {
     auto initial = std::make_unique<LaunchState>();
     std::vector<float> workspace;
     std::vector<double> kernel_times_us;
+    std::vector<double> builder_envelope_times_us;
+    std::vector<double> builder_max_vf_times_us;
     uint32_t passes = 0U;
     for (uint32_t run = 0U; run < options.runs; ++run) {
         const uint64_t nonce = UINT64_C(0xA550000000000000) ^ (static_cast<uint64_t>(options.batches) << 32U) ^
@@ -3804,6 +3816,19 @@ int main(int argc, char **argv) {
         ++passes;
         kernel_times_us.push_back(static_cast<double>(kernel_ms) * 1000.0);
         const FullPaState &full_pa = FullPaView(*state);
+        uint64_t builder_begin = UINT64_MAX;
+        uint64_t builder_end = 0U;
+        uint64_t builder_max_vf_ticks = 0U;
+        for (uint32_t builder = 0U; builder < options.builder_count; ++builder) {
+            const g0::FullPaRoleResult &role = full_pa.roles[g0::BuilderOwnerForInstance(builder)];
+            builder_begin = std::min(builder_begin, role.reserved[0]);
+            builder_end = std::max(builder_end, role.reserved[1]);
+            builder_max_vf_ticks = std::max(builder_max_vf_ticks, role.reserved[1] - role.reserved[0]);
+        }
+        const double builder_envelope_us = static_cast<double>(builder_end - builder_begin) / 1000.0;
+        const double builder_max_vf_us = static_cast<double>(builder_max_vf_ticks) / 1000.0;
+        builder_envelope_times_us.push_back(builder_envelope_us);
+        builder_max_vf_times_us.push_back(builder_max_vf_us);
         std::array<uint32_t, g0::kMaxBuilderCount> builder_wins{};
         uint64_t insert_poll_sum = 0U;
         uint32_t insert_poll_max = 0U;
@@ -3829,6 +3854,17 @@ int main(int argc, char **argv) {
             static_cast<unsigned long long>(insert_poll_sum), insert_poll_max,
             static_cast<double>(kernel_ms) * 1000.0
         );
+        std::printf(
+            "[BUILD_PERF] run=%u scope=earliest_builder_pre_async_to_latest_builder_post_wait "
+            "clock=get_sys_cnt_1ns trace=%s builders=%u envelope_us=%.3f max_single_vf_us=%.3f\n",
+            run + 1U,
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            "on",
+#else
+            "off",
+#endif
+            options.builder_count, builder_envelope_us, builder_max_vf_us
+        );
     }
     if (!kernel_times_us.empty()) {
         std::sort(kernel_times_us.begin(), kernel_times_us.end());
@@ -3849,6 +3885,36 @@ int main(int argc, char **argv) {
             "off",
 #endif
             count, kernel_times_us.front(), median, sum / static_cast<long double>(count), kernel_times_us.back()
+        );
+    }
+    if (!builder_envelope_times_us.empty()) {
+        std::sort(builder_envelope_times_us.begin(), builder_envelope_times_us.end());
+        std::sort(builder_max_vf_times_us.begin(), builder_max_vf_times_us.end());
+        const size_t count = builder_envelope_times_us.size();
+        const auto median_of = [count](const std::vector<double> &values) {
+            return count % 2U == 0U ? (values[count / 2U - 1U] + values[count / 2U]) / 2.0 :
+                                     values[count / 2U];
+        };
+        long double envelope_sum = 0.0L;
+        long double max_vf_sum = 0.0L;
+        for (size_t sample = 0U; sample < count; ++sample) {
+            envelope_sum += builder_envelope_times_us[sample];
+            max_vf_sum += builder_max_vf_times_us[sample];
+        }
+        std::printf(
+            "[BUILD_PERF_SUMMARY] scope=earliest_builder_pre_async_to_latest_builder_post_wait "
+            "clock=get_sys_cnt_1ns trace=%s samples=%zu envelope_min_us=%.3f envelope_median_us=%.3f "
+            "envelope_avg_us=%.3Lf envelope_max_us=%.3f max_vf_min_us=%.3f max_vf_median_us=%.3f "
+            "max_vf_avg_us=%.3Lf max_vf_max_us=%.3f\n",
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            "on",
+#else
+            "off",
+#endif
+            count, builder_envelope_times_us.front(), median_of(builder_envelope_times_us),
+            envelope_sum / static_cast<long double>(count), builder_envelope_times_us.back(),
+            builder_max_vf_times_us.front(), median_of(builder_max_vf_times_us),
+            max_vf_sum / static_cast<long double>(count), builder_max_vf_times_us.back()
         );
     }
     std::printf(

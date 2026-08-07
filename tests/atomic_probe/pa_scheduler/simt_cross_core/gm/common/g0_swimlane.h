@@ -27,7 +27,7 @@ constexpr uint64_t kTracePoison = UINT64_C(0xD3D3D3D3D3D3D3D3);
 constexpr uint32_t kTraceTaskCapacity = kDefaultBatches * kTasksPerBatch;
 constexpr uint32_t kTraceSimtWriterCount = kMaxBuilderLeaderCount;
 constexpr uint32_t kTraceScalarWriterCount = kOwnerCount;
-// profiling 变体同时覆盖 1..16 builder。数组按本次构建的最大 writer 数预留；
+// profiling 变体同时覆盖 1..32 builder。数组按本次构建的最大 writer 数预留；
 // control.simt_writer_count 只记录实际启动的 writer。每 writer 容量按其最多
 // task 数精确推导，避免降低 warp 数时用固定大数组把 sidecar 放大。
 constexpr uint32_t kTraceScalarRecordsPerWriter = 512U;

@@ -3328,7 +3328,7 @@ int main(int argc, char **argv) {
     );
 #else
     std::printf(
-        "[PASS] GM CPU complete: builders=1..16, B1/B256, leaders/builder=%u, unique build claim, "
+        "[PASS] GM CPU complete: builders=1..32, B1/B256, leaders/builder=%u, unique build claim, "
         "8-shard heap, exact DAG/payload, 4-token tickets, fanin/completion/drain/tail, "
         "same-address reuse rounds=%u\n",
         kBuilderLeaderCount, rounds
