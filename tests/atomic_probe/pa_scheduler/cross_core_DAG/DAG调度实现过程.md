@@ -315,3 +315,48 @@ CCEC 编译日志中的 warning 来自 PTO-ISA 头部的既有未使用变量和
 
 本阶段只证明设备源码能以 AIC/AIV 两种架构编译、静态链接并形成可校验
 产物。真实 A5 B1/B256、golden、端到端性能和泳道仍为 `NOT RUN`。
+
+## 7. 2026-08-07：S2 A5 B1/B256 正确性与 perf
+
+### 7.1 设备入口
+
+本机没有 `npu-smi` 和 `task-submit`，与仓库既有 A5 复现记录一致。设备
+节点 `/dev/davinci0`、`/dev/davinci_manager` 和 `devmm_svm` 存在，PCI
+设备为 Huawei d806；使用 CANN ACL host 对 device 0 直接同步 launch。
+
+这属于本机已记录的设备入口约束，不能写成完成了 `task-submit` 预约，也
+不能用设备节点本身替代上板执行证据。实际 B1/B256 ACL launch 均成功，
+CCEC 目标继续固定为 `dav-c310-cube/vec`。
+
+### 7.2 B1 真计算
+
+B1 使用默认 `real-compute/6,28,4,1`，结果：
+
+- 5 个 task 全部 Build exactly once；
+- QK/SF/PV/UP 四个 kernel 各执行一次；
+- 8 个 fresh output、5 次 symbol input load、3 次 INOUT symbol commit；
+- descriptor、history、fanin、8 路 heap、execution payload、golden 和
+  FinalDrain 全部 PASS；
+- startup 到 FinalDrain 为 `173.918 us`。
+
+### 7.3 B256 十轮 perf
+
+B256 同样使用默认真计算，每轮都是独立 ACL launch。1,280 个 Build、1,024
+个 kernel、2,048 个 published output、1,280 条 fanin edge、256 个 writer
+completion 和 `206,569,472 B` heap 全部闭合；每轮
+`execution/semantic/postprocess` 均为 PASS。
+
+startup 到 FinalDrain 的十轮结果为：
+
+```text
+2.341248  2.330751  2.321785  2.320387  2.344957 ms
+2.347033  2.311389  2.321238  2.337646  2.319769 ms
+```
+
+- 最快：`2.311389 ms`；
+- 中位数：`2.326268 ms`；
+- 均值：`2.329620 ms`；
+- 最慢：`2.347033 ms`。
+
+这是无泳道 `perf-clock` 产物的唯一性能裁决口径。swimlane 尚未运行，不能
+把之后的带观察时间与本节绝对值直接相减。
