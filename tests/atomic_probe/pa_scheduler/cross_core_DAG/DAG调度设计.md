@@ -362,3 +362,6 @@ Scalar 真实负载时间直接相减。
 8. Build owner、Execute owner和 Completion owner责任明确；
 9. host oracle 必须独立重建结果，不能复用设备结果充当 golden；
 10. 任何性能优化不得识别 PA 固定 DAG 或减少工作语义。
+11. 固定容量的本地 DAG/writer 投影只初始化标量边界和随后发布的
+    `[0, count)` 有效前缀；所有消费者必须先校验 `count`，不得读取未发布容量，
+    也不得依赖未使用槽为零。该约束用于避免在每个 task 上清零整块临时数组。

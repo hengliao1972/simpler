@@ -86,7 +86,10 @@ PA_DEVICE bool SharedDagTaskHasSymbolWriter(
     bool &has_writer
 ) {
     has_writer = false;
-    SharedDagWriterIntents intents{};
+    // WriterIntentsAt() 先写 count/ordinary_writer，并只发布
+    // [0, symbol_count) 有效前缀。这里不能为一次历史 candidate 查询
+    // 清零固定 32 项数组；反向搜索只允许读取 adapter 已发布的前缀。
+    SharedDagWriterIntents intents;
     if (!schema.WriterIntentsAt(task_id, intents) ||
         intents.symbol_count > kMaxTaskTensors) {
         return false;
@@ -150,7 +153,9 @@ template <typename Schema>
 PA_DEVICE bool SharedDagTaskHasOrdinaryWriter(
     const Schema &schema, uint32_t task_id, bool &has_writer
 ) {
-    SharedDagWriterIntents intents{};
+    // ordinary 查询只消费 adapter 明确写出的标量字段；保持与 symbol
+    // 查询相同的“有效前缀”合同，避免重复清零完整 writer 数组。
+    SharedDagWriterIntents intents;
     if (!schema.WriterIntentsAt(task_id, intents) ||
         intents.symbol_count > kMaxTaskTensors) {
         return false;
@@ -203,7 +208,8 @@ PA_DEVICE bool BuildSharedMetadataDag(
     }
 
     for (uint32_t index = 0; index < tensor_count; ++index) {
-        SharedDagTensor tensor{};
+        // TensorAt() 必须完整写出这个小投影；DAG 只读取成功调用后的值。
+        SharedDagTensor tensor;
         if (!schema.TensorAt(task_id, index, tensor)) {
             return false;
         }
@@ -1487,7 +1493,9 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     const SharedPaDagSchema dag_schema{
         &state->build_dispatch
     };
-    SharedMetadataDag metadata_dag{};
+    // BuildSharedMetadataDag() 在读取任何数组前先写对应 count，并只消费
+    // 有效前缀；无需为每个 task 清零三个 32 项数组。
+    SharedMetadataDag metadata_dag;
     if (!BuildSharedMetadataDagFromTaskArgs(
             dag_schema, task_id, args, metadata_dag
         )) {
@@ -1537,7 +1545,9 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
-    SharedTaskWriterDelta writer_delta{};
+    // FinalizeSharedTaskWriterDeltaFromDag() 先复位全部标量边界，只发布
+    // ordinary/symbol 的有效前缀。未使用容量不能进入热路清零成本。
+    SharedTaskWriterDelta writer_delta;
     if (!FinalizeSharedTaskWriterDeltaFromDag(
             args, context, metadata_dag, writer_delta
         )) {

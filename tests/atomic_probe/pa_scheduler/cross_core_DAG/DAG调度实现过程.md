@@ -885,3 +885,66 @@ CPU perf-clock 全量门槛、AIC/AIV CCEC、mixed ELF、ABI、强符号、
 - 相对初始 `2326.268 us` 累计改善 `59.92%`。
 
 目前距 `0.82 ms` 门槛约 `112 us`，距 `0.60 ms` 目标约 `332 us`。
+
+## 17. 2026-08-07：S11 固定容量对象只初始化有效前缀
+
+### 17.1 泳道证据与问题定位
+
+S10 的 B256、`6,28,4,1` 完整泳道为：
+
+```text
+outputs/pa_scheduler_cross_core_dag_swimlane_20260807_112721_3417151/ccec/
+```
+
+该次设备端 startup 到 FinalDrain 为 `1038.075 us`。按 task kind 统计
+Claim 结束到 Materialize 开始之间的未标记区间，Alloc/SF/UP 平均约
+`2.4/2.7/4.0 us`，而 QK/PV 分别达到约 `17.0/16.9 us`。同负载成熟
+`cross_core` 的五类 task 均约 `1.7--2.1 us`，说明 DAG 版本在参数构造与
+局部临时对象处理上还有明显额外 Scalar 工作，不能只归咎于 atomic。
+
+代码核查发现，每次 DAG 推导都会对若干固定 32 项的本地对象执行 `{}`
+值初始化：
+
+- 历史 writer intent 查询；
+- 单项 tensor 投影；
+- 当前 task 的 metadata DAG；
+- Materialize 后的 writer delta。
+
+这些生产函数本来就先写 `count`/布尔边界，并完整写出随后会读取的
+`[0, count)` 前缀。清零未使用容量既不提供新的正确性证明，也会放大
+QK/PV 热路的指令和栈访问。
+
+### 17.2 改造与合同
+
+本轮取消上述四类本地对象的整对象清零，并把合同收紧为：
+
+1. 生产者先写全部标量边界；
+2. 生产者只发布 `[0, count)` 有效前缀；
+3. 消费者先校验 `count`，只读取有效前缀；
+4. 未使用容量没有可观察语义，任何路径不得依赖其为零。
+
+没有减少 task、tensor、DAG candidate、atomic、DCCI 或 kernel workload，
+也没有识别 PA 固定拓扑。该原则可由其他算子的 adapter 复用。
+
+### 17.3 门槛与性能
+
+- `git diff --check` PASS；
+- CPU perf-clock 全量门槛 PASS；
+- AIC/AIV CCEC、mixed ELF、ABI、强符号、无 relocation 和 manifest PASS；
+- A5 B256、`6,28,4,1` 十轮全部
+  `execution/semantic/postprocess` PASS。
+
+startup 到 FinalDrain 的十次结果为：
+
+```text
+918.006  914.945  904.198  914.929  906.275 us
+929.908  904.425  925.128  911.470  957.381 us
+```
+
+- 最快：`904.198 us`；
+- 中位数：`914.937 us`；
+- 最慢：`957.381 us`；
+- 相对 S10 `932.310 us` 减少 `17.373 us`，改善 `1.86%`；
+- 相对初始 `2326.268 us` 累计改善 `60.67%`。
+
+目前距 `0.82 ms` 门槛约 `95 us`，距 `0.60 ms` 目标约 `315 us`。
