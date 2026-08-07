@@ -1175,3 +1175,74 @@ outputs/pa_scheduler_cross_core_dag_swimlane_20260807_132840_3887751/ccec/
 descriptor，且 AIC kernel compute 已接近关键路径下限；缩短的是 96 核聚合
 Build 工作，不会等比例缩短最慢 AIC 的串行关键链。该结果仍保留，因为合同
 通用、删除了真实重复搬运且所有 oracle 闭合，但它不能单独通向 `0.60 ms`。
+
+## 21. 2026-08-07：S15 去除 dispatched metadata 的重复 fatal 读取
+
+### 21.1 先排除三个不成立的 SIMT 候选
+
+S14 之后先从 SIMT 的「分散控制字」和「局部完成」中提炼了三个
+候选，但都不符合 Scalar 当前的动态均衡或可接管合同：
+
+1. **16 路动态争抢、固定 task shard 的 Build cursor**：CPU 正确性通过，
+   但 A5 十轮中位数 `857.808 us`，相对 S14 回退 `8.73%`。它虽然
+   降低了单地址 atomic 竞争，却把任务尾部和快慢核差异固化在 shard
+   内，破坏了中央 ticket 的全局动态均衡。
+2. **Build `FetchAdd(2)` 并把第二个 task 私藏在 owner 栈上**：目标是把
+   Build ticket 物理调用从 `1376` 降至 `736`，但 CPU
+   `release_before_build` 只完成 `17` 个 task。owner 停在第一个 Build 时，
+   第二个 task 也被私有化，其他 Scalar 无法接管；因此未上板。
+3. **16 组 FinalDrain 最后到达者动态收口**：CPU 全套通过，A5 十轮
+   中位数 `794.767 us`，回退 `0.74%`。原固定收口核的成功路径只有
+   `70` 次返回型 load、观察构建聚合约 `29.951 us`；新增的 16 次
+   RMW、分支和指令工作集得不偿失。
+
+三个候选均已完整撤回，没有进入 S15 代码。
+
+### 21.2 重复读取的合同依据
+
+shared Build 主循环已有两层 terminal-fatal 合同：
+
+- worker 进入 scheduler 时立即观察一次；
+- 此后每个 worker 每完成 `16` 个 Build，在领取下一张 ticket 前再观察
+  一次，因而远端错误后最多额外发放 `15` 个本核 task。
+
+同一代码的合同也明确：已取得的合法工作单允许闭合，不应在
+Materialize/Register 中又对全局 fatal cache line 逐 task 做返回型 Load。
+但正式 `FinishSharedWinnerSubmitBody()` 仍以 `CheckFatal=true` 实例化
+`PublishSharedTaskWriterMetadata()`，B256 因此产生 `1280` 次
+`SharedMetadataFatalGuardLoad`；S14 泳道聚合约 `0.647 ms` core-time。
+
+S15 只对正式 dispatched 调用点传入 `CheckFatal=false`：
+
+- 通用组合入口和隔离测试仍使用 helper 默认的逐次检查；
+- metadata DAG 前驱、writer CAS、DCCI、insert completion 和 FinalDrain 均不变；
+- 不读取 task kind、batch、fanin 或 PA 固定 DAG，对任意算子的中央
+  Build 发放合同都成立。
+
+### 21.3 正确性与性能
+
+- `git diff --check` PASS；
+- CPU 全量门槛 PASS，包括 `remote_fatal_cadence_closure`、乱序 Build、
+  严格 metadata writer 前驱、Execute drain 与独立 kernel overlap；
+- AIC/AIV CCEC、mixed ELF、ABI、强符号、无 relocation 和 manifest PASS；
+- A5 B256、`6,28,4,1` 十轮全部
+  `execution/semantic/postprocess` PASS。
+
+startup 到 FinalDrain 的十次结果为：
+
+```text
+782.196  784.846  785.561  789.696  793.672 us
+779.835  793.219  781.152  787.521  783.710 us
+```
+
+- 最快：`779.835 us`；
+- 中位数：`785.204 us`；
+- 最慢：`793.672 us`；
+- 相对 S14 `788.932 us` 减少 `3.729 us`，改善 `0.47%`；
+- AIV perf-clock 对象的 text 从 S14 约 `85,448 B` 降至
+  `84,424 B`，说明编译期确实删除了重复的返回型原子路径；
+- 距 `0.60 ms` 目标仍约 `185 us`。
+
+这是一个通用但幅度很小的热路减法。它不能支撑「继续微调单次
+atomic 即可到达 0.60 ms」的结论，后续仍需降低 Build/Execute 的通用
+非 kernel 工作量或关键路径指令工作集。

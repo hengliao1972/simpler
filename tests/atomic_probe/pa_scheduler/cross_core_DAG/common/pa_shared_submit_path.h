@@ -1677,8 +1677,11 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         : TraceTimestamp<Ops>(stats.trace, stats.result);
     const bool metadata_published =
         turn_ready &&
+        // 正式 dispatched 路径在领取 ticket 前按 16-task 周期观察
+        // terminal fatal；已领取的合法 task 继续闭合。这里关闭 helper
+        // 内逐 task 的同地址重复 Load，隔离入口仍保留默认检查。
         PublishSharedTaskWriterMetadata<
-            Ops, true, false, false, false, false, true
+            Ops, false, false, false, false, false, true
         >(
             state, context, writer_delta, stats, -1, -1
 #if !PA_BUILD_TRACE_FREE
