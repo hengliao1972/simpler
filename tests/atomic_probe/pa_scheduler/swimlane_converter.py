@@ -548,9 +548,20 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
     metadata_prefix_tasks_raw = metadata.get(
         "shared_metadata_prefix_tasks"
     )
+    shared_metadata_ordering = metadata.get(
+        "shared_metadata_ordering", "global_writer_chain"
+    )
     shared_metadata_writer_tasks: tuple[int, ...] = ()
     shared_metadata_prefix_tasks: tuple[int, ...] = ()
     if trace_schema_version == 5 and tensormap_mode == "shared":
+        if shared_metadata_ordering not in (
+            "global_writer_chain", "per_symbol_dag"
+        ):
+            raise ValueError(
+                "metadata.shared_metadata_ordering must be "
+                "global_writer_chain or per_symbol_dag for shared schema-v5"
+            )
+        metadata["shared_metadata_ordering"] = shared_metadata_ordering
         if not isinstance(metadata_writer_tasks_raw, list):
             raise ValueError(
                 "metadata.shared_metadata_writer_tasks must be an array "
@@ -578,33 +589,45 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
         metadata["shared_metadata_writer_tasks"] = list(
             normalized_writer_tasks
         )
-        if not isinstance(metadata_prefix_tasks_raw, list):
-            raise ValueError(
-                "metadata.shared_metadata_prefix_tasks must be an array "
-                "for shared schema-v5"
-            )
-        normalized_prefix_tasks = tuple(
-            _integer(
-                task_id,
-                f"metadata.shared_metadata_prefix_tasks[{index}]",
-            )
-            for index, task_id in enumerate(metadata_prefix_tasks_raw)
-        )
-        if any(task_id < 0 for task_id in normalized_prefix_tasks) or any(
-            left >= right
-            for left, right in zip(
-                normalized_prefix_tasks,
-                normalized_prefix_tasks[1:],
-            )
+        if (
+            shared_metadata_ordering == "per_symbol_dag"
+            and metadata_prefix_tasks_raw is not None
         ):
             raise ValueError(
-                "metadata.shared_metadata_prefix_tasks must be strictly "
-                "increasing nonnegative task ids"
+                "metadata.shared_metadata_prefix_tasks must be absent when "
+                "shared_metadata_ordering=per_symbol_dag"
             )
-        shared_metadata_prefix_tasks = normalized_prefix_tasks
-        metadata["shared_metadata_prefix_tasks"] = list(
-            normalized_prefix_tasks
-        )
+        if (
+            shared_metadata_ordering == "global_writer_chain"
+            and not isinstance(metadata_prefix_tasks_raw, list)
+        ):
+            raise ValueError(
+                "metadata.shared_metadata_prefix_tasks must be an array "
+                "for shared schema-v5 global_writer_chain"
+            )
+        if shared_metadata_ordering == "global_writer_chain":
+            normalized_prefix_tasks = tuple(
+                _integer(
+                    task_id,
+                    f"metadata.shared_metadata_prefix_tasks[{index}]",
+                )
+                for index, task_id in enumerate(metadata_prefix_tasks_raw)
+            )
+            if any(task_id < 0 for task_id in normalized_prefix_tasks) or any(
+                left >= right
+                for left, right in zip(
+                    normalized_prefix_tasks,
+                    normalized_prefix_tasks[1:],
+                )
+            ):
+                raise ValueError(
+                    "metadata.shared_metadata_prefix_tasks must be strictly "
+                    "increasing nonnegative task ids"
+                )
+            shared_metadata_prefix_tasks = normalized_prefix_tasks
+            metadata["shared_metadata_prefix_tasks"] = list(
+                normalized_prefix_tasks
+            )
     elif metadata_writer_tasks_raw is not None:
         raise ValueError(
             "metadata.shared_metadata_writer_tasks is only valid for "
@@ -614,6 +637,11 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
         raise ValueError(
             "metadata.shared_metadata_prefix_tasks is only valid for "
             "shared schema-v5"
+        )
+    elif "shared_metadata_ordering" in metadata:
+        raise ValueError(
+            "metadata.shared_metadata_ordering is only valid for shared "
+            "schema-v5"
         )
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
@@ -1256,8 +1284,11 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     "metadata.shared_metadata_prefix_tasks contains unknown "
                     f"tasks: {sorted(unknown_prefix_tasks)[:8]}"
                 )
-            if not writer_task_set.issubset(
-                metadata_prefix_task_set
+            if (
+                shared_metadata_ordering == "global_writer_chain"
+                and not writer_task_set.issubset(
+                    metadata_prefix_task_set
+                )
             ):
                 raise ValueError(
                     "metadata writers must also require the strict metadata "
@@ -1269,6 +1300,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
             previous_writer_by_task[planned_task_id] = previous_writer
             if planned_task_id in writer_task_set:
                 previous_writer = planned_task_id
+        matched_per_symbol_dag_polls = 0
         for task_key, (attempted, won, is_alloc) in v4_claims.items():
             submit_won, submit_alloc = v4_submit_semantics[task_key]
             task_kind = task_kind_by_id[task_key[1]]
@@ -1468,25 +1500,38 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         and int(poll[6]) == parent_start
                         and int(poll[7]) == detail_start
                     ]
-                    # 稀疏链只等待严格早于当前 task 的最近 metadata writer。
-                    # 首个 writer 及其之前的空 writer task 没有前驱；一旦
-                    # 首个 writer 发布，后续每个 winner 都观察该真实前驱。
-                    expected_poll_count = (
-                        1
-                        if task_key[1] in metadata_prefix_task_set
-                        and previous_writer_by_task[task_key[1]] is not None
-                        else 0
-                    )
-                    if len(matching_polls) != expected_poll_count:
-                        raise ValueError(
-                            "shared schema-v5 level4 requires exactly one "
-                            "SharedInsertTurnPoll PollBatch when a previous "
-                            "metadata writer exists and none before the first "
-                            "writer on "
-                            "Register.start->metadata.start at "
-                            f"{task_key}: count={len(matching_polls)} "
-                            f"expected={expected_poll_count}"
+                    if shared_metadata_ordering == "per_symbol_dag":
+                        # DAG 由 device Build 动态推导，host 不再提供逐 task
+                        # 前驱权威。设备把一个 task 的全部精确前驱轮询聚成
+                        # 至多一条 PollBatch；converter 只闭合数量上限和真实
+                        # Register 前段边界，不按 PA task 形状臆造前驱。
+                        if len(matching_polls) > 1:
+                            raise ValueError(
+                                "shared schema-v5 per_symbol_dag allows at "
+                                "most one SharedInsertTurnPoll PollBatch on "
+                                "Register.start->metadata.start at "
+                                f"{task_key}: count={len(matching_polls)}"
+                            )
+                        matched_per_symbol_dag_polls += len(matching_polls)
+                    else:
+                        # 全局稀疏链只等待严格早于当前 task 的最近 metadata
+                        # writer；host prefix 在该旧协议中是独立结构权威。
+                        expected_poll_count = (
+                            1
+                            if task_key[1] in metadata_prefix_task_set
+                            and previous_writer_by_task[task_key[1]] is not None
+                            else 0
                         )
+                        if len(matching_polls) != expected_poll_count:
+                            raise ValueError(
+                                "shared schema-v5 level4 requires exactly one "
+                                "SharedInsertTurnPoll PollBatch when a previous "
+                                "metadata writer exists and none before the first "
+                                "writer on "
+                                "Register.start->metadata.start at "
+                                f"{task_key}: count={len(matching_polls)} "
+                                f"expected={expected_poll_count}"
+                            )
                     handoffs = v4_shared_insert_turn_handoffs.get(
                         task_key, []
                     )
@@ -1592,29 +1637,42 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 winner_count = sum(
                     won for _attempted, won, _is_alloc in v4_claims.values()
                 )
-                predecessor_wait_winner_count = sum(
-                    1
-                    for (_core_id, task_id), (
-                        _attempted,
-                        won,
-                        _is_alloc,
-                    ) in v4_claims.items()
-                    if won and
-                    task_id in metadata_prefix_task_set and
-                    previous_writer_by_task[task_id] is not None
-                )
-                if (
-                    len(v4_shared_insert_turn_polls)
-                    != predecessor_wait_winner_count
-                ):
-                    raise ValueError(
-                        "shared schema-v5 level4 has orphan or duplicate "
-                        "SharedInsertTurnPoll records: "
-                        f"records={len(v4_shared_insert_turn_polls)} "
-                        "expected_predecessor_wait_winners="
-                        f"{predecessor_wait_winner_count} "
-                        f"all_winners={winner_count}"
+                if shared_metadata_ordering == "per_symbol_dag":
+                    if (
+                        len(v4_shared_insert_turn_polls)
+                        != matched_per_symbol_dag_polls
+                    ):
+                        raise ValueError(
+                            "shared schema-v5 per_symbol_dag has orphan "
+                            "SharedInsertTurnPoll records: "
+                            f"records={len(v4_shared_insert_turn_polls)} "
+                            f"matched_registers={matched_per_symbol_dag_polls} "
+                            f"all_winners={winner_count}"
+                        )
+                else:
+                    predecessor_wait_winner_count = sum(
+                        1
+                        for (_core_id, task_id), (
+                            _attempted,
+                            won,
+                            _is_alloc,
+                        ) in v4_claims.items()
+                        if won and
+                        task_id in metadata_prefix_task_set and
+                        previous_writer_by_task[task_id] is not None
                     )
+                    if (
+                        len(v4_shared_insert_turn_polls)
+                        != predecessor_wait_winner_count
+                    ):
+                        raise ValueError(
+                            "shared schema-v5 level4 has orphan or duplicate "
+                            "SharedInsertTurnPoll records: "
+                            f"records={len(v4_shared_insert_turn_polls)} "
+                            "expected_predecessor_wait_winners="
+                            f"{predecessor_wait_winner_count} "
+                            f"all_winners={winner_count}"
+                        )
                 handoff_count = sum(
                     len(items)
                     for items in v4_shared_insert_turn_handoffs.values()
@@ -1843,7 +1901,7 @@ def _iter_v5_cross_core_winner_build_pack_spans(
         )
 
 
-def _iter_v5_cross_core_semantic_gap_spans(
+def _iter_v5_cross_core_semantic_gap_spans(  # noqa: PLR0912, PLR0915
     rows: list[tuple[Any, ...]],
     frequency_hz: int,
     trace_schema_version: int,
@@ -2062,6 +2120,7 @@ def _iter_v5_cross_core_semantic_gap_spans(
                     (current_phase == "Atomic" and current_site == 5)
                     or current_phase == "Kernel"
                 ):
+                    assert previous is not None
                     task_id = int(previous[3])
                     name = "execute.bind_payload_and_rebuild_args[GM+Scalar]"
                 elif (
@@ -2091,6 +2150,7 @@ def _iter_v5_cross_core_semantic_gap_spans(
                     and current_phase == "Atomic"
                     and current_site == 48
                 ):
+                    assert previous is not None
                     task_id = int(previous[3])
                     name = "efdrain.evaluate_exec_claim[GM+Scalar]"
                 elif (
@@ -2106,6 +2166,7 @@ def _iter_v5_cross_core_semantic_gap_spans(
                     and current_phase == "Atomic"
                     and current_site in (5, 45)
                 ):
+                    assert previous is not None
                     task_id = int(previous[3])
                     name = "execute.recycle_token_and_continue[GM+Scalar]"
                 if name is not None:
@@ -2237,7 +2298,7 @@ def _emit_event(output: TextIO, event: dict[str, Any], first: bool) -> bool:
     return False
 
 
-def _iter_v5_residual_spans(
+def _iter_v5_residual_spans(  # noqa: PLR0912
     rows: list[tuple[Any, ...]],
     tensormap_mode: str | None = None,
     submit_topology: str | None = None,

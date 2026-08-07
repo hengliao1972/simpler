@@ -2065,6 +2065,92 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             ]
             self.assertEqual(len(atomic_polls), 1)
 
+    def test_v5_shared_per_symbol_dag_accepts_device_derived_poll_set(
+        self,
+    ) -> None:
+        capture = _v5_shared_register_atomic_capture()
+        metadata = capture["metadata"]
+        rows = capture["fdwic_events"]
+        assert isinstance(metadata, dict)
+        assert isinstance(rows, list)
+        metadata["shared_metadata_ordering"] = "per_symbol_dag"
+        metadata.pop("shared_metadata_prefix_tasks")
+        # task 0/4 是同一 symbol 的 writer。模拟 device DAG 只让 task 4
+        # 等 task 0；中间三个 task 不因全局 writer 前缀产生假等待。
+        rows[:] = [
+            row
+            for row in rows
+            if not (
+                row[5] == "Atomic"
+                and int(row[9]) == 19
+                and int(row[6]) in (170, 220, 270)
+            )
+        ]
+        _refresh_summary(capture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            convert(input_path, output_path)
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            merged["metadata"]["shared_metadata_ordering"],
+            "per_symbol_dag",
+        )
+        atomic_polls = [
+            event
+            for event in merged["traceEvents"]
+            if str(event.get("name", "")).startswith(
+                "atomic.poll_batch.return_ready."
+                "shared_insert_predecessor_poll.load"
+            )
+        ]
+        self.assertEqual(len(atomic_polls), 1)
+
+    def test_v5_shared_per_symbol_dag_rejects_host_prefix_authority(
+        self,
+    ) -> None:
+        capture = _v5_shared_register_atomic_capture()
+        metadata = capture["metadata"]
+        assert isinstance(metadata, dict)
+        metadata["shared_metadata_ordering"] = "per_symbol_dag"
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError,
+                "shared_metadata_prefix_tasks must be absent",
+            ):
+                convert(input_path, output_path)
+
+    def test_v5_shared_per_symbol_dag_rejects_duplicate_poll(self) -> None:
+        capture = _v5_shared_register_atomic_capture()
+        metadata = capture["metadata"]
+        rows = capture["fdwic_events"]
+        assert isinstance(metadata, dict)
+        assert isinstance(rows, list)
+        metadata["shared_metadata_ordering"] = "per_symbol_dag"
+        metadata.pop("shared_metadata_prefix_tasks")
+        poll = next(
+            row
+            for row in rows
+            if row[5] == "Atomic" and int(row[9]) == 19
+        )
+        rows.append(list(poll))
+        _refresh_summary(capture)
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.json"
+            output_path = Path(directory) / "merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError,
+                "per_symbol_dag allows at most one",
+            ):
+                convert(input_path, output_path)
+
     def test_v5_shared_claim_tournament_atomics_are_named(self) -> None:
         capture = _v5_shared_register_atomic_capture()
         rows = capture["fdwic_events"]

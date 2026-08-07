@@ -723,6 +723,7 @@ def _build_register_breakdown(  # noqa: PLR0912
     num_cores: int,
     trace_schema_version: int,
     tensormap_mode: str,
+    shared_metadata_ordering: str,
 ) -> dict[str, Any] | None:
     """由 raw 整数边界构造 Register 串行区排他闭合报告。"""
 
@@ -880,14 +881,28 @@ def _build_register_breakdown(  # noqa: PLR0912
             },
         }
 
+    wait_semantics = (
+        "Register.start to SharedRegisterPublishMetadata.start; the device "
+        "Build-derived per-symbol DAG waits only deduplicated exact "
+        "predecessors, so a task with no such predecessor enters directly"
+        if shared_metadata_ordering == "per_symbol_dag"
+        else "Register.start to SharedRegisterPublishMetadata.start; task 0 "
+        "enters directly, while a task in the host-declared global writer "
+        "prefix waits for the latest earlier metadata writer"
+    )
+    completion_semantics = (
+        "SharedRegisterPublishMetadata.end to Register.end; metadata writers "
+        "publish one task completion after every symbol commit, while "
+        "non-writers retain only the boundary remainder"
+        if shared_metadata_ordering == "per_symbol_dag"
+        else "SharedRegisterPublishMetadata.end to Register.end; publish this "
+        "task's global writer-chain completion for its successor"
+    )
     return {
         "semantics": {
             "parent": "the existing exclusive Register span",
-            "register_wait_predecessor_insert": (
-                "Register.start to SharedRegisterPublishMetadata.start; "
-                "task 0 enters directly, while task N waits for task N-1 to "
-                "publish its TensorMap insertion completion"
-            ),
+            "shared_metadata_ordering": shared_metadata_ordering,
+            "register_wait_predecessor_insert": wait_semantics,
             "register_publish_metadata": ("the SharedRegisterPublishMetadata raw parent detail"),
             "register_publish_writer_metadata": (
                 "the serialized ordinary/symbol writer publication. In new "
@@ -911,10 +926,7 @@ def _build_register_breakdown(  # noqa: PLR0912
             "register_publish_metadata_epilogue": (
                 "legacy compatibility field after Register-owned output publication; exactly zero in new captures"
             ),
-            "register_publish_insert_completion": (
-                "SharedRegisterPublishMetadata.end to Register.end; publish this "
-                "task's TensorMap insertion completion for its successor"
-            ),
+            "register_publish_insert_completion": completion_semantics,
             "raw_arithmetic": "integer cycle boundaries; merged swimlane is not read",
             "output_placement": output_placement,
             "included_in_submit_additive_totals": {
@@ -1931,6 +1943,11 @@ def analyze_capture(  # noqa: PLR0912, PLR0915
     submit_topology = (
         str(metadata.get("submit_topology", "all_worker_replay")) if trace_schema_version == 5 else "all_worker_replay"
     )
+    shared_metadata_ordering = (
+        str(metadata.get("shared_metadata_ordering", "global_writer_chain"))
+        if trace_schema_version == 5 and tensormap_mode == "shared"
+        else "none"
+    )
     if len(core_by_block_lane) != num_cores or set(core_by_block_lane.values()) != set(range(num_cores)):
         raise ValueError("block/lane to core mapping is incomplete")
 
@@ -1974,6 +1991,7 @@ def analyze_capture(  # noqa: PLR0912, PLR0915
         num_cores,
         trace_schema_version,
         tensormap_mode,
+        shared_metadata_ordering,
     )
     materialize_breakdown = _build_materialize_breakdown(
         children_by_submit,
@@ -2335,6 +2353,7 @@ def analyze_capture(  # noqa: PLR0912, PLR0915
         if tensormap_mode == "shared":
             semantics.update(
                 {
+                    "shared_metadata_ordering": shared_metadata_ordering,
                     "register_internal_detail": SHARED_REGISTER_DETAIL_PHASE,
                     "register_internal_children": [
                         "RegisterWaitInsertTurn",
@@ -2380,6 +2399,8 @@ def analyze_capture(  # noqa: PLR0912, PLR0915
         "core_count": num_cores,
         "event_count": len(events),
     }
+    if tensormap_mode == "shared":
+        capture["shared_metadata_ordering"] = shared_metadata_ordering
     if submit_topology == "central_ticket":
         capture["task_count_global"] = len(task_ids)
     else:

@@ -360,3 +360,89 @@ startup 到 FinalDrain 的十轮结果为：
 
 这是无泳道 `perf-clock` 产物的唯一性能裁决口径。swimlane 尚未运行，不能
 把之后的带观察时间与本节绝对值直接相减。
+
+## 8. 2026-08-07：S3 A5 B256 DAG 泳道闭合
+
+### 8.1 先修正观察协议，而不是放宽错误
+
+第一次真实 B256 采集的设备执行、语义和 golden 已全部 PASS，但公共
+converter 仍按旧 `global_writer_chain` 假设，要求 host 为每个 task 声明
+metadata writer 前缀，并据此断言每个前缀 task 必有一条
+`SharedInsertTurnPoll`。新实现的 DAG 在 device Build 中动态推导；没有精确
+同 symbol 前驱的 task 本来就不应产生该 PollBatch，因此旧断言拒绝了正确
+raw。
+
+本阶段没有用 PA 固定 task 间距在 host 侧重建 DAG，也没有简单删除结构
+门槛，而是：
+
+- DAG host raw 明确写入
+  `shared_metadata_ordering=per_symbol_dag`；
+- DAG raw 不再导出 `shared_metadata_prefix_tasks`，避免 host 重新成为逐 task
+  DAG 权威；
+- `shared_metadata_writer_tasks` 只说明哪些 task 确实发布 completion，用于
+  闭合 writer handoff 数量，不描述其前驱；
+- 每个 Build winner 允许零或一条聚合 `SharedInsertTurnPoll`，若存在则必须
+  精确覆盖 `Register.start -> metadata.start`；重复、越界和孤儿记录继续
+  fail-closed；
+- producer summary 继续闭合全部物理记录、逻辑 atomic 调用、PollBatch 和
+  DCCI 调用/行数；旧 `global_writer_chain` raw 仍走原有严格前缀校验。
+
+analyzer 同步读取该协议身份。`register_wait_predecessor_insert` 字段名为保持
+报告 schema 稳定而保留，但其说明已改为“等待 device 动态 DAG 的去重精确
+前驱”，不再错误描述成 `task N` 等待 `task N-1`。
+
+### 8.2 最终产物与闭合结果
+
+最终 B256 真计算泳道目录为：
+
+```text
+tests/atomic_probe/pa_scheduler/outputs/
+  pa_scheduler_cross_core_dag_swimlane_20260807_074759_2456882/ccec/
+```
+
+其中：
+
+- raw：`l2_swimlane_records.json`，约 `3.7 MiB`；
+- merged：`merged_swimlane.json`，约 `8.0 MiB`；
+- 排他分析：`swimlane_exclusive_analysis.json`，约 `340 KiB`。
+
+设备与 host 门槛全部 PASS：
+
+- 1,280 个 Build、1,024 个 kernel、2,048 个 published output；
+- 1,280 条 fanin edge、256 个 writer completion；
+- AIC 只执行 QK/PV，AIV 只执行 SF/UP；
+- heap、descriptor、history、execution payload、golden 与 FinalDrain 全部
+  闭合；
+- raw `57,105` 条、merged `72,538` 个事件，`dropped_records=0`；
+- 1,024 个 kernel 均有唯一父区间：EfDrain 814 个、FinalDrain 117 个、
+  OrchestrationTail 93 个，孤儿为 0。
+
+本次 PA G1 的 DAG 关键原语数量为：
+
+- `SharedInsertTurnPoll`：0 条物理记录、0 次逻辑调用。各 batch 的三个
+  writer symbol 均只回到本组 producer，没有跨 task writer 前驱；
+- `SharedMetadataOutputPublishedLoad`：768 条物理记录、1,246 次逻辑调用。
+  256 个 UP 各有 3 个目标 output，轮询次数按真实可见时序累计；
+- `SharedMetadataLastWriterCommit`：768 条物理记录、768 次逻辑调用，即
+  256 个 UP × 3 个独立 symbol CAS；
+- `SharedInsertTurnHandoff`：256 条物理记录、256 次逻辑调用，每个 metadata
+  writer 在全部 symbol commit 后发布一次 task completion；
+- `SharedWriterHistoryFlush` DCCI：256 条物理记录、256 次调用、256 条 cache
+  line，每个 writer 精确发布一条 immutable history cache line。
+
+`SharedInsertTurnPoll=0` 不是漏采：本用例不同 batch 使用不同 symbol，且
+producer output 的取得由 `SharedMetadataOutputPublishedLoad` 单独证明。以后
+加入同 symbol 多 writer 或 ordinary writer 门槛时，动态 DAG 才应产生对应
+的 predecessor PollBatch。
+
+### 8.3 时间口径
+
+这次带完整 atomic/DCCI 观察的单轮结果为：
+
+- host 摘要 Submit span：`1.984255 ms`；
+- startup 到 FinalDrain lifecycle：`2.047027 ms`；
+- analyzer 的全局 Submit raw 区间：`1.899758 ms`。
+
+三者边界不同；此外 swimlane ELF 含观察代码，不能与无泳道 ELF 做绝对时间
+相减。性能裁决仍以 S2 的十轮 `perf-clock` startup-to-FinalDrain 中位数
+`2.326268 ms` 为准，本节只作为业务阶段、atomic、DCCI 与 DAG 协议证据。

@@ -2656,9 +2656,16 @@ inline bool ExportSwimlaneRecords(
     }
     std::fprintf(output, "]");
 #if PTO_FDWIC_SHARED_MAP
+    // cross_core_DAG 的等待关系由 device Build 根据 tensor schema 动态
+    // 推导。converter 只能校验设备实际落下的 PollBatch，不能再拿 host
+    // 的全局 writer 前缀猜测逐 task DAG。
+    std::fprintf(
+        output,
+        ",\"shared_metadata_ordering\":\"per_symbol_dag\""
+    );
     // writer 计划来自与 device build_dispatch 同源、已经独立校验的 host
-    // task plan。它只增加极小的 host JSON 元数据，不增加 device raw 记录，
-    // 供 converter 精确区分“等待上一位真实 writer”和空 writer task。
+    // task plan。这里只导出“哪些 task 确实发布 completion”，供 converter
+    // 闭合 handoff 数量；它不描述任何 task 的 DAG 前驱。
     std::fprintf(output, ",\"shared_metadata_writer_tasks\":[");
     bool first_metadata_writer = true;
     for (const SharedHostPlannedTask &task : shared_plan.tasks) {
@@ -2670,21 +2677,6 @@ inline bool ExportSwimlaneRecords(
             first_metadata_writer ? "" : ",", task.task_id
         );
         first_metadata_writer = false;
-    }
-    std::fprintf(output, "]");
-    std::fprintf(
-        output, ",\"shared_metadata_prefix_tasks\":["
-    );
-    bool first_metadata_prefix = true;
-    for (const SharedHostPlannedTask &task : shared_plan.tasks) {
-        if (!task.requires_metadata_prefix) {
-            continue;
-        }
-        std::fprintf(
-            output, "%s%u",
-            first_metadata_prefix ? "" : ",", task.task_id
-        );
-        first_metadata_prefix = false;
     }
     std::fprintf(output, "]");
 #endif

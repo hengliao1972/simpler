@@ -499,18 +499,10 @@ def _v4_capture(  # noqa: PLR0912
         # completion”协议；显式列出与 raw handoff 完全一致的 writer 计划，
         # 让公共 converter 同时覆盖旧矩形测试与新稀疏生产数据。
         metadata["shared_metadata_writer_tasks"] = sorted(
-            {
-                int(row[3])
-                for row in rows
-                if row[5] == "Atomic" and int(row[9]) == 20
-            }
+            {int(cast(Any, row[3])) for row in rows if row[5] == "Atomic" and int(cast(Any, row[9])) == 20}
         )
         metadata["shared_metadata_prefix_tasks"] = sorted(
-            {
-                int(row[3])
-                for row in rows
-                if row[5] == "Register"
-            }
+            {int(cast(Any, row[3])) for row in rows if row[5] == "Register"}
         )
     _refresh_summary(capture)
     return capture
@@ -850,6 +842,7 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
                 "trace_schema_version": 5,
                 "tensormap_mode": "shared",
                 "submit_topology": "central_ticket",
+                "shared_metadata_ordering": "global_writer_chain",
                 "clock_freq_hz": 1_000_000_000,
                 "core_count": 96,
                 "event_count": 555,
@@ -873,6 +866,36 @@ class SwimlaneExclusiveAnalyzerTest(unittest.TestCase):
                 core["metrics_cycles"]["orchestration_replay"],
             )
             self.assertEqual(core["metrics_cycles"]["submit_union"], 0)
+
+    def test_v5_per_symbol_dag_reports_dynamic_register_semantics(
+        self,
+    ) -> None:
+        capture = _v5_materialize_output_capture(submit_topology="central_ticket")
+        metadata = capture["metadata"]
+        assert isinstance(metadata, dict)
+        metadata["shared_metadata_ordering"] = "per_symbol_dag"
+        metadata.pop("shared_metadata_prefix_tasks")
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, capture)
+            report = analyze_capture(path)
+
+        self.assertEqual(
+            report["capture"]["shared_metadata_ordering"],
+            "per_symbol_dag",
+        )
+        register_semantics = report["register_breakdown"]["semantics"]
+        self.assertEqual(
+            register_semantics["shared_metadata_ordering"],
+            "per_symbol_dag",
+        )
+        self.assertIn(
+            "device Build-derived per-symbol DAG",
+            register_semantics["register_wait_predecessor_insert"],
+        )
+        self.assertNotIn(
+            "task N-1",
+            register_semantics["register_wait_predecessor_insert"],
+        )
 
     def test_v5_central_ticket_rejects_duplicate_global_owner(self) -> None:
         capture = _v5_materialize_output_capture(submit_topology="central_ticket")
