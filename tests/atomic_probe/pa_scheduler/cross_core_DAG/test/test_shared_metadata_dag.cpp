@@ -87,6 +87,65 @@ struct TestSchema {
         }
         return true;
     }
+
+    bool PreviousOrdinaryWriter(
+        uint32_t task_id, int32_t &previous_writer
+    ) const {
+        if (task_id >= TaskCount()) {
+            return false;
+        }
+        previous_writer = -1;
+        for (int32_t candidate = static_cast<int32_t>(task_id) - 1;
+             candidate >= 0; --candidate) {
+            SharedDagWriterIntents intents;
+            if (!WriterIntentsAt(
+                    static_cast<uint32_t>(candidate), intents
+                )) {
+                return false;
+            }
+            if (intents.ordinary_writer) {
+                previous_writer = candidate;
+                return true;
+            }
+        }
+        return true;
+    }
+};
+
+// 只篡改 ordinary predecessor 接口，其余 schema 仍由同一份 tensor
+// 定义提供，用于证明公共 DAG 会拒绝越界或并非 writer 的 adapter 结果。
+struct InvalidOrdinaryPredecessorSchema {
+    const TestSchema *base = nullptr;
+    int32_t reported_previous = -1;
+
+    uint32_t TaskCount() const { return base->TaskCount(); }
+
+    bool TensorCount(uint32_t task_id, uint32_t &count) const {
+        return base->TensorCount(task_id, count);
+    }
+
+    bool TensorAt(
+        uint32_t task_id, uint32_t tensor_index,
+        SharedDagTensor &tensor
+    ) const {
+        return base->TensorAt(task_id, tensor_index, tensor);
+    }
+
+    bool WriterIntentsAt(
+        uint32_t task_id, SharedDagWriterIntents &intents
+    ) const {
+        return base->WriterIntentsAt(task_id, intents);
+    }
+
+    bool PreviousOrdinaryWriter(
+        uint32_t task_id, int32_t &previous_writer
+    ) const {
+        if (task_id >= TaskCount()) {
+            return false;
+        }
+        previous_writer = reported_previous;
+        return true;
+    }
 };
 
 [[noreturn]] void Fail(const char *message) {
@@ -210,6 +269,21 @@ void TestOrdinaryFallbackUsesOnlyOrdinaryWriterChain(const TestSchema &schema) {
     Require(dag.dependency_count == 1 && dag.dependencies[0] == 7, "ordinary writer dependency mismatch");
 }
 
+void TestInvalidOrdinaryPredecessorFailsClosed(const TestSchema &schema) {
+    SharedMetadataDag dag{};
+    InvalidOrdinaryPredecessorSchema invalid{&schema, 9};
+    Require(!BuildSharedMetadataDag(invalid, 9, dag),
+            "ordinary predecessor must be strictly earlier than the reader");
+
+    invalid.reported_previous = 8;
+    Require(!BuildSharedMetadataDag(invalid, 9, dag),
+            "symbol-only task must not be accepted as an ordinary writer");
+
+    invalid.reported_previous = -2;
+    Require(!BuildSharedMetadataDag(invalid, 9, dag),
+            "ordinary predecessor below the no-writer sentinel must fail");
+}
+
 void TestMalformedSchemaFailsClosed(const TestSchema &schema) {
     SharedMetadataDag dag{};
     Require(!BuildSharedMetadataDag(schema, 11, dag), "duplicate writer symbol must fail");
@@ -227,6 +301,7 @@ int main() {
     TestIndependentSymbolsDoNotCreateFalseOrder(schema);
     TestReadOnlyTaskWaitsForLatestEarlierWriter(schema);
     TestOrdinaryFallbackUsesOnlyOrdinaryWriterChain(schema);
+    TestInvalidOrdinaryPredecessorFailsClosed(schema);
     TestMalformedSchemaFailsClosed(schema);
     std::puts("PASS: dynamic per-symbol metadata DAG");
     return 0;

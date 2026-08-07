@@ -948,3 +948,68 @@ startup 到 FinalDrain 的十次结果为：
 - 相对初始 `2326.268 us` 累计改善 `60.67%`。
 
 目前距 `0.82 ms` 门槛约 `95 us`，距 `0.60 ms` 目标约 `315 us`。
+
+## 18. 2026-08-07：S12 schema 直接求解 ordinary writer 前驱
+
+### 18.1 根因证据
+
+S11 的旧 swimlane ELF 中，QK/PV 含普通 GM/local 输入，公共 DAG 为证明
+此前没有 ordinary writer，会从 `task_id - 1` 扫描到 0。按 task-id 四等分后，
+两类 task 的 Claim→Materialize 平均耗时随历史长度近似线性增长：
+
+| task | 前 1/4 | 第 2/4 | 第 3/4 | 后 1/4 |
+| ---- | ------: | -----: | -----: | -----: |
+| QK | `6.46 us` | `12.72 us` | `20.00 us` | `26.01 us` |
+| PV | `6.97 us` | `12.86 us` | `19.64 us` | `26.29 us` |
+
+PA 本轮 1,280 个 task 没有任何 ordinary writer，因此这段二次复杂度工作只是在
+重复证明空集。它不是 atomic、DCCI 或真实 kernel 开销。
+
+### 18.2 通用 schema 合同
+
+借鉴 SIMT “前驱由访问 schema 一次求解、Build 直接消费”的原则，公共 DAG
+新增 `PreviousOrdinaryWriter(task_id, previous)` adapter 合同：
+
+- 任意算子 adapter 都必须从自己的只读 tensor access schema 求最近 ordinary
+  writer；能紧凑求解的无需逐 task 枚举，不能紧凑求解的可在 adapter 内回退扫描；
+- 公共层继续校验 `-1 <= previous < task_id`；
+- 非负 candidate 必须再经 `WriterIntentsAt()` 复核确实为 ordinary writer；
+- 当前 task 是否读取/写入 ordinary region 仍从真实 `TaskArgs` 动态判定；
+- 不新增 host DAG、writer bitset 或 PA 固定 task 间距。
+
+PA adapter 的 schema 本身已经证明所有 metadata writer 都是
+`SharedOutputRef` symbol，因此直接返回 `-1`。CPU 任意 schema adapter 仍动态
+扫描自己的 tensor 定义，并覆盖 writer 与 reader 混排。新增负例还验证了
+返回当前 task、symbol-only task 或小于 `-1` 时必须 fail closed。
+
+### 18.3 门槛、泳道与性能
+
+- `git diff --check` PASS；
+- CPU perf-clock 全量门槛 PASS；
+- AIC/AIV CCEC、mixed ELF、ABI、强符号、无 relocation 和 manifest PASS；
+- A5 B256、`6,28,4,1` 十轮全部
+  `execution/semantic/postprocess` PASS。
+
+startup 到 FinalDrain 的十次结果为：
+
+```text
+808.007  831.690  817.445  815.316  819.482 us
+818.082  806.511  821.768  819.610  820.659 us
+```
+
+- 最快：`806.511 us`；
+- 中位数：`818.782 us`；
+- 最慢：`831.690 us`；
+- 相对 S11 `914.937 us` 减少 `96.155 us`，改善 `10.51%`；
+- 相对初始 `2326.268 us` 累计改善 `64.80%`；
+- 首次越过 `0.82 ms` 门槛，距 `0.60 ms` 仍约 `219 us`。
+
+重新编译后的完整泳道位于：
+
+```text
+outputs/pa_scheduler_cross_core_dag_swimlane_20260807_115606_3447126/ccec/
+```
+
+其 global Submit makespan 为 `758.765 us`。Claim→Materialize 聚合 core-time
+从旧 ELF 的 `10.689 ms` 降到 `3.672 ms`；QK/PV 平均分别从
+`16.30/16.44 us` 降到 `2.45/2.82 us`，且不再随 task-id 线性增长。

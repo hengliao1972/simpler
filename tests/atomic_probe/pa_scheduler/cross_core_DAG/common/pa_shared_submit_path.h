@@ -169,22 +169,23 @@ PA_DEVICE bool SharedDagFindPreviousOrdinaryWriter(
     const Schema &schema, uint32_t task_id,
     int32_t &previous_writer
 ) {
-    previous_writer = -1;
-    int32_t candidate = static_cast<int32_t>(task_id) - 1;
-    while (candidate >= 0) {
-        bool has_writer = false;
-        if (!SharedDagTaskHasOrdinaryWriter(
-                schema, static_cast<uint32_t>(candidate), has_writer
-            )) {
-            return false;
-        }
-        if (has_writer) {
-            previous_writer = candidate;
-            return true;
-        }
-        --candidate;
+    // ordinary writer 的枚举方式属于 schema：有的算子能从紧凑访问计划
+    // 直接得到最近 candidate，有的通用 adapter 可以自行反向扫描。
+    // 公共 DAG 不再强制每个 reader 扫过全部历史 task，但仍复核返回项的
+    // 边界和 writer 身份，不能把一个只读 task 当成依赖前驱。
+    if (!schema.PreviousOrdinaryWriter(task_id, previous_writer) ||
+        previous_writer < -1 ||
+        previous_writer >= static_cast<int32_t>(task_id)) {
+        return false;
     }
-    return true;
+    if (previous_writer < 0) {
+        return true;
+    }
+    bool has_writer = false;
+    return SharedDagTaskHasOrdinaryWriter(
+               schema, static_cast<uint32_t>(previous_writer),
+               has_writer
+           ) && has_writer;
 }
 
 template <typename Schema>
@@ -489,6 +490,22 @@ struct SharedPaDagSchema {
             producer * kSharedOutputMaxPerTask + 1U;
         return true;
     }
+
+    PA_DEVICE bool PreviousOrdinaryWriter(
+        uint32_t task_id, int32_t &previous_writer
+    ) const {
+        // 当前 PA schema 的全部 metadata writer 都是 SharedOutputRef
+        // symbol；普通 GM/local tensor 只读或 manual-dependency，不产生
+        // ordinary writer。这个结论来自与 WriterIntentsAt() 相同的
+        // adapter schema，而不是 host 预计算前驱或公共层的 PA 特判。
+        if (dispatch == nullptr || dispatch->task_count == 0 ||
+            dispatch->task_count > kMaxTasks ||
+            task_id >= dispatch->task_count) {
+            return false;
+        }
+        previous_writer = -1;
+        return true;
+    }
 };
 
 PA_DEVICE bool SharedDagTensorFromTaskArg(
@@ -583,6 +600,15 @@ struct SharedDagTaskArgsSchema {
     ) const {
         return schema != nullptr &&
             schema->WriterIntentsAt(task_id, intents);
+    }
+
+    PA_DEVICE bool PreviousOrdinaryWriter(
+        uint32_t task_id, int32_t &previous_writer
+    ) const {
+        return schema != nullptr &&
+            schema->PreviousOrdinaryWriter(
+                task_id, previous_writer
+            );
     }
 };
 

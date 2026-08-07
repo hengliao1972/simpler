@@ -80,6 +80,8 @@ adapter 还必须能对任意 task 一次导出最小 writer-intent 集合：
 
 - whole-object symbol key 列表；
 - 是否存在 ordinary writer。
+- 当前 task 之前最近的 ordinary writer；adapter 可以从紧凑访问计划
+  直接求解，也可以在自身 schema 内反向扫描。
 
 这是 schema adapter 的通用能力，不是 PA 快路：新算子提供自己的
 schema 翻译。公共反向搜索每个 candidate 只取这份 writer 集合，
@@ -133,6 +135,12 @@ while candidate > producer_task:
 
 扫描只读取只读 workload schema，不要求 candidate 已被 Build，也不读取其
 未发布 payload。不能用当前 `last_writer` 的物理值猜逻辑前驱。
+
+ordinary region 仍采用保守的“全部 ordinary writer”逻辑链，但候选枚举由
+schema adapter 完成。公共 DAG 不应强制每个 reader 从 `N-1` 扫到 0；它只
+消费 adapter 返回的最近候选，并复核 `-1 <= previous < N` 且非负候选的
+`WriterIntentsAt()` 确实声明 ordinary writer。adapter 是运行期 schema
+权威，不能由 host 预计算逐 task 前驱表替代。
 
 ### 3.4 History 与 commit
 
@@ -336,6 +344,8 @@ Scalar 真实负载时间直接相减。
 - 历史 writer intent 最小投影解码后：`1006.521 us`；
 - 无 writer candidate 快速拒绝后：`943.400 us`；
 - DAG 结果直接生成 writer delta 后：`932.310 us`；
+- 固定容量对象只初始化有效前缀后：`914.937 us`；
+- schema 直接求解最近 ordinary writer 后：`818.782 us`；
 - 第一门槛：DAG 实现必须低于 `0.82 ms`；
 - 最终目标：达到 `0.60 ms`。
 
