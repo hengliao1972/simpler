@@ -2907,7 +2907,8 @@ template <
     bool CheckOutputPublished = true,
     bool UseExpectedPrevious = false,
     bool UsePaUpShape = false,
-    bool TrustPreparedPaShape = false
+    bool TrustPreparedPaShape = false,
+    bool UseExpectedPreviousArray = false
 >
 PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     PA_GM SharedTensorMapSidecar &map,
@@ -2919,6 +2920,7 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
 #if !PA_BUILD_TRACE_FREE
     , DeferredSharedWriterMetadataTrace *deferred_trace = nullptr
 #endif
+    , const int32_t *expected_previous_by_symbol = nullptr
 ) {
     // 正式 ordered Submit 在 task-level completion 成功后统一记录完整
     // transaction；本 helper 固定不产生逐项成功统计，避免部分 CAS 前缀
@@ -2926,7 +2928,10 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     if (task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks) ||
         symbol_count > kSharedWriterHistoryMaxPerTask ||
-        (symbol_count != 0 && symbol_keys == nullptr)) {
+        (symbol_count != 0 &&
+         (symbol_keys == nullptr ||
+          (UseExpectedPreviousArray &&
+           expected_previous_by_symbol == nullptr)))) {
         return false;
     }
     static_assert(
@@ -2936,6 +2941,11 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
     static_assert(
         !TrustPreparedPaShape || UsePaUpShape,
         "only the PA UP path can trust a prepared writer shape"
+    );
+    static_assert(
+        !UseExpectedPreviousArray ||
+            (!UseExpectedPrevious && !UsePaUpShape),
+        "per-symbol predecessors cannot be mixed with PA scalar predecessor shortcuts"
     );
     if (symbol_count == 0) {
         if constexpr (!UsePaUpShape) {
@@ -2994,8 +3004,12 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
         map.writer_history[static_cast<uint32_t>(task_id)];
     for (uint32_t index = 0; index < symbol_count; ++index) {
         const uint32_t symbol_key = symbol_keys[index];
-        int64_t previous =
-            static_cast<int64_t>(expected_previous);
+        int64_t previous = static_cast<int64_t>(expected_previous);
+        if constexpr (UseExpectedPreviousArray) {
+            previous = static_cast<int64_t>(
+                expected_previous_by_symbol[index]
+            );
+        }
         if constexpr (!UsePaUpShape) {
             const FdwicOutputRef output_ref =
                 SharedSymbolHistoryReference(symbol_key);
@@ -3028,7 +3042,8 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
                 }
                 return false;
             }
-            if constexpr (!UseExpectedPrevious) {
+            if constexpr (!UseExpectedPrevious &&
+                          !UseExpectedPreviousArray) {
                 PA_GM volatile int64_t *last_writer =
                     &map.shared_outputs[
                          static_cast<uint32_t>(
@@ -3105,12 +3120,18 @@ PA_DEVICE bool CommitPreparedSymbolSharedWriterIntentSet(
             slot = 2U - index;
             previous =
                 static_cast<int64_t>(expected_previous);
-        } else if constexpr (UseExpectedPrevious) {
-            // 正式 PA 已在 flush 前验证并保留 owner-local key/previous。
+        } else if constexpr (UseExpectedPrevious ||
+                             UseExpectedPreviousArray) {
+            // 动态 DAG 或旧 PA 专路已在 flush 前验证并保留 owner-local
+            // key/previous。
             // clean-out 后不再从刚发布的 GM history 回读同一份记录；
             // history 仍完整写回，供跨核 reader 沿 writer 链读取。
             symbol_key = symbol_keys[index];
-            previous = static_cast<int64_t>(expected_previous);
+            previous = UseExpectedPreviousArray
+                ? static_cast<int64_t>(
+                      expected_previous_by_symbol[index]
+                  )
+                : static_cast<int64_t>(expected_previous);
         } else {
             PA_GM const SharedWriterHistoryRecord &record =
                 history.entries[index];

@@ -168,3 +168,66 @@ tensor 数及 `(TensorAccess, TensorRefKind, symbol_key, manual_dep)`；公共�
 全部旧协议测试。当前只完成“逻辑 DAG 推导”原语；生产 Build/Register 仍在
 读取 host metadata-writer plan 并走旧全局 writer 链，因此本阶段不宣称运行
 路径已经获得异 symbol 并行，也没有 CCEC/A5 性能结论。
+
+## 4. 2026-08-07：S0c 动态 DAG 接入 Scalar Build/Register
+
+### 4.1 PA schema adapter 与运行时交叉校验
+
+新增的 PA adapter 把随机访问 Build 已有的 task identity 翻译为公共 DAG
+schema：adapter 可以识别 `TaskKind`，但 `BuildSharedMetadataDag()`、等待和
+commit 只消费 `TensorAccess`、引用种类及 symbol key。进入 Materialize 前，
+运行时逐项比较 adapter schema 与真正构造出的 `TaskArgs`，任意 tensor 数、
+access、引用种类、symbol 或 manual-dependency 漂移都在共享副作用发生前
+终止。
+
+这一步没有把 PA 固定三 accumulator 写进公共 DAG 算法；PA 只是当前
+workload adapter，后续算子必须提供自己的 schema adapter。
+
+### 4.2 Register 从全局 writer baton 改为精确前驱
+
+生产 Build/Register 已完成以下替换：
+
+- 不再用 `DecodeSharedMetadataWriterPlan()` 给当前 task 找一条全局
+  `previous_metadata_writer`；
+- 对每个 SharedOutputRef reader/writer 等待动态 DAG 去重后的精确前驱；
+- UP 的三个 accumulator 不再压缩为 Alloc slot0 的 PA 专用 group word，
+  而是按三个独立 symbol 分别执行 expected CAS；
+- immutable history 保存每个 symbol 自己的 `previous_writer`；
+- 只有全部 symbol CAS 和 ordinary metadata 提交成功，才发布本 task 唯一
+  `insert_completion`；
+- 任一 CAS 冲突保留已经线性化的故障前缀并进入 fatal，不伪造事务回滚，
+  也不发布 completion。
+
+不同 batch 使用不同 Alloc producer，因此不会再因为旧全局 writer 计划而
+产生跨 batch 假依赖。同一 batch 内，三个 accumulator 虽由同一批 UP task
+更新，协议和 host oracle 仍逐 slot 独立校验，不能再把 slot1/2 当成永不
+变化。
+
+### 4.3 CPU 验证结果
+
+定向门槛已通过：
+
+- `test_shared_metadata_dag`：乱序 Build、同/异 symbol、纯 reader、ordinary
+  回退及非法 schema；
+- `test_shared_output_symbols`：三条不同 previous 的动态数组 commit，以及
+  第二条 CAS 冲突后的终止前缀；
+- `test_shared_ordered_submit`：不同 batch 无伪 completion load，末组 UP
+  独立推进 Alloc 的 slot0/1/2；
+- `build-perf-clock cpu`：源码覆盖、host plan、random-access args、96 worker
+  dispatch、heap、payload、Execute/FinalDrain 和 ordered-submit 全套 PASS；
+- CPU B256：1,280 个 Build、1,024 个 kernel、2,048 个 published output、
+  1,280 条 fanin edge、8 路 heap 和最终 normalized writer signature 全部
+  PASS。
+
+CPU B256 单次端到端约 `177.305 ms`，只受 host thread 调度影响，用于协议
+闭合而不作为 A5 性能结论。
+
+### 4.4 尚未完成的收口
+
+`SharedBuildDispatchState` 中旧的 metadata writer count/bitset 当前已不被
+生产 Build/Register 热路消费，但字段、host 初始化和旧门槛仍然存在。下一
+阶段要删除这份死计划及其 `Decode/Validate` 接口，避免 host 数据继续冒充
+DAG 权威；task identity 与 AIC/AIV Execute route 仍作为 launch 级计划单独
+审视，不能与 metadata DAG 混为一谈。
+
+CCEC 构建、A5 B1/B256、A5 端到端性能和泳道仍为 `NOT RUN`。

@@ -1047,9 +1047,14 @@ bool DispatchAndInsertEvidenceMatches(
                 OrderedSubmitTestOps::
                     completion_loads_by_cell[task_id]
                         .load(std::memory_order_relaxed);
+            // 每个 batch 的 accumulator symbol 独立成链；只有仍有后续
+            // group 的 UP 会被下一 UP 等待。不同 batch 的 Alloc producer
+            // 不同，不能沿用旧全局 writer 链制造跨 batch load。
+            const bool exact_symbol_successor =
+                task.kind == TaskKind::Up &&
+                task.has_following_group;
             exact &=
-                (publishes_metadata &&
-                 task_id + 1U < task_count)
+                exact_symbol_successor
                     ? completion_loads != 0
                     : completion_loads == 0;
         }
@@ -1738,16 +1743,15 @@ bool RunInsertReleaseBeforeBuildTest() {
         claim_cells_match &= state->tasks[task].deps_prepared ==
             SharedInsertCompletionInitialValue(task);
     }
-    // 正式 PA 将三个 lockstep accumulator 的 latest 收敛为 slot0 的
-    // group word；slot1/2 保持 Alloc producer，供 generic slot-specific
-    // resolver 继续遵守原合同。
+    // per-symbol DAG 不再把三个 accumulator 压成 PA 专用 group word；
+    // 三个 last_writer 都必须独立推进到同一个末组 UP。
     const bool final_group_writer_ok =
         state->shared_map.shared_outputs[0]
             .last_writer[0].value == 16 &&
         state->shared_map.shared_outputs[0]
-            .last_writer[1].value == 0 &&
+            .last_writer[1].value == 16 &&
         state->shared_map.shared_outputs[0]
-            .last_writer[2].value == 0;
+            .last_writer[2].value == 16;
 
     const bool overlap =
         OrderedSubmitTestOps::task8_built_before_task4_completion.load(

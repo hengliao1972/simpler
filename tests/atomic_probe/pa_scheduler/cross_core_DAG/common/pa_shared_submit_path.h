@@ -286,6 +286,187 @@ PA_DEVICE bool BuildSharedMetadataDag(
     return true;
 }
 
+// PA schema adapter 只负责把当前 workload 的参数形状翻译为公共 DAG 输入。
+// 动态前驱算法本身位于上方模板，不读取这里的 TaskKind 分支。
+struct SharedPaDagSchema {
+    PA_GM const SharedBuildDispatchState *dispatch;
+
+    PA_DEVICE uint32_t TaskCount() const {
+        return dispatch == nullptr ? 0U : dispatch->task_count;
+    }
+
+    PA_DEVICE bool TensorCount(
+        uint32_t task_id, uint32_t &tensor_count
+    ) const {
+        SharedBuildDispatchTask task{};
+        if (dispatch == nullptr ||
+            !DecodeSharedBuildDispatchTask(
+                *dispatch, task_id, task
+            )) {
+            return false;
+        }
+        switch (task.meta.kind) {
+            case TaskKind::Alloc:
+                tensor_count = 3;
+                return true;
+            case TaskKind::Qk:
+            case TaskKind::Sf:
+            case TaskKind::Pv:
+                tensor_count = 4;
+                return true;
+            case TaskKind::Up:
+                tensor_count = 7;
+                return true;
+            case TaskKind::Count:
+                return false;
+        }
+        return false;
+    }
+
+    PA_DEVICE bool TensorAt(
+        uint32_t task_id, uint32_t tensor_index,
+        SharedDagTensor &tensor
+    ) const {
+        uint32_t tensor_count = 0;
+        SharedBuildDispatchTask task{};
+        if (dispatch == nullptr ||
+            !DecodeSharedBuildDispatchTask(
+                *dispatch, task_id, task
+            ) ||
+            !TensorCount(task_id, tensor_count) ||
+            tensor_index >= tensor_count) {
+            return false;
+        }
+        tensor.access = TensorArgType::Input;
+        tensor.reference_kind = TensorRefKind::LocalTensor;
+        tensor.symbol_key = 0;
+        tensor.manual_dependency = false;
+
+        const TaskKind kind = task.meta.kind;
+        if (kind == TaskKind::Alloc) {
+            tensor.access = TensorArgType::Output;
+            tensor.reference_kind = TensorRefKind::CreateInfo;
+            return true;
+        }
+        if (kind == TaskKind::Qk) {
+            if (tensor_index == 3) {
+                tensor.access = TensorArgType::Output;
+                tensor.reference_kind = TensorRefKind::CreateInfo;
+            }
+            return true;
+        }
+
+        uint32_t producer = UINT32_MAX;
+        uint32_t output_slot = 0;
+        if (kind == TaskKind::Sf) {
+            if (tensor_index == 0) {
+                producer = task.meta.batch_start +
+                    SharedPaTaskOffset(
+                        TaskKind::Qk, task.meta.group_index
+                    );
+            } else {
+                tensor.access = TensorArgType::Output;
+                tensor.reference_kind = TensorRefKind::CreateInfo;
+                return true;
+            }
+        } else if (kind == TaskKind::Pv) {
+            if (tensor_index == 0) {
+                producer = task.meta.batch_start +
+                    SharedPaTaskOffset(
+                        TaskKind::Sf, task.meta.group_index
+                    );
+            } else if (tensor_index == 3) {
+                tensor.access = TensorArgType::Output;
+                tensor.reference_kind = TensorRefKind::CreateInfo;
+                return true;
+            } else {
+                return true;
+            }
+        } else if (kind == TaskKind::Up) {
+            if (tensor_index == 0 || tensor_index == 1) {
+                producer = task.meta.batch_start +
+                    SharedPaTaskOffset(
+                        TaskKind::Sf, task.meta.group_index
+                    );
+                output_slot = tensor_index + 1U;
+            } else if (tensor_index == 2) {
+                producer = task.meta.batch_start +
+                    SharedPaTaskOffset(
+                        TaskKind::Pv, task.meta.group_index
+                    );
+            } else if (tensor_index >= 3 && tensor_index <= 5) {
+                producer = task.meta.batch_start;
+                output_slot = 5U - tensor_index;
+                tensor.access = TensorArgType::Inout;
+            } else {
+                tensor.access = TensorArgType::Inout;
+                tensor.reference_kind = TensorRefKind::LocalTensor;
+                tensor.manual_dependency = true;
+                return true;
+            }
+        } else {
+            return false;
+        }
+
+        if (producer >= task_id ||
+            output_slot >= kSharedOutputMaxPerTask) {
+            return false;
+        }
+        tensor.reference_kind = TensorRefKind::SharedOutputRef;
+        tensor.symbol_key = producer * kSharedOutputMaxPerTask +
+            output_slot + 1U;
+        return true;
+    }
+};
+
+template <typename Schema>
+PA_DEVICE bool ValidateSharedDagTaskArgs(
+    const Schema &schema, uint32_t task_id, const TaskArgs &args
+) {
+    uint32_t tensor_count = 0;
+    if (args.has_error || args.tensor_count < 0 ||
+        args.tensor_count > static_cast<int32_t>(kMaxTaskTensors) ||
+        !schema.TensorCount(task_id, tensor_count) ||
+        tensor_count != static_cast<uint32_t>(args.tensor_count)) {
+        return false;
+    }
+    for (uint32_t index = 0; index < tensor_count; ++index) {
+        SharedDagTensor expected{};
+        if (!schema.TensorAt(task_id, index, expected)) {
+            return false;
+        }
+        const TaskTensorRef &reference = args.tensors[index];
+        if (expected.access != TaskTag(args, index) ||
+            expected.reference_kind != reference.kind) {
+            return false;
+        }
+        if (reference.kind == TensorRefKind::SharedOutputRef) {
+            uint32_t symbol_key = 0;
+            if (!SharedSymbolHistoryKey(
+                    SharedOutputReference(reference), symbol_key
+                ) ||
+                symbol_key != expected.symbol_key) {
+                return false;
+            }
+        } else if (reference.kind == TensorRefKind::GmTensor) {
+            if (reference.pointer.gm_tensor == nullptr ||
+                reference.pointer.gm_tensor->manual_dep !=
+                    expected.manual_dependency) {
+                return false;
+            }
+        } else if (reference.kind == TensorRefKind::LocalTensor) {
+            if (reference.pointer.local_tensor == nullptr ||
+                reference.pointer.local_tensor->manual_dep !=
+                    expected.manual_dependency) {
+                return false;
+            }
+        } else if (reference.kind != TensorRefKind::CreateInfo) {
+            return false;
+        }
+    }
+    return true;
+}
+
 PA_DEVICE bool SharedTensorArgNeedsMetadataPrefix(
     const TaskTensorRef &reference, TensorArgType tag,
     int32_t task_id, int32_t previous_metadata_writer,
@@ -587,7 +768,8 @@ template <
     bool CheckOutputPublished = true,
     bool UseExpectedPrevious = false,
     bool UsePaUpShape = false,
-    bool TrustPreparedPaShape = false
+    bool TrustPreparedPaShape = false,
+    bool UseDynamicDag = false
 >
 PA_DEVICE bool PublishSharedTaskWriterMetadata(
     PA_GM SchedulerState *state, const SubmitContext &context,
@@ -597,6 +779,7 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
 #if !PA_BUILD_TRACE_FREE
     , DeferredSharedWriterMetadataTrace *deferred_trace = nullptr
 #endif
+    , const SharedMetadataDag *metadata_dag = nullptr
 ) {
     static_assert(
         !UsePaUpShape || UseExpectedPrevious,
@@ -605,6 +788,12 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
     static_assert(
         !TrustPreparedPaShape || UsePaUpShape,
         "only the PA path can trust a prepared writer shape"
+    );
+    static_assert(
+        !UseDynamicDag ||
+            (!UseExpectedPrevious && !UsePaUpShape &&
+             !TrustPreparedPaShape),
+        "dynamic DAG cannot be mixed with PA writer shortcuts"
     );
     const int32_t task_id = context.task_id;
     bool fatal_clear = true;
@@ -632,6 +821,26 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
             SetFatal<Ops>(state, stats, task_id);
         }
         return false;
+    }
+
+    if constexpr (UseDynamicDag) {
+        bool dag_valid = metadata_dag != nullptr &&
+            metadata_dag->prepared_task_id == task_id &&
+            metadata_dag->writer_count == delta.symbol_count &&
+            metadata_dag->ordinary_writer ==
+                (delta.ordinary_count != 0);
+        for (uint32_t index = 0;
+             dag_valid && index < delta.symbol_count; ++index) {
+            dag_valid =
+                metadata_dag->writer_symbol_keys[index] ==
+                    delta.symbol_keys[index] &&
+                metadata_dag->writer_previous[index] >= 0 &&
+                metadata_dag->writer_previous[index] < task_id;
+        }
+        if (!dag_valid) {
+            SetFatal<Ops>(state, stats, task_id);
+            return false;
+        }
     }
 
     if constexpr (UsePaUpShape) {
@@ -673,7 +882,7 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
         !CommitPreparedSymbolSharedWriterIntentSet<
             Ops, true, CheckOutputPublished,
             UseExpectedPrevious, UsePaUpShape,
-            TrustPreparedPaShape
+            TrustPreparedPaShape, UseDynamicDag
         >(
             state->shared_map, delta.symbol_keys,
             delta.symbol_count, task_id, &state->fatal.value,
@@ -681,6 +890,9 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
 #if !PA_BUILD_TRACE_FREE
             , deferred_trace
 #endif
+            , UseDynamicDag
+                ? metadata_dag->writer_previous
+                : nullptr
         )) {
         SetFatal<Ops>(state, stats, task_id);
         return false;
@@ -934,6 +1146,39 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
     );
 }
 
+template <typename Ops>
+PA_DEVICE bool WaitForSharedMetadataDagDependencies(
+    PA_GM SchedulerState *state, int32_t task_id,
+    const SharedMetadataDag &dag, LocalStats &stats,
+    int64_t &ready_observed, uint64_t &load_count
+) {
+    ready_observed = -1;
+    load_count = 0;
+    if (state == nullptr || task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks) ||
+        dag.prepared_task_id != task_id ||
+        dag.dependency_count > kMaxTaskTensors) {
+        return false;
+    }
+    for (uint32_t index = 0;
+         index < dag.dependency_count; ++index) {
+        const int32_t predecessor = dag.dependencies[index];
+        int64_t dependency_observed = -1;
+        uint64_t dependency_loads = 0;
+        if (predecessor < 0 || predecessor >= task_id ||
+            !WaitForSharedMetadataPredecessor<Ops>(
+                state, task_id, predecessor, stats,
+                dependency_observed, dependency_loads
+            ) ||
+            UINT64_MAX - load_count < dependency_loads) {
+            return false;
+        }
+        load_count += dependency_loads;
+        ready_observed = dependency_observed;
+    }
+    return true;
+}
+
 PA_DEVICE bool DecodeSharedMetadataWriterPlan(
     PA_GM const SharedBuildDispatchState &dispatch,
     uint32_t task_id, bool &publishes_metadata,
@@ -1120,23 +1365,19 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     const TaskKind kind = task_meta.kind;
     const int32_t function_id =
         static_cast<int32_t>(ticket.function_id);
-    bool publishes_metadata = false;
-    int32_t previous_metadata_writer = -1;
-    if (!DecodeSharedMetadataWriterPlan(
-            state->build_dispatch, task_id,
-            publishes_metadata, previous_metadata_writer
+    const SharedPaDagSchema dag_schema{
+        &state->build_dispatch
+    };
+    SharedMetadataDag metadata_dag{};
+    if (!ValidateSharedDagTaskArgs(
+            dag_schema, task_id, args
+        ) ||
+        !BuildSharedMetadataDag(
+            dag_schema, task_id, metadata_dag
         )) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
-    // 在进入 Materialize/Register 之前从 PA 计划推导 previous writer，
-    // 避免把这段确定性标量计算放进全局有序插入区。
-    const int32_t expected_previous =
-        kind == TaskKind::Up
-        ? (task_meta.group_index == 0
-              ? static_cast<int32_t>(task_meta.batch_start)
-              : static_cast<int32_t>(task_id) - 4)
-        : -1;
 
     // Claim owner 先构造 descriptor 和 writer delta；这一段不查询
     // TensorMap，也不占用有序插入通道。
@@ -1181,20 +1422,21 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         return false;
     }
     SharedTaskWriterDelta writer_delta{};
-    if (!PrepareSharedTaskWriterDelta(
-            args, context, writer_delta,
-            previous_metadata_writer,
-            state->build_dispatch
-                    .ordinary_metadata_writer_count != 0,
-            true
-        ) ||
-        !ValidatePreparedPaWriterShape(
-            writer_delta, kind, static_cast<int32_t>(task_id),
-            expected_previous,
-            static_cast<int32_t>(task_meta.batch_start)
-        ) ||
-        writer_delta.writer_intent_required !=
-            publishes_metadata) {
+    bool writer_delta_matches_dag =
+        PrepareSharedTaskWriterDelta(
+            args, context, writer_delta
+        ) &&
+        writer_delta.symbol_count == metadata_dag.writer_count &&
+        (writer_delta.ordinary_count != 0) ==
+            metadata_dag.ordinary_writer;
+    for (uint32_t index = 0;
+         writer_delta_matches_dag &&
+         index < writer_delta.symbol_count; ++index) {
+        writer_delta_matches_dag =
+            writer_delta.symbol_keys[index] ==
+                metadata_dag.writer_symbol_keys[index];
+    }
+    if (!writer_delta_matches_dag) {
         RollbackSharedTaskOutputs<Ops>(
             state->shared_map.shared_outputs[task_id],
             expected_output_count,
@@ -1206,30 +1448,8 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
-    // count 只开启“该类 writer 全局为零”的快路径，不能授予 writer
-    // 资格。实际 delta 若推翻 host 的零计数，必须在任何 metadata lookup
-    // 前终止；非零但偏保守的计数最多增加等待，不会跳过依赖。
-    if ((writer_delta.ordinary_count != 0 &&
-         state->build_dispatch
-                 .ordinary_metadata_writer_count == 0) ||
-        (writer_delta.symbol_count != 0 &&
-         state->build_dispatch
-                 .symbol_metadata_writer_count == 0) ||
-        (publishes_metadata &&
-         state->build_dispatch.metadata_writer_count == 0)) {
-        RollbackSharedTaskOutputs<Ops>(
-            state->shared_map.shared_outputs[task_id],
-            expected_output_count,
-            static_cast<int32_t>(task_id), &stats
-        );
-        EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
-            pmu_context
-        );
-        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-        return false;
-    }
-    const bool metadata_prefix_required =
-        writer_delta.metadata_prefix_required;
+    const bool publishes_metadata =
+        writer_delta.writer_intent_required;
 #if PA_BUILD_TRACE_FREE
     const bool task_outputs_published =
         PublishSharedTaskOutputs<Ops, true, true, true>(
@@ -1281,65 +1501,30 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         return false;
     }
 #if !PA_BUILD_TRACE_FREE
-    // 只初始化实际会写入的计数；每组端点在对应 DCCI/CAS 执行时覆盖，
-    // 避免为每个非 UP winner 清零整块 72B 本地对象。
+    // 只初始化实际会写入的计数；端点在对应 DCCI/CAS 执行时覆盖，
+    // 避免为空 writer 清零完整本地对象。
     DeferredSharedWriterMetadataTrace writer_metadata_trace;
     writer_metadata_trace.history_dcci_lines = 0;
     writer_metadata_trace.writer_cas_count = 0;
 #endif
-    // UP history cell 由本 task 独占，payload 又已经通过上面的 PA shape
-    // 校验。先在并行 Materialize 尾部写入 header+3 records 并完成原有
-    // 单行 DCCI；它在 last_writer CAS 前不可达，不提前发布 writer。
-    const bool writer_history_prepared =
-        writer_delta.symbol_count == 0 ||
-        PublishTrustedPaUpWriterHistoryPayload<Ops, true>(
-            state->shared_map, writer_delta.symbol_keys,
-            static_cast<int32_t>(task_id), expected_previous,
-            static_cast<int32_t>(task_meta.batch_start), &stats
-#if !PA_BUILD_TRACE_FREE
-            , &writer_metadata_trace
-#endif
-        );
-    if (!writer_history_prepared) {
-        EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
-            pmu_context
-        );
-        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
-        return false;
-    }
-    if (writer_delta.symbol_count != 0) {
-        // history 的 DCCI+DSB 已结束，此时预取稍后唯一会 CAS 的 Alloc
-        // group-writer cache line，并用 predecessor wait 提供提前量。它只
-        // 是性能 hint；正确性仍完全依赖后面的 return-ready CAS。
-        Ops::PreloadDataCache(
-            &state->shared_map.shared_outputs[
-                 static_cast<uint32_t>(task_meta.batch_start)
-             ].last_writer[0]
-        );
-    }
     EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
         pmu_context
     );
     const uint64_t materialize_end =
         TraceTimestamp<Ops>(stats.trace, stats.result);
 
-    // 仅这一段全局串行：等待 host/operator 只读计划中
-    // 严格早于 N 的最后一个 metadata writer。当前 task 有实际
-    // writer delta 时才发布自己的 completion；空 writer task 不再
-    // 人为充当 baton。fresh output descriptor 已在 Materialize 尾部
-    // 独立发布，后续 Fanin 必须直接观察实际 producer。
+    // 只等待当前 task 的精确 DAG 前驱：同 symbol writer 和 ordinary
+    // 保守链分别推进，异 symbol 不再进入一条全局 writer baton。
     const uint64_t register_begin = materialize_end;
     BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(
         pmu_context
     );
     int64_t ready_observed = -1;
     uint64_t insert_turn_load_count = 0;
-    const bool turn_ready = WaitForSharedMetadataPredecessor<Ops>(
+    const bool turn_ready =
+        WaitForSharedMetadataDagDependencies<Ops>(
         state, static_cast<int32_t>(task_id),
-        metadata_prefix_required
-            ? previous_metadata_writer
-            : -1,
-        stats,
+        metadata_dag, stats,
         ready_observed, insert_turn_load_count
     );
     // wait_end 对最后一次返回 Ready 的 atomic Load 建立数据依赖。只在
@@ -1350,26 +1535,20 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
               stats.trace, stats.result, ready_observed
           )
         : TraceTimestamp<Ops>(stats.trace, stats.result);
-    // PA 的三个 accumulator symbol 共用同一 writer 链。首组 UP 的
-    // previous writer 是本 batch Alloc；后续组是前一 UP（task-4）。
-    // group CAS 仍使用该值作 expected-old 并返回实际旧值，因此不跳过
-    // 共享状态一致性校验；三个 slot 的原始 history 记录继续分别保留。
     const bool metadata_published =
         turn_ready &&
-        (writer_delta.symbol_count == 0 ||
-         // history payload 已在 Materialize 尾部完成 DCCI；取得 turn 后
-         // 只用一次 return-ready CAS 发布 accumulator group latest。
-         CommitTrustedPaUpGroupWriter<Ops, true, true>(
-            state->shared_map, static_cast<int32_t>(task_id),
-            expected_previous,
-            static_cast<int32_t>(task_meta.batch_start), &stats
+        PublishSharedTaskWriterMetadata<
+            Ops, true, false, false, false, false, true
+        >(
+            state, context, writer_delta, stats, -1, -1
 #if !PA_BUILD_TRACE_FREE
             , &writer_metadata_trace
 #endif
-        ));
+            , &metadata_dag
+        );
     if (turn_ready && !metadata_published) {
-        // 单次 group CAS 冲突时没有部分发布前缀；整轮进入 terminal
-        // fatal，且不得发布本 task 的 insert completion。
+        // 多 symbol CAS 不是事务；任何冲突都保留故障现场并终止整轮，
+        // 且不得发布本 task 的 insert completion。
         SetFatal<Ops>(
             state, stats, static_cast<int32_t>(task_id)
         );

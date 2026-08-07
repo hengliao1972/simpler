@@ -2791,6 +2791,86 @@ void TestOrderedPreparedSymbolUsesSinglePublicationCheck() {
                 kProducer,
         "PA expected-previous CAS rejects a mismatched writer"
     );
+
+    // cross_core_DAG 正式分支由动态 schema 为每个 symbol 分别给出
+    // previous writer。三个 symbol 可以来自同一 producer，但前驱不必
+    // 相同；提交不得回读物理 last_writer 来替换这份逻辑 DAG 结果。
+    ResetSharedState(*map);
+    const int32_t dynamic_previous[3] = {1, 2, 3};
+    for (uint32_t index = 0; index < 3; ++index) {
+        const FdwicOutputRef ref =
+            SharedSymbolHistoryReference(pa_up_keys[index]);
+        map->shared_outputs[kProducer]
+            .last_writer[static_cast<uint32_t>(ref.output_slot)]
+            .value = dynamic_previous[index];
+    }
+    fatal = 0;
+    const bool dynamic_committed =
+        CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, false, false, false, true
+        >(
+            *map, pa_up_keys, 3, /*task_id=*/4, &fatal,
+            nullptr, -1, -1, nullptr, dynamic_previous
+        );
+    bool dynamic_history_exact = dynamic_committed && fatal == 0;
+    for (uint32_t index = 0; index < 3; ++index) {
+        const FdwicOutputRef ref =
+            SharedSymbolHistoryReference(pa_up_keys[index]);
+        dynamic_history_exact &=
+            map->writer_history[4].entries[index].symbol_key ==
+                pa_up_keys[index] &&
+            map->writer_history[4].entries[index].previous_writer ==
+                dynamic_previous[index] &&
+            map->shared_outputs[kProducer]
+                .last_writer[static_cast<uint32_t>(ref.output_slot)]
+                .value == 4;
+    }
+    Check(
+        dynamic_history_exact,
+        "dynamic DAG commit preserves each independent symbol predecessor"
+    );
+
+    // 多 CAS 仍是 fail-stop 而非伪事务：第二个 symbol 冲突时保留第一条
+    // 已线性化的证据，第三条保持旧值。上层只有在返回 true 后才能发布
+    // task insert_completion。
+    ResetSharedState(*map);
+    for (uint32_t index = 0; index < 3; ++index) {
+        const FdwicOutputRef ref =
+            SharedSymbolHistoryReference(pa_up_keys[index]);
+        map->shared_outputs[kProducer]
+            .last_writer[static_cast<uint32_t>(ref.output_slot)]
+            .value = dynamic_previous[index];
+    }
+    const FdwicOutputRef conflict_ref =
+        SharedSymbolHistoryReference(pa_up_keys[1]);
+    map->shared_outputs[kProducer]
+        .last_writer[static_cast<uint32_t>(conflict_ref.output_slot)]
+        .value = kProducer;
+    fatal = 0;
+    const bool dynamic_partial_rejected =
+        !CommitPreparedSymbolSharedWriterIntentSet<
+            SymbolTestOps, false, false, false, false, false, true
+        >(
+            *map, pa_up_keys, 3, /*task_id=*/4, &fatal,
+            nullptr, -1, -1, nullptr, dynamic_previous
+        );
+    const FdwicOutputRef first_ref =
+        SharedSymbolHistoryReference(pa_up_keys[0]);
+    const FdwicOutputRef untouched_ref =
+        SharedSymbolHistoryReference(pa_up_keys[2]);
+    Check(
+        dynamic_partial_rejected &&
+            map->shared_outputs[kProducer]
+                .last_writer[static_cast<uint32_t>(first_ref.output_slot)]
+                .value == 4 &&
+            map->shared_outputs[kProducer]
+                .last_writer[static_cast<uint32_t>(conflict_ref.output_slot)]
+                .value == kProducer &&
+            map->shared_outputs[kProducer]
+                .last_writer[static_cast<uint32_t>(untouched_ref.output_slot)]
+                .value == dynamic_previous[2],
+        "dynamic DAG CAS conflict preserves terminal prefix without false success"
+    );
 }
 
 void TestPublicationWaitFailuresFailClosed() {

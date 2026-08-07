@@ -4766,11 +4766,11 @@ inline SharedOutputValidation ValidateSharedOutputs(
                         false, task_id, slot,
                         "missing batch plan"
                     );
-                } else if (batch->group_count != 0 &&
-                           slot == 0) {
-                    // 正式 PA 的三个 accumulator 同步推进，generation 12
-                    // 只以 Alloc slot0 保存 group latest。slot1/2 的
-                    // descriptor 仍有效，但不再是 writer 链发布字。
+                } else if (batch->group_count != 0) {
+                    // 动态 per-symbol DAG 为三个 accumulator 分别维护
+                    // writer 链。它们在 PA 中恰好由同一组 UP 更新，但
+                    // host 必须逐 slot 校验，不能再用旧的 slot0 group-word
+                    // 专路把 slot1/2 当成永不变化。
                     expected_writer =
                         static_cast<int64_t>(
                             batch->final_up_task_id
@@ -5054,7 +5054,7 @@ inline uint64_t SharedNormalizedWriterSignature(
                 alloc->group_block_count,
                 alloc->canonical_task_base
             ),
-            static_cast<uint32_t>(cell.last_writer[0].value)
+            static_cast<uint32_t>(cell.last_writer[2].value)
         );
         AddNormalizedWriter(
             by_bucket,
@@ -5063,7 +5063,7 @@ inline uint64_t SharedNormalizedWriterSignature(
                 alloc->group_block_count,
                 alloc->canonical_task_base
             ),
-            static_cast<uint32_t>(cell.last_writer[0].value)
+            static_cast<uint32_t>(cell.last_writer[1].value)
         );
         AddNormalizedWriter(
             by_bucket,
