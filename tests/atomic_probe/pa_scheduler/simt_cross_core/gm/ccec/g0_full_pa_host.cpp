@@ -2246,13 +2246,17 @@ bool ValidateRolesAndDrain(
             )) {
             return false;
         }
-        for (uint32_t reserved = 2U; reserved < sizeof(role.reserved) / sizeof(role.reserved[0]); ++reserved) {
-            if (!RecordCheck(
-                    role.reserved[reserved] == 0U, failure, "role-reserved", UINT32_MAX, owner, reserved, 0U,
-                    role.reserved[reserved]
-                )) {
-                return false;
-            }
+        const bool lifecycle_timing_valid =
+            role.reserved[2] != 0U &&
+            (owner == g0::kBuilderOwner ?
+                 role.reserved[3] > role.reserved[2] :
+                 role.reserved[3] == 0U) &&
+            role.reserved[4] == 0U;
+        if (!RecordCheck(
+                lifecycle_timing_valid, failure, "role-lifecycle-timing", UINT32_MAX,
+                owner, UINT32_MAX, 1U, lifecycle_timing_valid ? 1U : 0U
+            )) {
+            return false;
         }
         total_execute += role.execute_count;
         total_tickets += role.ticket_count;
@@ -4365,6 +4369,7 @@ int main(int argc, char **argv) {
     std::vector<double> kernel_times_us;
     std::vector<double> builder_envelope_times_us;
     std::vector<double> builder_max_vf_times_us;
+    std::vector<double> lifecycle_times_us;
     uint32_t passes = 0U;
     for (uint32_t run = 0U; run < options.runs; ++run) {
         const uint64_t nonce = UINT64_C(0xA550000000000000) ^ (static_cast<uint64_t>(options.batches) << 32U) ^
@@ -4482,6 +4487,15 @@ int main(int argc, char **argv) {
         const double builder_max_vf_us = static_cast<double>(builder_max_vf_ticks) / 1000.0;
         builder_envelope_times_us.push_back(builder_envelope_us);
         builder_max_vf_times_us.push_back(builder_max_vf_us);
+        uint64_t lifecycle_begin = UINT64_MAX;
+        for (uint32_t owner = 0U; owner < g0::kOwnerCount; ++owner) {
+            lifecycle_begin = std::min(lifecycle_begin, full_pa.roles[owner].reserved[2]);
+        }
+        const uint64_t lifecycle_end =
+            full_pa.roles[g0::kBuilderOwner].reserved[3];
+        const double lifecycle_us =
+            static_cast<double>(lifecycle_end - lifecycle_begin) / 1000.0;
+        lifecycle_times_us.push_back(lifecycle_us);
         std::array<uint32_t, g0::kMaxBuilderCount> builder_wins{};
         uint64_t insert_poll_sum = 0U;
         uint32_t insert_poll_max = 0U;
@@ -4517,6 +4531,17 @@ int main(int argc, char **argv) {
             "off",
 #endif
             options.builder_count, builder_envelope_us, builder_max_vf_us
+        );
+        std::printf(
+            "[LIFECYCLE_PERF] run=%u scope=earliest_role_startup_to_root_final_drain_end "
+            "clock=get_sys_cnt_1ns trace=%s span_us=%.3f\n",
+            run + 1U,
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            "on",
+#else
+            "off",
+#endif
+            lifecycle_us
         );
     }
     if (!kernel_times_us.empty()) {
@@ -4568,6 +4593,31 @@ int main(int argc, char **argv) {
             envelope_sum / static_cast<long double>(count), builder_envelope_times_us.back(),
             builder_max_vf_times_us.front(), median_of(builder_max_vf_times_us),
             max_vf_sum / static_cast<long double>(count), builder_max_vf_times_us.back()
+        );
+    }
+    if (!lifecycle_times_us.empty()) {
+        std::sort(lifecycle_times_us.begin(), lifecycle_times_us.end());
+        long double sum = 0.0L;
+        for (double value : lifecycle_times_us) {
+            sum += value;
+        }
+        const size_t count = lifecycle_times_us.size();
+        const double median = count % 2U == 0U ?
+                                  (lifecycle_times_us[count / 2U - 1U] +
+                                   lifecycle_times_us[count / 2U]) /
+                                      2.0 :
+                                  lifecycle_times_us[count / 2U];
+        std::printf(
+            "[LIFECYCLE_PERF_SUMMARY] scope=earliest_role_startup_to_root_final_drain_end "
+            "clock=get_sys_cnt_1ns trace=%s samples=%zu min_us=%.3f median_us=%.3f "
+            "avg_us=%.3Lf max_us=%.3f\n",
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            "on",
+#else
+            "off",
+#endif
+            count, lifecycle_times_us.front(), median,
+            sum / static_cast<long double>(count), lifecycle_times_us.back()
         );
     }
     std::printf(

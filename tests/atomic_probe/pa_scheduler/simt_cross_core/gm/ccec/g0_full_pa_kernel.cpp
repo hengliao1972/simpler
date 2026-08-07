@@ -3377,6 +3377,15 @@ ArriveAndDrain(
         ) != 0U) {
         TracePublishFatal(state, ExecFatalReason::DrainMismatch, owner, UINT32_MAX, trace);
     }
+    // 与 Scalar cross_core_DAG 的 perf-clock 使用同一设备时钟口径：root
+    // 已观察全部执行者到达、完成数校验通过并发布 root_finished 后，才记录
+    // FinalDrain 终点。角色结果在进入 drain 时已经发布，因此这里只旁路写
+    // 一个既有保留槽，避免为了计时重写整份 128B 结果。
+    result->reserved[3] = static_cast<uint64_t>(get_sys_cnt());
+    __gm__ uint64_t *root_result =
+        reinterpret_cast<__gm__ uint64_t *>(&state->roles[owner]);
+    StoreDev64(root_result + 14U, result->reserved[3]);
+    dsb(DSB_ALL);
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     TraceRoleTimestamp(state, owner, 6U);
     TraceRoleTimestamp(state, owner, 7U);
@@ -3427,6 +3436,9 @@ simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
     const uint32_t owner = kBuilderOwner + aiv_id;
     FullPaRoleResult result;
     InitializeRoleResult(&result, owner, state->control.builder_count, state->control.launch_nonce);
+    // 启动配置已取得、尚未进入合法性检查/Build/Execute；取所有角色的最早
+    // 值作为与 Scalar startup increment 前边界等价的轻量设备起点。
+    result.reserved[2] = static_cast<uint64_t>(get_sys_cnt());
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     TraceRoleEnter(state, owner, result.role, result.physical_block, subblock, startup_dcci_begin);
     alignas(32U) ScalarTraceContext trace;
@@ -3538,6 +3550,7 @@ simt_cross_core_g0_0_mix_aic(__gm__ pa_scheduler::simt_cross_core::g0::FullPaSta
     const uint32_t owner = static_cast<uint32_t>(get_block_idx());
     FullPaRoleResult result;
     InitializeRoleResult(&result, owner, state->control.builder_count, state->control.launch_nonce);
+    result.reserved[2] = static_cast<uint64_t>(get_sys_cnt());
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     TraceRoleEnter(
         state, owner, result.role, result.physical_block, static_cast<uint32_t>(get_subblockid()),

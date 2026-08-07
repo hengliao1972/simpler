@@ -295,6 +295,20 @@ cross_core_DAG/
 最早 startup timestamp -> 最后 FinalDrain timestamp
 ```
 
+两种实现都用 A5 跨核共享的 1 ns `get_sys_cnt()` 取设备内边界：Scalar
+复用 `WorkerResult::submit_begin/finish_cycle`，SIMT 复用
+`FullPaRoleResult::reserved[2:3]`。SIMT 的 ACL kernel event 与 builder
+包络仍作为辅助量，不得替代上述端到端指标。
+
+截至 2026-08-07，同负载 SIMT B32/W4 的 10/10 PASS 基准为：
+
+- startup 到 root FinalDrain 结束中位数：`394.563 us`；
+- ACL kernel event 中位数：`422.813 us`；
+- builder 包络中位数：`343.760 us`。
+
+Scalar DAG 当前中位数为 `2326.268 us`，约为 SIMT 同口径的 `5.90` 倍；
+后续优化只以 `394.563 us` 这条设备内完整周期基线判断是否持平。
+
 辅助指标不作为第二套性能结论，只解释端到端差异：
 
 - 最早 Build 开始到最后一个 task `BUILT`；

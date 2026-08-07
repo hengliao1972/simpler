@@ -3628,6 +3628,27 @@ oracle 通过，JSON 已通过 `jq` 解析：
 这份图只用于保存 B32/W4 的 atomic、DCCI、builder/executor 重叠证据；是否达到
 0.3 ms 仍只看 trace-off build-envelope，结论仍是未达到。
 
+### 22.5 补齐 Startup 到 FinalDrain 的同口径设备时钟
+
+为了与 Scalar `cross_core_DAG` 的端到端性能直接比较，trace-off 产物复用
+`FullPaRoleResult::reserved[2:3]` 新增两个低频 `get_sys_cnt()` 边界：96 个
+角色在配置取得后记录 startup，root 在所有角色到达、completion 校验和
+`root_finished` 发布后记录 FinalDrain 终点。host 取最早 startup 到 root
+终点；不新增 ABI、不增加逐 task 记录，终点只旁路写一个既有 64-bit 槽。
+
+用 `SIMT_CROSS_CORE_GM_BUILDER_WARPS=4` 重建 B32/W4 后，CPU builders=1..32
+三套、CCEC/bitcode/mixed ELF/GCC15 host 全部 PASS。正式 A5 B256 十轮
+10/10 PASS：
+
+- startup 到 root FinalDrain 中位 `394.563 us`；
+- ACL kernel event 中位 `422.813 us`；
+- builder 包络中位 `343.760 us`。
+
+这证明旧 `436.673 us` ACL event 与完整设备周期处于同一量级；它不能与
+builder 包络混称，但也没有隐藏毫秒级执行尾部。一次 W16 误构建得到的
+`606.719 us` 已由设备输出的 `warps_per_builder=16` 识别并排除，不作为 W4
+结论。
+
 用户在此阶段决定性能优化告一段落。本轮保留的是：
 
 - 可复用的 trace-off 构建包络测量与 host 校验；

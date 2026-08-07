@@ -446,3 +446,63 @@ producer output 的取得由 `SharedMetadataOutputPublishedLoad` 单独证明。
 三者边界不同；此外 swimlane ELF 含观察代码，不能与无泳道 ELF 做绝对时间
 相减。性能裁决仍以 S2 的十轮 `perf-clock` startup-to-FinalDrain 中位数
 `2.326268 ms` 为准，本节只作为业务阶段、atomic、DCCI 与 DAG 协议证据。
+
+## 9. 2026-08-07：S4 对齐 SIMT 端到端计时基线
+
+### 9.1 先消除比较口径歧义
+
+历史 SIMT B32/W4 的 `436.673 us` 是 ACL kernel event，`348.332 us` 是
+builder 包络；Scalar 的 `2326.268 us` 则是设备内最早 startup 到最后
+FinalDrain。三者原先不能直接相减。
+
+本轮没有增加逐 task 记录，而是复用 SIMT `FullPaRoleResult` 的既有保留槽：
+
+- 每个 AIC/AIV 在配置 DCCI 完成、进入 Build/Execute 前记录
+  `reserved[2]`；
+- root 在观察全部角色到达、验证 1,024 个 kernel completion 并发布
+  `root_finished` 后记录 `reserved[3]`；
+- host 取 96 个角色最早的 `reserved[2]` 到 root `reserved[3]`，作为
+  `earliest_role_startup_to_root_final_drain_end`；
+- root 终点只旁路写一个既有 64-bit 槽，不重写整份 128B role result，
+  不把泳道或逐 task PMU 带入性能产物。
+
+host 同时严格校验所有角色起点非零、只有 root 拥有递增终点、最后一个保留
+槽保持零。ABI 大小与 task/DAG/payload 协议均未变化。
+
+### 9.2 构建配置查证
+
+第一次校准误用了脚本默认 W16，设备输出明确显示
+`warps_per_builder=16`；其 10/10 PASS 的完整周期中位数为
+`606.719 us`，不能冒充历史最优 W4。随后通过已存在的
+`SIMT_CROSS_CORE_GM_BUILDER_WARPS=4` 重建 B32/W4：
+
+- CPU builders=1..32 的 optimized、ASan+UBSan、TSan 全部 PASS；
+- AIC/AIV CCEC、bitcode inventory、1:2 mixed ELF 和 GCC15 host PASS；
+- 每个 builder 4 warp/128 thread，32 个 builder 共 128 个活跃 lane0
+  leader，每个 builder 精确构建 40 个 task。
+
+### 9.3 W4 十轮 A5 结果
+
+第一组十轮出现一次 `fatal-nonzero`，只形成 9/10，不作为正式基线。未修改
+代码后重新运行，得到 10/10 PASS；每轮均闭合 1,280 个 Build、1,024 个
+kernel、8 路 heap、per-symbol DAG、payload、golden 和 FinalDrain。
+
+正式十轮完整周期为：
+
+```text
+401.243  393.017  391.942  399.137  398.913 us
+395.434  394.909  394.217  393.187  391.591 us
+```
+
+汇总为：
+
+- startup 到 root FinalDrain：最小 `391.591 us`，中位 `394.563 us`，
+  均值 `395.359 us`，最大 `401.243 us`；
+- ACL kernel event：中位 `422.813 us`；
+- builder 包络：中位 `343.760 us`；
+- max single builder VF：中位 `343.505 us`。
+
+因此历史约 `0.43 ms` 并没有遗漏一个毫秒级 FinalDrain 尾部；同口径设备内
+完整周期反而约为 `0.395 ms`。Scalar DAG 当前 `2326.268 us` 比它多
+`1931.705 us`，约慢 `5.90` 倍。下一阶段不再讨论口径，直接以这条 W4
+基线拆解并优化 Scalar 关键路径。
