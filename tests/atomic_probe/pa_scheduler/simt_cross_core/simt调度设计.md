@@ -141,140 +141,323 @@ AIV entry 同时承载 SIMT builder 和普通 AIV task executor，最终 ELF 必
   `_simt_entry`；
 - UB metadata 与静态/动态 UB 预算满足至少 32 KB Data Cache 的要求。
 
-### 2.5 与 fully-distributed、same-core 和 Scalar cross-core 的关系
+### 2.5 四种 TensorMap / 调度方案与原始 fully-distributed 设计的关系
 
-#### 2.5.1 结论与术语边界
+#### 2.5.1 比较基线与总判断
 
-本方案不偏离“全分布式运行在 AICore、依赖由 Tensor 关系决定”这个总思想，
-但它并不等同于
+本节以
 [`fully_distributed_within_core.md`](../../../../docs/fully_distributed_within_core.md)
-定义的原始机制。严格说，Scalar `cross_core` 从诞生起就已经是
-fully-distributed 的一个新变体；偏离原始机制的部分不是 SIMT 按 symbol
-解开 metadata 全局链后才产生的。
+为原始设计基线，但必须区分该文档中的三个层次：
 
-本文采用以下三个层次，避免把“设计目标相同”误写成“实现机制完全相同”：
+1. §1～§6 定义的原始机制有四个支柱：claim race、
+   `owner = builder = executor`、每 worker 全量复制 TensorMap、每 worker
+   私有任务环加全局完成标志。
+2. §12 记录的是后续 shared TensorMap 推演与历史 a2a3 落地：从单副本、
+   winner-only insert 的并发设想，收紧到 `tm_insert_next` 的全局强序。
+3. 文首“当前 A5 实现边界”又明确说明：private 是默认通用路径；当前 shared
+   是单独编译的 PA 协议，不等于 §12 的通用 shared region ring 已经全部落地。
 
-1. **fully-distributed 总目标**：编排、调度和执行全部位于 AICore，AICPU
-   不进入关键路径；task id、Tensor 依赖和完成语义保持确定。
-2. **原始 fully-distributed / same-core 机制**：每个 worker 重放相同 submit
-   序列，通过 claim race 取得 task，并遵守
-   `owner = builder = executor`。
-3. **cross-core 变体**：仍满足第 1 层，但主动拆开 Build 与 Execute；Scalar
-   `cross_core` 和本 SIMT 方案属于这一层，不能不加说明地称为原始
-   `owner = builder = executor` 模型。
+因此，这里比较的是四种彼此独立的实际设计：
 
-因此，本文将 Scalar 版本称为“全 AICore 的 Scalar build/execute 分离变体”，
-将本方案称为“全 AICore 的 SIMT-builder/Scalar-executor 分离变体”。这里的
-`Scalar executor` 指 AIC/AIV Main Scalar 负责领取和发射对应 engine kernel，
-不表示调度退回 AICPU。
+- **P：private TensorMap**——原始 fully-distributed 的通用基准路径；
+- **S：shared same-core**——共享元数据，但 task 仍由同一 Scalar owner 构建和执行；
+- **C：shared Scalar cross-core**——Scalar Build 与 Scalar Execute 按 task 解耦；
+- **T：shared SIMT cross-core**——专职 AIV SIMT builder 与 Scalar executor 解耦。
 
-#### 2.5.2 三种 standalone 实现的结构差异
+总判断是：四者都可以属于“运行期编排、调度和执行留在 AICore，依赖由 Tensor
+关系决定”的 fully-distributed 大方向；但只有 P 基本逐条实现原始四支柱。S
+改变 TensorMap 所有权，C 再改变 Build/Execute 和任务存储，T 又改变 Build
+执行域及 metadata 同步粒度。因此，S/C/T 是有明确替代合同的新变体，不能写成
+与原始 `fully_distributed_within_core` 机制完全相同。
 
-| 维度 | `same_core` | Scalar `cross_core` | `simt_cross_core` |
-| ---- | ----------- | ------------------- | ----------------- |
-| 编排与调度位置 | AICore Main Scalar | AICore Main Scalar | builder 位于 AIV SIMT VF；领取、执行与 drain 位于 AIC/AIV Main Scalar |
-| task 到达方式 | 96 个 worker 全量 replay 同一 submit 序列 | 全局 Build ticket，每个 task 只分发给一个 Build owner | `B×W` 个 warp leader 静态唯一分片；每个 task 仍以 CAS 证明唯一构建 |
-| Build 竞争成本 | 类型匹配的两级 Claim tournament，存在大量 loser/not-attempted actor | 每 task 一个中央 ticket，无全员 replay Claim | 无动态 Build loser；`task_id % (B×W)` 决定唯一 leader |
-| Build/Execute 关系 | winner 保存本地执行包，后续由同一 worker执行，保持 `owner = builder = executor` | Build owner 将执行包发布到 task-indexed GM cell，由另一个兼容 owner Claim 并执行 | 专职 builder AIV 只构建；其余 AIC/AIV 只 Claim、执行和完成，角色严格互斥 |
-| 执行包位置 | winner 的本地 slot/ring | 跨核共享的 GM execution cell | 与 Scalar cross-core 同语义的 GM execution cell；UBUF 路径只改变 builder 的中间 staging |
-| shared output | winner 构造 descriptor 并发布 | Build owner 构造 descriptor、clean-out 后发布 | SIMT leader 直接构造 descriptor/payload，fence 后发布；Scalar reader 按协议 invalidate/acquire |
-| metadata 插入纪律 | 当前 PA 使用 `deps_prepared[N-1] -> N` 的严格 task-id 链 | 保留同一条严格 task-id 链；ticket 只管 Build 唯一性，不保证 metadata 次序 | descriptor/payload 可独立并行；writer metadata 按精确 symbol predecessor 排队，同 symbol 串行、不同 symbol 并行 |
-| kernel 执行依赖 | 本地包中的 fanin 轮询 completion | executor Claim 包后轮询同一 fanin completion | 与 Scalar cross-core 相同，不改变 task DAG、fanin 或 completion |
-| 主要代价 | 全员 replay、Claim loser 和每核 Submit 壳 | execution payload 的跨核 clean/invalidate，以及全局 metadata baton 等待 | 占用 `B` 个 AIV、不参与 AIV task 执行；SIMT GM 构建、原子发布和 builder/executor 资源折中 |
+AICPU/host 仍可承担 setup、只读计划初始化、attach、wait 和 teardown；这里的
+“留在 AICore”专指 kernel 运行期的 Build、Claim、依赖等待、Execute 与
+FinalDrain 不依赖 AICPU 逐 task 调度。
 
-三种实现共同保持以下不可变化的业务合同：
+#### 2.5.2 两个正交设计轴
 
-- 每 batch 的 task id、task 数、function/engine 类型和参数 ABI 不变；
-- producer 必须先于 consumer，fanin 只接受合法的更早 task；
-- descriptor/payload 完整可见后才能发布可领取状态；
-- 每个 task 恰好构建一次、执行至多一次并发布一次 completion；
-- AIC 只执行 Cube task，非 builder AIV 只执行 Vector task；
-- host 必须以 task、DAG、payload、writer history、last-writer、completion 和
-  golden 的完整 oracle 取证，不能只凭计数推断正确。
+四种方案不是简单的“新版本覆盖旧版本”，而是沿两个轴逐步展开：
 
-#### 2.5.3 与原始 fully-distributed 四个支柱的逐项关系
+| 轴 | 选项一 | 选项二 |
+| -- | ------ | ------ |
+| TensorMap / metadata 所有权 | P：每 worker 一份完整 private map | S/C/T：全局一份 shared metadata |
+| task Build / Execute 放置 | P/S：同一 owner、同一 worker | C：Scalar 跨核解耦；T：SIMT builder 与 Scalar executor 严格分工 |
 
-原始文档把设计建立在 claim race、`owner = builder = executor`、每核全量复制
-TensorMap、每核私有任务环加全局完成标志四个支柱上。三种实现的关系如下：
+由此得到以下结构：
 
-| 原始支柱 | `same_core` | Scalar `cross_core` / `simt_cross_core` |
-| -------- | ----------- | --------------------------------------- |
-| 所有 worker 重放并参与 claim race | 基本保留 | 不保留；改为唯一 Build 分发或静态唯一分片 |
-| `owner = builder = executor` | 保留 | 明确不保留；builder 与 executor 是不同角色 |
-| 每核全量 TensorMap 副本 | 当前 A5 shared PA 已采用文首声明的 PA shared 专用协议，不应再把历史 private 设计当成真实接口 | 沿用同一 shared-output/writer-history 语义，并将执行包放入 GM；不重新引入每核全量副本 |
-| 每核私有任务环 | winner 本地保存待执行包 | 改为 task-indexed GM execution cell，由兼容 executor 跨核领取 |
+| 方案 | metadata 形态 | Build 执行域 | Execute 执行域 |
+| ---- | ------------- | ------------ | --------------- |
+| P：private TensorMap | 每 worker 全量副本 | 获胜 worker 的 Main Scalar | 同一 worker |
+| S：shared same-core | 单份 shared PA metadata | Claim winner 的 Main Scalar | 同一 winner |
+| C：shared Scalar cross-core | 单份 shared PA metadata | 动态取得 Build ticket 的 Main Scalar | 任一兼容 Main Scalar |
+| T：shared SIMT cross-core | 单份 shared PA metadata | 专职 builder AIV 的 SIMT warp leader | 非 builder AIC/AIV 的 Main Scalar |
 
-由此可见，Scalar `cross_core` 在引入“唯一 Build + 异核 Execute”时就已经改变
-后三项中的两项；SIMT 方案只是把 Build 计算域从 Main Scalar 换成专职 AIV
-的 SIMT warp，并进一步缩小 metadata 的同步粒度。不能把这一步描述成
-“SIMT 首次背离 fully-distributed”，也不能反过来声称它仍逐条实现了原始四
-支柱。
+这里的 “cross-core” 表示执行包可以由不同于 builder 的兼容 worker 领取；C
+中 builder 与 executor 可能碰巧是同一物理 worker，但协议不要求相同。T 则
+明确禁止 builder AIV 执行 task，也禁止 executor 参与构建。
 
-#### 2.5.4 按 symbol 解链为何不是业务语义降级
+#### 2.5.3 四种方案完整设计对比
 
-历史 shared TensorMap 设计的 §12.4 原本允许 winner-only 的并发追加；
-§12.10 的 a2a3 落地为了让 shared 与 private 逐位一致，才收紧为全局
-`tm_insert_next` 串行追加。当前 standalone `same_core` 和 Scalar
-`cross_core` 使用的 `deps_prepared` 链继承了这种保守强序：
+| 维度 | P：private TensorMap | S：shared same-core | C：shared Scalar cross-core | T：shared SIMT cross-core |
+| ---- | -------------------- | ------------------- | --------------------------- | ------------------------- |
+| 当前定位 | 默认通用 fully-distributed 路径，也是依赖正确性的参照 | PA standalone shared 方案 | PA standalone shared 方案 | PA standalone 第四种方案 |
+| 运行期控制域 | 所有 worker 的 Main Scalar | 所有 worker 的 Main Scalar | AIC/AIV Main Scalar | builder 在 AIV SIMT VF；领取、执行和 drain 在 Main Scalar |
+| task id | 所有 worker 以同一确定性 submit 序列得到同一 id | 同 P，96 worker 全量 replay | 中央 Build ticket 发放确定 task id | `task_id % (B×W)` 静态分片，task id 仍来自同一只读计划 |
+| 唯一 Build owner | 类型匹配 worker 的 claim race | 类型匹配候选的两级 Claim tournament | 每个 task 的中央 Build ticket | 唯一 warp leader 静态负责，并以 task-cell CAS 证明唯一构建 |
+| loser / 重复前端 | 所有 worker replay；每 worker 维护自己的完整 map | 所有 worker replay；loser 只闭合轻量 submit 和稳定 output symbol | 无全员 replay Claim；每 task 只被一个 Scalar builder 完整构建 | 无动态 Build loser；只有被分片命中的 leader 构建 |
+| 参数与 descriptor 物化 | 所有 worker 为本地 map 语义重放，只有 winner 建立可执行 slot | 只有 Claim winner 完整物化 shared descriptor 和执行包 | Build owner 完整物化并发布 portable execution packet | SIMT leader 逐字段构造 descriptor/payload；GM/UBUF 仅是 builder staging 差异 |
+| TensorMap / metadata 副本 | 每 worker 一份完整 region TensorMap | 全局一份 immutable descriptor、writer history 和 last-writer 状态 | 与 S 同类的全局 shared metadata | 与 C 同一终态语义，由 SIMT builder 发布 |
+| ordinary region 能力 | 支持原始文档定义的 region 重叠、view/alias 和多版本查询，结果取最大合法 producer | 当前 PA Case1 ordinary writer 必须为空，不等价于通用 shared region ring | 当前 PA 计划保留 ordinary writer 统计和保守前缀规则，但本 PA 实例 ordinary writer 为 0 | 当前 PA 实例只闭合 whole-object symbol 快路；ordinary region 必须走保守回退 |
+| metadata 写者 | 每个 worker 把所有输出写入自己的 map；当前优化只把 fanin lookup 门控到 winner | 每 task 的 Claim winner 写共享 metadata | 取得 Build ticket 的 Scalar owner；只有真实 metadata writer 有 side effect | 被静态分片命中的 SIMT leader；只有真实 writer 有 side effect |
+| metadata 顺序 | 各 worker 按本地确定 task-id 顺序更新，无跨核 map 顺序 | 全 1280 task 的 `N-1 -> N` insert-completion 链；空 writer 也交接 baton | 仅 256 个真实 writer 形成全局 task-id insert-completion 链；非 writer 只在实际 metadata 消费要求时等待前缀 | whole-object writer 等精确 `previous_writer(symbol,N)`；同 symbol 串行、不同 symbol 可并行 |
+| fanin 解析 | winner 在本地 region map 查询，零跨核 metadata 读取 | winner 查 shared descriptor/history；严格链提供保守前缀 | 按真实 SharedOutputRef / ordinary lookup 需求等待 writer 前缀，并直接等待实际 producer 的 published | 与 C 保持同一 task DAG；按精确 symbol history 或 ordinary 回退解析 |
+| Build / Execute 关系 | `owner = builder = executor` | `owner = builder = executor` | Build owner 与 Execute owner 解耦；同一 worker 可为不同 task 承担不同角色 | builder 与 executor 角色严格互斥 |
+| 执行包位置 | winner 的每核私有 slot/ring | winner 的每核私有 slot/ring | task-indexed GM execution cell | task-indexed GM execution cell |
+| Execute 领取 | owner 本地 drain 自己的 slot | owner 本地 drain 自己的 slot | 兼容 engine 的 Scalar 领取已发布 cell | 非 builder AIC/AIV Scalar 领取已发布 cell |
+| 完成语义 | 全局 per-task completion，consumer 拉取轮询 | 同一全局 task DAG / completion 语义 | executor 发布 DONE/completion，FinalDrain 闭合全部 task | 与 C 相同，不改变 DAG、fanin 或 FinalDrain |
+| metadata 一致性成本 | map 只被本 worker 访问，无跨核 map DCCI；producer 数据仍需完成发布合同 | shared metadata 需要原子、DCCI 和跨核可见性纪律 | 在 S 基础上增加 execution cell 的 clean/invalidate 与 Build/Execute handoff | 还需满足 SIMT DCache、SIMT GM 写和 Scalar reader 之间已验证的 DCCI/fence 合同 |
+| 内存形态 | `O(worker × map)`，外加每 worker 私有 ring | `O(1 × shared metadata)`，但仍有每 worker 私有 slot | 单份 metadata + task-indexed GM cells | 同 C，并额外占用 `B` 个 AIV 作为专职 builder |
+| 主要原子热点 | claim cursor / completion | Claim tournament、全 task insert handoff、completion | Build ticket、稀疏 writer handoff、Execute Claim、completion | task build CAS、per-symbol writer CAS、Execute Claim、completion |
+| 主要收益 | 通用、确定、map 查询本地化，机制最接近原始文档 | 删除 worker 数倍的 map 副本和重复 insert，同时保留 same-core 执行包 | 删除全员 replay/Claim loser，并允许 Build 与 Execute 重叠和重新负载均衡 | 用多 AIV、多 warp 并行构建，并删除不同 symbol 间的假串行 |
+| 主要代价 | map 内存和 insert 工作量随 worker 数放大 | 保留 96 路 replay/Claim，并引入 shared coherence 与全 task 严格链 | 跨核执行包、DCCI、全局真实-writer 链和调度状态更复杂 | 消耗 AIV 执行资源，SIMT/Scalar 一致性与 builder/executor 配比成为新约束 |
+| 泛化程度 | 当前四者中最高，是原始 max-overlap region 合同的正确性参照 | 当前实现限 PA shared 协议 | 调度机制可泛化，但当前上板闭合范围仍是 PA shared schema | SIMT 分片机制可泛化；per-symbol 快路只对可证明的 whole-object 关系成立 |
+
+四种方案共同不得改变以下合同：
+
+- task id、task 数、function/engine 类型、参数 ABI 和原始 task DAG；
+- producer 必须先于 consumer，fanin 只能引用合法的更早 producer；
+- descriptor/payload 完整可见后才能发布 BUILT/published；
+- 每个 task 恰好构建一次、至多执行一次并恰好发布一次终态 completion；
+- AIC 只执行 Cube task，AIV 只执行 Vector task；采用 T 时 builder AIV 不执行 task；
+- fatal、超时和不支持的 ordinary region 必须显式失败，不能静默漏依赖；
+- host 必须对 task、payload、fanin、writer history、last-writer、completion、
+  golden 和 FinalDrain 做完整 oracle，不能只用计数或性能结果代替正确性证明。
+
+#### 2.5.4 P：private TensorMap
+
+P 的核心流程是：
 
 ```text
-task[N-1] metadata 完成
-  -> task[N] 发布全部 writer metadata
-  -> task[N] 交出完成 baton
+所有 worker 重放 submit(N)
+  -> 各自在本地完整 TensorMap 中维护 task N 的输出版本
+  -> 类型匹配者参与 claim，唯一 winner 取得所有权
+  -> winner 解析本地 fanin、构建本地 slot
+  -> 同一 worker 在 fanin ready 后执行
+  -> 发布全局 completion(N)
 ```
 
-这条链保证正确，但把互不相关的 Tensor symbol 也串在一起。SIMT 通用版把
-等待对象收紧为 workload schema 推导出的精确关系：
+它与原始文档最一致：确定 task id、claim race、
+`owner = builder = executor`、每核全量 map、私有任务环和全局完成标志都在。
+后续实现把物理结构收敛为 ring-per-bucket、把 fanin lookup 下沉到 winner，
+属于减少本地冗余的实现优化，不改变“每 worker 的 map 对全部 producer 完整”
+这一核心不变量。
+
+P 的代价同样直接：每个 worker 都要重放并登记全部输出，map 内存和 insert
+总量随 worker 数增长。它的价值不是“任何场景都最快”，而是依赖语义最通用、
+本地 map 无跨核一致性成本，并可作为 S/C/T 的 golden 与保守回退。
+
+#### 2.5.5 S：shared same-core
+
+S 只先拆掉“每核 TensorMap 副本”，仍保留 same-core ownership：
 
 ```text
-完整 descriptor/payload 并行构建
-  -> 等待 previous_writer(symbol, N)
-  -> 发布本 task 的 immutable history
-  -> fence
-  -> CAS last_writer(symbol): previous -> N
+96 worker 重放 submit(N)
+  -> 两级 tournament 产生唯一 Claim winner
+  -> winner 物化 descriptor / writer delta
+  -> 等 task[N-1] insert completion
+  -> 发布本 task metadata，并交接 insert_completion(N)
+  -> winner 构建自己的私有 slot
+  -> 同一 winner 执行
 ```
 
-同一个 symbol 的 writer 仍严格按 task id 串行；只有不存在 Tensor 依赖的
-不同 symbol 才允许并行。因此变化的是**同步粒度**，不是 task DAG、writer
-次序或 reader 可见集合。它更接近历史 §12.4 希望保留的并发性，但使用
-“精确前驱 + immutable history + expected CAS”避免把物理到达顺序误当成
-逻辑 task-id 顺序。
+当前 PA 路径的 fresh output descriptor 可在严格链外按 task cell 独占发布，但
+每个 task 仍必须交接 `N-1 -> N` baton；即使 writer 集合为空，也要推进下一
+task。这是为了得到简单、强序的 metadata 前缀，不应误写成“只有 256 个 writer
+参与顺序”。
 
-禁止用“读取当前 `last_writer`，失败后重试 CAS”替代精确前驱。不同 builder
-的物理到达顺序不等于 task-id 顺序；这种实现可能让未来 writer 先占位，既
-破坏 history 链，也可能让 reader 漏掉过去 writer。
+S 与历史 §12.4 的共同点是单份 metadata、winner-only insert；区别是当前 A5
+PA 使用 immutable descriptor + writer history 的专用协议，并没有把历史通用
+shared region ring 当作现成接口。它还采用比 §12.4 并发 MPSC 更强的逐 task
+顺序，思路更接近 §12.10 为逐位一致而采用的强序收紧。
 
-#### 2.5.5 泛化边界与必须保留的回退路径
+这项偏差是合理的第一步：它把 map 内存和 insert 从 worker 数倍压到一份，同时
+不改变 owner 与执行位置，便于隔离验证 shared metadata。但它没有消除全员 replay、
+Claim loser 和全 task baton，因此 shared coherence 成本可能抵消一部分收益。
 
-按 symbol 的单链只有在调度器可以从通用 `TensorAccess` 和
-`SharedOutputRef` 证明下列条件时才完整：
+#### 2.5.6 C：shared Scalar cross-core
+
+C 进一步拆开 Build 与 Execute：
+
+```text
+任一 Main Scalar 取得 Build ticket(N)
+  -> 物化并发布 fresh descriptor
+  -> 按只读 writer plan 判断 N 是否发布 metadata
+  -> 真实 writer 等 previous_metadata_writer(N) 后提交 metadata
+  -> 构造 task-indexed GM execution cell 并发布 BUILT
+  -> 任一兼容 Scalar Claim、执行并发布 completion
+```
+
+当前实现已经不是旧的 1280-task 全链。PA Case1 的 1280 个 task 中，只有 256
+个真实 metadata writer 形成：
+
+```text
+W0 -> W1 -> ... -> W255
+```
+
+即 `previous_metadata_writer(N) = max(writer_task < N)`。1024 个空 writer
+不再发布 metadata insert-completion baton；非 writer 是否等待最近 writer，又由它是否真实消费
+SharedOutputRef 或 ordinary metadata 决定。与此同时，这仍是一条**跨所有
+metadata key 的全局 writer 链**：两个互不相关 symbol 的 writer 在 C 中尚未
+解耦。
+
+C 的合理性在于删除 96 worker 对同一 submit 的重复 Claim/前端工作，并让
+Build owner 不再被 task engine 类型限制，execution 也可重新分配到兼容核。
+它为此放弃原始 `owner = builder = executor` 和本地执行包，必须新增 GM
+execution cell、发布/领取状态机及 clean/invalidate。它仍是全 AICore 的
+fully-distributed 变体，但不是原始 within-core ownership 的直接实现。
+
+#### 2.5.7 T：shared SIMT cross-core
+
+T 保留 C 的 portable execution cell 和 Scalar executor，只替换 Build 域并
+细化 writer 顺序：
+
+```text
+B 个 builder AIV × 每 AIV W 个 warp leader
+  -> task_id % (B×W) 决定唯一负责者
+  -> lane0 在 SIMT 中构造 descriptor / payload
+  -> 同 symbol 等精确 previous_writer(symbol,N)
+  -> 发布 immutable history 和 expected CAS last_writer
+  -> fence 后发布 BUILT
+  -> 非 builder Scalar executor Claim、执行、完成
+```
+
+同一 symbol 的 writer 仍按 task id 严格串行；只有可证明不存在依赖关系的不同
+symbol 才能并行。因此 T 删除的是 C 的跨 symbol 假依赖，不是放松真实 Tensor
+依赖。禁止把“读取当前 last_writer 后反复 CAS”当成等价替代：物理到达顺序
+不等于逻辑 task-id 顺序，后到达的旧 task 不能覆盖先到达的未来 task。
+
+T 的收益来自多 builder AIV、多 warp 的构建吞吐及更细的同步域；代价是 `B`
+个 AIV 不再执行 Vector task，且 SIMT DCache、GM 写入、Scalar invalidate 和
+状态发布必须形成可审计的一致性闭环。GM 与 UBUF 只改变 builder 的中间数据
+路径，不能改变最终 execution cell、writer history、DAG 或 completion 合同。
+
+#### 2.5.8 与原始四支柱及关键不变量的偏差矩阵
+
+| 原始要求 / 不变量 | P | S | C | T |
+| ----------------- | - | - | - | - |
+| kernel 运行期调度位于 AICore | 保留 | 保留 | 保留 | 保留；Build 位于 AIV SIMT |
+| 确定 submit 序号 / task id | 保留 | 保留 | 保留为中央只读计划 id | 保留为静态分片计划 id |
+| 所有 worker SPMD replay 同一 submit | 保留 | 保留 | 改为中央唯一 Build 分发 | 改为 `B×W` 静态分片 |
+| claim race 决定 Build owner | 保留 | 保留为两级 tournament | 改为 Build ticket | 改为静态 owner + 唯一 CAS |
+| `owner = builder = executor` | 保留 | 保留 | 不保留 | 不保留，且角色严格互斥 |
+| 每 worker 全量复制 TensorMap | 保留 | 改为单份 shared metadata | 同 S | 同 S |
+| 所有 worker insert 自己的 map | 保留 | 改为 Claim winner-only | 改为真实 Build-writer-only | 改为真实 SIMT-writer-only |
+| 每 worker 私有任务环 | 保留 | 保留 | 改为 task-indexed GM cell | 同 C |
+| 全局 completion 驱动依赖与终止 | 保留 | 保留 | 保留 | 保留 |
+| 依赖来自 Tensor 关系而非 TaskKind | 保留原始 max-overlap region 语义 | 在当前 PA shared schema 内保留 | 通用 writer bitset / access tag 判定；PA 是当前实例 | 通用 symbol/access 判定；ordinary region 必须回退 |
+| AICPU 不逐 task 调度 | 保留；setup 等控制面仍存在 | 保留 | 保留 | 保留 |
+
+所以偏差不是从 T 才开始：
+
+- S 首次改变第三支柱，把每核全量 map 变成单份 shared metadata；
+- C 再改变第一、第二和第四支柱，把 replay claim、same-core owner 和私有执行包
+  替换为唯一 Build 分发、跨核 Execute 与 GM cell；
+- T 在 C 的基础上改变 Build 执行域，并把全局真实-writer 链细化到可证明的
+  per-symbol predecessor。
+
+#### 2.5.9 偏差为何合理，以及不可接受的偏差
+
+判断偏差是否合理，不能看“代码是否长得像原文”，而要看被删除的机制是否有
+等价且可验证的替代合同。
+
+| 方案 | 删除或改变的原始机制 | 替代合同 | 合理性 |
+| ---- | -------------------- | -------- | ------ |
+| P | linked map 等早期物理细节、所有 actor 重复 fanin lookup | 本地 ring、多版本 producer、winner-only fanin | 只减少本地冗余，不改变全量副本和依赖结果 |
+| S | 每 worker map 与重复 insert | 唯一 Claim winner 发布单份 metadata，逐 task 强序交接 | 节省副本和 insert；以原子、DCCI 和 baton 成本换取 |
+| C | 全员 Build replay、same-core ownership、私有执行包 | exactly-once Build ticket、portable GM cell、兼容 executor Claim、稀疏全局 writer 链 | 删除无效前端竞争并允许 Build/Execute 重叠，代价由显式状态机承担 |
+| T | Scalar Build、动态 Build 领取、跨 key 全局 writer 链 | 静态 SIMT 分片 + CAS 证明、精确 per-symbol predecessor | 提高构建并行度，只在可证明无依赖的 key 间解链 |
+
+相对原始文档 §12 的演进也应准确描述：
+
+- S 落实了 §12.4 的“单副本 + winner-only insert”，但当前 PA 数据结构不是
+  那个历史通用 shared ring，并采用更强的全 task 顺序；
+- C 沿 §12.10 的强序方向继续优化，只让真实 metadata writer 交接，全局 writer
+  逻辑顺序仍然确定；
+- T 重新取得 §12.4 期望的并发性，但不是按物理到达顺序 MPSC，而是用精确
+  logical predecessor 保证同 key 的 task-id 顺序。
+
+以下变化不可接受，不能用性能收益解释：
+
+- 改变 task id、task 数、engine 类型、DAG、fanin 或 completion 语义；
+- 用 builder 的物理到达顺序替代 task-id 顺序，或用“当前 last_writer”猜前驱；
+- 在公共调度器中检查 PA `TaskKind`、固定五 task 间距、固定 batch 或固定
+  三个 accumulator 才能成立；
+- 把 ordinary region/view/alias 强行压成一个 last-writer，导致重叠 writer
+  集合丢失；
+- 省略 SIMT/Scalar 或跨核 GM 的 DCCI、fence、published/acquire 证明；
+- 让两个 builder 构建同一 task、让两个 executor 执行同一 task，或让
+  FinalDrain 在未闭合全部 task 前退出；
+- 把逐 task 决策重新交给 AICPU/host，从而使其回到运行期关键路径。
+
+#### 2.5.10 泛化边界与回退路径
+
+P 的 region TensorMap 实现原始文档定义的语义：在与查询区间重叠的存活条目
+中返回 task id 最大的 producer，并支持多版本、view 和 alias。因此它是四种
+方案对“max-overlap producer”合同的通用语义基准。S/C/T 当前 PA 快路使用
+`SharedOutputRef`、immutable descriptor、writer history 和 last-writer；按
+symbol 解链只有在调度器能从通用 `TensorAccess` / 引用关系证明以下条件时
+才完整：
 
 - writer 针对同一个 whole-object symbol；
-- 该 symbol 的 writer 可以按 task id 形成唯一前驱链；
-- reader 所需的最近 producer 可表示为唯一的
+- 每个 symbol 的 writer 可按 task id 形成唯一前驱链；
+- reader 所需 producer 可表示为
   `max(writer_task < reader_task)`；
-- descriptor、history 和 last-writer 在 reader 使用期间具有有效生命周期。
+- descriptor、history、last-writer 和 output cell 生命周期覆盖 reader；
+- whole-object symbol history 与原始 max-overlap 查询结果等价。
 
-任意 region/view/alias 可能打破这个前提。例如两个 task 分别写同一 root 的
-两个不相交 view，后续 full-root reader 必须同时依赖两个 writer；单个
-`last_writer` 无法表达这个 fanin 集合。若把这种 ordinary region entry 强行
-压成一条 symbol 链，就会真实偏离原始 TensorMap 的地址重叠语义并漏依赖。
-
-因此可泛化的最终分流必须是：
+因此最终可泛化分流必须是：
 
 ```text
 whole-object SharedOutputRef
-  -> 精确 per-symbol predecessor；异 symbol 可并行
+  -> 精确 per-symbol predecessor；不同 symbol 可并行
 
 ordinary region / view / alias
-  -> 能表达多个重叠 writer 的通用 TensorMap 路径；在并行协议未被证明前，
-     保留严格有序提交
+  -> 保留原始 max-overlap region TensorMap；在 shared per-key 协议被证明前，
+     使用全局强序，或回退到 private TensorMap
 ```
 
-分流只能读取通用 access tag、symbol/region 描述和引用关系，不能检查 PA
-`TaskKind`、固定 task 间距或固定三个 accumulator。当前 PA workload 的
-ordinary writer 数为 0，只能证明 per-symbol 快路在该输入上闭合，不能据此
-宣称任意 region TensorMap 已经被 SIMT 并行化。
+分流只能读取通用 access tag、symbol/region 描述和引用关系，不能读取 PA
+`TaskKind` 或固定图形。当前 PA workload 的 ordinary writer 数为 0，只能
+证明 whole-object 快路在该 workload 上闭合；不能据此宣称 S/C/T 已等价覆盖
+任意 region TensorMap。
+
+还要单独说明原始合同的上界：当前 private `LookupTensor` 对一个 tensor
+参数只返回“全部重叠项中 task id 最大的一个 producer”。如果未来业务语义要求
+一次读取同时依赖多个互不重叠的 view writer，这已经超出 P 本身的 max-overlap
+合同，不能只写“回退 private”了事；四种方案都必须把 region lookup 扩展为
+producer 集合，并同步扩展 fanin oracle。
+
+#### 2.5.11 最终关系
+
+四种方案的演进可以概括为：
+
+```text
+P private
+  -> S：删除 worker_count-1 份冗余 metadata 副本及重复 insert
+  -> C：再删除 worker_count 路 replay Build，并解耦 Build / Execute
+  -> T：把 Build 迁入 SIMT，并删除不同 symbol 间的假串行
+```
+
+这不是单向替代关系。P 提供最通用、最本地化的依赖语义；S 用共享一致性换取
+副本和 insert 缩减；C 用跨核 handoff 换取前端去重和负载重分配；T 再用
+builder AIV 资源换取 SIMT 构建吞吐。某一方案性能更高，只能证明它更适合当前
+workload 和资源配比，不能自动证明它更通用。
+
+最终结论仍是：T 不偏离“全分布式运行在 AICore、依赖由 Tensor 关系决定”的
+总思想；但它不等同于原始四支柱。严格说，S 已是 shared 变体，C 从诞生起
+就是 Build/Execute 分离变体，T 是该变体上的 SIMT 与 per-symbol 并行化。只要
+上述不可变合同、泛化判定和回退路径都被保留，这些偏差就是有依据、可验证的
+工程演进，而不是业务语义降级。
 
 ## 3. 协议与内存合同
 
