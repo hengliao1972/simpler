@@ -135,3 +135,36 @@ PYTHON=.venv/bin/python \
 - 动态 per-symbol DAG：NOT RUN。
 - CCEC 构建：NOT RUN。
 - 真实 A5：NOT RUN。
+
+## 3. 2026-08-07：S0b 动态 DAG 通用原语
+
+### 3.1 先失败再实现
+
+先增加不依赖 PA `TaskKind` 的 `test_shared_metadata_dag.cpp`。旧基线因缺少
+`SharedDagTensor`、`SharedMetadataDag` 和 `BuildSharedMetadataDag()` 无法
+编译，证明测试确实命中了尚未实现的能力，而不是重复覆盖旧全局 writer
+bitset。
+
+随后实现只消费 adapter schema 的动态 DAG 原语。schema 对每个 task 只提供
+tensor 数及 `(TensorAccess, TensorRefKind, symbol_key, manual_dep)`；公共算法
+不读取 PA kind、固定 task 间距或设备 `last_writer`。
+
+### 3.2 已闭合语义
+
+定向测试已证明：
+
+- task 6 在 task 2/5 尚未实际 Build 时仍从只读 schema 找到 task 5；
+- 同 symbol A 严格得到最近逻辑 writer，夹在中间的 symbol B writer 不参与；
+- 首个 symbol B writer 直接以前序 descriptor producer 为基线，不等待
+  symbol A；
+- 纯 reader 也得到自己查询所需的精确早期 writer；
+- ordinary input/writer 只沿 ordinary writer 保守链推进，不被 symbol-only
+  task 串行；
+- 同 task 重复 symbol、future producer 和越界 task 全部 fail closed。
+
+### 3.3 回归结果与边界
+
+`build-perf-clock cpu` 全套回归 PASS，包括新增 DAG 门槛以及 S0a 已列出的
+全部旧协议测试。当前只完成“逻辑 DAG 推导”原语；生产 Build/Register 仍在
+读取 host metadata-writer plan 并走旧全局 writer 链，因此本阶段不宣称运行
+路径已经获得异 symbol 并行，也没有 CCEC/A5 性能结论。

@@ -99,6 +99,20 @@ echo "[BUILD] atomic PollBatch boundary self-test"
 echo "[TEST] atomic PollBatch boundary self-test"
 "$BUILD_DIR/test_atomic_poll_batch"
 
+# 动态 metadata DAG 只消费 adapter 提供的 access/reference schema。该门槛
+# 不使用 PA TaskKind，专门证明乱序 Build 仍按逻辑 task id 找到同 symbol
+# 最近 writer，并让异 symbol 与 ordinary 保守链互不制造假前驱。
+echo "[BUILD] dynamic per-symbol metadata DAG self-test"
+"$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+    -DPTO_FDWIC_SHARED_MAP=1 \
+    -DPA_BUILD_SWIMLANE=1 \
+    -I"$ROOT_DIR/common" \
+    "$ROOT_DIR/test/test_shared_metadata_dag.cpp" \
+    -o "$BUILD_DIR/test_shared_metadata_dag"
+
+echo "[TEST] dynamic per-symbol metadata DAG self-test"
+"$BUILD_DIR/test_shared_metadata_dag"
+
 # shared ring 是当前 ordered writer-delta 的 ordinary-region 原语，隔离
 # 覆盖 seq/ABA、回收与容量预检。PA Case1 当前 ordinary entry 为零，
 # 因此这些门槛仍不能代替后面的完整 96-worker Submit 测试。

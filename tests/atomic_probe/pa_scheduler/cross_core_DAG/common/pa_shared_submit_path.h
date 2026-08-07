@@ -16,6 +16,276 @@
 // TensorMap 的 Submit 控制流独立放在这里，避免继续把两套协议塞进同一
 // 个宏分支密集的热函数；CPU 与 CCEC 仍复用相同的 Ops 和底层原语。
 
+// 公共 DAG 层只消费 adapter 提供的 access、reference kind 和 packed
+// SharedOutputRef key。PA TaskKind、固定五 task 形状以及参数构造细节都必须
+// 留在 schema adapter 中，不能渗入下面的逻辑前驱算法。
+struct SharedDagTensor {
+    TensorArgType access;
+    TensorRefKind reference_kind;
+    uint32_t symbol_key;
+    bool manual_dependency;
+};
+
+struct SharedMetadataDag {
+    uint32_t writer_symbol_keys[kMaxTaskTensors];
+    int32_t writer_previous[kMaxTaskTensors];
+    int32_t dependencies[kMaxTaskTensors];
+    int32_t prepared_task_id;
+    uint32_t writer_count;
+    uint32_t dependency_count;
+    int32_t ordinary_previous_writer;
+    bool ordinary_writer;
+    bool ordinary_dependency_required;
+};
+static_assert(
+    __is_trivially_constructible(SharedMetadataDag),
+    "shared metadata DAG must remain trivial for CCEC local state"
+);
+
+PA_DEVICE bool SharedDagAccessReadsExistingValue(TensorArgType access) {
+    return access == TensorArgType::Input ||
+           access == TensorArgType::Inout ||
+           access == TensorArgType::OutputExisting;
+}
+
+PA_DEVICE bool SharedDagAddDependency(
+    SharedMetadataDag &dag, int32_t dependency
+) {
+    if (dependency < 0) {
+        return true;
+    }
+    for (uint32_t index = 0; index < dag.dependency_count; ++index) {
+        if (dag.dependencies[index] == dependency) {
+            return true;
+        }
+    }
+    if (dag.dependency_count >= kMaxTaskTensors) {
+        return false;
+    }
+    dag.dependencies[dag.dependency_count++] = dependency;
+    return true;
+}
+
+template <typename Schema>
+PA_DEVICE bool SharedDagTaskHasSymbolWriter(
+    const Schema &schema, uint32_t task_id, uint32_t expected_key,
+    bool &has_writer
+) {
+    has_writer = false;
+    uint32_t tensor_count = 0;
+    if (!schema.TensorCount(task_id, tensor_count) ||
+        tensor_count > kMaxTaskTensors) {
+        return false;
+    }
+    for (uint32_t index = 0; index < tensor_count; ++index) {
+        SharedDagTensor tensor{};
+        if (!schema.TensorAt(task_id, index, tensor)) {
+            return false;
+        }
+        if (!IsSharedWriterIntentTag(tensor.access) ||
+            tensor.reference_kind != TensorRefKind::SharedOutputRef) {
+            continue;
+        }
+        const FdwicOutputRef output_ref =
+            SharedSymbolHistoryReference(tensor.symbol_key);
+        if (!IsPlainSharedOutputRef(output_ref) ||
+            output_ref.producer_task_id < 0 ||
+            output_ref.producer_task_id >=
+                static_cast<int32_t>(task_id)) {
+            return false;
+        }
+        if (tensor.symbol_key != expected_key) {
+            continue;
+        }
+        if (has_writer) {
+            // 同一 task 对同一 symbol 发布两次会让第二次 CAS 把本 task
+            // 自己当成 expected-old，必须在任何共享状态修改前拒绝。
+            return false;
+        }
+        has_writer = true;
+    }
+    return true;
+}
+
+template <typename Schema>
+PA_DEVICE bool SharedDagFindPreviousSymbolWriter(
+    const Schema &schema, uint32_t task_id, uint32_t symbol_key,
+    int32_t &previous_writer
+) {
+    const FdwicOutputRef output_ref =
+        SharedSymbolHistoryReference(symbol_key);
+    if (!IsPlainSharedOutputRef(output_ref) ||
+        output_ref.producer_task_id < 0 ||
+        output_ref.producer_task_id >=
+            static_cast<int32_t>(task_id)) {
+        return false;
+    }
+    previous_writer = output_ref.producer_task_id;
+    int32_t candidate = static_cast<int32_t>(task_id) - 1;
+    while (candidate > output_ref.producer_task_id) {
+        bool has_writer = false;
+        if (!SharedDagTaskHasSymbolWriter(
+                schema, static_cast<uint32_t>(candidate),
+                symbol_key, has_writer
+            )) {
+            return false;
+        }
+        if (has_writer) {
+            previous_writer = candidate;
+            return true;
+        }
+        --candidate;
+    }
+    return true;
+}
+
+template <typename Schema>
+PA_DEVICE bool SharedDagTaskHasOrdinaryWriter(
+    const Schema &schema, uint32_t task_id, bool &has_writer
+) {
+    has_writer = false;
+    uint32_t tensor_count = 0;
+    if (!schema.TensorCount(task_id, tensor_count) ||
+        tensor_count > kMaxTaskTensors) {
+        return false;
+    }
+    for (uint32_t index = 0; index < tensor_count; ++index) {
+        SharedDagTensor tensor{};
+        if (!schema.TensorAt(task_id, index, tensor)) {
+            return false;
+        }
+        if (!IsSharedWriterIntentTag(tensor.access) ||
+            tensor.manual_dependency) {
+            continue;
+        }
+        if (tensor.reference_kind == TensorRefKind::GmTensor ||
+            tensor.reference_kind == TensorRefKind::LocalTensor) {
+            has_writer = true;
+        }
+    }
+    return true;
+}
+
+template <typename Schema>
+PA_DEVICE bool SharedDagFindPreviousOrdinaryWriter(
+    const Schema &schema, uint32_t task_id,
+    int32_t &previous_writer
+) {
+    previous_writer = -1;
+    int32_t candidate = static_cast<int32_t>(task_id) - 1;
+    while (candidate >= 0) {
+        bool has_writer = false;
+        if (!SharedDagTaskHasOrdinaryWriter(
+                schema, static_cast<uint32_t>(candidate), has_writer
+            )) {
+            return false;
+        }
+        if (has_writer) {
+            previous_writer = candidate;
+            return true;
+        }
+        --candidate;
+    }
+    return true;
+}
+
+template <typename Schema>
+PA_DEVICE bool BuildSharedMetadataDag(
+    const Schema &schema, uint32_t task_id, SharedMetadataDag &dag
+) {
+    dag.prepared_task_id = -1;
+    dag.writer_count = 0;
+    dag.dependency_count = 0;
+    dag.ordinary_previous_writer = -1;
+    dag.ordinary_writer = false;
+    dag.ordinary_dependency_required = false;
+    const uint32_t task_count = schema.TaskCount();
+    uint32_t tensor_count = 0;
+    if (task_count == 0 || task_count > kMaxTasks ||
+        task_id >= task_count ||
+        !schema.TensorCount(task_id, tensor_count) ||
+        tensor_count > kMaxTaskTensors) {
+        return false;
+    }
+
+    for (uint32_t index = 0; index < tensor_count; ++index) {
+        SharedDagTensor tensor{};
+        if (!schema.TensorAt(task_id, index, tensor)) {
+            return false;
+        }
+        if (tensor.reference_kind == TensorRefKind::SharedOutputRef) {
+            if (!SharedDagAccessReadsExistingValue(tensor.access)) {
+                return false;
+            }
+            int32_t previous_writer = -1;
+            if (!SharedDagFindPreviousSymbolWriter(
+                    schema, task_id, tensor.symbol_key,
+                    previous_writer
+                )) {
+                return false;
+            }
+            const FdwicOutputRef output_ref =
+                SharedSymbolHistoryReference(tensor.symbol_key);
+            if (previous_writer != output_ref.producer_task_id &&
+                !SharedDagAddDependency(dag, previous_writer)) {
+                return false;
+            }
+            if (!IsSharedWriterIntentTag(tensor.access)) {
+                continue;
+            }
+            for (uint32_t writer = 0;
+                 writer < dag.writer_count; ++writer) {
+                if (dag.writer_symbol_keys[writer] ==
+                    tensor.symbol_key) {
+                    return false;
+                }
+            }
+            if (dag.writer_count >= kMaxTaskTensors) {
+                return false;
+            }
+            dag.writer_symbol_keys[dag.writer_count] =
+                tensor.symbol_key;
+            dag.writer_previous[dag.writer_count] =
+                previous_writer;
+            ++dag.writer_count;
+            continue;
+        }
+
+        if (tensor.reference_kind == TensorRefKind::GmTensor ||
+            tensor.reference_kind == TensorRefKind::LocalTensor) {
+            if (tensor.manual_dependency ||
+                !SharedDagAccessReadsExistingValue(tensor.access)) {
+                continue;
+            }
+            dag.ordinary_dependency_required = true;
+            dag.ordinary_writer |=
+                IsSharedWriterIntentTag(tensor.access);
+            continue;
+        }
+
+        // CreateInfo 是输出构造描述，不读旧值也不登记 writer。若 adapter
+        // 把它标成依赖访问，说明 schema 与实际 TaskArgs 已经漂移。
+        if (tensor.reference_kind == TensorRefKind::CreateInfo &&
+            !SharedDagAccessReadsExistingValue(tensor.access)) {
+            continue;
+        }
+        return false;
+    }
+
+    if (dag.ordinary_dependency_required) {
+        if (!SharedDagFindPreviousOrdinaryWriter(
+                schema, task_id, dag.ordinary_previous_writer
+            ) ||
+            !SharedDagAddDependency(
+                dag, dag.ordinary_previous_writer
+            )) {
+            return false;
+        }
+    }
+    dag.prepared_task_id = static_cast<int32_t>(task_id);
+    return true;
+}
+
 PA_DEVICE bool SharedTensorArgNeedsMetadataPrefix(
     const TaskTensorRef &reference, TensorArgType tag,
     int32_t task_id, int32_t previous_metadata_writer,
