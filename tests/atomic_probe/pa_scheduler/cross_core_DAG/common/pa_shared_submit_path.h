@@ -423,21 +423,37 @@ struct SharedPaDagSchema {
     ) const {
         intents.symbol_count = 0;
         intents.ordinary_writer = false;
-        SharedBuildDispatchTask task{};
-        if (dispatch == nullptr ||
-            !DecodeSharedBuildDispatchTask(
-                *dispatch, task_id, task
-            )) {
+        // 历史 candidate 只需要 metadata writer schema，不消费
+        // Execute route/engine/executable。这里仅解码 4B identity
+        // 中的 PA metadata 投影，避免每次反向搜索都走
+        // 完整 Build dispatch 解码；边界和 last-task 合同仍
+        // 在任何 writer intent 被消费前 fail closed。
+        if (dispatch == nullptr || dispatch->task_count == 0 ||
+            dispatch->task_count > kMaxTasks ||
+            dispatch->batch_count == 0 ||
+            dispatch->batch_count > kMaxBatches ||
+            task_id >= dispatch->task_count) {
             return false;
         }
-        if (task.meta.kind != TaskKind::Up) {
+        PA_GM const SharedBuildDispatchTaskIdentity &identity =
+            dispatch->tasks[task_id];
+        SharedPaTaskMeta meta{};
+        if (identity.batch >= dispatch->batch_count ||
+            !DecodeSharedPaTaskMeta(
+                identity.encoded_meta, task_id, meta
+            ) ||
+            meta.is_last_submit !=
+                (task_id + 1U == dispatch->task_count)) {
+            return false;
+        }
+        if (meta.kind != TaskKind::Up) {
             return true;
         }
 
         // PA adapter 只在这里把 UP schema 翻译成三个 INOUT
         // symbol。通用前驱算法不读 TaskKind，也不知道固定
         // task 间距。顺序与 TaskArgs 中 UP tensor[3..5] 一致。
-        const uint32_t producer = task.meta.batch_start;
+        const uint32_t producer = meta.batch_start;
         if (producer >= task_id) {
             return false;
         }

@@ -680,3 +680,88 @@ startup 到 FinalDrain 的十次结果为：
 收益稳定但不大，说明只消除当前 task 的重复 schema 重建不足以
 突破 `0.82 ms`。下一轮将同一当前 task 的全部 symbol 合并为
 一次反向 candidate 扫描，避免对同一 candidate 重复解码。
+
+## 13. 2026-08-07：失败候选——合并多 symbol 反向扫描
+
+S7 后曾尝试把当前 task 的全部 symbol 先收集起来，再从
+`task_id - 1` 向前扫描一次 candidate，一次 `WriterIntentsAt()`
+同时解析多个 symbol 和 ordinary predecessor。CPU 证据确认同一
+candidate 从旧算法的多次解码降为一次，所有正确性门槛
+和 CCEC 构建也全部 PASS。
+
+但 A5 B256、`6,28,4,1` 端到端前五次为：
+
+```text
+1644.693  1611.894  1588.758  1608.016  1602.784 us
+```
+
+随后又将新增的 32-entry 本地 symbol 数组删除，改为原地
+复用 `SharedMetadataDag` 已有数组，以排除 Scalar 栈/寄存器压力。
+第二版五次仍为：
+
+```text
+1602.470  1627.251  1607.983  1579.952  1632.277 us
+```
+
+因此回退不是大数组导致，而是“多 symbol 批量解析”增加的
+通用控制流、循环和代码形态在 A5 Scalar 上明显重于它减少的
+GM 解码。两版失败实现均已完整撤回，未提交。后续不再
+扩展热路反向扫描，改为验证“前驱推导一次后持久化，Build 直接
+消费紧凑结果”的 SIMT 机制。
+
+## 14. 2026-08-07：S8 历史 writer intent 只解码必要投影
+
+### 14.1 查证与修改
+
+失败的批量扫描说明，A5 Scalar 上不能为了减少读取而引入
+更重的通用控制流。继续检查单次 `WriterIntentsAt()` 后发现：
+历史 candidate 只需要 task-local metadata writer schema，但 PA adapter
+每次都调用 `DecodeSharedBuildDispatchTask()`，额外解码和校验：
+
+- Execute route；
+- executable 标志；
+- AIC/AIV engine class；
+- 与 writer intent 无关的完整 Build task 结构。
+
+本轮不改反向搜索算法和调用次数，只改 PA schema adapter 的
+投影边界：
+
+```text
+WriterIntentsAt(candidate)
+  -> 检查 dispatch task/batch 边界
+  -> 读 candidate 的 4B immutable identity
+  -> 只解码 encoded PA metadata
+  -> 校验 batch/last-task 合同
+  -> 输出紧凑 writer symbol 集
+```
+
+Execute route 由 launch 前 host plan 和每个当前 task 的完整 dispatch
+解码独立校验，不再在每次历史 writer 查询时重复执行。
+这是“adapter 只解码调用者需要的 schema 投影”的通用原则；
+公共 DAG 层没有新增 PA `TaskKind` 或固定图形分支。
+
+### 14.2 校验与性能
+
+- CPU perf-clock 全量门槛 PASS；
+- AIC/AIV CCEC、mixed ELF、ABI、强符号、无 relocation 和 manifest
+  PASS；
+- A5 B256、`6,28,4,1` 十轮全部
+  `execution/semantic/postprocess` PASS。
+
+startup 到 FinalDrain 的十次结果为：
+
+```text
+1020.537  1003.856  1010.410  1015.094  1009.150 us
+1013.102   999.118   991.684   992.143  1003.892 us
+```
+
+- 最快：`991.684 us`；
+- 中位数：`1006.521 us`；
+- 均值：`1005.899 us`；
+- 最慢：`1020.537 us`；
+- 相对 S7 `1108.832 us` 减少 `102.311 us`，改善 `9.23%`；
+- 相对初始 `2326.268 us` 累计改善 `56.73%`。
+
+目前距成熟 Scalar `0.82 ms` 门槛仍有约 `187 us`，距 `0.60 ms`
+目标约 `407 us`。下一步继续减少历史 schema 的重复 GM 读取，但
+不再扩大 DAG 热路控制流。

@@ -327,6 +327,7 @@ Scalar 真实负载时间直接相减。
 - `cross_core_DAG` 初始基线：10 次中位数 `2326.268 us`；
 - 紧凑 writer-intent adapter 后的阶段值：`1119.226 us`；
 - 当前 TaskArgs 直接构 DAG 后的阶段值：`1108.832 us`；
+- 历史 writer intent 最小投影解码后：`1006.521 us`；
 - 第一门槛：DAG 实现必须低于 `0.82 ms`；
 - 最终目标：达到 `0.60 ms`。
 
