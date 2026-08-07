@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -565,10 +566,10 @@ void InitializeState(
     state->control.heap_bytes = UINT64_C(256) << 20U;
     state->control.workspace_base = workspace_address;
     state->control.workspace_bytes = kWorkloadBytes;
-    state->control.qk_repeats = 1U;
-    state->control.sf_repeats = 1U;
-    state->control.pv_repeats = 1U;
-    state->control.up_repeats = 1U;
+    state->control.qk_repeats = g0::kDefaultQkRepeats;
+    state->control.sf_repeats = g0::kDefaultSfRepeats;
+    state->control.pv_repeats = g0::kDefaultPvRepeats;
+    state->control.up_repeats = g0::kDefaultUpRepeats;
     state->control.builder_count = builder_count;
     state->control.reserved32 = 0U;
     for (uint64_t &reserved : state->control.reserved) {
@@ -2729,28 +2730,31 @@ bool ValidateSwimlaneTrace(
             continue;
         }
         if (!RecordCheck(executor.launch_nonce == nonce, failure, "swimlane-executor-nonce", task_id) ||
-            !RecordCheck(executor.task_id == task_id, failure, "swimlane-executor-task", task_id) ||
             !RecordCheck(
-                executor.task_kind == static_cast<uint32_t>(kind), failure, "swimlane-executor-kind", task_id
+                g0_swimlane::ExecutorTraceTaskKind(executor.task_kind_and_phase_bits) == kind, failure,
+                "swimlane-executor-kind", task_id
             ) ||
             !RecordCheck(
                 g0::OwnerCanExecute(executor.execute_owner, g0::TaskEngine(kind), builder_count), failure,
                 "swimlane-executor-owner", task_id, executor.execute_owner
             ) ||
             !RecordCheck(
-                executor.phase_bits == g0_swimlane::kExpectedExecutorTraceBits, failure,
+                g0_swimlane::ExecutorTracePhaseBits(executor.task_kind_and_phase_bits) ==
+                    g0_swimlane::kExpectedExecutorTraceBits,
+                failure,
                 "swimlane-executor-phases", task_id, executor.execute_owner
             ) ||
             !RecordCheck(
                 executor.ticket_assigned <= executor.claim_end && executor.claim_end <= executor.fanin_ready &&
-                    executor.fanin_ready <= executor.execute_begin && executor.execute_begin <= executor.execute_end,
+                    executor.fanin_ready <= executor.workload_begin &&
+                    executor.workload_begin <= executor.workload_end && executor.workload_end <= executor.task_end,
                 failure, "swimlane-executor-time-order", task_id, executor.execute_owner
             )) {
             return false;
         }
         const g0_swimlane::RoleTrace &executor_role = trace.roles[executor.execute_owner];
         if (!RecordCheck(
-                executor_role.work_begin <= executor.ticket_assigned && executor.execute_end <= executor_role.work_end,
+                executor_role.work_begin <= executor.ticket_assigned && executor.task_end <= executor_role.work_end,
                 failure, "swimlane-executor-envelope", task_id, executor.execute_owner
             )) {
             return false;
@@ -2826,16 +2830,40 @@ const char *TraceTaskKindName(g0::TaskKind kind) {
     return "Unknown";
 }
 
-const char *TraceRoleName(g0::OwnerRole role) {
-    switch (role) {
-    case g0::OwnerRole::AicExecutor:
-        return "AIC executor";
-    case g0::OwnerRole::AivBuilder:
-        return "AIV SIMT builder";
-    case g0::OwnerRole::AivExecutor:
-        return "AIV executor";
+const char *TraceTaskEngineName(g0::TaskKind kind) {
+    const g0::ExecEngineClass engine = g0::TaskEngine(kind);
+    if (engine == g0::ExecEngineClass::Aic) {
+        return "AIC";
     }
-    return "unknown role";
+    if (engine == g0::ExecEngineClass::Aiv) {
+        return "AIV";
+    }
+    return "none";
+}
+
+std::string TraceScalarLaneName(uint32_t owner, g0::OwnerRole role) {
+    if (role == g0::OwnerRole::AicExecutor) {
+        return "AIC (core" + std::to_string(owner) + ")";
+    }
+    const uint32_t subblock = (owner - g0::kAicOwnerCount) % 2U;
+    const std::string prefix = "AIV" + std::to_string(subblock);
+    return prefix +
+           (role == g0::OwnerRole::AivBuilder ? "\\u00b7SIMT Scalar host (core" : " (core") +
+           std::to_string(owner) + ")";
+}
+
+std::string TraceKernelLaneName(uint32_t owner) {
+    if (owner < g0::kAicOwnerCount) {
+        return "AIC\\u00b7kernel (core" + std::to_string(owner) + ")";
+    }
+    const uint32_t subblock = (owner - g0::kAicOwnerCount) % 2U;
+    return "AIV" + std::to_string(subblock) + "\\u00b7kernel (core" + std::to_string(owner) + ")";
+}
+
+std::string TraceSimtLaneName(uint32_t builder_owner, uint32_t warp) {
+    const uint32_t subblock = (builder_owner - g0::kAicOwnerCount) % 2U;
+    return "AIV" + std::to_string(subblock) + "\\u00b7SIMT warp" + std::to_string(warp) + " (core" +
+           std::to_string(builder_owner) + ")";
 }
 
 const char *TraceDomainName(g0_swimlane::TraceDomain domain) {
@@ -2991,10 +3019,18 @@ void WriteTraceMetadata(
             << ",\"args\":{\"name\":\"" << value << "\"}}";
 }
 
+void WriteTraceIntegerMetadata(
+    std::ofstream *output, bool *first, const char *name, uint32_t pid, uint32_t tid, int32_t value
+) {
+    WriteTraceSeparator(output, first);
+    *output << "{\"name\":\"" << name << "\",\"ph\":\"M\",\"pid\":" << pid << ",\"tid\":" << tid
+            << ",\"args\":{\"sort_index\":" << value << "}}";
+}
+
 void WriteTraceEvent(
     std::ofstream *output, bool *first, const std::string &name, const char *category, uint32_t pid, uint32_t tid,
     uint64_t begin, uint64_t end, uint64_t origin, uint32_t task_id = UINT32_MAX, uint32_t owner = UINT32_MAX,
-    uint32_t polls = UINT32_MAX
+    uint32_t polls = UINT32_MAX, const char *task_kind = nullptr, const char *engine = nullptr
 ) {
     WriteTraceSeparator(output, first);
     const long double begin_us = static_cast<long double>(begin - origin) / 1000.0L;
@@ -3010,6 +3046,13 @@ void WriteTraceEvent(
         *output << "\"" << key << "\":" << value;
         first_argument = false;
     };
+    const auto string_argument = [&](const char *key, const char *value) {
+        if (!first_argument) {
+            *output << ',';
+        }
+        *output << "\"" << key << "\":\"" << value << "\"";
+        first_argument = false;
+    };
     if (task_id != UINT32_MAX) {
         argument("task", task_id);
         argument("batch", task_id / g0::kTasksPerBatch);
@@ -3020,7 +3063,108 @@ void WriteTraceEvent(
     if (polls != UINT32_MAX) {
         argument("polls", polls);
     }
+    if (task_kind != nullptr) {
+        string_argument("task_kind", task_kind);
+    }
+    if (engine != nullptr) {
+        string_argument("engine", engine);
+    }
     *output << "}}";
+}
+
+constexpr uint64_t kScalarPollAtomicCostEstimateNs = 160U;
+
+std::string TraceAtomicCostEstimateUs(uint32_t call_count) {
+    const uint64_t estimate_ns = static_cast<uint64_t>(call_count) * kScalarPollAtomicCostEstimateNs;
+    char text[48];
+    std::snprintf(
+        text, sizeof(text), "%llu.%03lluus",
+        static_cast<unsigned long long>(estimate_ns / 1000U),
+        static_cast<unsigned long long>(estimate_ns % 1000U)
+    );
+    return text;
+}
+
+void WriteScalarAttributionTraceEvent(
+    std::ofstream *output, bool *first, uint32_t pid, uint32_t tid, uint64_t begin, uint64_t end,
+    uint64_t origin, uint32_t owner, uint32_t exec_state_polls, uint32_t fanin_polls,
+    uint32_t drain_polls, uint32_t other_polls, const char *role_phase,
+    const std::string &ordinary_name, const std::string &ordinary_category,
+    const std::string &previous_exact, const std::string &next_exact
+) {
+    if (end <= begin) {
+        return;
+    }
+    const uint32_t pending_poll_episodes = exec_state_polls + fanin_polls + drain_polls + other_polls;
+    std::string name;
+    const char *category = nullptr;
+    if (pending_poll_episodes != 0U) {
+        const uint32_t active_classes = (exec_state_polls != 0U ? 1U : 0U) +
+                                        (fanin_polls != 0U ? 1U : 0U) +
+                                        (drain_polls != 0U ? 1U : 0U) +
+                                        (other_polls != 0U ? 1U : 0U);
+        if (active_classes != 1U) {
+            name = "wait.mixed[AtomicPoll+GM+Scalar]";
+            category = "atomic_poll.mixed";
+        } else if (exec_state_polls != 0U) {
+            name = "wait.exec_state[AtomicPoll+GM+Scalar]";
+            category = "atomic_poll.exec_state";
+        } else if (fanin_polls != 0U) {
+            name = "wait.fanin_flag[AtomicPoll+GM+Scalar]";
+            category = "atomic_poll.fanin_flag";
+        } else if (drain_polls != 0U) {
+            name = "wait.drain_arrival[AtomicPoll+GM+Scalar]";
+            category = "atomic_poll.drain";
+        } else {
+            name = "wait.other[AtomicPoll+GM+Scalar]";
+            category = "atomic_poll.other";
+        }
+        name += " x" + std::to_string(pending_poll_episodes) + " pending";
+        name += " | " + ordinary_name;
+    } else {
+        name = ordinary_name;
+        category = ordinary_category.c_str();
+    }
+    WriteTraceSeparator(output, first);
+    const long double begin_us = static_cast<long double>(begin - origin) / 1000.0L;
+    const long double duration_us = static_cast<long double>(end - begin) / 1000.0L;
+    *output << std::fixed << std::setprecision(3) << "{\"name\":\"" << name << "\",\"cat\":\""
+            << category << "\",\"ph\":\"X\",\"pid\":" << pid << ",\"tid\":" << tid
+            << ",\"ts\":" << begin_us << ",\"dur\":" << duration_us << ",\"args\":{"
+            << "\"owner\":" << owner << ",\"role_phase\":\"" << role_phase
+            << "\",\"pending_poll_episodes\":" << pending_poll_episodes
+            << ",\"exec_state_poll_episodes\":" << exec_state_polls
+            << ",\"fanin_flag_poll_episodes\":" << fanin_polls
+            << ",\"drain_poll_episodes\":" << drain_polls
+            << ",\"other_poll_episodes\":" << other_polls
+            << ",\"coexecuted_scalar_stage\":\"" << ordinary_name
+            << "\",\"coexecuted_scalar_category\":\"" << ordinary_category << "\""
+            << ",\"previous_exact\":\"" << previous_exact
+            << "\",\"next_exact\":\"" << next_exact << "\""
+            << ",\"attribution\":\"host_synthesized_complement_between_exact_scalar_events\"";
+    if (pending_poll_episodes != 0U) {
+        *output << ",\"duration_semantics\":\"physical_scalar_wall_time_while_poll_episode_pending\""
+                   ",\"precision\":\"individual_poll_calls_not_timestamped\"";
+    } else {
+        *output << ",\"duration_semantics\":\"ordinary_gm_and_scalar_code_between_adjacent_exact_events\""
+                   ",\"precision\":\"classified_from_role_phase_and_adjacent_exact_events\"";
+    }
+    *output << ",\"includes_trace_record_write_overhead\":true}}";
+}
+
+void WriteKernelEndToEndTraceEvent(
+    std::ofstream *output, bool *first, double kernel_end_to_end_us, double device_trace_span_us
+) {
+    WriteTraceSeparator(output, first);
+    *output << std::fixed << std::setprecision(3)
+            << "{\"name\":\"kernel.end_to_end[ACL event]\",\"cat\":\"kernel_end_to_end\","
+               "\"ph\":\"X\",\"pid\":1000,\"tid\":1,\"ts\":0.000,\"dur\":"
+            << kernel_end_to_end_us
+            << ",\"args\":{\"scope\":\"acl_event_before_launch_to_event_after_kernel_final_drain_and_return\","
+               "\"device_trace_span_us\":"
+            << device_trace_span_us << ",\"end_to_end_minus_device_trace_us\":"
+            << kernel_end_to_end_us - device_trace_span_us
+            << ",\"alignment\":\"duration_reference_only_acl_event_and_get_sys_cnt_have_no_exposed_shared_absolute_epoch\"}}";
 }
 
 void WriteProfileTraceEvent(
@@ -3030,12 +3174,15 @@ void WriteProfileTraceEvent(
 ) {
     const bool has_task = record.task_id != g0_swimlane::kTraceNoTask;
     const uint64_t raw_ticks = record.end - record.begin;
+    const bool poll_batch =
+        record.kind == g0_swimlane::TraceKind::Atomic &&
+        (record.flags & g0_swimlane::kAtomicPollBatch) != 0U;
+    const bool scalar_poll_marker = domain == g0_swimlane::TraceDomain::Scalar && poll_batch;
     std::string name;
     std::string category;
     if (record.kind == g0_swimlane::TraceKind::Atomic) {
         const auto site = static_cast<g0_swimlane::AtomicSite>(record.site);
         const auto op = static_cast<g0_swimlane::AtomicOp>(record.op);
-        const bool poll_batch = (record.flags & g0_swimlane::kAtomicPollBatch) != 0U;
         const bool return_ready = (record.flags & g0_swimlane::kAtomicReturnReady) != 0U;
         const std::string boundary = return_ready ? "return_ready" : "source_issue";
         name = poll_batch ? "atomic.poll_batch." + boundary + "." : "atomic." + boundary + ".";
@@ -3044,6 +3191,9 @@ void WriteProfileTraceEvent(
         name += TraceAtomicOpName(op);
         if (poll_batch) {
             name += "x" + std::to_string(record.call_count);
+            if (scalar_poll_marker) {
+                name += ".atomic_est" + TraceAtomicCostEstimateUs(record.call_count);
+            }
         } else if (has_task) {
             name += "#" + std::to_string(record.task_id);
         }
@@ -3063,9 +3213,17 @@ void WriteProfileTraceEvent(
     WriteTraceSeparator(output, first);
     const long double begin_us = static_cast<long double>(begin - origin) / 1000.0L;
     const long double duration_us = static_cast<long double>(end - begin) / 1000.0L;
+    const long double event_us =
+        static_cast<long double>((scalar_poll_marker ? end : begin) - origin) / 1000.0L;
     *output << std::fixed << std::setprecision(3) << "{\"name\":\"" << name << "\",\"cat\":\""
-            << category << "\",\"ph\":\"X\",\"pid\":" << pid << ",\"tid\":" << tid
-            << ",\"ts\":" << begin_us << ",\"dur\":" << duration_us << ",\"args\":{";
+            << category << "\",\"ph\":\"" << (scalar_poll_marker ? "i" : "X") << "\",\"pid\":"
+            << pid << ",\"tid\":" << tid << ",\"ts\":" << event_us;
+    if (scalar_poll_marker) {
+        *output << ",\"s\":\"t\"";
+    } else {
+        *output << ",\"dur\":" << duration_us;
+    }
+    *output << ",\"args\":{";
     *output << "\"phase\":\"" << (record.kind == g0_swimlane::TraceKind::Atomic ? "atomic" : "dcci")
             << "\",\"execution_unit\":\"" << TraceDomainName(domain) << "\",\"writer\":" << writer;
     if (has_task) {
@@ -3073,7 +3231,6 @@ void WriteProfileTraceEvent(
                 << record.task_id / g0::kTasksPerBatch;
     }
     if (record.kind == g0_swimlane::TraceKind::Atomic) {
-        const bool poll_batch = (record.flags & g0_swimlane::kAtomicPollBatch) != 0U;
         *output << ",\"site\":\""
                 << TraceAtomicSiteName(static_cast<g0_swimlane::AtomicSite>(record.site))
                 << "\",\"site_id\":" << record.site << ",\"op\":\""
@@ -3090,7 +3247,19 @@ void WriteProfileTraceEvent(
                 << "\",\"is_poll_batch\":" << (poll_batch ? "true" : "false");
         if (poll_batch) {
             *output << ",\"duration_semantics\":\"logical_poll_episode_envelope_not_single_atomic_latency\""
-                       ",\"estimate_formula\":\"call_count * calibrated_atomic_cost\"";
+                       ",\"per_call_timestamp_recorded\":false";
+            if (domain == g0_swimlane::TraceDomain::Scalar) {
+                *output << ",\"estimate_formula\":\"call_count * calibrated_atomic_cost\""
+                        << ",\"calibrated_atomic_cost_ns\":" << kScalarPollAtomicCostEstimateNs
+                        << ",\"estimated_atomic_time_ns\":"
+                        << static_cast<uint64_t>(record.call_count) * kScalarPollAtomicCostEstimateNs;
+            }
+            if (scalar_poll_marker) {
+                *output << ",\"display_semantics\":\"instant_at_episode_end_preserves_one_physical_scalar_lane\""
+                           ",\"episode_begin_ts_us\":"
+                        << begin_us << ",\"episode_duration_us\":" << duration_us
+                        << ",\"atomic_estimate_semantics\":\"instruction_cost_reference_not_episode_wall_time\"";
+            }
         }
         if (static_cast<g0_swimlane::AtomicOp>(record.op) == g0_swimlane::AtomicOp::Load) {
             *output << ",\"value_zero\":"
@@ -3109,7 +3278,11 @@ void WriteProfileTraceEvent(
             << "\",\"flags\":" << record.flags << "}}";
 }
 
-bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
+bool WriteSwimlaneJson(const LaunchState &state, const std::string &path, double kernel_end_to_end_us) {
+    if (!std::isfinite(kernel_end_to_end_us) || kernel_end_to_end_us <= 0.0) {
+        std::fprintf(stderr, "invalid kernel end-to-end duration: %.3f us\n", kernel_end_to_end_us);
+        return false;
+    }
     std::error_code path_error;
     if (std::filesystem::exists(path, path_error) || path_error) {
         std::fprintf(
@@ -3205,13 +3378,35 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
         std::fprintf(stderr, "cannot open swimlane output: %s\n", path.c_str());
         return false;
     }
-    output << "{\"schema\":\"simt_cross_core_g0_swimlane_v5\","
-              "\"clock\":\"Scalar get_sys_cnt: 1 ns/tick; SIMT CLOCK64: raw ticks\","
+    const double device_trace_span_us = static_cast<double>(finish - origin) / 1000.0;
+    output << "{\"schema\":\"simt_cross_core_g0_swimlane_v13\",\"raw_trace_abi\":"
+           << g0_swimlane::kTraceVersion
+           << ",\"clock\":\"Scalar get_sys_cnt: 1 ns/tick; SIMT CLOCK64: raw ticks\","
               "\"simt_alignment\":\"per_builder_affine_to_own_scalar_vf_envelope_for_display_only\","
               "\"simt_atomic_boundary\":\"source_issue; CCEC SIMT return-register dependency is not claimed\","
+              "\"block_layout\":\"non_simt:1C2V_scalar_then_kernel; simt:builder_scalar_host_and_warps_then_executor_scalar_then_kernel\","
+              "\"task_execution_view\":\"per_physical_block_scalar_and_matching_kernel_projection\","
+              "\"task_execution_boundary\":\"workload_only_matching_cross_core_kernel_bracket\","
+              "\"kernel_projection\":\"same_workload_interval_as_scalar_projection_do_not_sum\","
+              "\"executor_scalar_view\":\"continuous_one_physical_thread_with_nonoverlapping_host_synthesized_attribution\","
+              "\"builder_scalar_view\":\"continuous_scalar_host_setup_vf_envelope_and_drain_attribution\","
+              "\"scalar_poll_display\":\"wall_time_bar_names_wait_object_and_coexecuted_scalar_stage_plus_episode_end_marker_with_exact_count_and_160ns_per_call_reference\","
+              "\"scalar_poll_bar_semantics\":\"physical_scalar_wall_time_while_one_or_more_classified_poll_episodes_are_pending\","
+              "\"scalar_poll_marker_semantics\":\"exact_episode_call_count_and_envelope; per_call_timestamp_not_recorded\","
+              "\"scalar_poll_atomic_cost_estimate_ns_per_call\":160,"
+              "\"scalar_gap_fill\":\"complement_between_exact_workload_atomic_dcci_events; classified_poll_first; remaining_ordinary_code_classified_by_role_phase_and_adjacent_exact_events\","
+              "\"kernel_end_to_end_scope\":\"acl_event_before_launch_to_event_after_kernel_final_drain_and_return\","
+              "\"end_to_end_alignment\":\"duration_reference_only; ACL event and get_sys_cnt have no exposed shared absolute epoch\","
               "\"instrumented\":true,\"batches\":"
            << state.full_pa.control.batch_count << ",\"tasks\":" << state.full_pa.control.task_count
-           << ",\"device_span_ns\":" << (finish - origin) << ",\"simt_clock64_span_ticks\":"
+           << ",\"workload_repeats\":{\"qk\":" << state.full_pa.control.qk_repeats
+           << ",\"sf\":" << state.full_pa.control.sf_repeats << ",\"pv\":"
+           << state.full_pa.control.pv_repeats << ",\"up\":" << state.full_pa.control.up_repeats
+           << "},\"kernel_end_to_end_us\":" << std::fixed << std::setprecision(3)
+           << kernel_end_to_end_us << ",\"device_span_ns\":" << (finish - origin)
+           << ",\"device_trace_span_us\":" << device_trace_span_us
+           << ",\"end_to_end_minus_device_trace_us\":" << kernel_end_to_end_us - device_trace_span_us
+           << ",\"simt_clock64_span_ticks\":"
            << max_simt_raw_span << ",\"simt_clock64_span_ticks_by_builder\":[";
     for (uint32_t builder = 0U; builder < builder_count; ++builder) {
         output << (builder == 0U ? "" : ",") << (simt_raw_end[builder] - simt_raw_begin[builder]);
@@ -3221,48 +3416,487 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
            << simt_totals.poll_calls << ",\"records\":" << simt_totals.records
            << ",\"poll_records\":" << simt_totals.poll_records << "},\"scalar\":{\"atomic_calls\":"
            << scalar_totals.atomic_calls << ",\"poll_calls\":" << scalar_totals.poll_calls
+           << ",\"poll_atomic_time_estimate_ns\":"
+           << scalar_totals.poll_calls * kScalarPollAtomicCostEstimateNs
            << ",\"dcci_calls\":" << scalar_totals.dcci_calls << ",\"dcci_cache_lines\":"
            << scalar_totals.dcci_lines << ",\"records\":" << scalar_totals.records
            << ",\"poll_records\":" << scalar_totals.poll_records << ",\"dcci_records\":"
            << scalar_totals.dcci_records << "}},\"traceEvents\":[\n";
     bool first = true;
-    WriteTraceMetadata(&output, &first, "process_name", 1U, 0U, "Main Scalar roles + task/atomic/DCCI overlays");
-    WriteTraceMetadata(&output, &first, "process_name", 2U, 0U, "SIMT builder warps + atomic overlays");
+    std::array<uint32_t, g0::kOwnerCount> scalar_tids{};
+    std::array<uint32_t, g0::kOwnerCount> kernel_tids{};
+    std::array<uint32_t, g0_swimlane::kTraceSimtWriterCount> simt_tids{};
+    scalar_tids.fill(UINT32_MAX);
+    kernel_tids.fill(UINT32_MAX);
+    simt_tids.fill(UINT32_MAX);
+
+    WriteTraceMetadata(&output, &first, "process_name", 1000U, 0U, "Kernel end-to-end total");
+    WriteTraceIntegerMetadata(&output, &first, "process_sort_index", 1000U, 0U, -1);
+    WriteTraceMetadata(
+        &output, &first, "thread_name", 1000U, 1U,
+        "ACL event: kernel launch -> final drain/end"
+    );
+    WriteTraceIntegerMetadata(&output, &first, "thread_sort_index", 1000U, 1U, 0);
+    WriteKernelEndToEndTraceEvent(
+        &output, &first, kernel_end_to_end_us, device_trace_span_us
+    );
+
+    for (uint32_t block = 0U; block < g0::kAicOwnerCount; ++block) {
+        const uint32_t aic_owner = block;
+        const uint32_t aiv0_owner = g0::kAicOwnerCount + block * 2U;
+        const uint32_t aiv1_owner = aiv0_owner + 1U;
+        const bool aiv0_builder = g0::IsBuilderOwner(aiv0_owner, builder_count);
+        const bool aiv1_builder = g0::IsBuilderOwner(aiv1_owner, builder_count);
+        const bool block_has_simt = aiv0_builder || aiv1_builder;
+        uint32_t next_tid = 1U;
+
+        WriteTraceMetadata(&output, &first, "process_name", block, 0U, "block" + std::to_string(block));
+        WriteTraceIntegerMetadata(
+            &output, &first, "process_sort_index", block, 0U, static_cast<int32_t>(block)
+        );
+        const auto add_scalar_lane = [&](uint32_t owner) {
+            const g0::OwnerRole role = g0::OwnerRoleAt(owner, builder_count);
+            scalar_tids[owner] = next_tid;
+            WriteTraceMetadata(
+                &output, &first, "thread_name", block, next_tid, TraceScalarLaneName(owner, role)
+            );
+            WriteTraceIntegerMetadata(
+                &output, &first, "thread_sort_index", block, next_tid, static_cast<int32_t>(next_tid)
+            );
+            ++next_tid;
+        };
+        const auto add_kernel_lane = [&](uint32_t owner) {
+            kernel_tids[owner] = next_tid;
+            WriteTraceMetadata(
+                &output, &first, "thread_name", block, next_tid, TraceKernelLaneName(owner)
+            );
+            WriteTraceIntegerMetadata(
+                &output, &first, "thread_sort_index", block, next_tid, static_cast<int32_t>(next_tid)
+            );
+            ++next_tid;
+        };
+        const auto add_simt_builder_group = [&](uint32_t owner) {
+            add_scalar_lane(owner);
+            const uint32_t builder_instance = owner - g0::kBuilderOwner;
+            for (uint32_t warp = 0U; warp < g0::kBuilderWarpCount; ++warp) {
+                const uint32_t writer = builder_instance * g0::kBuilderWarpCount + warp;
+                simt_tids[writer] = next_tid;
+                WriteTraceMetadata(
+                    &output, &first, "thread_name", block, next_tid, TraceSimtLaneName(owner, warp)
+                );
+                WriteTraceIntegerMetadata(
+                    &output, &first, "thread_sort_index", block, next_tid, static_cast<int32_t>(next_tid)
+                );
+                ++next_tid;
+            }
+        };
+
+        if (!block_has_simt) {
+            // 与 cross_core 既有 1C2V 图完全相同：三条 Scalar 在上，三条 kernel 在下。
+            add_scalar_lane(aic_owner);
+            add_scalar_lane(aiv0_owner);
+            add_scalar_lane(aiv1_owner);
+            add_kernel_lane(aic_owner);
+            add_kernel_lane(aiv0_owner);
+            add_kernel_lane(aiv1_owner);
+            continue;
+        }
+
+        // 参与构建的 AIV 各自形成独立的 Scalar-host + SIMT-warp 调度组。
+        if (aiv0_builder) {
+            add_simt_builder_group(aiv0_owner);
+        }
+        if (aiv1_builder) {
+            add_simt_builder_group(aiv1_owner);
+        }
+        // executor 仍沿用 Scalar 在上、kernel 在下的旧布局；AIC 始终保持原呈现方式。
+        add_scalar_lane(aic_owner);
+        if (!aiv0_builder) {
+            add_scalar_lane(aiv0_owner);
+        }
+        if (!aiv1_builder) {
+            add_scalar_lane(aiv1_owner);
+        }
+        add_kernel_lane(aic_owner);
+        if (!aiv0_builder) {
+            add_kernel_lane(aiv0_owner);
+        }
+        if (!aiv1_builder) {
+            add_kernel_lane(aiv1_owner);
+        }
+    }
+
+    enum class ScalarExactKind : uint8_t {
+        BuilderWork,
+        Workload,
+        Atomic,
+        Dcci,
+    };
+    struct ScalarExactInterval {
+        uint64_t begin;
+        uint64_t end;
+        ScalarExactKind kind;
+        uint16_t site;
+        uint32_t task_id;
+    };
+    struct ScalarTimelineBoundary {
+        uint64_t time;
+        int32_t exact_delta;
+        int32_t exec_state_poll_delta;
+        int32_t fanin_poll_delta;
+        int32_t drain_poll_delta;
+        int32_t other_poll_delta;
+    };
+    std::array<std::vector<ScalarTimelineBoundary>, g0::kOwnerCount> scalar_boundaries;
+    std::array<std::vector<ScalarExactInterval>, g0::kOwnerCount> scalar_exact_intervals;
+    const auto add_scalar_boundary = [&scalar_boundaries](
+                                         uint32_t owner, uint64_t time, int32_t exact_delta,
+                                         int32_t exec_state_poll_delta, int32_t fanin_poll_delta,
+                                         int32_t drain_poll_delta, int32_t other_poll_delta
+                                     ) {
+        scalar_boundaries[owner].push_back(
+            {time, exact_delta, exec_state_poll_delta, fanin_poll_delta, drain_poll_delta, other_poll_delta}
+        );
+    };
     for (uint32_t owner = 0U; owner < g0::kOwnerCount; ++owner) {
-        const g0::OwnerRole role = g0::OwnerRoleAt(owner, state.full_pa.control.builder_count);
-        const std::string owner_name = std::string(TraceRoleName(role)) + " #" + std::to_string(owner);
-        WriteTraceMetadata(&output, &first, "thread_name", 1U, owner, owner_name);
-        const g0_swimlane::RoleTrace &record = trace.roles[owner];
-        WriteTraceEvent(
-            &output, &first, "Scalar role lifetime", "scalar", 1U, owner, record.entry, record.exit, origin,
-            UINT32_MAX, owner
-        );
-        WriteTraceEvent(
-            &output, &first, "setup/config", "scalar", 1U, owner, record.entry, record.config_ready, origin,
-            UINT32_MAX, owner
-        );
-        WriteTraceEvent(
-            &output, &first, role == g0::OwnerRole::AivBuilder ? "SIMT VF build" : "executor loop", "scalar", 1U,
-            owner, record.work_begin, record.work_end, origin, UINT32_MAX, owner
-        );
-        WriteTraceEvent(
-            &output, &first, "final_drain", "scalar", 1U, owner, record.drain_begin, record.drain_end, origin,
-            UINT32_MAX, owner
+        const g0_swimlane::RoleTrace &role = trace.roles[owner];
+        add_scalar_boundary(owner, role.entry, 0, 0, 0, 0, 0);
+        add_scalar_boundary(owner, role.config_ready, 0, 0, 0, 0, 0);
+        add_scalar_boundary(owner, role.work_begin, 0, 0, 0, 0, 0);
+        add_scalar_boundary(owner, role.work_end, 0, 0, 0, 0, 0);
+        add_scalar_boundary(owner, role.drain_begin, 0, 0, 0, 0, 0);
+        add_scalar_boundary(owner, role.drain_end, 0, 0, 0, 0, 0);
+        add_scalar_boundary(owner, role.exit, 0, 0, 0, 0, 0);
+        if (g0::IsBuilderOwner(owner, builder_count)) {
+            add_scalar_boundary(owner, role.work_begin, 1, 0, 0, 0, 0);
+            add_scalar_boundary(owner, role.work_end, -1, 0, 0, 0, 0);
+            scalar_exact_intervals[owner].push_back(
+                {role.work_begin, role.work_end, ScalarExactKind::BuilderWork, 0U,
+                 g0_swimlane::kTraceNoTask}
+            );
+        }
+    }
+    for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
+        const g0::TaskKind kind = g0::TaskKindAt(task_id);
+        if (!g0::TaskExecutable(kind)) {
+            continue;
+        }
+        const g0_swimlane::ExecutorTaskTrace &executor = trace.executors[task_id];
+        add_scalar_boundary(executor.execute_owner, executor.workload_begin, 1, 0, 0, 0, 0);
+        add_scalar_boundary(executor.execute_owner, executor.workload_end, -1, 0, 0, 0, 0);
+        scalar_exact_intervals[executor.execute_owner].push_back(
+            {executor.workload_begin, executor.workload_end, ScalarExactKind::Workload, 0U, task_id}
         );
     }
-    for (uint32_t writer = 0U; writer < active_simt_writers; ++writer) {
-        const uint32_t builder = writer / g0::kBuilderWarpCount;
-        const uint32_t warp = writer % g0::kBuilderWarpCount;
-        WriteTraceMetadata(
-            &output, &first, "thread_name", 2U, writer,
-            "AIV" + std::to_string(builder) + " SIMT warp " + std::to_string(warp)
+    for (uint32_t owner = 0U; owner < g0_swimlane::kTraceScalarWriterCount; ++owner) {
+        for (uint32_t slot = 0U; slot < trace.scalar_logs[owner].record_count; ++slot) {
+            const g0_swimlane::TraceRecord &record = trace.scalar_records[owner][slot];
+            const bool poll_batch =
+                record.kind == g0_swimlane::TraceKind::Atomic &&
+                (record.flags & g0_swimlane::kAtomicPollBatch) != 0U;
+            if (poll_batch) {
+                int32_t exec_state_poll = 0;
+                int32_t fanin_poll = 0;
+                int32_t drain_poll = 0;
+                int32_t other_poll = 0;
+                switch (static_cast<g0_swimlane::AtomicSite>(record.site)) {
+                case g0_swimlane::AtomicSite::ScalarExecStatePoll:
+                    exec_state_poll = 1;
+                    break;
+                case g0_swimlane::AtomicSite::ScalarFaninFlagPoll:
+                    fanin_poll = 1;
+                    break;
+                case g0_swimlane::AtomicSite::ScalarDrainArrivalPoll:
+                    drain_poll = 1;
+                    break;
+                default:
+                    other_poll = 1;
+                    break;
+                }
+                add_scalar_boundary(
+                    owner, record.begin, 0, exec_state_poll, fanin_poll, drain_poll, other_poll
+                );
+                add_scalar_boundary(
+                    owner, record.end, 0, -exec_state_poll, -fanin_poll, -drain_poll, -other_poll
+                );
+            } else {
+                add_scalar_boundary(owner, record.begin, 1, 0, 0, 0, 0);
+                add_scalar_boundary(owner, record.end, -1, 0, 0, 0, 0);
+                scalar_exact_intervals[owner].push_back(
+                    {record.begin, record.end,
+                     record.kind == g0_swimlane::TraceKind::Atomic ? ScalarExactKind::Atomic :
+                                                                    ScalarExactKind::Dcci,
+                     record.site, record.task_id}
+                );
+            }
+        }
+    }
+
+    const auto exact_interval_name = [](const ScalarExactInterval *interval) {
+        if (interval == nullptr) {
+            return std::string("role_boundary");
+        }
+        std::string name;
+        if (interval->kind == ScalarExactKind::BuilderWork) {
+            name = "SIMT VF build";
+        } else if (interval->kind == ScalarExactKind::Workload) {
+            name = "task.execute";
+        } else if (interval->kind == ScalarExactKind::Atomic) {
+            name = "atomic." + std::string(
+                TraceAtomicSiteName(static_cast<g0_swimlane::AtomicSite>(interval->site))
+            );
+        } else {
+            name = "dcci." + std::string(
+                TraceDcciSiteName(static_cast<g0_swimlane::DcciSite>(interval->site))
+            );
+        }
+        if (interval->task_id != g0_swimlane::kTraceNoTask) {
+            name += "#" + std::to_string(interval->task_id);
+        }
+        return name;
+    };
+    const auto classify_ordinary_scalar = [builder_count](
+                                              uint32_t owner, const char *role_phase,
+                                              const ScalarExactInterval *previous,
+                                              const ScalarExactInterval *next,
+                                              std::string *name, std::string *category
+                                          ) {
+        const bool builder = g0::IsBuilderOwner(owner, builder_count);
+        if (std::strcmp(role_phase, "setup_config") == 0) {
+            *name = "scalar.validate_config[GM+Scalar]";
+            *category = "scalar.config_validate";
+            return;
+        }
+        if (std::strcmp(role_phase, "setup") == 0) {
+            *name = builder ? "scalar.prepare_simt_builder[Scalar]" :
+                              "scalar.prepare_executor[Scalar]";
+            *category = builder ? "scalar.builder_setup" : "scalar.executor_setup";
+            return;
+        }
+        if (std::strcmp(role_phase, "drain_setup") == 0) {
+            *name = builder ? "scalar.finalize_simt_builder[GM+Scalar]" :
+                              "scalar.finalize_executor[GM+Scalar]";
+            *category = builder ? "scalar.builder_finalize" : "scalar.executor_finalize";
+            return;
+        }
+        if (std::strcmp(role_phase, "final_drain") == 0) {
+            if (owner == g0::kBuilderOwner) {
+                *name = "scalar.root_drain_validate_and_publish[GM+Scalar]";
+                *category = "scalar.root_drain";
+            } else {
+                *name = "scalar.publish_role_result_and_arrive[GM+Scalar]";
+                *category = "scalar.drain_publish";
+            }
+            return;
+        }
+        if (std::strcmp(role_phase, "exit") == 0) {
+            *name = "scalar.finalize_trace[GM+Scalar]";
+            *category = "scalar.trace_finalize";
+            return;
+        }
+
+        const auto atomic_site_is = [](const ScalarExactInterval *interval, g0_swimlane::AtomicSite site) {
+            return interval != nullptr && interval->kind == ScalarExactKind::Atomic &&
+                   interval->site == static_cast<uint16_t>(site);
+        };
+        const auto dcci_site_is = [](const ScalarExactInterval *interval, g0_swimlane::DcciSite site) {
+            return interval != nullptr && interval->kind == ScalarExactKind::Dcci &&
+                   interval->site == static_cast<uint16_t>(site);
+        };
+        const auto completion_site = [](const ScalarExactInterval *interval) {
+            if (interval == nullptr || interval->kind != ScalarExactKind::Atomic) {
+                return false;
+            }
+            const auto site = static_cast<g0_swimlane::AtomicSite>(interval->site);
+            return site >= g0_swimlane::AtomicSite::ScalarExecutionWitnessPublish &&
+                   site <= g0_swimlane::AtomicSite::ScalarEngineDoneIncrement;
+        };
+        const uint32_t previous_task = previous == nullptr ? g0_swimlane::kTraceNoTask : previous->task_id;
+        const uint32_t next_task = next == nullptr ? g0_swimlane::kTraceNoTask : next->task_id;
+        const bool same_task = previous_task != g0_swimlane::kTraceNoTask && previous_task == next_task;
+        const bool changes_task = previous_task != g0_swimlane::kTraceNoTask &&
+                                  next_task != g0_swimlane::kTraceNoTask && previous_task != next_task;
+        uint32_t attributed_task = same_task ? previous_task : g0_swimlane::kTraceNoTask;
+
+        if (previous != nullptr && previous->kind == ScalarExactKind::Workload) {
+            *name = "scalar.complete_task[GM+Scalar]";
+            *category = "scalar.task_complete";
+            attributed_task = previous_task;
+        } else if (next != nullptr && next->kind == ScalarExactKind::Workload) {
+            *name = "scalar.prepare_engine[GM+Scalar]";
+            *category = "scalar.task_prepare_engine";
+            attributed_task = next_task;
+        } else if (!changes_task && (completion_site(previous) || completion_site(next))) {
+            *name = "scalar.complete_task[GM+Scalar]";
+            *category = "scalar.task_complete";
+        } else if (!changes_task &&
+                   (atomic_site_is(previous, g0_swimlane::AtomicSite::ScalarExecClaim) ||
+                    atomic_site_is(next, g0_swimlane::AtomicSite::ScalarExecClaim))) {
+            *name = "scalar.decode_built_and_claim[GM+Scalar]";
+            *category = "scalar.task_claim";
+        } else if (!changes_task &&
+                   (dcci_site_is(previous, g0_swimlane::DcciSite::ExecPayloadInvalidate) ||
+                    dcci_site_is(next, g0_swimlane::DcciSite::ExecPayloadInvalidate) ||
+                    atomic_site_is(previous, g0_swimlane::AtomicSite::ScalarProducerTaskBaseLoad) ||
+                    atomic_site_is(next, g0_swimlane::AtomicSite::ScalarProducerTaskBaseLoad))) {
+            *name = "scalar.bind_and_validate_payload[GM+Scalar]";
+            *category = "scalar.task_bind_payload";
+        } else if (changes_task) {
+            *name = "scalar.rotate_execution_tokens[GM+Scalar]";
+            *category = "scalar.token_rotation";
+        } else if (atomic_site_is(previous, g0_swimlane::AtomicSite::ScalarDispatchTicket) ||
+                   atomic_site_is(next, g0_swimlane::AtomicSite::ScalarDispatchTicket) ||
+                   dcci_site_is(previous, g0_swimlane::DcciSite::DispatchTaskIdInvalidate) ||
+                   dcci_site_is(next, g0_swimlane::DcciSite::DispatchTaskIdInvalidate)) {
+            *name = "scalar.dispatch_and_initialize_token[GM+Scalar]";
+            *category = "scalar.task_dispatch";
+            attributed_task = previous_task != g0_swimlane::kTraceNoTask ? previous_task : next_task;
+        } else if (dcci_site_is(previous, g0_swimlane::DcciSite::TerminalTokenInvalidate) ||
+                   dcci_site_is(next, g0_swimlane::DcciSite::TerminalTokenInvalidate)) {
+            *name = "scalar.publish_terminal_token_state[GM+Scalar]";
+            *category = "scalar.executor_finalize";
+        } else {
+            *name = "scalar.scan_and_advance_tokens[GM+Scalar]";
+            *category = "scalar.token_scan";
+        }
+        if (attributed_task != g0_swimlane::kTraceNoTask) {
+            *name += "#" + std::to_string(attributed_task);
+        }
+    };
+
+    for (uint32_t owner = 0U; owner < g0::kOwnerCount; ++owner) {
+        const g0::OwnerRole role = g0::OwnerRoleAt(owner, builder_count);
+        const uint32_t pid = g0::OwnerPhysicalBlock(owner);
+        const uint32_t tid = scalar_tids[owner];
+        if (tid == UINT32_MAX) {
+            return false;
+        }
+        const g0_swimlane::RoleTrace &record = trace.roles[owner];
+        if (role == g0::OwnerRole::AivBuilder) {
+            WriteTraceEvent(
+                &output, &first, "SIMT VF build", "scalar", pid, tid, record.work_begin, record.work_end,
+                origin, UINT32_MAX, owner
+            );
+        }
+
+        const g0_swimlane::RoleTrace &role_trace = trace.roles[owner];
+        std::vector<ScalarTimelineBoundary> &boundaries = scalar_boundaries[owner];
+        std::vector<ScalarExactInterval> &exact_intervals = scalar_exact_intervals[owner];
+        if (boundaries.empty()) {
+            return false;
+        }
+        for (const ScalarTimelineBoundary &boundary : boundaries) {
+            if (boundary.time < role_trace.entry || boundary.time > role_trace.exit) {
+                return false;
+            }
+        }
+        std::sort(
+            boundaries.begin(), boundaries.end(),
+            [](const ScalarTimelineBoundary &left, const ScalarTimelineBoundary &right) {
+                return left.time < right.time;
+            }
         );
+        std::sort(
+            exact_intervals.begin(), exact_intervals.end(),
+            [](const ScalarExactInterval &left, const ScalarExactInterval &right) {
+                return left.begin < right.begin || (left.begin == right.begin && left.end < right.end);
+            }
+        );
+        for (size_t exact = 0U; exact < exact_intervals.size(); ++exact) {
+            if (exact_intervals[exact].end < exact_intervals[exact].begin ||
+                (exact != 0U && exact_intervals[exact - 1U].end > exact_intervals[exact].begin)) {
+                return false;
+            }
+        }
+        int32_t exact_depth = 0;
+        int32_t exec_state_polls = 0;
+        int32_t fanin_polls = 0;
+        int32_t drain_polls = 0;
+        int32_t other_polls = 0;
+        uint64_t cursor = boundaries.front().time;
+        size_t index = 0U;
+        size_t next_exact_index = 0U;
+        const ScalarExactInterval *previous_exact_interval = nullptr;
+        while (index < boundaries.size()) {
+            const uint64_t boundary_time = boundaries[index].time;
+            while (next_exact_index < exact_intervals.size() &&
+                   exact_intervals[next_exact_index].end <= cursor) {
+                previous_exact_interval = &exact_intervals[next_exact_index];
+                ++next_exact_index;
+            }
+            if (boundary_time > cursor && exact_depth == 0) {
+                const char *role_phase = nullptr;
+                if (cursor < role_trace.config_ready) {
+                    role_phase = "setup_config";
+                } else if (cursor < role_trace.work_begin) {
+                    role_phase = "setup";
+                } else if (cursor < role_trace.work_end) {
+                    role_phase = "executor_loop";
+                } else if (cursor < role_trace.drain_begin) {
+                    role_phase = "drain_setup";
+                } else if (cursor < role_trace.drain_end) {
+                    role_phase = "final_drain";
+                } else {
+                    role_phase = "exit";
+                }
+                const ScalarExactInterval *next_exact_interval =
+                    next_exact_index < exact_intervals.size() ? &exact_intervals[next_exact_index] : nullptr;
+                std::string ordinary_name;
+                std::string ordinary_category;
+                classify_ordinary_scalar(
+                    owner, role_phase, previous_exact_interval, next_exact_interval,
+                    &ordinary_name, &ordinary_category
+                );
+                WriteScalarAttributionTraceEvent(
+                    &output, &first, pid, tid, cursor, boundary_time, origin, owner,
+                    static_cast<uint32_t>(exec_state_polls), static_cast<uint32_t>(fanin_polls),
+                    static_cast<uint32_t>(drain_polls), static_cast<uint32_t>(other_polls), role_phase,
+                    ordinary_name, ordinary_category, exact_interval_name(previous_exact_interval),
+                    exact_interval_name(next_exact_interval)
+                );
+            }
+            int32_t exact_delta = 0;
+            int32_t exec_state_poll_delta = 0;
+            int32_t fanin_poll_delta = 0;
+            int32_t drain_poll_delta = 0;
+            int32_t other_poll_delta = 0;
+            while (index < boundaries.size() && boundaries[index].time == boundary_time) {
+                exact_delta += boundaries[index].exact_delta;
+                exec_state_poll_delta += boundaries[index].exec_state_poll_delta;
+                fanin_poll_delta += boundaries[index].fanin_poll_delta;
+                drain_poll_delta += boundaries[index].drain_poll_delta;
+                other_poll_delta += boundaries[index].other_poll_delta;
+                ++index;
+            }
+            exact_depth += exact_delta;
+            exec_state_polls += exec_state_poll_delta;
+            fanin_polls += fanin_poll_delta;
+            drain_polls += drain_poll_delta;
+            other_polls += other_poll_delta;
+            if (exact_depth < 0 || exact_depth > 1 || exec_state_polls < 0 || fanin_polls < 0 ||
+                drain_polls < 0 || other_polls < 0) {
+                return false;
+            }
+            cursor = boundary_time;
+        }
+        if (exact_depth != 0 || exec_state_polls != 0 || fanin_polls != 0 || drain_polls != 0 ||
+            other_polls != 0 || cursor != role_trace.exit) {
+            return false;
+        }
     }
     for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
         const g0_swimlane::BuilderTaskTrace &builder = trace.builders[task_id];
         const g0::TaskKind kind = g0::TaskKindAt(task_id);
         const uint32_t builder_instance = builder.build_owner - g0::kBuilderOwner;
-        const uint32_t warp = builder.builder_thread / g0::kWarpSize;
+        const uint32_t writer = builder.builder_thread / g0::kWarpSize;
+        const uint32_t simt_pid = g0::OwnerPhysicalBlock(builder.build_owner);
+        if (writer >= active_simt_writers || writer >= simt_tids.size()) {
+            return false;
+        }
+        const uint32_t simt_tid = simt_tids[writer];
+        if (simt_tid == UINT32_MAX) {
+            return false;
+        }
         const std::string prefix = "task[" + std::to_string(task_id) + "] " + TraceTaskKindName(kind);
         const uint64_t attempt_begin = align_simt_clock(builder.attempt_begin, builder_instance);
         const uint64_t claim_end = align_simt_clock(builder.claim_end, builder_instance);
@@ -3271,62 +3905,78 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path) {
         const uint64_t commit_end = align_simt_clock(builder.commit_end, builder_instance);
         const uint64_t report_end = align_simt_clock(builder.report_end, builder_instance);
         WriteTraceEvent(
-            &output, &first, prefix + " build", "simt_build", 2U, warp, attempt_begin, report_end, origin, task_id,
-            builder.build_owner, builder.insert_poll_count
+            &output, &first, prefix + " build", "simt_build", simt_pid, simt_tid, attempt_begin, report_end,
+            origin, task_id, builder.build_owner, builder.insert_poll_count
         );
         WriteTraceEvent(
-            &output, &first, "claim", "simt_build", 2U, warp, attempt_begin, claim_end, origin, task_id,
+            &output, &first, "claim", "simt_build", simt_pid, simt_tid, attempt_begin, claim_end, origin, task_id,
             builder.build_owner
         );
         WriteTraceEvent(
-            &output, &first, "prepare", "simt_build", 2U, warp, claim_end, prepare_end, origin, task_id,
+            &output, &first, "prepare", "simt_build", simt_pid, simt_tid, claim_end, prepare_end, origin, task_id,
             builder.build_owner
         );
         WriteTraceEvent(
-            &output, &first, "ordered_insert", "simt_build", 2U, warp, commit_begin, commit_end, origin, task_id,
-            builder.build_owner, builder.insert_poll_count
+            &output, &first, "ordered_insert", "simt_build", simt_pid, simt_tid, commit_begin, commit_end, origin,
+            task_id, builder.build_owner, builder.insert_poll_count
         );
         WriteTraceEvent(
-            &output, &first, "build_report_publish", "simt_build", 2U, warp, commit_end, report_end, origin,
-            task_id, builder.build_owner
+            &output, &first, "build_report_publish", "simt_build", simt_pid, simt_tid, commit_end, report_end,
+            origin, task_id, builder.build_owner
         );
         if (!g0::TaskExecutable(kind)) {
             continue;
         }
         const g0_swimlane::ExecutorTaskTrace &executor = trace.executors[task_id];
+        const char *kind_name = TraceTaskKindName(kind);
+        const char *engine_name = TraceTaskEngineName(kind);
+        const uint32_t execute_owner = executor.execute_owner;
+        const uint32_t execute_pid = g0::OwnerPhysicalBlock(execute_owner);
+        const uint32_t scalar_tid = scalar_tids[execute_owner];
+        const uint32_t kernel_tid = kernel_tids[execute_owner];
+        if (scalar_tid == UINT32_MAX || kernel_tid == UINT32_MAX) {
+            return false;
+        }
+        const std::string execute_name =
+            "task.execute." + std::string(kind_name) + "#" + std::to_string(task_id);
         WriteTraceEvent(
-            &output, &first, prefix + " lifecycle", "task", 1U, executor.execute_owner, executor.ticket_assigned,
-            executor.execute_end, origin, task_id, executor.execute_owner
+            &output, &first, execute_name, "task_execute", execute_pid, scalar_tid,
+            executor.workload_begin, executor.workload_end, origin, task_id, execute_owner, UINT32_MAX,
+            kind_name, engine_name
         );
         WriteTraceEvent(
-            &output, &first, "wait_built+claim", "task_wait", 1U, executor.execute_owner,
-            executor.ticket_assigned, executor.claim_end, origin, task_id, executor.execute_owner
-        );
-        WriteTraceEvent(
-            &output, &first, "bind+fanin_wait", "task_wait", 1U, executor.execute_owner, executor.claim_end,
-            executor.fanin_ready, origin, task_id, executor.execute_owner
-        );
-        WriteTraceEvent(
-            &output, &first, "task_execute", "task_execute", 1U, executor.execute_owner, executor.execute_begin,
-            executor.execute_end, origin, task_id, executor.execute_owner
+            &output, &first, std::string(kind_name) + "#" + std::to_string(task_id), "kernel", execute_pid,
+            kernel_tid, executor.workload_begin, executor.workload_end, origin, task_id, execute_owner,
+            UINT32_MAX, kind_name, engine_name
         );
     }
     for (uint32_t writer = 0U; writer < active_simt_writers; ++writer) {
         const uint32_t builder_instance = writer / g0::kBuilderWarpCount;
+        const uint32_t builder_owner = g0::BuilderOwnerForInstance(builder_instance);
+        const uint32_t pid = g0::OwnerPhysicalBlock(builder_owner);
+        const uint32_t tid = simt_tids[writer];
+        if (tid == UINT32_MAX) {
+            return false;
+        }
         for (uint32_t slot = 0U; slot < trace.simt_logs[writer].record_count; ++slot) {
             const g0_swimlane::TraceRecord &record = trace.simt_records[writer][slot];
             WriteProfileTraceEvent(
-                &output, &first, record, g0_swimlane::TraceDomain::Simt, writer, 2U, writer,
+                &output, &first, record, g0_swimlane::TraceDomain::Simt, writer, pid, tid,
                 align_simt_clock(record.begin, builder_instance),
                 align_simt_clock(record.end, builder_instance), origin
             );
         }
     }
     for (uint32_t writer = 0U; writer < g0_swimlane::kTraceScalarWriterCount; ++writer) {
+        const uint32_t pid = g0::OwnerPhysicalBlock(writer);
+        const uint32_t tid = scalar_tids[writer];
+        if (tid == UINT32_MAX) {
+            return false;
+        }
         for (uint32_t slot = 0U; slot < trace.scalar_logs[writer].record_count; ++slot) {
             const g0_swimlane::TraceRecord &record = trace.scalar_records[writer][slot];
             WriteProfileTraceEvent(
-                &output, &first, record, g0_swimlane::TraceDomain::Scalar, writer, 1U, writer,
+                &output, &first, record, g0_swimlane::TraceDomain::Scalar, writer, pid, tid,
                 record.begin, record.end, origin
             );
         }
@@ -3699,12 +4349,14 @@ int main(int argc, char **argv) {
     std::printf(
         "[DEVICE] id=%d soc=%s topology=32*(1AIC+2AIV) builders=%u "
         "simt_threads_per_builder=%u simt_threads_total=%u warps_per_builder=%u "
-        "state_bytes=%zu state=0x%llx workspace_bytes=%llu workspace=0x%llx batches=%u runs=%u"
+        "state_bytes=%zu state=0x%llx workspace_bytes=%llu workspace=0x%llx batches=%u runs=%u "
+        "workload_repeats=%u/%u/%u/%u"
         "\n",
         options.device, session.SocName().c_str(), options.builder_count, kHostBuilderThreadCount,
         g0::BuilderThreadCount(options.builder_count), kHostBuilderWarpCount, sizeof(LaunchState),
         static_cast<unsigned long long>(session.DeviceStateAddress()), static_cast<unsigned long long>(kWorkloadBytes),
-        static_cast<unsigned long long>(session.DeviceWorkspaceAddress()), options.batches, options.runs
+        static_cast<unsigned long long>(session.DeviceWorkspaceAddress()), options.batches, options.runs,
+        g0::kDefaultQkRepeats, g0::kDefaultSfRepeats, g0::kDefaultPvRepeats, g0::kDefaultUpRepeats
     );
 
     auto state = std::make_unique<LaunchState>();
@@ -3808,7 +4460,8 @@ int main(int argc, char **argv) {
             continue;
         }
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-        if (!options.swimlane_json.empty() && !WriteSwimlaneJson(*state, options.swimlane_json)) {
+        if (!options.swimlane_json.empty() &&
+            !WriteSwimlaneJson(*state, options.swimlane_json, static_cast<double>(kernel_ms) * 1000.0)) {
             std::fprintf(stderr, "[FAIL] run=%u could not export swimlane\n", run + 1U);
             continue;
         }

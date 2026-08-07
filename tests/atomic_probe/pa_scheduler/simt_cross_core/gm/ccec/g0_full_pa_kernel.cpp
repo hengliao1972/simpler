@@ -413,66 +413,91 @@ __aicore__ __attribute__((always_inline)) inline void
 TraceExecutorTicket(__gm__ FullPaState *state, uint32_t owner, uint32_t task_id) {
     __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
     StoreDev64(words + 1U, static_cast<uint64_t>(get_sys_cnt()));
-    StoreDev64(words + 6U, static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(owner) << 32U));
     StoreDev64(
         words + 7U,
-        static_cast<uint64_t>(TaskKindAt(task_id)) |
-            (static_cast<uint64_t>(g0_swimlane::kExecutorTicketRecorded) << 32U)
+        static_cast<uint64_t>(owner) |
+            (static_cast<uint64_t>(g0_swimlane::PackExecutorTraceState(
+                 TaskKindAt(task_id), g0_swimlane::kExecutorTicketRecorded
+             ))
+             << 32U)
     );
 }
 
 __aicore__ __attribute__((always_inline)) inline void
-TraceExecutorClaim(__gm__ FullPaState *state, uint32_t task_id) {
+TraceExecutorClaim(__gm__ FullPaState *state, uint32_t owner, uint32_t task_id) {
     __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
     StoreDev64(words + 2U, static_cast<uint64_t>(get_sys_cnt()));
     StoreDev64(
         words + 7U,
-        static_cast<uint64_t>(TaskKindAt(task_id)) |
-            (static_cast<uint64_t>(
+        static_cast<uint64_t>(owner) |
+            (static_cast<uint64_t>(g0_swimlane::PackExecutorTraceState(
+                 TaskKindAt(task_id),
                  g0_swimlane::kExecutorTicketRecorded | g0_swimlane::kExecutorClaimRecorded
-             )
+             ))
              << 32U)
     );
 }
 
 __aicore__ __attribute__((always_inline)) inline void
-TraceExecutorFaninReady(__gm__ FullPaState *state, uint32_t task_id) {
+TraceExecutorFaninReady(__gm__ FullPaState *state, uint32_t owner, uint32_t task_id) {
     __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
     StoreDev64(words + 3U, static_cast<uint64_t>(get_sys_cnt()));
     StoreDev64(
         words + 7U,
-        static_cast<uint64_t>(TaskKindAt(task_id)) |
-            (static_cast<uint64_t>(
+        static_cast<uint64_t>(owner) |
+            (static_cast<uint64_t>(g0_swimlane::PackExecutorTraceState(
+                 TaskKindAt(task_id),
                  g0_swimlane::kExecutorTicketRecorded | g0_swimlane::kExecutorClaimRecorded |
                  g0_swimlane::kExecutorFaninReadyRecorded
-             )
+             ))
              << 32U)
     );
 }
 
 __aicore__ __attribute__((always_inline)) inline void
-TraceExecutorBegin(__gm__ FullPaState *state, uint32_t task_id) {
+TraceExecutorBegin(__gm__ FullPaState *state, uint32_t owner, uint32_t task_id) {
     __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
     StoreDev64(words + 4U, static_cast<uint64_t>(get_sys_cnt()));
     StoreDev64(
         words + 7U,
-        static_cast<uint64_t>(TaskKindAt(task_id)) |
-            (static_cast<uint64_t>(
+        static_cast<uint64_t>(owner) |
+            (static_cast<uint64_t>(g0_swimlane::PackExecutorTraceState(
+                 TaskKindAt(task_id),
                  g0_swimlane::kExecutorTicketRecorded | g0_swimlane::kExecutorClaimRecorded |
                  g0_swimlane::kExecutorFaninReadyRecorded | g0_swimlane::kExecutorBeginRecorded
-             )
+             ))
              << 32U)
     );
 }
 
 __aicore__ __attribute__((always_inline)) inline void
-TraceExecutorEnd(__gm__ FullPaState *state, uint32_t task_id) {
+TraceExecutorWorkloadEnd(__gm__ FullPaState *state, uint32_t owner, uint32_t task_id) {
+    __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
+    StoreDev64(words + 6U, static_cast<uint64_t>(get_sys_cnt()));
+    StoreDev64(
+        words + 7U,
+        static_cast<uint64_t>(owner) |
+            (static_cast<uint64_t>(g0_swimlane::PackExecutorTraceState(
+                 TaskKindAt(task_id),
+                 g0_swimlane::kExecutorTicketRecorded | g0_swimlane::kExecutorClaimRecorded |
+                 g0_swimlane::kExecutorFaninReadyRecorded | g0_swimlane::kExecutorBeginRecorded |
+                 g0_swimlane::kExecutorWorkloadBeginRecorded | g0_swimlane::kExecutorWorkloadEndRecorded
+             ))
+             << 32U)
+    );
+}
+
+__aicore__ __attribute__((always_inline)) inline void
+TraceExecutorEnd(__gm__ FullPaState *state, uint32_t owner, uint32_t task_id) {
     __gm__ uint64_t *words = ExecutorTraceWords(state, task_id);
     StoreDev64(words + 5U, static_cast<uint64_t>(get_sys_cnt()));
     StoreDev64(
         words + 7U,
-        static_cast<uint64_t>(TaskKindAt(task_id)) |
-            (static_cast<uint64_t>(g0_swimlane::kExpectedExecutorTraceBits) << 32U)
+        static_cast<uint64_t>(owner) |
+            (static_cast<uint64_t>(g0_swimlane::PackExecutorTraceState(
+                 TaskKindAt(task_id), g0_swimlane::kExpectedExecutorTraceBits
+             ))
+             << 32U)
     );
     dsb(DSB_ALL);
     StoreDev64(words, state->control.launch_nonce);
@@ -2824,6 +2849,9 @@ RunClaimedWorkload(
     // task's valid checksum and publish a false-positive witness.
     StoreDev64(reinterpret_cast<__gm__ uint64_t *>(output), output_poison);
     dsb(DSB_ALL);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceExecutorBegin(state, owner, task_id);
+#endif
 #if defined(__DAV_VEC__)
     if (kind == TaskKind::Sf) {
         RunG0VectorAdd(input_a, input_b, output, state->control.sf_repeats);
@@ -2846,6 +2874,9 @@ RunClaimedWorkload(
         );
         return false;
     }
+#endif
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceExecutorWorkloadEnd(state, owner, task_id);
 #endif
     const uint64_t checksum = LoadDev64(reinterpret_cast<__gm__ const uint64_t *>(output));
     if (checksum != ExpectedWorkloadOutputPair(kind)) {
@@ -2963,7 +2994,7 @@ AdvanceToken(
         }
         ++result->claim_count;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-        TraceExecutorClaim(state, task_id);
+        TraceExecutorClaim(state, owner, task_id);
 #endif
         token->control.phase = ExecTokenPhase::Binding;
         if (!ValidatePayloadAndBind(state, owner, token G0_SCALAR_TRACE_ARGUMENT)) {
@@ -2983,20 +3014,17 @@ AdvanceToken(
             return false;
         }
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-        TraceExecutorFaninReady(state, task_id);
+        TraceExecutorFaninReady(state, owner, task_id);
 #endif
         token->control.phase = ExecTokenPhase::EngineInflight;
     }
     if (token->control.phase == ExecTokenPhase::EngineInflight) {
         token->control.phase = ExecTokenPhase::Completing;
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-        TraceExecutorBegin(state, task_id);
-#endif
         if (!RunClaimedWorkload(state, owner, token G0_SCALAR_TRACE_ARGUMENT)) {
             return false;
         }
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-        TraceExecutorEnd(state, task_id);
+        TraceExecutorEnd(state, owner, task_id);
 #endif
         ++result->execute_count;
         ++result->completed_by_kind[static_cast<uint32_t>(TaskKindAt(task_id))];

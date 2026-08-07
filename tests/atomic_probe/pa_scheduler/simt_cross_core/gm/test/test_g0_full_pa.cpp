@@ -2433,10 +2433,10 @@ private:
         state->control.heap_bytes = kHeapBytes;
         state->control.workspace_base = 0x800000000ULL;
         state->control.workspace_bytes = kWorkloadBytes;
-        state->control.qk_repeats = 1U;
-        state->control.sf_repeats = 1U;
-        state->control.pv_repeats = 1U;
-        state->control.up_repeats = 1U;
+        state->control.qk_repeats = kDefaultQkRepeats;
+        state->control.sf_repeats = kDefaultSfRepeats;
+        state->control.pv_repeats = kDefaultPvRepeats;
+        state->control.up_repeats = kDefaultUpRepeats;
         state->control.builder_count = builder_count_;
         for (uint32_t task_id = 0U; task_id < kMaxTasks; ++task_id) {
             InitializeTaskAbi(&state->tasks[task_id], task_id);
@@ -2784,8 +2784,10 @@ private:
             state.control.timeout_ticks != 2000000000ULL || state.control.builder_thread_count != kBuilderThreadCount ||
             state.control.heap_base != kSyntheticHeapBase || state.control.heap_bytes != kHeapBytes ||
             state.control.workspace_base != 0x800000000ULL || state.control.workspace_bytes != kWorkloadBytes ||
-            state.control.qk_repeats != 1U || state.control.sf_repeats != 1U || state.control.pv_repeats != 1U ||
-            state.control.up_repeats != 1U || state.control.builder_count != builder_count_ ||
+            state.control.qk_repeats != kDefaultQkRepeats ||
+            state.control.sf_repeats != kDefaultSfRepeats ||
+            state.control.pv_repeats != kDefaultPvRepeats ||
+            state.control.up_repeats != kDefaultUpRepeats || state.control.builder_count != builder_count_ ||
             state.control.reserved32 != 0U || state.fatal.state != 0 || !GuardsValid(state) ||
             state.ordinary_map.head.value != 0 || state.ordinary_map.tail.value != 0 ||
             state.ordinary_map.lookup_count.value != 0 || state.ordinary_map.append_count.value != 0) {

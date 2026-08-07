@@ -22,7 +22,7 @@ namespace pa_scheduler::simt_cross_core::g0_swimlane {
 using namespace pa_scheduler::simt_cross_core::g0;
 
 constexpr uint64_t kTraceMagic = UINT64_C(0x47305357494D4C4E);
-constexpr uint64_t kTraceVersion = 5U;
+constexpr uint64_t kTraceVersion = 6U;
 constexpr uint64_t kTracePoison = UINT64_C(0xD3D3D3D3D3D3D3D3);
 constexpr uint32_t kTraceTaskCapacity = kDefaultBatches * kTasksPerBatch;
 constexpr uint32_t kTraceSimtWriterCount = kMaxBuilderLeaderCount;
@@ -202,11 +202,28 @@ enum ExecutorTraceBits : uint32_t {
     kExecutorFaninReadyRecorded = 1U << 2U,
     kExecutorBeginRecorded = 1U << 3U,
     kExecutorEndRecorded = 1U << 4U,
+    kExecutorWorkloadBeginRecorded = 1U << 5U,
+    kExecutorWorkloadEndRecorded = 1U << 6U,
 };
 
 constexpr uint32_t kExpectedExecutorTraceBits = kExecutorTicketRecorded | kExecutorClaimRecorded |
                                                 kExecutorFaninReadyRecorded | kExecutorBeginRecorded |
-                                                kExecutorEndRecorded;
+                                                kExecutorEndRecorded | kExecutorWorkloadBeginRecorded |
+                                                kExecutorWorkloadEndRecorded;
+constexpr uint32_t kExecutorTraceTaskKindMask = 0xFFU;
+
+SIMT_CROSS_CORE_G0_TRACE_INLINE uint32_t
+PackExecutorTraceState(TaskKind kind, uint32_t phase_bits) {
+    return static_cast<uint32_t>(kind) | (phase_bits << 8U);
+}
+
+SIMT_CROSS_CORE_G0_TRACE_INLINE TaskKind ExecutorTraceTaskKind(uint32_t packed) {
+    return static_cast<TaskKind>(packed & kExecutorTraceTaskKindMask);
+}
+
+SIMT_CROSS_CORE_G0_TRACE_INLINE uint32_t ExecutorTracePhaseBits(uint32_t packed) {
+    return packed >> 8U;
+}
 
 // Builder 与 executor 会同时处理同一 task。两类记录故意拆成独立 cache line，
 // 避免 profiling 本身引入同一 cache line 的跨执行单元写竞争。
@@ -230,12 +247,11 @@ struct alignas(kCacheLineBytes) ExecutorTaskTrace {
     uint64_t ticket_assigned;
     uint64_t claim_end;
     uint64_t fanin_ready;
-    uint64_t execute_begin;
-    uint64_t execute_end;
-    uint32_t task_id;
+    uint64_t workload_begin;
+    uint64_t task_end;
+    uint64_t workload_end;
     uint32_t execute_owner;
-    uint32_t task_kind;
-    uint32_t phase_bits;
+    uint32_t task_kind_and_phase_bits;
 };
 
 struct alignas(kCacheLineBytes) RoleTrace {

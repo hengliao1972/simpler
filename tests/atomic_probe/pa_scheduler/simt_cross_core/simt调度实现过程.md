@@ -3638,6 +3638,282 @@ oracle 通过，JSON 已通过 `jq` 解析：
 优化。后续若重新开启性能工作，必须从本节的独立 build-envelope 口径继续，
 不能只凭 ACL kernel-event 猜测构建时间。
 
+### 22.5 Scalar task 展示与真实 workload 口径纠正
+
+用户检查新图时指出 AIV task 只有约 5 us，而此前 cross_core 的 SF 应约
+50 us。对照实际 JSON 和源码后确认这不是绘图缩放误差：SIMT G0 host 一直把
+QK/SF/PV/UP 的 `repeats` 全部固定为 1；standalone shared same-core/
+cross-core 的 A5 标定默认值是 `6/28/4/1`，其中 SF 的 28 次完整 128x128
+Vector add 正是约 50 us 的来源。
+
+本轮在 SIMT 自有 model 中冻结同一组 `6/28/4/1` 常量，没有引入对 cross_core
+源码的依赖。base B32/W4、B256 在真实 A5 上 5/5 通过，纠正后的性能为：
+
+| 口径 | min/us | median/us | avg/us | max/us |
+| ---- | -----: | --------: | -----: | -----: |
+| kernel event | 984.649 | **1014.989** | 1129.106 | 1634.115 |
+| SIMT build envelope | 346.248 | **347.307** | 348.696 | 355.491 |
+
+首轮 1634.115 us 是未锁设备上的冷/噪声样本，但仍保留在全部 5 轮统计中。
+旧的 436.673 us kernel 中位和 348.332 us build 中位是
+`repeats=1/1/1/1` 的历史事实；构建时间仍有效，端到端时间不再作为与
+same-core/cross-core 可比的结论。
+
+展示方式也按 cross_core 的物理 block 合同重做，不再把 96 条 Scalar 和
+全部 SIMT warp 拆成两个全局 process：
+
+- 未参与 SIMT 的 block 严格保留 1C2V 顺序：AIC/AIV0/AIV1 Scalar 在上，
+  AIC/AIV0/AIV1 kernel 在下；
+- 参与 SIMT 的 block 中，每个 builder AIV 单独形成 `SIMT Scalar host + N 条
+  SIMT warp` 调度组；调度组之后，AIC 仍按 `AIC Scalar + AIC kernel` 的旧
+  方式展示；
+- 若只有一个 AIV 是 builder，另一个普通 AIV 会和 AIC 一样保留 Scalar 和
+  kernel 两条轨，因此布局逻辑不依赖 B32；
+- Scalar 执行区间命名为 `task.execute.QK/SF/PV/UP#task_id`，kernel 轨命名为
+  `QK/SF/PV/UP#task_id`；两者是相同 workload 起止时间的重复投影，不能相加；
+- direct atomic、DCCI 和 workload 只在真实 Scalar 轨展示，不复制到 kernel
+  轨；完整 lifecycle/fanin 时间戳保留在 raw trace 中供 host 校验。
+
+首版边界仍包住了 workload 后的 witness/completion/DONE atomic，SF 中位为
+60.233 us，尚不等价于 cross_core 的 `TracePhase::Kernel`。最终版把
+workload begin/end 与完整 task end 分开：`task.execute.*` 只显示 engine
+workload，外层 lifecycle 继续覆盖完成发布。为避免扩大 profiling 写竞争，
+没有把 `ExecutorTaskTrace` 扩成两条 cache line；task id 由数组下标确定，
+kind/phase 压入一个 32-bit 字段，因而新增 workload end 后记录仍严格为原来
+的 64 B。
+
+随后用户指出 AIC Scalar 明明只有一个线程，图中却被展开成很多层。检查事件
+和源码后确认：每个 executor Scalar 确实只有一个物理线程，但
+`kTokensPerOwner=4`，该线程会交错推进四个 token。上一版把每个 token 从首次
+poll 到就绪的逻辑 episode，以及 ticket 到 task end 的 lifecycle，都作为
+连续 `X` 区间放进同一个 `tid`。block0 AIC 因此出现最多 4 个互相重叠的 poll
+episode；叠加 role/lifecycle/wait 后，viewer 最大展开深度达到 14。这不代表
+14 个线程，而是错误地把“逻辑 pending 时间”当成了“物理线程连续占用时间”。
+
+v8 改为严格单物理线程展示：
+
+- executor Scalar 持续区间只保留 workload、direct atomic 和 DCCI；
+- 不再导出 role、executor loop、task lifecycle 和宽泛 wait 包络；这些原始
+  时间戳仍在 64 B trace 记录中，并继续参与 host 时序校验；
+- 合并 poll 改成 episode 结束处的 instant marker，`call_count`、逻辑包络起点
+  和包络时长完整保存在 args，既不丢统计，也不再占据四条重叠显示行；
+- SIMT warp 内的 build/claim/prepare/insert 分层仍保留，因为那是用户要求的
+  SIMT 调度结构，不冒充 AIC/AIV Scalar 线程。
+
+v8 虽然消除了假多线程层级，但用户继续指出 AIC Scalar 出现大量空白。对 v8
+真机图量化后，32 条 AIC 平均内部空白为 304.268 us，其中 280.876 us 位于
+至少一个 pending poll episode 内，占 92.3%；block0 分别为 326.788 us、
+294.701 us。空白不是 idle 的可靠证据，而是 poll 只保留结束 marker、普通
+Scalar 控制代码和 trace record 写入没有独立持续区间造成的展示缺口。
+
+v9 因此继续在 host 导出阶段计算“精确持续区间的补集”：
+
+- workload、direct atomic、DCCI 保持原始精确边界并拥有最高优先级；
+- 补集处若有 pending poll episode，生成单层 `scalar.poll/control`，args 记录
+  pending episode 数；否则按 role phase 生成 scheduler/setup/drain control；
+- 每个补位段明确标为 host synthesized，表示 poll/control 未逐条定时，并且
+  可能包含 profiling 写 record 的开销，不冒充单次 atomic；
+- 补位算法只读现有 raw trace 并生成 JSON，不增加 device record、atomic、DCCI
+  或 kernel 执行开销；
+- 所有补位与精确事件互斥，因此 Scalar 始终是一条连续且不重叠的物理时间线。
+
+最终按物理 block 重排后的真实 A5 图中，各类均为 256 个样本：
+
+| kind | cross_core median/us | SIMT median/us | SIMT min/p95/max us |
+| ---- | -------------------: | -------------: | ------------------: |
+| QK | 40.954 | 41.081 | 40.216 / 49.361 / 51.982 |
+| SF | 53.575 | **56.920** | 52.077 / 61.878 / 67.431 |
+| PV | 27.460 | 27.306 | 26.792 / 34.740 / 36.746 |
+| UP | 2.533 | 2.050 | 1.872 / 2.992 / 3.244 |
+
+最终 B32 图的 block0..15 各有 12 轨（两个 builder 调度组和两条 AIC 轨），
+block16..31 各有 6 轨（标准 1C2V），共 288 个唯一 `(pid, tid)`。Scalar 与
+kernel 各有 1024 个 workload 区间，按 task 对比后的起点、时长、owner、
+kind 和 engine 差异为 0；SIMT/Scalar atomic 与 DCCI 的错轨数也为 0。
+64 条 executor Scalar 的全部持续区间最大重叠深度均为 1，重叠轨数为 0；
+相邻持续区间之间的空白轨数和空白总时长也均为 0。1793 个 Scalar poll
+record 全部保持 instant marker，与 summary 精确一致。host 另外生成 15918
+段 `scalar.poll/control`（合计 20921.962 us）和 2942 段其他 control（合计
+1204.904 us），全部只占 exact 事件的补集。
+另用 B1/W4/B1 真机覆盖了奇数 builder 分支：block0 为一个五轨 SIMT 组加
+AIC/AIV1 的两条 Scalar 和两条 kernel，block1 仍是标准六轨 1C2V，完整
+oracle 和 4 对 Scalar/kernel workload 均通过；95 条 executor Scalar 的
+重叠轨数与空白轨数同样都是 0。
+trace-on device span 为 1082.567 us、SIMT build span 为 403.544 us、kernel
+event 为 1678.656 us；完整 PA oracle 1/1 通过。该 v9 JSON 是展示实现过程中的
+中间证据，最终已在第 22.8 节收敛为 v13 后删除，不再作为当前入口。
+
+本轮 base/swimlane 共同通过 CPU optimized、ASan+UBSan、TSan、AIC/AIV CCEC、
+bitcode、mixed ELF 和 GCC15 host 门槛。两个已判定错误的 2026-08-07 中间
+JSON 以及后续错误的全局 Scalar 中间图均已删除；上述 v9 图作为“首次连续
+Executor Scalar”历史版本保留，后续 v10/v11 也使用新文件名，没有覆盖它；
+2026-08-06 的历史 v5 图同样未覆盖。
+
+### 22.6 Scalar 等待对象与普通代码的完整归因
+
+用户继续指出 `scalar.poll/control` 只能说明“这里有空白”，看不出 Scalar
+究竟在等待什么、poll 本体开销多少，也把本来可以由控制流确定的普通 Scalar
+代码混成了一个兜底类别。最终 v11 仅修改 host JSON 导出，device raw ABI 仍为
+6，没有增加设备记录和 profiling 热路径开销。
+
+新的单物理线程展示同时保留三层证据：
+
+1. workload、direct atomic、DCCI 继续使用设备记录的精确起止时间；
+2. 三个合并 poll site 分别显示为 `exec_state`、`fanin_flag`、`drain_arrival`；
+   每个 episode 仍在结束点保存精确 `call_count` 和逻辑 envelope；
+3. 精确事件的剩余补集，根据 role phase 与相邻的 `previous_exact/next_exact`
+   拆为 payload bind、claim、dispatch、engine prepare、completion、token rotation、
+   config 和 drain 等阶段，不再生成 `scalar.control`。
+
+poll 宽条命名为 `[AtomicPoll+GM+Scalar]`，表示“这一物理 Scalar 墙钟区间内至少
+一个相应 poll episode 处于 pending”，而不是宣称整条都是 atomic 指令。
+marker 另给出 `call_count * 160 ns` 的 Atomic 本体参考值。这样能同时回答：
+
+- 等待对象是谁；
+- episode 墙钟占了多少；
+- 实际执行了多少次 atomic load；
+- 若按 standalone probe 的约 160 ns/次估算，Atomic 本体约占多少；
+- 两者之间为何不能直接画等号。
+
+最终 B32/W4/B256 v11 真机图完整 PA oracle 1/1 通过：
+
+| 项目 | v11 数据 |
+| ---- | -------: |
+| trace-on device span | 1073.060 us |
+| trace-on kernel event | 1673.578 us |
+| trace-on SIMT build span | 405.684 us |
+| Scalar poll record / call | 1793 / 31973 |
+| `call_count * 160 ns` | 5115.680 us |
+| 分类后的 poll 墙钟条，96 轨累加 | 21533.369 us |
+| 普通 Scalar 具体阶段，96 轨累加 | 1397.176 us |
+| `scalar.control` | 0 段 / 0 us |
+
+poll 墙钟条进一步分解为 fanin 13353.351 us、exec-state 4807.583 us、mixed
+2672.722 us、root drain 699.713 us。普通 Scalar 中较大的部分是 payload bind
+440.233 us、task completion 267.020 us、token rotation 155.187 us、config
+validate 129.195 us、engine prepare 115.291 us 和 dispatch 105.613 us。所有数字
+都是跨物理 Scalar 轨累加，不能当成端到端墙钟。
+
+机械校验覆盖：全部 96 条物理 Scalar 连续且最大重叠深度为 1，空白轨和重叠
+轨均为 0；1024 对 Scalar/kernel workload 的 task、owner、kind、engine、起止
+和时长逐项一致；1793 个 marker 的 call count 与 31973 次 raw poll 完全闭合，
+估算值严格等于 `31973 * 160 ns`。额外真实 A5 B1/W4/builder=1 也通过完整
+oracle：block0 为 9 轨、其余 block 为标准 6 轨，全部 96 条 Scalar 仍为 0
+空白、0 重叠，4 对 workload 投影完全一致。
+
+v11 当时使用独立文件完成验证；最终已在第 22.8 节收敛为 v13 后删除。
+
+### 22.7 poll 等待对象与当前 Scalar 阶段双标签
+
+抽查 v11 的 block0 AIC 后发现，仅把补集优先画成 `wait.exec_state x3` 仍可能
+隐藏四 token 交错：三个 token 的 exec-state episode 虽然 pending，当前物理
+Scalar 可能正在为第四个 token 绑定 payload。v12 因此不改变区间切分，只把
+已经用于普通区间归因的相邻精确事件结果也附到 poll 条上。
+
+现在的名称直接同时显示两种信息，例如：
+
+```text
+wait.exec_state[AtomicPoll+GM+Scalar] x3 pending |
+scalar.bind_and_validate_payload[GM+Scalar]#83
+```
+
+args 同时保存 `coexecuted_scalar_stage/category` 和
+`previous_exact/next_exact`。poll category 仍用于按等待对象着色，`|` 后半段
+说明该物理补集位于哪类 Scalar 代码的相邻精确边界之间。它不会把 episode
+墙钟冒充成纯 Atomic，也不会因为另一个 token 正在等待就隐藏当前 token 的
+payload/claim/completion 阶段。该变化仍只发生在 host JSON 导出，raw ABI 和
+device trace 数均不变。
+
+v12 的真实 A5 B32/W4/B256 完整 PA oracle 1/1 通过：device span
+1086.576 us、kernel event 1676.610 us、SIMT build 400.234 us。全部 96 条物理
+Scalar 仍是单层连续轨，空白和重叠均为 0；1024 对 Scalar/kernel workload
+逐字段一致；1793 个 poll marker 合计 30673 次 load，`30673 * 160 ns =
+4907.680 us`。分类 poll 墙钟条跨轨累计 21149.803 us，普通 Scalar 具体阶段
+累计 1287.404 us，`scalar.control` 仍为 0。v12 当时使用独立文件完成验证；
+最终已在第 22.8 节收敛为 v13 后删除。
+
+### 22.8 固定 6/28/4/1、补齐完整 E2E 并收敛最终文件
+
+最终口径统一为 cross_core 正式 real-compute 默认值：QK/SF/PV/UP 分别执行
+`6/28/4/1` 次完整 128x128 engine pipeline。SIMT host 初始化直接写入四个
+编译期常量，没有保留运行时 workload 覆盖入口；启动日志和 JSON 顶层均再次
+保存实际值，避免把轻量 smoke 数据混入正式性能结果。
+
+同一份 W4 生产产物在真实 A5、B256、关闭埋点下分别复测 B16/B32 五轮：
+
+| 配置 | PASS | min/us | median/us | avg/us | max/us | build median/us |
+| ---- | ---: | -----: | --------: | -----: | -----: | --------------: |
+| B16/W4 | 5/5 | 946.581 | **956.976** | 1086.910 | 1620.327 | 418.222 |
+| B32/W4 | 5/5 | 955.730 | **972.090** | 1108.654 | 1673.095 | 338.831 |
+
+v13 在 JSON 顶部新增单独的 `Kernel end-to-end total` 轨，duration 直接来自
+kernel launch 前后的 ACL event，覆盖 kernel final drain 和返回。ACL event 与
+device `get_sys_cnt()` 没有公开的共同绝对 epoch，因此该轨明确标记为
+`duration_reference_only`，不伪造它与设备子阶段的绝对相位关系。
+
+每种配置生成两个 trace-on 候选，保留 ACL E2E 更短且完整 oracle 通过的一份：
+
+| 配置 | trace-on ACL E2E/us | device span/us | build envelope/us | 最终文件 |
+| ---- | ------------------: | -------------: | ----------------: | -------- |
+| B16/W4 | 1600.264 | 1015.929 | 563.086 | `test_record/2026-8-7/gm_b16_b256_warp4_traceoff_957us_traceon_e2e1600us_device1016us_build563us_per_block_full_scalar_wait_stage_v13_simt_aic_atomic_dcci_swimlane.json` |
+| B32/W4 | 1659.830 | 1061.737 | 396.792 | `test_record/2026-8-7/gm_b32_b256_warp4_traceoff_972us_traceon_e2e1660us_device1062us_build397us_per_block_full_scalar_wait_stage_v13_simt_aic_atomic_dcci_swimlane.json` |
+
+两份图均有 96 条非空物理 Scalar 轨，空白轨与重叠轨均为 0；Scalar/kernel
+各 1024 个 workload 投影逐字段一致；E2E 事件恰好一个且 duration 与顶层值
+完全相等；1793 个 Scalar poll episode 继续合并并保留精确 call count；
+`scalar.control` 为 0。B16/B32 的 SF 中位分别为 54.639/57.025 us，符合统一
+workload 口径。
+
+在 22.8 阶段，`2026-8-7` 当时只保留上述两份 v13 JSON 和一份 README；
+随后 22.9 按新的六种 B、每种三种 W 要求替换为 18 份最终图。v9/v10/v11/v12
+展示中间图已删除；文件名也不再重复携带 `realcompute_6_28_4_1`，固定 workload
+由 JSON 元数据和文档说明承担。
+
+### 22.9 B=1/2/4/8/16/32 的 W 扫描与 18 份最终泳道图
+
+用户进一步要求同时观察 B=`1/2/4/8/16/32`，并让每种 B 都保留三种实测较优
+的 W。该轮不修改调度协议和 workload，只对同一份通用源码改变编译期
+`SIMT_CROSS_CORE_GM_BUILDER_WARPS`，继续固定 QK/SF/PV/UP=`6/28/4/1`。
+
+测试分两层进行：先以 trace-off 五轮中位数做宽范围候选扫描，再对每种 B 的
+近邻入围项统一复测 11 轮。第一轮新鲜初始化没有剔除，最终排序只采用 11/11
+通过配置的 ACL kernel event 中位数。入围结果如下：
+
+| B | 第 1 名 | median/us | 第 2 名 | median/us | 第 3 名 | median/us |
+| -: | ------- | --------: | ------- | --------: | ------- | --------: |
+| 1 | W16 | 2946.263 | W14 | 3303.954 | W26 | 3307.122 |
+| 2 | W32 | 1646.371 | W28 | 1697.087 | W8 | 1784.520 |
+| 4 | W30 | 1013.554 | W16 | 1041.676 | W15 | 1047.185 |
+| 8 | W5 | **926.038** | W7 | 945.652 | W6 | 952.794 |
+| 16 | W5 | 946.850 | W3 | 947.485 | W4 | 954.408 |
+| 32 | W2 | 950.701 | W1 | 988.489 | W5 | 1006.230 |
+
+本轮扫描范围内的全局最优是 B8/W5 的 926.038 us。B16/W4 与未入选 W6
+只差 0.469 us，B1/W14 与 W26 只差 3.168 us，属于 unlocked device 上的
+近似并列，不解释为确定的架构收益。
+
+B32 暴露了不能仅凭性能数选配置的稳定性问题：W3 初筛为 0/5，W6、W8 为
+4/5；W4 早期虽曾得到 5/5，但 11 轮复测出现一次 `fatal-nonzero`，只有 10/11。
+因此 B32 最终只保留 11/11 的 W2/W1/W5，旧 W4 图退出最终目录。
+
+复测自动化最初还捕获到一次测试基础设施问题：W1 的 CPU optimized 校验失败后，
+日志 `tee` 掩盖了构建退出码，设备启动行显示实际仍是上一轮
+`warps_per_builder=33`。该批数据立即作废；后续构建启用 `pipefail`，每次运行
+都强制核对设备打印的 W、`workload_repeats=6/28/4/1`、PASS 分母和 build
+manifest，避免把旧产物误记到新配置。这个失败没有进入上表和最终 JSON。
+
+每个 Top-3 配置又生成两个 trace-on 候选，只保留 ACL E2E 更短且完整 PA oracle
+通过的一份。最终 `test_record/2026-8-7` 恰好包含 18 份 v13 JSON，每个 B 三份；
+文件名包含 B、W、trace-off 中位数以及该图的 trace-on E2E/device/build 整数 us，
+完整小数和配置表记录在同目录 README。
+
+18 份图统一通过机械校验：schema/raw ABI 和 workload 正确；96 条物理 Scalar
+连续且无空白、无重叠；Scalar/kernel 各 1024 个 workload 区间按 task、pid、
+owner、kind、engine、起点和时长逐项一致；唯一 E2E 轨与顶层 duration 相等；
+1793 个 Scalar poll marker 的 call count 与 summary 闭合；`scalar.control` 为 0。
+泳道图编译仍通过 AIC/AIV CCEC、bitcode、mixed ELF 和 GCC15 host 静态门槛，
+该轮没有为特定 PA task kind 增加路径或调度特判。
+
 ## 23. 阶段状态索引
 
 | 阶段 | 状态 | 结果/提交 |
@@ -3652,7 +3928,7 @@ oracle 通过，JSON 已通过 `jq` 解析：
 | A1 warp 推进语义 | 完成 | CPU 三套和 CCEC/ELF 门槛 PASS；A5 同地址复用 100/100，SameWarp 始终 T/S+disjoint，CrossWarp 始终 S/S+overlap。 |
 | G0 GM 完整 PA | 完成 | 16-warp/lane0 纯 SIMT 构建；CPU 三套与 CCEC/ELF 门槛 PASS；A5 B1/B256 功能闭合；原始 64-warp B256 trace-off 中位约 15.0 ms。 |
 | G1 双 builder GM | 完成 | 双 VF 各 512-thread/16-warp/lane0 静态唯一分片；B256 trace-off 中位 3.637 ms；五组独立 v4 atomic/DCCI 泳道已保存。 |
-| GN 多 builder GM 扫描 | 完成，性能优化告一段落 | 通用版按 symbol 建立精确 writer 前驱，保留 768 次真实 CAS、去掉 255 个假等待 episode 和 768 次 atomic load；B16/W4 的 21 轮 kernel-event 中位为 0.495 ms。随后用独立 trace-off build-envelope 扩到 B32/W4：总 kernel 三轮中位 0.437 ms、构建中位 0.348 ms，0.3 ms 构建目标未达到；W8 对照已否决。 |
+| GN 多 builder GM 扫描 | 完成，性能优化告一段落 | 通用版按 symbol 建立精确 writer 前驱，保留 768 次真实 CAS、去掉 255 个假等待 episode 和 768 次 atomic load。最终统一固定 `6/28/4/1`，完成 B=`1/2/4/8/16/32` 的 W 扫描和 11 轮入围复测；当前扫描范围内 B8/W5 最优中位为 0.926 ms。`2026-8-7` 按每种 B 的稳定 Top-3 保存 18 份 v13 泳道图，全部带完整 ACL E2E 参考轨。0.3 ms 构建目标仍未达到。 |
 | U0 UBUF 单槽 | 完成 | 64-warp/lane0 纯 SIMT 单槽；CPU 三套、CCEC/ELF 门槛和 A5 同地址 100/100 全部 PASS；G0/G1 四组真机回归 PASS。 |
 | U1 UBUF 多槽/多 task | 完成 | `a20a29e2`；CPU 三套、CCEC/bitcode/mixed ELF 门槛全部 PASS；A5 smoke 1/1 与同地址复用 100/100，四槽 `maxbusy=4`、每槽 generation `0..31`精确闭合。 |
 | U2 UBUF 完整 PA | 功能完成，停止性能优化 | 同源 transport policy、四槽 ordered generation、真实 payload word/tail 与完整 PA oracle 已闭合；共享的按-symbol writer 协议在最终 B1 令 predecessor poll 为 0；CPU 三套和 CCEC/bitcode/mixed ELF 全部 PASS，真机 B1 3/3。由于 UBUF staging 不能消除最终 GM 写，后续只保留功能与共享协议回归。 |

@@ -105,6 +105,11 @@ constexpr float kWorkloadExpectedSf = 5.0F;
 constexpr float kWorkloadExpectedUp = 6.0F;
 constexpr float kWorkloadOutputSentinel = -12345.0F;
 
+constexpr uint32_t kDefaultQkRepeats = 6U;
+constexpr uint32_t kDefaultSfRepeats = 28U;
+constexpr uint32_t kDefaultPvRepeats = 4U;
+constexpr uint32_t kDefaultUpRepeats = 1U;
+
 enum class TaskKind : uint32_t {
     Alloc = 0,
     Qk = 1,
@@ -617,6 +622,11 @@ static_assert(
     "mixed owner topology changed"
 );
 static_assert(kWorkloadTileBytes == 65536U && kWorkloadBytes == 12713984U, "workload layout changed");
+static_assert(
+    kDefaultQkRepeats == 6U && kDefaultSfRepeats == 28U && kDefaultPvRepeats == 4U &&
+        kDefaultUpRepeats == 1U,
+    "default real-compute calibration changed"
+);
 static_assert(sizeof(TensorDesc) == kTensorDescBytes, "TensorDesc ABI changed");
 static_assert(offsetof(TensorDesc, shapes) == 44U && offsetof(TensorDesc, extent_elem_cache) == 64U &&
                   offsetof(TensorDesc, strides) == 72U,
