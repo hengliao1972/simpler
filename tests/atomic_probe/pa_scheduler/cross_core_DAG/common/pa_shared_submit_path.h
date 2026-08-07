@@ -437,17 +437,29 @@ struct SharedPaDagSchema {
         }
         PA_GM const SharedBuildDispatchTaskIdentity &identity =
             dispatch->tasks[task_id];
-        SharedPaTaskMeta meta{};
+        const uint8_t encoded = identity.encoded_meta;
+        const TaskKind projected_kind = static_cast<TaskKind>(
+            encoded & kSharedPaTicketKindMask
+        );
         if (identity.batch >= dispatch->batch_count ||
-            !DecodeSharedPaTaskMeta(
-                identity.encoded_meta, task_id, meta
+            (encoded & kSharedPaTicketMetaPresent) == 0 ||
+            projected_kind >= TaskKind::Count) {
+            return false;
+        }
+        // 无 writer 的历史 task 到此即可确定最小结果。
+        // 它的完整 PA identity 已在 host plan 发布前校验，
+        // 并会在自身取得 Build ticket 时再做完整 device
+        // decode；反向搜索不必为“空 writer 集”重复该工作。
+        if (projected_kind != TaskKind::Up) {
+            return true;
+        }
+        SharedPaTaskMeta meta{};
+        if (!DecodeSharedPaTaskMeta(
+                encoded, task_id, meta
             ) ||
             meta.is_last_submit !=
                 (task_id + 1U == dispatch->task_count)) {
             return false;
-        }
-        if (meta.kind != TaskKind::Up) {
-            return true;
         }
 
         // PA adapter 只在这里把 UP schema 翻译成三个 INOUT

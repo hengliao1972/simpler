@@ -765,3 +765,49 @@ startup 到 FinalDrain 的十次结果为：
 目前距成熟 Scalar `0.82 ms` 门槛仍有约 `187 us`，距 `0.60 ms`
 目标约 `407 us`。下一步继续减少历史 schema 的重复 GM 读取，但
 不再扩大 DAG 热路控制流。
+
+## 15. 2026-08-07：S9 无 writer candidate 最小快速拒绝
+
+### 15.1 原理与边界
+
+S8 已把历史查询从完整 Build dispatch 缩小到 PA metadata，但
+仍然对每个 candidate 完整调用 `DecodeSharedPaTaskMeta()` 后才
+判断 writer 集是否为空。writer intent adapter 的输出只有两类：
+
+- 明确无 writer：返回空集；
+- 可能有 writer：继续完整解码并构造 symbol key。
+
+因此本轮先从 immutable identity 的 `encoded_meta` 投影
+`present + kind`，同时检查 task/batch 边界；若 adapter 可当场证明
+该 kind 无 metadata writer，直接返回空集。只有可能写 metadata
+的 task 才进入完整 PA metadata 解码。
+
+这个快速拒绝位于 PA schema adapter，公共 DAG 仍只消费通用
+`WriterIntentsAt()`；新算子可以在自己的 adapter 中使用同一
+“先证明空集，再解码完整 schema”原则。host plan 发布前仍校验
+全部 identity，每个 task 自身取得 Build ticket 时仍执行完整
+device dispatch 解码；没有放松副作用发布边界。
+
+### 15.2 校验与性能
+
+- CPU perf-clock 全量门槛 PASS；
+- AIC/AIV CCEC、mixed ELF、ABI、强符号、无 relocation 和 manifest
+  PASS；
+- A5 B256、`6,28,4,1` 十轮全部
+  `execution/semantic/postprocess` PASS。
+
+startup 到 FinalDrain 的十次结果为：
+
+```text
+953.852  949.250  943.093  932.885  933.149 us
+943.707  933.897  957.536  945.365  938.186 us
+```
+
+- 最快：`932.885 us`；
+- 中位数：`943.400 us`；
+- 均值：`943.092 us`；
+- 最慢：`957.536 us`；
+- 相对 S8 `1006.521 us` 减少 `63.121 us`，改善 `6.27%`；
+- 相对初始 `2326.268 us` 累计改善 `59.45%`。
+
+目前距 `0.82 ms` 门槛约 `123 us`，距 `0.60 ms` 目标约 `343 us`。
