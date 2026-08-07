@@ -356,12 +356,13 @@ PA_DEVICE bool MakePaExecPayloadSpec(
         context.scalar_count != args.scalar_count) {
         return false;
     }
-    // completion_vend 必须在 Materialize 完成后从 worker.heap_next 取值并
-    // 按值冻结进 payload；executor 完成时不得读取 builder 的 WorkerState。
+    // 非空输出的 completion_vend 在 Materialize 后取本 task 物理区间结束
+    // 地址并按值冻结；零输出 task 固定发布 0。executor 完成时不得读取
+    // builder 的 WorkerState，也不依赖诊断性的全局 heap 累计值。
     spec = ExecPayloadSpec{
         task_id,
         function_address,
-        worker.heap_next,
+        context.output_bytes == 0 ? 0 : worker.heap_next,
         route.function_id,
         static_cast<uint16_t>(args.tensor_count),
         static_cast<uint16_t>(args.scalar_count),

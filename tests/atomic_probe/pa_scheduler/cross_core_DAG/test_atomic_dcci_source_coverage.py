@@ -63,10 +63,9 @@ EXEMPT_MARKER = re.compile(
     r"(pretrace|test-only|aggregate|trace-free)\s*-\s*(\S.*)$"
 )
 
-# 这两个调用是 shared heap 的中央“无观察构建”编译期出口。精确匹配文本
-# 并校验各自只出现一次，防止把整个文件变成不受检查的区域。
+# 这个调用是 shared heap 的中央“无观察构建”编译期出口。精确匹配文本
+# 并校验只出现一次，防止把整个文件变成不受检查的区域。
 SHARED_HEAP_FALLBACKS: Mapping[str, str] = {
-    "Load": "return Ops::Load(address);",
     "FetchAdd": "return Ops::FetchAdd(address, value);",
 }
 
@@ -431,7 +430,7 @@ class AtomicDcciSourceCoverageTest(unittest.TestCase):
         self.assertEqual(
             heap_fallback_counts,
             {operation: 1 for operation in SHARED_HEAP_FALLBACKS},
-            f"pa_shared_heap.h 应且只应保留两个 ObserveAtomics=false 中央 fallback，实际为 {heap_fallback_counts}",
+            f"pa_shared_heap.h 应且只应保留一个 ObserveAtomics=false 中央 fallback，实际为 {heap_fallback_counts}",
         )
         if violations:
             rendered = "\n".join(f"  {call.diagnostic()}" for call in violations)

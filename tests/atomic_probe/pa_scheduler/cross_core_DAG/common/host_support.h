@@ -1098,8 +1098,8 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
             state->shared_map.shared_outputs[task_id].last_writer[slot].value = -1;
         }
     }
-    // shared heap 允许不同 winner 并发推进分片 cursor 与 aggregate vend；
-    // 每轮仍必须从绝对零点开始，不能继承上一轮 sidecar 的终态。
+    // shared heap 允许不同 winner 并发推进分片 cursor。legacy vend 已退出
+    // 运行时协议并作为 canary 保留；每轮都从零初始化，执行后仍须为零。
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
         state->shared_map.shared_heap_cursor[shard].value = 0;
     }
@@ -5584,7 +5584,8 @@ inline Metrics Validate(
 
     // private 按连续逻辑 heap 重建逐 task prefix；shared 只按 task_id%8
     // 重建每个 shard 的最终字节总量。并发 FetchAdd 后，某 task 获得的
-    // task_base 和 aggregate vend prefix 都不再由 task_id 顺序决定。
+    // task_base 不由 task_id 顺序决定；其 completion vend 由最终 descriptor
+    // 反推出 task 物理区间终点，不再依赖全局累计原子。
     uint64_t expected_heap_next = 0;
     bool vend_progress_bounds_ok = true;
     uint32_t first_bad_vend = task_count;
@@ -5690,21 +5691,43 @@ inline Metrics Validate(
     }
     const int64_t raw_shared_vend =
         state.shared_map.shared_heap_vend.value;
-    shared_heap_state_ok &= raw_shared_vend >= 0;
-    const uint64_t actual_shared_vend =
-        raw_shared_vend < 0 ? 0 : static_cast<uint64_t>(raw_shared_vend);
+    // 该 ABI 字段保留给旧布局和故障取证；no-wrap shared allocator 已不再
+    // 用它做运行时进度，正常执行必须保持初始化值 0。
     shared_heap_state_ok &=
-        actual_shared_vend == expected_heap_next &&
-        actual_shared_cursor_sum == actual_shared_vend &&
+        raw_shared_vend == 0 &&
+        actual_shared_cursor_sum == expected_heap_next &&
         expected_shared_cursor_sum == expected_heap_next;
     shared_heap_state_ok &= shared_heap_capacity_ok;
 #endif
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
-        // kernel 可以晚于后续 Submit 完成，故 task vend 可以高于本 task
-        // reserve 后的 prefix。private 使用确定 task-order prefix；shared
-        // 的并发 prefix 只要求覆盖本 task 自身 reserve 且不越过最终 vend。
-        if (state.tasks[task_id].vend < minimum_vends[task_id] ||
-            state.tasks[task_id].vend > expected_heap_next) {
+#if PTO_FDWIC_SHARED_MAP
+        const SharedHostPlannedTask *planned_task =
+            shared_plan.TaskAt(task_id);
+        uint64_t expected_task_vend = 0;
+        if (planned_task != nullptr && planned_task->output_bytes != 0) {
+            const uint64_t first_output_address =
+                state.shared_map.shared_outputs[task_id]
+                    .tensors[0].buffer_addr;
+            if (planned_task->output_bytes <= state.heap_size &&
+                first_output_address >= kSyntheticHeapBase &&
+                first_output_address - kSyntheticHeapBase <=
+                    state.heap_size - planned_task->output_bytes) {
+                expected_task_vend =
+                    first_output_address - kSyntheticHeapBase +
+                    planned_task->output_bytes;
+            }
+        }
+        const bool task_vend_ok =
+            planned_task != nullptr &&
+            state.tasks[task_id].vend == expected_task_vend;
+#else
+        // private ring 的 kernel 可以晚于后续 Submit 完成，故 task vend
+        // 可以高于本 task reserve 后的 prefix，但不能越过最终 cursor。
+        const bool task_vend_ok =
+            state.tasks[task_id].vend >= minimum_vends[task_id] &&
+            state.tasks[task_id].vend <= expected_heap_next;
+#endif
+        if (!task_vend_ok) {
             vend_progress_bounds_ok = false;
             if (first_bad_vend == task_count) {
                 first_bad_vend = task_id;
@@ -5782,7 +5805,7 @@ inline Metrics Validate(
     bool shared_output_heap_layout_ok =
         shared_output_validation.protocol_ok &&
         shared_output_validation.allocated_bytes == expected_heap_next &&
-        shared_output_validation.allocated_bytes == actual_shared_vend;
+        shared_output_validation.allocated_bytes == actual_shared_cursor_sum;
     for (uint32_t shard = 0; shard < kSharedHeapShards; ++shard) {
         const int64_t raw_cursor =
             state.shared_map.shared_heap_cursor[shard].value;
@@ -6003,28 +6026,30 @@ inline Metrics Validate(
             result.materialized_outputs ==
                 alloc_wins * 3 + qk_wins + sf_wins * 3 + pv_wins;
         frontend_worker_counts_ok &= result.map_inserts == 0;
-        // shared 的权威进度是 sidecar cursor/vend。worker.heap_next 只保存
-        // 该 worker 最近一次获胜时观察到的并发 aggregate prefix；不同
-        // winner 的 FetchAdd 顺序不由 task_id 决定，因此不能再拿确定的
-        // task-order prefix 集合核对。未取得有效 ticket 的 worker 仍须为 0。
+        // shared 的权威分配进度是 sidecar shard cursor。worker.heap_next
+        // 只保存该 worker 最近一次非空 reservation 的物理结束偏移；它不
+        // 参与后续分配或依赖协议。未取得有效 ticket 的 worker 仍须为 0。
         const uint64_t nonzero_output_wins =
             alloc_wins + qk_wins + sf_wins + pv_wins;
-        // WorkerResult 只按 kind 聚合 wins，不保存每个动态 group 的
-        // nblocks；对 partial final group 只能重建该 worker 自身 reserve
-        // 的严格下界。全局逐 task output/descriptor/heap cursor 仍由
-        // shared_plan 做精确校验。
-        const uint64_t own_reserved_minimum =
-            alloc_wins * 10240ULL +
-            qk_wins * 8192ULL +
-            sf_wins * 6144ULL +
-            pv_wins * 8192ULL;
+        bool final_heap_snapshot_matches_task =
+            result.final_heap_next == 0;
+        for (uint32_t task_id = 0;
+             !final_heap_snapshot_matches_task &&
+             task_id < task_count; ++task_id) {
+            const SharedHostPlannedTask *planned_task =
+                shared_plan.TaskAt(task_id);
+            final_heap_snapshot_matches_task =
+                planned_task != nullptr &&
+                planned_task->output_bytes != 0 &&
+                state.tasks[task_id].vend == result.final_heap_next;
+        }
         final_worker_state_ok &=
-            result.final_heap_next <= expected_heap_next &&
-            result.final_heap_next >= own_reserved_minimum &&
+            result.final_heap_next <= state.heap_size &&
             (result.final_heap_next == 0 ||
              result.final_heap_next % kOutputAlignment == 0) &&
             (result.claim_wins != 0 || result.final_heap_next == 0) &&
-            (nonzero_output_wins == 0 || result.final_heap_next != 0);
+            (nonzero_output_wins == 0 || result.final_heap_next != 0) &&
+            final_heap_snapshot_matches_task;
 #else
         frontend_worker_counts_ok &= result.context_reads == batches;
         frontend_worker_counts_ok &= result.views_created == static_cast<uint64_t>(batches) * 2;
@@ -6082,7 +6107,8 @@ inline Metrics Validate(
             role_kernel_routing_ok = false;
         }
 #if PTO_FDWIC_SHARED_MAP
-        // shared no-wrap heap 不消费连续 frontier；每核完成只发布 vend/flag。
+        // shared no-wrap heap 不消费连续 frontier；每核完成只发布本 task
+        // 物理区间终点（零输出为 0）和 ready flag。
         // 三个计数必须保持零，防止 private reclaim helping 悄悄回到热路径。
         frontier_worker_counts_ok &=
             result.frontier_initial_loads == 0 &&
@@ -6153,9 +6179,8 @@ inline Metrics Validate(
         // ready flag 和 vend 是跨核 completion 的最终外部可见状态，不能只依赖 worker 私有计数判断完成。
         ready_flags += state.tasks[task_id].flag == 1;
 #if PTO_FDWIC_SHARED_MAP
-        // 无全局 turn 时，零输出 UP 可能在任一非零 reserve 前观察到
-        // aggregate vend=0。shared 不使用该值做 heap reclaim，因此 oracle
-        // 允许 0；有实际 output reserve 的 task 仍必须发布非零 vend。
+        // 零输出 task 的 completion vend 固定为 0；有实际 output reserve
+        // 的 task 发布其物理区间终点，精确值在后续 descriptor oracle 核对。
         const SharedHostPlannedTask *planned_task =
             shared_plan.TaskAt(task_id);
         vend_values_ok &=
@@ -6422,7 +6447,7 @@ inline Metrics Validate(
         vend_progress_bounds_ok,
         kCompiledTensorMapMode == TensorMapBuildMode::Private
             ? "every task vend is within private worker heap progress bounds"
-            : "every task vend is within shared aggregate heap progress bounds",
+            : "every shared task vend matches its own allocated interval end",
         &metrics
     );
 #if PTO_FDWIC_SHARED_MAP
@@ -6598,7 +6623,7 @@ inline Metrics Validate(
 #if PTO_FDWIC_SHARED_MAP
     Expect(
         shared_heap_state_ok,
-        "shared heap cursors, vend sum, and shard capacity are exact",
+        "shared heap cursors and shard capacity are exact; legacy global vend stays zero",
         &metrics
     );
     std::printf(
@@ -6614,7 +6639,7 @@ inline Metrics Validate(
         );
     }
     std::printf(
-        "] cursor_sum=%llu vend=%lld expected_vend=%llu capacity_ok=%u\n",
+        "] cursor_sum=%llu legacy_vend=%lld allocated_bytes=%llu capacity_ok=%u\n",
         static_cast<unsigned long long>(actual_shared_cursor_sum),
         static_cast<long long>(state.shared_map.shared_heap_vend.value),
         static_cast<unsigned long long>(expected_heap_next),

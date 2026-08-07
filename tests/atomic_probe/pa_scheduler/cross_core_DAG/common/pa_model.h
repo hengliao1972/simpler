@@ -1778,7 +1778,8 @@ struct alignas(64) SharedTensorMapSidecar {
     // 现有 shared sidecar H2D/D2H 按 sizeof 搬运。
     SharedOutputCell shared_outputs[kMaxTasks];
     // shared heap 控制字继续追加在 S3.1 output table 之后。每个 shard cursor
-    // 与全局 aggregate vend 独占 cache line，避免不同 winner 的原子更新伪共享。
+    // 独占 cache line。shared_heap_vend 保留既有 ABI 地址作为未使用 canary；
+    // no-wrap allocator 不再为诊断性累计进度争抢该全局 cache line。
     AtomicLine shared_heap_cursor[kSharedHeapShards];
     AtomicLine shared_heap_vend;
     // S4.14a 的 shared-only Vector Claim cursor 追加在既有 sidecar 尾部；

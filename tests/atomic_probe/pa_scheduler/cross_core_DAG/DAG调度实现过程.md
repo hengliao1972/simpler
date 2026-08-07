@@ -1246,3 +1246,93 @@ startup 到 FinalDrain 的十次结果为：
 这是一个通用但幅度很小的热路减法。它不能支撑「继续微调单次
 atomic 即可到达 0.60 ms」的结论，后续仍需降低 Build/Execute 的通用
 非 kernel 工作量或关键路径指令工作集。
+
+## 22. 2026-08-07：S16 去除 shared heap 的诊断性全局 vend 原子
+
+### 22.1 先区分可借鉴的 SIMT 原则与不可照搬的调度形态
+
+本阶段固定使用 B256、`6,28,4,1`、96 workers，并只比较 startup 起点到
+FinalDrain 结束的端到端时间。SIMT 的 `1,1,1,1` 轻负载绝对时间不参与比较。
+
+先验证了两类直接照搬 SIMT 形态的候选，均未保留：
+
+1. **固定 builder 角色，Build 完成后再回归 AIV Execute**：B8/B16 功能闭合，
+   但 Build 尾部和角色负载失衡使完整周期接近 `1 ms`；B32 还触发设备协议
+   fatal。说明 Scalar 当前需要全局动态 Build 均衡，不能长期隔离 builder。
+2. **96 核静态 task 映射，去掉中央 Build ticket**：A5 业务断言虽闭合，
+   但依赖未就绪读取增至 `27,552` 次，FinalDrain 留下 `337` 个 kernel，
+   完整周期退化到 `2034.516 us`。静态映射消除了一个共享 cursor，却同时
+   消除了慢核工作被其他 Scalar 接管的能力。
+
+因此，后续只借鉴 SIMT 中可以独立证明的局部机制，不再把角色布局或轻负载
+数字当作结论。
+
+### 22.2 全局 vend 为什么可以退出运行时协议
+
+原 shared/no-wrap heap 对 1,024 个非空 task 各执行：
+
+```text
+FetchAdd(shard_cursor, bytes)
+FetchAdd(shared_heap_vend, bytes)
+```
+
+256 个零输出 UP 还各执行一次 `Load(shared_heap_vend)`。审计所有消费者后确认：
+
+- 输出地址只由 `task_id % 8` 对应的 shard cursor 返回旧值决定；
+- TensorMap、fanin、Execute ready 和 FinalDrain 都只依赖 descriptor、writer
+  metadata 与逐 task flag；
+- shared 模式明确 no-wrap，不用 task vend 做 heap reclaim；
+- 全局 vend 只用于 host 检查累计分配字节及给 completion payload 填一个诊断值。
+
+这条全地址 `FetchAdd` 因而不是正确性线性化点。S16 将 completion vend 改为
+本 task 物理区间的结束偏移；零输出 task 固定为 0。legacy
+`shared_heap_vend` 保留 ABI 地址并作为 canary，正常执行前后都必须为 0。
+
+该改法删除了每轮：
+
+- `1,024` 次所有 builder 同地址的返回型 `FetchAdd`；
+- `256` 次零输出 task 的返回型 Load。
+
+所属 shard cursor、容量判断、descriptor DCCI、published/last-writer atomic、
+TensorMap 严格 writer 插入链、Execute completion vend/flag 顺序均未改变。
+
+### 22.3 正确性门槛
+
+host 不再用弱化的“vend 位于全局累计范围”判断，而是对每个 task 独立验证：
+
+1. 非空 task 的第一个 output descriptor 地址落在其指定 shard；
+2. `task.vend == descriptor_base + task_output_bytes`；
+3. 零输出 task 的 vend 精确为 0；
+4. 每个 shard 区间连续、无重叠，cursor 等于该 shard 字节总和；
+5. 八个 cursor 的和仍精确等于 `206569472 B`；
+6. legacy 全局 vend 保持 0。
+
+CPU 全量单测通过，覆盖串行/并发 reservation、同 shard 竞争、容量竞态、零输出、
+Materialize、四种真实 PA payload 和 Execute completion。A5 十轮中全部
+`execution/semantic/postprocess` PASS，且上述 host oracle 全部闭合。
+
+### 22.4 同窗口端到端结果
+
+修改前十次：
+
+```text
+790.810  789.400  780.651  789.561  793.115 us
+786.515  787.680  791.986  789.345  779.258 us
+```
+
+修改后十次：
+
+```text
+781.776  780.425  791.447  780.594  786.507 us
+781.471  780.840  782.783  782.086  780.555 us
+```
+
+- 修改前中位数：`789.373 us`；
+- 修改后中位数：`781.623 us`；
+- 中位数减少：`7.749 us`，改善 `0.982%`；
+- 修改后最快/最慢：`780.425 / 791.447 us`；
+- 距 `0.60 ms` 仍约 `181.6 us`。
+
+该结果证明删除诊断性共享状态是有效方向，但也证明单独消减 heap 全局原子
+只能回收约 8 us。下一阶段必须继续找能减少 Build 发布链或 Execute 关键路径
+GM 往返的通用机制，不能把剩余约 182 us 归因给这一条原子。

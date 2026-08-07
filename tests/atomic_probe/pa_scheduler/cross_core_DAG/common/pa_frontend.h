@@ -1756,7 +1756,12 @@ PA_DEVICE bool MaterializeTask(
         return false;
     }
     uint64_t task_base = reservation.task_base;
-    worker.heap_next = reservation.aggregate_vend;
+    // shared/no-wrap 的 completion vend 表示本 task 的物理区间结束地址。
+    // 零输出 task 不覆盖 worker 最近一次有效快照，且其执行 payload 会由
+    // context.output_bytes 明确编码为 0，避免引入无意义的全局 vend Load。
+    if (total != 0) {
+        worker.heap_next = reservation.completion_vend;
+    }
 #else
     uint64_t task_base = FrontendAlignUp(worker.heap_next, kOutputAlignment);
     if (total > heap_size || (total != 0 && heap_base == 0)) {

@@ -156,9 +156,9 @@ void TestValidQkMaterialize() {
         "valid QK advances only shard one"
     );
     Check(
-        fixture.map->shared_heap_vend.value == static_cast<int64_t>(bytes) &&
-            fixture.worker->heap_next == bytes,
-        "valid QK advances and snapshots the aggregate vend"
+        fixture.map->shared_heap_vend.value == 0 &&
+            fixture.worker->heap_next == shard_span + bytes,
+        "valid QK snapshots its physical interval end without global vend"
     );
     Check(
         fixture.context.output_bytes == bytes &&

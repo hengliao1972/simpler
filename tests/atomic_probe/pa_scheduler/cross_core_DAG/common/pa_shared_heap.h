@@ -16,12 +16,14 @@
 
 namespace pa_scheduler {
 
-// shared heap 的首版只验证 PA Case1 当前有界规模，不启用物理区间复用。
-// task_base 是 heap 内的物理偏移；aggregate_vend 只是所有 shard 已分配字节
-// 的全局累计值，不是任一 shard 的地址，也不能代替旧单 ring HeapGuard。
+// shared heap 只分配有界、no-wrap 的物理区间，不启用区间复用。
+// task_base 是 heap 内的物理偏移；completion_vend 是本 task 已分配区间
+// 的物理结束偏移，供跨核 Execute 完成协议携带和 host 精确核验。
+// 分配正确性只依赖所属 shard cursor，不再为诊断性全局累计值额外争抢
+// 一条所有 builder 共用的返回型 atomic。
 struct SharedHeapReservation {
     uint64_t task_base;
-    uint64_t aggregate_vend;
+    uint64_t completion_vend;
 };
 static_assert(sizeof(SharedHeapReservation) == 16, "shared heap reservation ABI changed");
 
@@ -36,24 +38,6 @@ PA_DEVICE bool SharedHeapAligned(uint64_t value) {
 // 单元测试默认实例化 ObserveAtomics=false，保持原有简洁 Ops 接口；真实
 // scheduler 显式选择 true 并传入本 worker 独占 trace/result。trace-free
 // 构建中的 TraceAtomic* 会在编译期退化为原始 Ops，不给性能基线增加分支。
-template <typename Ops, bool ObserveAtomics>
-PA_DEVICE int64_t SharedHeapAtomicLoad(
-    PA_GM volatile int64_t *address, int32_t task_id, AtomicSite site,
-    TraceContext *trace, WorkerResult *result
-) {
-    if constexpr (ObserveAtomics) {
-        return TraceAtomicLoad<Ops>(
-            *trace, *result, task_id, site, address
-        );
-    } else {
-        (void)task_id;
-        (void)site;
-        (void)trace;
-        (void)result;
-        return Ops::Load(address);
-    }
-}
-
 template <typename Ops, bool ObserveAtomics>
 PA_DEVICE int64_t SharedHeapAtomicFetchAdd(
     PA_GM volatile int64_t *address, int64_t value, int32_t task_id,
@@ -88,7 +72,7 @@ PA_DEVICE bool ReserveSharedOutputHeap(
     TraceContext *trace = nullptr, WorkerResult *result = nullptr
 ) {
     reservation.task_base = 0;
-    reservation.aggregate_vend = 0;
+    reservation.completion_vend = 0;
 
     static_assert(kSharedHeapShards == 8, "standalone shared heap must use eight shards");
     static_assert(
@@ -105,28 +89,9 @@ PA_DEVICE bool ReserveSharedOutputHeap(
     }
     const uint64_t shard_span =
         SharedHeapAlignDown(heap_size / kSharedHeapShards);
-    const uint64_t usable_capacity =
-        shard_span * kSharedHeapShards;
-
-    // 零输出 task 仍需要取得当前 aggregate vend，供完成协议发布该 task 的
-    // progress；但它不读取或推进任一 shard cursor，也不要求可用 heap 空间。
+    // shared/no-wrap 模式不使用 task vend 回收 heap。零输出 task 因此不需要
+    // 读取任何全局进度；它发布 completion_vend=0 和 ready flag 即可。
     if (total == 0) {
-        const int64_t observed_vend =
-            SharedHeapAtomicLoad<Ops, ObserveAtomics>(
-                &map.shared_heap_vend.value,
-                static_cast<int32_t>(task_id),
-                AtomicSite::SharedHeapVendLoad, trace, result
-            );
-        if (observed_vend < 0 ||
-            !SharedHeapAligned(
-                static_cast<uint64_t>(observed_vend)
-            ) ||
-            static_cast<uint64_t>(observed_vend) >
-                usable_capacity) {
-            return false;
-        }
-        reservation.aggregate_vend =
-            static_cast<uint64_t>(observed_vend);
         return true;
     }
     if (shard_span == 0) {
@@ -168,26 +133,9 @@ PA_DEVICE bool ReserveSharedOutputHeap(
         return false;
     }
 
-    PA_GM volatile int64_t *vend_address = &map.shared_heap_vend.value;
-    const int64_t observed_vend =
-        SharedHeapAtomicFetchAdd<Ops, ObserveAtomics>(
-            vend_address, static_cast<int64_t>(reserve),
-            static_cast<int32_t>(task_id),
-            AtomicSite::SharedHeapVendAdvance, trace, result
-        );
-    if (observed_vend < 0) {
-        return false;
-    }
-    const uint64_t vend = static_cast<uint64_t>(observed_vend);
-    if (!SharedHeapAligned(vend) ||
-        vend > usable_capacity - reserve ||
-        vend > static_cast<uint64_t>(INT64_MAX) - reserve) {
-        return false;
-    }
-
     reservation.task_base =
         static_cast<uint64_t>(shard) * shard_span + cursor;
-    reservation.aggregate_vend = vend + reserve;
+    reservation.completion_vend = reservation.task_base + reserve;
     return true;
 }
 

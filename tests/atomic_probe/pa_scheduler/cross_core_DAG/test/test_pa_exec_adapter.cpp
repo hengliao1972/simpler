@@ -1027,6 +1027,10 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
 
     CaseFixture fixture{};
     BuildCaseArgs(shape, state, builder, fixture);
+    fixture.context.output_bytes =
+        shape.kind == TaskKind::Up ? 0 : kOutputAlignment;
+    const uint64_t expected_completion_vend =
+        fixture.context.output_bytes == 0 ? 0 : completion_vend;
     PaExecShape contract{};
     Check(
         ResolvePaExecShape(shape.kind, contract) &&
@@ -1133,7 +1137,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
     ExecPayloadLayout expected_layout{};
     Check(
         ValidateExecPayloadSpec(spec, expected_layout) &&
-            spec.completion_vend == completion_vend &&
+            spec.completion_vend == expected_completion_vend &&
             expected_layout.payload_bytes == shape.payload_bytes &&
             expected_layout.payload_lines == shape.payload_lines,
         shape.kind, "payload spec and exact line shape"
@@ -1169,7 +1173,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
     Check(
         PayloadMatches(
             cell.payload, shape, fixture,
-            completion_vend, observed_layout
+            expected_completion_vend, observed_layout
         ),
         shape.kind, "cell carries the exact PA payload"
     );
@@ -1210,7 +1214,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
     );
     Check(
         TokenDispatchMatches(
-            token, shape, fixture, executor, completion_vend
+            token, shape, fixture, executor, expected_completion_vend
         ),
         shape.kind,
         "shared payload pointers and executor-local PA contexts"
