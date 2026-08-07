@@ -269,3 +269,49 @@ route；它们用于随机访问构参和 engine 路由，不提供 DAG 前驱�
 冒充 A5 收益。
 
 CCEC 构建、A5 B1/B256、A5 端到端性能和泳道仍为 `NOT RUN`。
+
+## 6. 2026-08-07：S1 CCEC 双产物闭合
+
+### 6.1 固定环境
+
+- CANN：`9.1.0-weekly-20260708`；
+- PTO-ISA：`ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8`；
+- AIC：`dav-c310-cube`；
+- AIV：`dav-c310-vec`；
+- shared insert-turn identity：`groups=1`；
+- Scalar 自动 DCCI 与 kernel-end DCCI 均关闭，只保留源码显式协议。
+
+### 6.2 构建结果
+
+分别执行：
+
+```bash
+tests/atomic_probe/pa_scheduler/cross_core_DAG/run.sh \
+  build-perf-clock ccec
+tests/atomic_probe/pa_scheduler/cross_core_DAG/run.sh \
+  build ccec
+```
+
+`perf-clock` 与 `swimlane` 两类独立产物均 PASS，覆盖：
+
+- AIC/AIV generic shared protocol 的真实 CCEC 模板实例化；
+- 两种架构各自的 entry、block-local runtime 和 noinline finish；
+- 1:2 mixed AICore ELF；
+- 两个入口及 kernel metadata section；
+- role-specific real-compute helper 非空且不跨角色引用；
+- 最终 ELF 无未解析 relocation；
+- host runner；
+- variant、trace ABI、insert-turn identity 与 SHA256 manifest。
+
+`perf-clock` mixed kernel 约 `2.3 MiB`，`swimlane` mixed kernel 约
+`4.1 MiB`。这里的大小只用于确认两种编译身份确实隔离，不据此推断
+I-cache 或端到端收益。
+
+CCEC 编译日志中的 warning 来自 PTO-ISA 头部的既有未使用变量和 pragma
+兼容提示；构建退出码、链接检查和最终 manifest 均成功，没有把 warning
+误报为错误。
+
+### 6.3 当前边界
+
+本阶段只证明设备源码能以 AIC/AIV 两种架构编译、静态链接并形成可校验
+产物。真实 A5 B1/B256、golden、端到端性能和泳道仍为 `NOT RUN`。
