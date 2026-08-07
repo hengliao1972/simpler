@@ -59,6 +59,34 @@ struct TestSchema {
         tensor.manual_dependency = source.manual_dependency;
         return true;
     }
+
+    bool WriterIntentsAt(uint32_t task_id, SharedDagWriterIntents &intents) const {
+        intents.symbol_count = 0;
+        intents.ordinary_writer = false;
+        if (task_id >= TaskCount()) {
+            return false;
+        }
+        const TestTask &task = tasks[task_id];
+        if (task.tensor_count > task.tensors.size()) {
+            return false;
+        }
+        for (uint32_t index = 0; index < task.tensor_count; ++index) {
+            const TestTensor &tensor = task.tensors[index];
+            if (!IsSharedWriterIntentTag(tensor.access) || tensor.manual_dependency) {
+                continue;
+            }
+            if (tensor.reference_kind == TensorRefKind::SharedOutputRef) {
+                if (intents.symbol_count >= kMaxTaskTensors) {
+                    return false;
+                }
+                intents.symbol_keys[intents.symbol_count++] = tensor.symbol_key;
+            } else if (tensor.reference_kind == TensorRefKind::GmTensor ||
+                       tensor.reference_kind == TensorRefKind::LocalTensor) {
+                intents.ordinary_writer = true;
+            }
+        }
+        return true;
+    }
 };
 
 [[noreturn]] void Fail(const char *message) {

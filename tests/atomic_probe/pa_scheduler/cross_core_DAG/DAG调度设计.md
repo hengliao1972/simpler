@@ -76,6 +76,15 @@ PA adapter 可以根据 `TaskKind` 构造参数并给出每个 tensor 的：
 - ordinary region 描述；
 - engine class、function id 和 payload shape。
 
+adapter 还必须能对任意 task 一次导出最小 writer-intent 集合：
+
+- whole-object symbol key 列表；
+- 是否存在 ordinary writer。
+
+这是 schema adapter 的通用能力，不是 PA 快路：新算子提供自己的
+schema 翻译。公共反向搜索每个 candidate 只取这份 writer 集合，
+不得为待查的每个 symbol 反复重建 candidate 的全部 tensor 参数。
+
 从 writer-intent 生成开始，公共 DAG 代码只消费上述通用信息。调度层不得
 读取 `TaskKind` 或 PA 固定图形。
 
@@ -309,6 +318,7 @@ Scalar 真实负载时间直接相减。
 
 - 成熟 `cross_core`：历史 12 组中位数 `815.937 us`；
 - `cross_core_DAG` 初始基线：10 次中位数 `2326.268 us`；
+- 紧凑 writer-intent adapter 后的阶段值：`1119.226 us`；
 - 第一门槛：DAG 实现必须低于 `0.82 ms`；
 - 最终目标：达到 `0.60 ms`。
 

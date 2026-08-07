@@ -562,3 +562,69 @@ startup 到 FinalDrain 的十次结果为：
 这证明重复 schema GM 解码是一项真实主开销，但当前仍比
 `0.82 ms` 门槛慢约 `1.23 ms`。下一轮继续合并当前 task 的 schema
 Validate 和 DAG 构建，并让后续 writer delta 直接消费一次推导结果。
+
+## 11. 2026-08-07：S6 用紧凑 writer-intent 集合取代 candidate 全参数重建
+
+### 11.1 理论与 SIMT 可复用部分
+
+SIMT 已验证的有效机制不是 PA 固定图形本身，而是：每个 candidate
+一次生成最小 writer intent，反向前驱搜索只比较 symbol，commit 再直接
+消费已求得的 exact predecessor。
+
+Scalar DAG 此前的 `SharedDagTaskHasSymbolWriter()` 对每个待查 symbol
+都执行：
+
+```text
+TensorCount(candidate)
+-> TensorAt(candidate, 0..N)
+-> 再从全部 tensor 里筛 writer
+```
+
+UP 一次 Build 会对多个 input/INOUT symbol 搜索多个 candidate，因而同一
+candidate 的 GM 计划项和全量 tensor schema 被重建多次。
+
+### 11.2 通用改造
+
+新增通用 `SharedDagWriterIntents`，固定容量保存：
+
+- whole-object `symbol_keys[]`；
+- `symbol_count`；
+- `ordinary_writer`。
+
+schema adapter 新增 `WriterIntentsAt(task_id, intents)`：
+
+- PA adapter 可以读取 `TaskKind`，一次把当前 workload schema 翻译成
+  紧凑 writer 集合；
+- 公共 `SharedDagTaskHasSymbolWriter()` 不读 `TaskKind`，只检查 key、
+  producer 边界和同 task 重复 symbol；
+- ordinary 前驱搜索复用同一 adapter 结果；
+- CPU 的任意 schema 模型也实现同一接口，继续覆盖同/异 symbol、
+  重复 writer、future producer 和 ordinary 回退。
+
+这一接口是每个算子 schema adapter 都可以实现的通用合同，公共路径
+没有 PA task-id 间距、固定 batch 形状或特例分支。atomic、DCCI、
+per-symbol CAS 和 TensorMap 顺序均未改动。
+
+### 11.3 校验与性能
+
+- `build-perf-clock cpu` 全量门槛 PASS；
+- AIC/AIV CCEC perf-clock 产物和 manifest PASS；
+- A5 B256、`6,28,4,1` 十轮全部正确。
+
+startup 到 FinalDrain 的十次结果为：
+
+```text
+1131.659  1121.307  1108.034  1131.233  1127.642 us
+1107.674  1111.810  1124.130  1099.495  1117.145 us
+```
+
+- 最快：`1099.495 us`；
+- 中位数：`1119.226 us`；
+- 均值：`1118.013 us`；
+- 最慢：`1131.659 us`；
+- 相对 S5 `2045.065 us` 减少 `925.839 us`，改善 `45.27%`；
+- 相对初始 `2326.268 us` 累计改善 `51.89%`。
+
+结果证明 candidate 全参数重建是当前最大的 DAG 纯 Scalar 开销。目前
+距 `0.82 ms` 门槛约 `299 us`；下一轮将当前 task 的 Validate、
+DAG 分类和 writer-delta 构造合并为一次 `TaskArgs` 扫描。

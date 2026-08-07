@@ -26,6 +26,19 @@ struct SharedDagTensor {
     bool manual_dependency;
 };
 
+// adapter 一次从某个 task 的 schema 中提取最小 writer 集合。
+// 反向寻找前驱只需要这些 symbol key 和 ordinary-writer 标志，
+// 不应为每个待查 symbol 反复重建 candidate 的全量 tensor 列表。
+struct SharedDagWriterIntents {
+    uint32_t symbol_keys[kMaxTaskTensors];
+    uint32_t symbol_count;
+    bool ordinary_writer;
+};
+static_assert(
+    __is_trivially_constructible(SharedDagWriterIntents),
+    "shared DAG writer intents must remain trivial for CCEC local state"
+);
+
 struct SharedMetadataDag {
     uint32_t writer_symbol_keys[kMaxTaskTensors];
     int32_t writer_previous[kMaxTaskTensors];
@@ -72,35 +85,28 @@ PA_DEVICE bool SharedDagTaskHasSymbolWriter(
     bool &has_writer
 ) {
     has_writer = false;
-    uint32_t tensor_count = 0;
-    if (!schema.TensorCount(task_id, tensor_count) ||
-        tensor_count > kMaxTaskTensors) {
+    SharedDagWriterIntents intents{};
+    if (!schema.WriterIntentsAt(task_id, intents) ||
+        intents.symbol_count > kMaxTaskTensors) {
         return false;
     }
-    for (uint32_t index = 0; index < tensor_count; ++index) {
-        SharedDagTensor tensor{};
-        if (!schema.TensorAt(task_id, index, tensor)) {
-            return false;
-        }
-        if (!IsSharedWriterIntentTag(tensor.access) ||
-            tensor.reference_kind != TensorRefKind::SharedOutputRef) {
-            continue;
-        }
+    for (uint32_t index = 0; index < intents.symbol_count; ++index) {
+        const uint32_t symbol_key = intents.symbol_keys[index];
         const FdwicOutputRef output_ref =
-            SharedSymbolHistoryReference(tensor.symbol_key);
+            SharedSymbolHistoryReference(symbol_key);
         if (!IsPlainSharedOutputRef(output_ref) ||
             output_ref.producer_task_id < 0 ||
             output_ref.producer_task_id >=
                 static_cast<int32_t>(task_id)) {
             return false;
         }
-        if (tensor.symbol_key != expected_key) {
-            continue;
+        for (uint32_t earlier = 0; earlier < index; ++earlier) {
+            if (intents.symbol_keys[earlier] == symbol_key) {
+                return false;
+            }
         }
-        if (has_writer) {
-            // 同一 task 对同一 symbol 发布两次会让第二次 CAS 把本 task
-            // 自己当成 expected-old，必须在任何共享状态修改前拒绝。
-            return false;
+        if (symbol_key != expected_key) {
+            continue;
         }
         has_writer = true;
     }
@@ -143,26 +149,12 @@ template <typename Schema>
 PA_DEVICE bool SharedDagTaskHasOrdinaryWriter(
     const Schema &schema, uint32_t task_id, bool &has_writer
 ) {
-    has_writer = false;
-    uint32_t tensor_count = 0;
-    if (!schema.TensorCount(task_id, tensor_count) ||
-        tensor_count > kMaxTaskTensors) {
+    SharedDagWriterIntents intents{};
+    if (!schema.WriterIntentsAt(task_id, intents) ||
+        intents.symbol_count > kMaxTaskTensors) {
         return false;
     }
-    for (uint32_t index = 0; index < tensor_count; ++index) {
-        SharedDagTensor tensor{};
-        if (!schema.TensorAt(task_id, index, tensor)) {
-            return false;
-        }
-        if (!IsSharedWriterIntentTag(tensor.access) ||
-            tensor.manual_dependency) {
-            continue;
-        }
-        if (tensor.reference_kind == TensorRefKind::GmTensor ||
-            tensor.reference_kind == TensorRefKind::LocalTensor) {
-            has_writer = true;
-        }
-    }
+    has_writer = intents.ordinary_writer;
     return true;
 }
 
@@ -423,6 +415,39 @@ struct SharedPaDagSchema {
         tensor.reference_kind = TensorRefKind::SharedOutputRef;
         tensor.symbol_key = producer * kSharedOutputMaxPerTask +
             output_slot + 1U;
+        return true;
+    }
+
+    PA_DEVICE bool WriterIntentsAt(
+        uint32_t task_id, SharedDagWriterIntents &intents
+    ) const {
+        intents.symbol_count = 0;
+        intents.ordinary_writer = false;
+        SharedBuildDispatchTask task{};
+        if (dispatch == nullptr ||
+            !DecodeSharedBuildDispatchTask(
+                *dispatch, task_id, task
+            )) {
+            return false;
+        }
+        if (task.meta.kind != TaskKind::Up) {
+            return true;
+        }
+
+        // PA adapter 只在这里把 UP schema 翻译成三个 INOUT
+        // symbol。通用前驱算法不读 TaskKind，也不知道固定
+        // task 间距。顺序与 TaskArgs 中 UP tensor[3..5] 一致。
+        const uint32_t producer = task.meta.batch_start;
+        if (producer >= task_id) {
+            return false;
+        }
+        intents.symbol_count = 3;
+        intents.symbol_keys[0] =
+            producer * kSharedOutputMaxPerTask + 3U;
+        intents.symbol_keys[1] =
+            producer * kSharedOutputMaxPerTask + 2U;
+        intents.symbol_keys[2] =
+            producer * kSharedOutputMaxPerTask + 1U;
         return true;
     }
 };
