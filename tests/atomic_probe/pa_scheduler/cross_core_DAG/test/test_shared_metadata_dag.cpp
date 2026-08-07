@@ -159,6 +159,8 @@ void TestSameSymbolUsesExactLogicalPredecessor(const TestSchema &schema) {
     Require(BuildSharedMetadataDag(schema, 5, dag), "task 5 DAG must build");
     Require(dag.prepared_task_id == 5, "task 5 DAG identity must be retained");
     Require(dag.writer_count == 1, "task 5 must publish exactly one symbol");
+    Require(dag.writer_tensor_mask == 1,
+            "task 5 writer tensor mask must retain its INOUT slot");
     Require(dag.writer_symbol_keys[0] == SymbolKey(0, 0), "task 5 writer symbol mismatch");
     Require(dag.writer_previous[0] == 2, "task 5 symbol A must follow task 2, not unrelated task 3");
     Require(dag.dependency_count == 2, "task 5 must wait for its two exact symbol predecessors");
@@ -189,6 +191,8 @@ void TestReadOnlyTaskWaitsForLatestEarlierWriter(const TestSchema &schema) {
     SharedMetadataDag dag{};
     Require(BuildSharedMetadataDag(schema, 4, dag), "read-only task 4 DAG must build");
     Require(dag.writer_count == 0, "read-only task must not publish metadata");
+    Require(dag.writer_tensor_mask == 0,
+            "read-only task must not retain writer tensor bits");
     Require(dag.dependency_count == 1 && dag.dependencies[0] == 2, "read-only task must wait for latest symbol A writer");
 }
 
@@ -201,6 +205,8 @@ void TestOrdinaryFallbackUsesOnlyOrdinaryWriterChain(const TestSchema &schema) {
 
     Require(BuildSharedMetadataDag(schema, 10, dag), "ordinary writer DAG must build");
     Require(dag.ordinary_writer && dag.ordinary_previous_writer == 7, "ordinary writer must retain conservative predecessor");
+    Require(dag.writer_tensor_mask == 1,
+            "ordinary writer DAG must retain its materialized tensor bit");
     Require(dag.dependency_count == 1 && dag.dependencies[0] == 7, "ordinary writer dependency mismatch");
 }
 

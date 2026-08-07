@@ -432,6 +432,34 @@ bool CheckG1DynamicDagClassification() {
                 dag.ordinary_previous_writer != -1) {
                 return false;
             }
+            SubmitContext delta_context{};
+            delta_context.task_id = static_cast<int32_t>(task_id);
+            delta_context.won = true;
+            delta_context.result.task_id = task_id;
+            delta_context.shared_result.Reset(
+                static_cast<int32_t>(task_id)
+            );
+            for (int32_t tensor = 0;
+                 tensor < args.tensor_count; ++tensor) {
+                if (IsSharedWriterIntentTag(
+                        TaskTag(
+                            args, static_cast<uint32_t>(tensor)
+                        )
+                    )) {
+                    delta_context.register_mask |=
+                        uint32_t{1} << static_cast<uint32_t>(tensor);
+                }
+            }
+            SharedTaskWriterDelta writer_delta{};
+            if (!FinalizeSharedTaskWriterDeltaFromDag(
+                    args, delta_context, dag, writer_delta
+                ) ||
+                writer_delta.ordinary_count != 0 ||
+                writer_delta.symbol_count != dag.writer_count ||
+                writer_delta.writer_intent_required !=
+                    (planned.kind == TaskKind::Up)) {
+                return false;
+            }
             if (dag.writer_count != 0) {
                 ++writers_by_kind[
                     static_cast<uint32_t>(planned.kind)

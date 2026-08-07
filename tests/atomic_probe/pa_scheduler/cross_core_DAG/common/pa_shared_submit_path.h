@@ -47,6 +47,7 @@ struct SharedMetadataDag {
     uint32_t writer_count;
     uint32_t dependency_count;
     int32_t ordinary_previous_writer;
+    uint32_t writer_tensor_mask;
     bool ordinary_writer;
     bool ordinary_dependency_required;
 };
@@ -189,6 +190,7 @@ PA_DEVICE bool BuildSharedMetadataDag(
     dag.writer_count = 0;
     dag.dependency_count = 0;
     dag.ordinary_previous_writer = -1;
+    dag.writer_tensor_mask = 0;
     dag.ordinary_writer = false;
     dag.ordinary_dependency_required = false;
     const uint32_t task_count = schema.TaskCount();
@@ -204,6 +206,9 @@ PA_DEVICE bool BuildSharedMetadataDag(
         SharedDagTensor tensor{};
         if (!schema.TensorAt(task_id, index, tensor)) {
             return false;
+        }
+        if (IsSharedWriterIntentTag(tensor.access)) {
+            dag.writer_tensor_mask |= uint32_t{1} << index;
         }
         if (tensor.reference_kind == TensorRefKind::SharedOutputRef) {
             if (!SharedDagAccessReadsExistingValue(tensor.access)) {
@@ -661,6 +666,40 @@ static_assert(
     "prepared bucket and ordinal metadata no longer cover the build"
 );
 
+template <typename Tensor>
+PA_DEVICE bool AppendSharedOrdinaryWriterDelta(
+    const Tensor &tensor, int32_t task_id,
+    SharedTaskWriterDelta &delta
+) {
+    if (tensor.manual_dep) {
+        return true;
+    }
+    if (delta.ordinary_count >= kMaxTaskTensors ||
+        !MakeValidatedSharedWriterRegion(
+            tensor, task_id,
+            delta.ordinary_entries[delta.ordinary_count]
+        ) ||
+        !ValidateOrdinarySharedWriterOwner(tensor, task_id)) {
+        return false;
+    }
+    const uint32_t bucket = TensorMapHash(
+        delta.ordinary_entries[delta.ordinary_count].buffer_addr
+    );
+    uint32_t ordinal = 0;
+    for (uint32_t previous = 0;
+         previous < delta.ordinary_count; ++previous) {
+        ordinal += delta.ordinary_buckets[previous] == bucket
+            ? 1U
+            : 0U;
+    }
+    delta.ordinary_buckets[delta.ordinary_count] =
+        static_cast<uint16_t>(bucket);
+    delta.ordinary_bucket_ordinals[delta.ordinary_count] =
+        static_cast<uint8_t>(ordinal);
+    ++delta.ordinary_count;
+    return true;
+}
+
 PA_DEVICE bool PrepareSharedTaskWriterDelta(
     const TaskArgs &args, const SubmitContext &context,
     SharedTaskWriterDelta &delta,
@@ -744,84 +783,22 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
             if (reference.pointer.gm_tensor == nullptr) {
                 return false;
             }
-            PA_GM const TensorDesc &tensor =
-                *reference.pointer.gm_tensor;
-            if (!tensor.manual_dep) {
-                if (delta.ordinary_count >= kMaxTaskTensors ||
-                    !MakeValidatedSharedWriterRegion(
-                        tensor, task_id,
-                        delta.ordinary_entries[
-                            delta.ordinary_count
-                        ]
-                    ) ||
-                    !ValidateOrdinarySharedWriterOwner(
-                        tensor, task_id
-                    )) {
-                    return false;
-                }
-                const uint32_t bucket = TensorMapHash(
-                    delta.ordinary_entries[
-                        delta.ordinary_count
-                    ].buffer_addr
-                );
-                uint32_t ordinal = 0;
-                for (uint32_t previous = 0;
-                     previous < delta.ordinary_count;
-                     ++previous) {
-                    ordinal +=
-                        delta.ordinary_buckets[previous] == bucket
-                            ? 1U
-                            : 0U;
-                }
-                delta.ordinary_buckets[
-                    delta.ordinary_count
-                ] = static_cast<uint16_t>(bucket);
-                delta.ordinary_bucket_ordinals[
-                    delta.ordinary_count
-                ] = static_cast<uint8_t>(ordinal);
-                ++delta.ordinary_count;
+            if (!AppendSharedOrdinaryWriterDelta(
+                    *reference.pointer.gm_tensor,
+                    task_id, delta
+                )) {
+                return false;
             }
         } else if (reference.kind ==
                    TensorRefKind::LocalTensor) {
             if (reference.pointer.local_tensor == nullptr) {
                 return false;
             }
-            const TensorDesc &tensor =
-                *reference.pointer.local_tensor;
-            if (!tensor.manual_dep) {
-                if (delta.ordinary_count >= kMaxTaskTensors ||
-                    !MakeValidatedSharedWriterRegion(
-                        tensor, task_id,
-                        delta.ordinary_entries[
-                            delta.ordinary_count
-                        ]
-                    ) ||
-                    !ValidateOrdinarySharedWriterOwner(
-                        tensor, task_id
-                    )) {
-                    return false;
-                }
-                const uint32_t bucket = TensorMapHash(
-                    delta.ordinary_entries[
-                        delta.ordinary_count
-                    ].buffer_addr
-                );
-                uint32_t ordinal = 0;
-                for (uint32_t previous = 0;
-                     previous < delta.ordinary_count;
-                     ++previous) {
-                    ordinal +=
-                        delta.ordinary_buckets[previous] == bucket
-                            ? 1U
-                            : 0U;
-                }
-                delta.ordinary_buckets[
-                    delta.ordinary_count
-                ] = static_cast<uint16_t>(bucket);
-                delta.ordinary_bucket_ordinals[
-                    delta.ordinary_count
-                ] = static_cast<uint8_t>(ordinal);
-                ++delta.ordinary_count;
+            if (!AppendSharedOrdinaryWriterDelta(
+                    *reference.pointer.local_tensor,
+                    task_id, delta
+                )) {
+                return false;
             }
         } else {
             return false;
@@ -841,6 +818,100 @@ PA_DEVICE bool PrepareSharedTaskWriterDelta(
     delta.writer_intent_required = writer_required;
     if (classify_metadata_prefix && writer_required) {
         delta.metadata_prefix_required = true;
+    }
+    delta.prepared_task_id = task_id;
+    return true;
+}
+
+PA_DEVICE_NOINLINE bool FinalizeSharedOrdinaryWriterDeltaFromDag(
+    const TaskArgs &args, const SubmitContext &context,
+    const SharedMetadataDag &dag, SharedTaskWriterDelta &delta
+) {
+    uint32_t observed_symbol_writers = 0;
+    for (int32_t index = 0; index < args.tensor_count; ++index) {
+        const uint32_t bit = uint32_t{1} <<
+            static_cast<uint32_t>(index);
+        if ((context.register_mask & bit) == 0) {
+            continue;
+        }
+        const TaskTensorRef &reference = args.tensors[index];
+        if (reference.kind == TensorRefKind::SharedOutputRef) {
+            ++observed_symbol_writers;
+            continue;
+        }
+        if (reference.kind == TensorRefKind::GmTensor) {
+            if (reference.pointer.gm_tensor == nullptr ||
+                !AppendSharedOrdinaryWriterDelta(
+                    *reference.pointer.gm_tensor,
+                    context.task_id, delta
+                )) {
+                return false;
+            }
+            continue;
+        }
+        if (reference.kind == TensorRefKind::LocalTensor) {
+            if (reference.pointer.local_tensor == nullptr ||
+                !AppendSharedOrdinaryWriterDelta(
+                    *reference.pointer.local_tensor,
+                    context.task_id, delta
+                )) {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+    return observed_symbol_writers == dag.writer_count &&
+        delta.ordinary_count != 0;
+}
+
+// DAG 已在 Materialize 前从同一份 const TaskArgs 完成
+// writer 分类。Materialize 后只需用 register_mask 证明
+// descriptor 实例与该计划一致，symbol writer 直接
+// 消费 DAG 结果；只有 ordinary writer 才调用隔离的
+// noinline 回退，读取 Materialize 后的 TensorDesc 构造 region。
+PA_DEVICE bool FinalizeSharedTaskWriterDeltaFromDag(
+    const TaskArgs &args, const SubmitContext &context,
+    const SharedMetadataDag &dag, SharedTaskWriterDelta &delta
+) {
+    delta.prepared_task_id = -1;
+    delta.ordinary_count = 0;
+    delta.symbol_count = 0;
+    delta.writer_intent_required = false;
+    delta.metadata_prefix_required = false;
+    const int32_t task_id = context.task_id;
+    if (!context.won || task_id < 0 ||
+        task_id >= static_cast<int32_t>(kMaxTasks) ||
+        args.has_error || args.tensor_count < 0 ||
+        args.tensor_count > static_cast<int32_t>(kMaxTaskTensors) ||
+        context.result.task_id != static_cast<uint64_t>(task_id) ||
+        context.result.count > kSharedOutputMaxPerTask ||
+        dag.prepared_task_id != task_id ||
+        dag.writer_count > kMaxTaskTensors ||
+        context.register_mask != dag.writer_tensor_mask ||
+        (args.tensor_count < static_cast<int32_t>(kMaxTaskTensors) &&
+         (context.register_mask >>
+             static_cast<uint32_t>(args.tensor_count)) != 0)) {
+        return false;
+    }
+
+    for (uint32_t writer = 0; writer < dag.writer_count; ++writer) {
+        delta.symbol_keys[writer] = dag.writer_symbol_keys[writer];
+    }
+    delta.symbol_count = dag.writer_count;
+
+    if (dag.ordinary_writer &&
+        !FinalizeSharedOrdinaryWriterDeltaFromDag(
+            args, context, dag, delta
+        )) {
+        return false;
+    }
+
+    delta.writer_intent_required =
+        delta.symbol_count != 0 || delta.ordinary_count != 0;
+    if (delta.writer_intent_required !=
+        (dag.writer_count != 0 || dag.ordinary_writer)) {
+        return false;
     }
     delta.prepared_task_id = task_id;
     return true;
@@ -1467,21 +1538,9 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         return false;
     }
     SharedTaskWriterDelta writer_delta{};
-    bool writer_delta_matches_dag =
-        PrepareSharedTaskWriterDelta(
-            args, context, writer_delta
-        ) &&
-        writer_delta.symbol_count == metadata_dag.writer_count &&
-        (writer_delta.ordinary_count != 0) ==
-            metadata_dag.ordinary_writer;
-    for (uint32_t index = 0;
-         writer_delta_matches_dag &&
-         index < writer_delta.symbol_count; ++index) {
-        writer_delta_matches_dag =
-            writer_delta.symbol_keys[index] ==
-                metadata_dag.writer_symbol_keys[index];
-    }
-    if (!writer_delta_matches_dag) {
+    if (!FinalizeSharedTaskWriterDeltaFromDag(
+            args, context, metadata_dag, writer_delta
+        )) {
         RollbackSharedTaskOutputs<Ops>(
             state->shared_map.shared_outputs[task_id],
             expected_output_count,

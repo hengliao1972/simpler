@@ -1218,6 +1218,36 @@ void TestWriterDeltaRequiresExactRegisterMask() {
         "writer delta freezes task identity, writer counts, buckets and symbol keys"
     );
 
+    SharedMetadataDag prepared_dag{};
+    prepared_dag.prepared_task_id = context.task_id;
+    prepared_dag.writer_symbol_keys[0] = 1;
+    prepared_dag.writer_count = 1;
+    prepared_dag.writer_tensor_mask = 3;
+    prepared_dag.ordinary_writer = true;
+    SharedTaskWriterDelta dag_delta{};
+    Check(
+        FinalizeSharedTaskWriterDeltaFromDag(
+            args, context, prepared_dag, dag_delta
+        ) &&
+            dag_delta.prepared_task_id == context.task_id &&
+            dag_delta.ordinary_count == 1 &&
+            dag_delta.symbol_count == 1 &&
+            dag_delta.symbol_keys[0] == 1 &&
+            dag_delta.ordinary_buckets[0] ==
+                TensorMapHash(tensor.buffer_addr) &&
+            dag_delta.writer_intent_required,
+        "DAG finalizer reuses symbol intent and materializes only the ordinary fallback"
+    );
+    const uint32_t exact_mask = context.register_mask;
+    context.register_mask = 1;
+    Check(
+        !FinalizeSharedTaskWriterDeltaFromDag(
+            args, context, prepared_dag, dag_delta
+        ),
+        "DAG finalizer rejects a Materialize register-mask mismatch"
+    );
+    context.register_mask = exact_mask;
+
     TaskArgs duplicate_args;
     ConstructTaskArgs(duplicate_args);
     AddOutputHandleTensor(

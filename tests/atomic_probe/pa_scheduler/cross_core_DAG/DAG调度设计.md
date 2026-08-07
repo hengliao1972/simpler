@@ -95,6 +95,12 @@ adapter 对历史 candidate 的稳定合同，必须与该 adapter 生成的
 从 writer-intent 生成开始，公共 DAG 代码只消费上述通用信息。调度层不得
 读取 `TaskKind` 或 PA 固定图形。
 
+DAG 在首次遍历当前 `TaskArgs` 时同时保留 writer tensor mask
+和 symbol key。Materialize 后先以实际 `register_mask` 核对该计划：
+若没有 ordinary writer，writer delta 直接消费 DAG 结果，不得第二次
+扫描整份 `TaskArgs`；只有 ordinary region/view/alias writer 才进入隔离的
+保守回退，读取 Materialize 后 TensorDesc 构造 region。
+
 ### 3.2 Writer intent
 
 只有满足以下条件的 tensor 才形成 whole-object writer intent：
@@ -329,6 +335,7 @@ Scalar 真实负载时间直接相减。
 - 当前 TaskArgs 直接构 DAG 后的阶段值：`1108.832 us`；
 - 历史 writer intent 最小投影解码后：`1006.521 us`；
 - 无 writer candidate 快速拒绝后：`943.400 us`；
+- DAG 结果直接生成 writer delta 后：`932.310 us`；
 - 第一门槛：DAG 实现必须低于 `0.82 ms`；
 - 最终目标：达到 `0.60 ms`。
 

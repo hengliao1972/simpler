@@ -811,3 +811,77 @@ startup 到 FinalDrain 的十次结果为：
 - 相对初始 `2326.268 us` 累计改善 `59.45%`。
 
 目前距 `0.82 ms` 门槛约 `123 us`，距 `0.60 ms` 目标约 `343 us`。
+
+### 15.3 无明确收益的 immutable header 快照
+
+后续候选将 `task_count/batch_count` 在构造 schema 时读入 8B 本地
+快照，避免每个 candidate 重读 dispatch header。CPU/CCEC 门槛和
+A5 正确性均 PASS，但十轮中位数仅从 `943.400 us` 变为
+`942.356 us`，差值 `1.044 us / 0.11%` 小于波动，不足以证明收益。
+该候选已完整撤回，不增加 schema 本地状态。
+
+## 16. 2026-08-07：S10 DAG 推导结果直接生成 writer delta
+
+### 16.1 重复工作
+
+S9 后当前 task 的 DAG 已经从真实 `TaskArgs` 得到：
+
+- writer symbol key；
+- ordinary writer 分类；
+- exact predecessor 与 fanin；
+- 同 task 内重复 symbol 和引用合法性结论。
+
+但 Materialize 后仍调用 `PrepareSharedTaskWriterDelta()` 第二次遍历
+整份 1,280B `TaskArgs`，重新计算 symbol key、重复检查和 writer
+分类，再逐 key 与 DAG 比较。这些工作对 symbol-only 路径没有新的
+正确性证明。
+
+### 16.2 通用 derive-once 改造
+
+`SharedMetadataDag` 新增 `writer_tensor_mask`，首次 DAG 遍历同时记录
+所有 `Inout/OutputExisting` tensor 位。Materialize 后的新流程为：
+
+```text
+actual register_mask == DAG writer_tensor_mask
+-> symbol keys 直接从 DAG 复制到 writer delta
+-> ordinary_writer == false: 立即完成
+-> ordinary_writer == true:
+     进入 noinline 保守回退
+     只为真实 ordinary writer 读 TensorDesc/构造 region
+```
+
+旧 `PrepareSharedTaskWriterDelta()` 和它的独立通用门槛保留；生产
+DAG 路径使用 `FinalizeSharedTaskWriterDeltaFromDag()`。ordinary 的
+GM/local address-space 由模板引用保留，不把 `__gm__ TensorDesc`
+强制转成 local 引用。
+
+首版把 ordinary 循环内联进热路后，前五次中位数约 `949 us`，
+未取得收益。将它隔离为 noinline 回退后，symbol-only 主路不再
+承担该代码形态，才获得下述稳定改善。
+
+### 16.3 门槛与性能
+
+新增/加强的 CPU 证据包括：
+
+- 动态 DAG 保留 writer tensor mask；
+- PA 随机访问构参的 symbol-only delta 与 DAG 一致；
+- ordinary + symbol 混合回退仍构造正确 bucket/region；
+- Materialize register mask 与 DAG 不一致时 fail closed。
+
+CPU perf-clock 全量门槛、AIC/AIV CCEC、mixed ELF、ABI、强符号、
+无 relocation 和 manifest 全部 PASS。A5 B256、`6,28,4,1` 十轮
+`execution/semantic/postprocess` 全部 PASS：
+
+```text
+931.088  922.405  923.536  942.034  929.284 us
+978.265  935.013  933.532  920.605  944.017 us
+```
+
+- 最快：`920.605 us`；
+- 中位数：`932.310 us`；
+- 均值：`935.978 us`；
+- 最慢：`978.265 us`；
+- 相对 S9 `943.400 us` 减少 `11.090 us`，改善 `1.18%`；
+- 相对初始 `2326.268 us` 累计改善 `59.92%`。
+
+目前距 `0.82 ms` 门槛约 `112 us`，距 `0.60 ms` 目标约 `332 us`。
