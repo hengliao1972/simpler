@@ -287,27 +287,30 @@ cross_core_DAG/
 
 每个阶段完成后更新过程文档并独立提交。未经用户明确授权不得 push。
 
-## 10. 性能与公平比较口径
+## 10. 性能口径与目标
 
-唯一裁决指标为同一 PA、同一 kernel 负载、B256、10 次运行的：
+唯一裁决指标为同一 PA、默认真实计算负载
+`QK/SF/PV/UP=6,28,4,1`、B256、10 次运行的：
 
 ```text
 最早 startup timestamp -> 最后 FinalDrain timestamp
 ```
 
-两种实现都用 A5 跨核共享的 1 ns `get_sys_cnt()` 取设备内边界：Scalar
-复用 `WorkerResult::submit_begin/finish_cycle`，SIMT 复用
-`FullPaRoleResult::reserved[2:3]`。SIMT 的 ACL kernel event 与 builder
-包络仍作为辅助量，不得替代上述端到端指标。
+A5 跨核共享的 1 ns `get_sys_cnt()` 取设备内边界，Scalar 复用
+`WorkerResult::submit_begin/finish_cycle`。ACL kernel event、Build 包络和泳道时间
+只用于解释，不得替代上述端到端指标。
 
-截至 2026-08-07，同负载 SIMT B32/W4 的 10/10 PASS 基准为：
+现有 SIMT B32/W4 产物将 workload 固定为 `1,1,1,1`，而下列
+Scalar 基线使用 `6,28,4,1`。因此 SIMT 的约 `0.39 ms` 只能用来
+查证“per-symbol 前驱一次推导、后续直接消费”等机制，不得与
+Scalar 真实负载时间直接相减。
 
-- startup 到 root FinalDrain 结束中位数：`394.563 us`；
-- ACL kernel event 中位数：`422.813 us`；
-- builder 包络中位数：`343.760 us`。
+默认真实负载的权威参考线为：
 
-Scalar DAG 当前中位数为 `2326.268 us`，约为 SIMT 同口径的 `5.90` 倍；
-后续优化只以 `394.563 us` 这条设备内完整周期基线判断是否持平。
+- 成熟 `cross_core`：历史 12 组中位数 `815.937 us`；
+- `cross_core_DAG` 初始基线：10 次中位数 `2326.268 us`；
+- 第一门槛：DAG 实现必须低于 `0.82 ms`；
+- 最终目标：达到 `0.60 ms`。
 
 辅助指标不作为第二套性能结论，只解释端到端差异：
 

@@ -291,21 +291,10 @@ PA_DEVICE bool BuildSharedMetadataDag(
 struct SharedPaDagSchema {
     PA_GM const SharedBuildDispatchState *dispatch;
 
-    PA_DEVICE uint32_t TaskCount() const {
-        return dispatch == nullptr ? 0U : dispatch->task_count;
-    }
-
-    PA_DEVICE bool TensorCount(
-        uint32_t task_id, uint32_t &tensor_count
-    ) const {
-        SharedBuildDispatchTask task{};
-        if (dispatch == nullptr ||
-            !DecodeSharedBuildDispatchTask(
-                *dispatch, task_id, task
-            )) {
-            return false;
-        }
-        switch (task.meta.kind) {
+    PA_DEVICE static bool TensorCountForKind(
+        TaskKind kind, uint32_t &tensor_count
+    ) {
+        switch (kind) {
             case TaskKind::Alloc:
                 tensor_count = 3;
                 return true;
@@ -323,6 +312,23 @@ struct SharedPaDagSchema {
         return false;
     }
 
+    PA_DEVICE uint32_t TaskCount() const {
+        return dispatch == nullptr ? 0U : dispatch->task_count;
+    }
+
+    PA_DEVICE bool TensorCount(
+        uint32_t task_id, uint32_t &tensor_count
+    ) const {
+        SharedBuildDispatchTask task{};
+        if (dispatch == nullptr ||
+            !DecodeSharedBuildDispatchTask(
+                *dispatch, task_id, task
+            )) {
+            return false;
+        }
+        return TensorCountForKind(task.meta.kind, tensor_count);
+    }
+
     PA_DEVICE bool TensorAt(
         uint32_t task_id, uint32_t tensor_index,
         SharedDagTensor &tensor
@@ -333,7 +339,9 @@ struct SharedPaDagSchema {
             !DecodeSharedBuildDispatchTask(
                 *dispatch, task_id, task
             ) ||
-            !TensorCount(task_id, tensor_count) ||
+            // task 已在本调用中从 GM 计划项完整解码。直接消费其 kind，
+            // 不能再经 TensorCount() 对同一 task 做第二次 GM 解码。
+            !TensorCountForKind(task.meta.kind, tensor_count) ||
             tensor_index >= tensor_count) {
             return false;
         }

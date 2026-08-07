@@ -506,3 +506,59 @@ kernel、8 路 heap、per-symbol DAG、payload、golden 和 FinalDrain。
 完整周期反而约为 `0.395 ms`。Scalar DAG 当前 `2326.268 us` 比它多
 `1931.705 us`，约慢 `5.90` 倍。下一阶段不再讨论口径，直接以这条 W4
 基线拆解并优化 Scalar 关键路径。
+
+## 10. 2026-08-07：S5 去除 `TensorAt` 内部重复 GM 解码
+
+### 10.1 先修正性能裁决口径
+
+复查 host 初始化后确认，SIMT B32/W4 将 QK/SF/PV/UP 的完整
+128x128 计算流水重复次数固定为 `1,1,1,1`；Scalar 约 `0.82 ms`
+和 DAG 约 `2.33 ms` 基线使用默认 `6,28,4,1`。前者不再作为后者
+的绝对性能裁决线，只借鉴 SIMT 已验证的 DAG 数据流和并行构建
+机制。后续统一使用 B256、`6,28,4,1`、startup 到 FinalDrain 的
+10 次中位数裁决候选；先低于成熟 `cross_core` 的约 `0.82 ms`，
+再向 `0.60 ms` 收敛。
+
+### 10.2 根因与修改
+
+`SharedPaDagSchema::TensorAt()` 已经通过
+`DecodeSharedBuildDispatchTask()` 从 GM 计划项得到 `TaskKind`，却又调用
+`TensorCount()` 对同一 task 完整解码第二次。这不仅发生于当前
+task 的 Validate/Build，也会放大每次反向搜索 candidate writer 的 GM
+访问。
+
+本轮只做一项机械消减：
+
+- 新增纯 `TaskKind -> tensor_count` 的 `TensorCountForKind()`；
+- `TensorCount()` 仍独立解码并保留原有 fail-closed 校验；
+- `TensorAt()` 直接消费本调用已解码的 `task.meta.kind`，不再读取
+  第二次 GM 计划项。
+
+本轮没有改动 per-symbol 前驱算法、writer 数量、atomic、DCCI、
+TensorMap 顺序或 Execute 调度。
+
+### 10.3 校验与性能
+
+- `build-perf-clock cpu` 全量门槛 PASS，包括动态 DAG、乱序 Build、
+  ordinary 回退、writer intent、execution payload 和 FinalDrain；
+- AIC/AIV `build-perf-clock ccec` PASS，mixed ELF、ABI、强符号、无 relocation
+  和 manifest 全部闭合；
+- A5 B256 默认真计算 10/10 `execution/semantic/postprocess` PASS。
+
+startup 到 FinalDrain 的十次结果为：
+
+```text
+2025.531  2052.315  2041.195  2057.606  2034.688 us
+2020.123  2068.275  2048.935  2025.603  2066.209 us
+```
+
+- 最快：`2020.123 us`；
+- 中位数：`2045.065 us`；
+- 均值：`2044.048 us`；
+- 最慢：`2068.275 us`；
+- 相对 S2 的 `2326.268 us` 中位数减少 `281.203 us`，改善
+  `12.09%`。
+
+这证明重复 schema GM 解码是一项真实主开销，但当前仍比
+`0.82 ms` 门槛慢约 `1.23 ms`。下一轮继续合并当前 task 的 schema
+Validate 和 DAG 构建，并让后续 writer delta 直接消费一次推导结果。
