@@ -452,52 +452,112 @@ struct SharedPaDagSchema {
     }
 };
 
-template <typename Schema>
-PA_DEVICE bool ValidateSharedDagTaskArgs(
-    const Schema &schema, uint32_t task_id, const TaskArgs &args
+PA_DEVICE bool SharedDagTensorFromTaskArg(
+    const TaskArgs &args, uint32_t index,
+    SharedDagTensor &tensor
 ) {
-    uint32_t tensor_count = 0;
     if (args.has_error || args.tensor_count < 0 ||
-        args.tensor_count > static_cast<int32_t>(kMaxTaskTensors) ||
-        !schema.TensorCount(task_id, tensor_count) ||
-        tensor_count != static_cast<uint32_t>(args.tensor_count)) {
+        index >= static_cast<uint32_t>(args.tensor_count) ||
+        args.tags[index] <
+            static_cast<int32_t>(TensorArgType::Input) ||
+        args.tags[index] >
+            static_cast<int32_t>(TensorArgType::NoDependency)) {
         return false;
     }
-    for (uint32_t index = 0; index < tensor_count; ++index) {
-        SharedDagTensor expected{};
-        if (!schema.TensorAt(task_id, index, expected)) {
-            return false;
-        }
-        const TaskTensorRef &reference = args.tensors[index];
-        if (expected.access != TaskTag(args, index) ||
-            expected.reference_kind != reference.kind) {
-            return false;
-        }
-        if (reference.kind == TensorRefKind::SharedOutputRef) {
-            uint32_t symbol_key = 0;
-            if (!SharedSymbolHistoryKey(
-                    SharedOutputReference(reference), symbol_key
-                ) ||
-                symbol_key != expected.symbol_key) {
-                return false;
-            }
-        } else if (reference.kind == TensorRefKind::GmTensor) {
-            if (reference.pointer.gm_tensor == nullptr ||
-                reference.pointer.gm_tensor->manual_dep !=
-                    expected.manual_dependency) {
-                return false;
-            }
-        } else if (reference.kind == TensorRefKind::LocalTensor) {
-            if (reference.pointer.local_tensor == nullptr ||
-                reference.pointer.local_tensor->manual_dep !=
-                    expected.manual_dependency) {
-                return false;
-            }
-        } else if (reference.kind != TensorRefKind::CreateInfo) {
-            return false;
-        }
+    tensor.access = TaskTag(args, index);
+    const TaskTensorRef &reference = args.tensors[index];
+    tensor.reference_kind = reference.kind;
+    tensor.symbol_key = 0;
+    tensor.manual_dependency = false;
+    if (reference.kind == TensorRefKind::SharedOutputRef) {
+        return SharedSymbolHistoryKey(
+            SharedOutputReference(reference), tensor.symbol_key
+        );
     }
-    return true;
+    if (reference.kind == TensorRefKind::GmTensor) {
+        if (reference.pointer.gm_tensor == nullptr) {
+            return false;
+        }
+        tensor.manual_dependency =
+            reference.pointer.gm_tensor->manual_dep;
+        return true;
+    }
+    if (reference.kind == TensorRefKind::LocalTensor) {
+        if (reference.pointer.local_tensor == nullptr) {
+            return false;
+        }
+        tensor.manual_dependency =
+            reference.pointer.local_tensor->manual_dep;
+        return true;
+    }
+    return reference.kind == TensorRefKind::CreateInfo;
+}
+
+// 当前 task 已经由 adapter 构造成真实 TaskArgs，它本身就是 DAG
+// 需要消费的 access/reference schema。公共层从这份参数一次
+// 解码并 fail-closed 校验；adapter schema 只用来查历史 candidate
+// writer，不再从 GM 重建第二份当前 task schema。
+template <typename Schema>
+struct SharedDagTaskArgsSchema {
+    const Schema *schema;
+    const TaskArgs *args;
+    uint32_t current_task_id;
+
+    PA_DEVICE uint32_t TaskCount() const {
+        return schema == nullptr ? 0U : schema->TaskCount();
+    }
+
+    PA_DEVICE bool TensorCount(
+        uint32_t task_id, uint32_t &tensor_count
+    ) const {
+        if (schema == nullptr || args == nullptr) {
+            return false;
+        }
+        if (task_id != current_task_id) {
+            return schema->TensorCount(task_id, tensor_count);
+        }
+        if (args->has_error || args->tensor_count < 0 ||
+            args->tensor_count >
+                static_cast<int32_t>(kMaxTaskTensors)) {
+            return false;
+        }
+        tensor_count = static_cast<uint32_t>(args->tensor_count);
+        return true;
+    }
+
+    PA_DEVICE bool TensorAt(
+        uint32_t task_id, uint32_t tensor_index,
+        SharedDagTensor &tensor
+    ) const {
+        if (schema == nullptr || args == nullptr) {
+            return false;
+        }
+        return task_id == current_task_id
+            ? SharedDagTensorFromTaskArg(
+                  *args, tensor_index, tensor
+              )
+            : schema->TensorAt(task_id, tensor_index, tensor);
+    }
+
+    PA_DEVICE bool WriterIntentsAt(
+        uint32_t task_id, SharedDagWriterIntents &intents
+    ) const {
+        return schema != nullptr &&
+            schema->WriterIntentsAt(task_id, intents);
+    }
+};
+
+template <typename Schema>
+PA_DEVICE bool BuildSharedMetadataDagFromTaskArgs(
+    const Schema &schema, uint32_t task_id, const TaskArgs &args,
+    SharedMetadataDag &dag
+) {
+    const SharedDagTaskArgsSchema<Schema> task_args_schema{
+        &schema, &args, task_id
+    };
+    return BuildSharedMetadataDag(
+        task_args_schema, task_id, dag
+    );
 }
 
 PA_DEVICE bool SharedTensorArgNeedsMetadataPrefix(
@@ -1329,11 +1389,8 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         &state->build_dispatch
     };
     SharedMetadataDag metadata_dag{};
-    if (!ValidateSharedDagTaskArgs(
-            dag_schema, task_id, args
-        ) ||
-        !BuildSharedMetadataDag(
-            dag_schema, task_id, metadata_dag
+    if (!BuildSharedMetadataDagFromTaskArgs(
+            dag_schema, task_id, args, metadata_dag
         )) {
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;

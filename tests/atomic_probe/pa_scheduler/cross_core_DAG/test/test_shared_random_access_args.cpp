@@ -423,11 +423,8 @@ bool CheckG1DynamicDagClassification() {
 
             const SharedPaDagSchema schema{&dispatch};
             SharedMetadataDag dag{};
-            if (!ValidateSharedDagTaskArgs(
-                    schema, task_id, args
-                ) ||
-                !BuildSharedMetadataDag(
-                    schema, task_id, dag
+            if (!BuildSharedMetadataDagFromTaskArgs(
+                    schema, task_id, args, dag
                 ) ||
                 dag.writer_count !=
                     (planned.kind == TaskKind::Up ? 3U : 0U) ||
@@ -450,6 +447,22 @@ bool CheckG1DynamicDagClassification() {
             dependency_tasks +=
                 dag.dependency_count != 0 ? 1U : 0U;
         }
+    }
+
+    // TaskArgs 权威路径必须在构建 DAG 的同一次 tensor 枚举中
+    // 拒绝非法的 access/reference 组合，不能因删除独立 Validate
+    // 遍历而只保留形式检查。循环结束时 args 对应最后一个 UP。
+    const int32_t saved_tag = args.tags[0];
+    args.tags[0] = static_cast<int32_t>(TensorArgType::Output);
+    const SharedPaDagSchema final_schema{&dispatch};
+    SharedMetadataDag invalid_dag{};
+    const bool rejects_invalid_access =
+        !BuildSharedMetadataDagFromTaskArgs(
+            final_schema, kTasks - 1U, args, invalid_dag
+        );
+    args.tags[0] = saved_tag;
+    if (!rejects_invalid_access) {
+        return false;
     }
 
     std::printf(

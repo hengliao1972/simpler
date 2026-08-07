@@ -85,6 +85,13 @@ adapter 还必须能对任意 task 一次导出最小 writer-intent 集合：
 schema 翻译。公共反向搜索每个 candidate 只取这份 writer 集合，
 不得为待查的每个 symbol 反复重建 candidate 的全部 tensor 参数。
 
+当前 task 已经由 adapter 构造成真实 `TaskArgs`，公共 DAG 层将
+它作为当前 task 的唯一权威 schema：在一次 tensor 遍历中校验
+tag、reference kind、指针、symbol producer 和重复 writer，不再从 GM
+dispatch plan 重建第二份当前 task schema。`WriterIntentsAt()` 则是
+adapter 对历史 candidate 的稳定合同，必须与该 adapter 生成的
+`TaskArgs` writer 语义一致；CPU adapter 门槛必须覆盖这一点。
+
 从 writer-intent 生成开始，公共 DAG 代码只消费上述通用信息。调度层不得
 读取 `TaskKind` 或 PA 固定图形。
 
@@ -319,6 +326,7 @@ Scalar 真实负载时间直接相减。
 - 成熟 `cross_core`：历史 12 组中位数 `815.937 us`；
 - `cross_core_DAG` 初始基线：10 次中位数 `2326.268 us`；
 - 紧凑 writer-intent adapter 后的阶段值：`1119.226 us`；
+- 当前 TaskArgs 直接构 DAG 后的阶段值：`1108.832 us`；
 - 第一门槛：DAG 实现必须低于 `0.82 ms`；
 - 最终目标：达到 `0.60 ms`。
 

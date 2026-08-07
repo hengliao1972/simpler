@@ -451,11 +451,9 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
                     &state.build_dispatch
                 };
                 SharedMetadataDag metadata_dag{};
-                if (!ValidateSharedDagTaskArgs(
-                        dag_schema, task_id, args
-                    ) ||
-                    !BuildSharedMetadataDag(
-                        dag_schema, task_id, metadata_dag
+                if (!BuildSharedMetadataDagFromTaskArgs(
+                        dag_schema, task_id, args,
+                        metadata_dag
                     )) {
                     RecordFailure(evidence);
                     break;

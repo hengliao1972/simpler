@@ -628,3 +628,55 @@ startup 到 FinalDrain 的十次结果为：
 结果证明 candidate 全参数重建是当前最大的 DAG 纯 Scalar 开销。目前
 距 `0.82 ms` 门槛约 `299 us`；下一轮将当前 task 的 Validate、
 DAG 分类和 writer-delta 构造合并为一次 `TaskArgs` 扫描。
+
+## 12. 2026-08-07：S7 当前 `TaskArgs` 直接构建 DAG
+
+### 12.1 问题与合同
+
+S6 后的生产 Build 对当前 task 仍然做两份等价工作：
+
+1. adapter 已经根据 ticket 构造真实 `TaskArgs`；
+2. 独立 Validate 又从 GM dispatch plan 重建 schema 并逐 tensor 比较；
+3. DAG Build 第三次遍历 schema 并分类 reader/writer。
+
+本轮借鉴 SIMT “实际参数一次推导、后续直接消费”的数据流，
+但不复制 PA 固定图形：
+
+- 当前 task 的 `TaskArgs` 是唯一权威 DAG 输入；
+- 同一次 tensor 遍历检查 tag 范围、reference kind、空指针、
+  SharedOutputRef key/producer、重复 writer 与 ordinary 回退；
+- adapter schema 只为历史 candidate 提供紧凑 writer intent，不再
+  重建当前 task 的第二份 schema；
+- 没有改动 atomic、DCCI、per-symbol CAS、TensorMap 顺序、task
+  数或 Execute 调度。
+
+`SharedDagTaskArgsSchema` 是通用 adapter 包装，公共路径不读
+`TaskKind`。每个新算子 adapter 必须保证 `WriterIntentsAt()` 与它
+构造的 `TaskArgs` writer 语义一致，CPU schema 模型继续覆盖
+同/异 symbol、future producer、重复 writer 和 ordinary 回退。
+
+### 12.2 校验与性能
+
+- `build-perf-clock cpu` 全量门槛 PASS；
+- AIC/AIV CCEC 编译、mixed ELF、ABI、强符号、无 relocation 和
+  manifest PASS；
+- A5 B256、`6,28,4,1` 十轮全部
+  `execution/semantic/postprocess` PASS。
+
+startup 到 FinalDrain 的十次结果为：
+
+```text
+1119.658  1134.944  1113.214  1094.545  1100.290 us
+1099.653  1093.872  1104.449  1116.927  1130.450 us
+```
+
+- 最快：`1093.872 us`；
+- 中位数：`1108.832 us`；
+- 均值：`1110.800 us`；
+- 最慢：`1134.944 us`；
+- 相对 S6 `1119.226 us` 减少 `10.394 us`，改善 `0.93%`；
+- 相对初始 `2326.268 us` 累计改善 `52.33%`。
+
+收益稳定但不大，说明只消除当前 task 的重复 schema 重建不足以
+突破 `0.82 ms`。下一轮将同一当前 task 的全部 symbol 合并为
+一次反向 candidate 扫描，避免对同一 candidate 重复解码。
