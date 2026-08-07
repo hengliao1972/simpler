@@ -1013,3 +1013,74 @@ outputs/pa_scheduler_cross_core_dag_swimlane_20260807_115606_3447126/ccec/
 其 global Submit makespan 为 `758.765 us`。Claim→Materialize 聚合 core-time
 从旧 ELF 的 `10.689 ms` 降到 `3.672 ms`；QK/PV 平均分别从
 `16.30/16.44 us` 降到 `2.45/2.82 us`，且不再随 task-id 线性增长。
+
+## 19. 2026-08-07：S13 shared heap 直接消费 RMW 旧值
+
+### 19.1 先排除 Execute 推进次数不足
+
+S12 后先验证了一个不改协议的调度候选：若 Build 边界上的
+`ProgressCrossCoreExec()` 完成过 task，就立即重复调用，直到本次不再完成。
+A5 B256、`6,28,4,1` 十轮为：
+
+```text
+828.861  811.766  829.337  817.519  824.746 us
+825.684  821.341  829.017  815.092  808.333 us
+```
+
+中位数 `823.044 us`，比 S12 的 `818.782 us` 回退 `0.52%`。代码核查同时
+确认，一次 `ProgressCrossCoreExec()` 已经会消费本核所有当前 ready token；
+外层重复只增加一次无效 Execute 扫描。该候选已完整回退，不把调度频率误判为
+当前主要矛盾。
+
+### 19.2 与 SIMT heap 合同的差异
+
+Scalar 的非空 output reservation 原来依次执行：
+
+```text
+Load(aggregate vend)
+Load(shard cursor)
+FetchAdd(shard cursor)
+FetchAdd(aggregate vend)
+```
+
+前两次 Load 的值随时可能被并发 builder 改写，只能提前发现部分明显异常，
+不能证明随后 reservation 成功；真正确定唯一物理区间和累计进度的是两次
+`FetchAdd` 返回的旧值。SIMT builder 已采用后者的直接 RMW 合同。
+
+本轮令 Scalar 非空 task 也直接执行两次 `FetchAdd`，并继续完整消费返回旧值：
+
+- shard old cursor 决定 task 的唯一连续物理区间；
+- aggregate old vend 决定本次发布的完成进度；
+- 静态非法 task、heap、alignment 和单次 reserve 大小仍在 RMW 前拒绝；
+- RMW 后发现越界属于 terminal failure，保留已线性化控制字供诊断，绝不
+  回滚覆盖其他 builder 的进度；
+- 零输出 task 仍只 Load aggregate vend，不推进任何分配控制字。
+
+PA B256 中共有 `1024` 个非空 output task，因此热路径减少 `2048` 次返回型
+atomic Load；task 数、输出字节、8 路 shard、DCCI、TensorMap、DAG、payload
+及 kernel workload 均未改变。这是 allocator 通用优化，不依赖 PA 固定 DAG。
+
+### 19.3 正确性门槛与性能
+
+- 原子泳道门槛更新为：非空 reservation 仅记录
+  `SharedHeapCursorReserve`、`SharedHeapVendAdvance` 两次 return-ready RMW；
+- 单测覆盖静态失败零写入、合法并发唯一无缝区间、cursor/vend 交错，以及
+  terminal 容量竞争保留 overrun 现场；
+- CPU perf-clock 全量门槛 PASS；
+- A5 B256、`6,28,4,1` 十轮全部
+  `execution/semantic/postprocess` PASS。
+
+startup 到 FinalDrain 的十次结果为：
+
+```text
+786.785  793.558  793.245  799.376  809.046 us
+792.927  789.551  792.300  787.899  806.446 us
+```
+
+- 最快：`786.785 us`；
+- 中位数：`793.086 us`；
+- 均值：`795.113 us`；
+- 最慢：`809.046 us`；
+- 相对 S12 `818.782 us` 减少 `25.696 us`，改善 `3.14%`；
+- 相对初始 `2326.268 us` 累计改善 `65.91%`；
+- 距 `0.60 ms` 目标仍约 `193 us`。

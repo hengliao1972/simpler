@@ -76,11 +76,11 @@ PA_DEVICE int64_t SharedHeapAtomicFetchAdd(
 
 // no-wrap 是本阶段的明确边界：每个 shard 的绝对 cursor 只能从 0 推进到
 // shard_span，绝不取模。FetchAdd 返回的旧 cursor 是当前 task 唯一的物理
-// 区间；合法并发 writer 可以让它不同于前置 Load 的观察值，不能因此回滚。
+// 区间；不再用竞态 Load 快照预判随后 RMW 的结果。
 //
 // 容量竞争若在 FetchAdd 后才被发现，则本轮进入 terminal fatal 并保留已经
-// 推进的控制字供 host 取证。并发 allocator 绝不能用 Exchange 恢复预检
-// 快照，否则会覆盖其他 winner 的合法进度。
+// 推进的控制字供 host 取证。并发 allocator 绝不能用 Exchange 恢复旧值，
+// 否则会覆盖其他 winner 的合法进度。
 template <class Ops, bool ObserveAtomics = false>
 PA_DEVICE bool ReserveSharedOutputHeap(
     PA_GM SharedTensorMapSidecar &map, uint32_t task_id, uint64_t total,
@@ -108,24 +108,25 @@ PA_DEVICE bool ReserveSharedOutputHeap(
     const uint64_t usable_capacity =
         shard_span * kSharedHeapShards;
 
-    const int64_t checked_vend =
-        SharedHeapAtomicLoad<Ops, ObserveAtomics>(
-            &map.shared_heap_vend.value, static_cast<int32_t>(task_id),
-            AtomicSite::SharedHeapVendLoad, trace, result
-        );
-    if (checked_vend < 0) {
-        return false;
-    }
-    const uint64_t vend_snapshot = static_cast<uint64_t>(checked_vend);
-    if (!SharedHeapAligned(vend_snapshot) ||
-        vend_snapshot > usable_capacity) {
-        return false;
-    }
-
     // 零输出 task 仍需要取得当前 aggregate vend，供完成协议发布该 task 的
     // progress；但它不读取或推进任一 shard cursor，也不要求可用 heap 空间。
     if (total == 0) {
-        reservation.aggregate_vend = vend_snapshot;
+        const int64_t observed_vend =
+            SharedHeapAtomicLoad<Ops, ObserveAtomics>(
+                &map.shared_heap_vend.value,
+                static_cast<int32_t>(task_id),
+                AtomicSite::SharedHeapVendLoad, trace, result
+            );
+        if (observed_vend < 0 ||
+            !SharedHeapAligned(
+                static_cast<uint64_t>(observed_vend)
+            ) ||
+            static_cast<uint64_t>(observed_vend) >
+                usable_capacity) {
+            return false;
+        }
+        reservation.aggregate_vend =
+            static_cast<uint64_t>(observed_vend);
         return true;
     }
     if (shard_span == 0) {
@@ -141,30 +142,18 @@ PA_DEVICE bool ReserveSharedOutputHeap(
         return false;
     }
 
-    if (reserve > shard_span ||
-        vend_snapshot > usable_capacity - reserve ||
-        vend_snapshot > static_cast<uint64_t>(INT64_MAX) - reserve) {
+    if (reserve > shard_span) {
         return false;
     }
 
     const uint32_t shard = task_id % kSharedHeapShards;
     PA_GM volatile int64_t *cursor_address =
         &map.shared_heap_cursor[shard].value;
-    const int64_t signed_cursor_before =
-        SharedHeapAtomicLoad<Ops, ObserveAtomics>(
-            cursor_address, static_cast<int32_t>(task_id),
-            AtomicSite::SharedHeapCursorLoad, trace, result
-        );
-    if (signed_cursor_before < 0) {
-        return false;
-    }
-    const uint64_t cursor_before =
-        static_cast<uint64_t>(signed_cursor_before);
-    if (!SharedHeapAligned(cursor_before) ||
-        cursor_before > shard_span - reserve) {
-        return false;
-    }
-
+    // FetchAdd 的返回值才是当前 reservation 的线性化 old value。先做
+    // Load 得到的仅是可能立刻过期的竞态快照，既不能证明容量，也会为
+    // 每个非空 task 增加一次返回型 Atomic；直接消费 RMW 旧值与 SIMT
+    // builder 的 heap 合同一致。越界仍是 terminal failure，并保留已经
+    // 推进的控制字作为故障现场，绝不回滚覆盖并发 owner。
     const int64_t observed_cursor =
         SharedHeapAtomicFetchAdd<Ops, ObserveAtomics>(
             cursor_address, static_cast<int64_t>(reserve),

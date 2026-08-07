@@ -61,9 +61,9 @@ struct HeapTestOps {
 
 uint64_t HeapTestOps::now = 0;
 
-// 在 cursor 的前置 Load 与 FetchAdd 之间插入另一笔 reserve；它可以暂停在
+// 紧邻当前 cursor FetchAdd 前插入另一笔 reserve；它可以暂停在
 // cursor/vend 两条原子之间，也可以完整推进。helper 必须消费 FetchAdd 的
-// 真实 old value，不能要求它等于预检快照，更不能回滚并发进度。
+// 真实 old value，不能回滚并发进度。
 struct HeapInterleaveOps : HeapTestOps {
     static volatile int64_t *race_cursor;
     static volatile int64_t *race_vend;
@@ -157,17 +157,15 @@ void TestAtomicTraceSites() {
         "traced nonempty reservation succeeds"
     );
     const AtomicSite expected_sites[] = {
-        AtomicSite::SharedHeapVendLoad,
-        AtomicSite::SharedHeapCursorLoad,
         AtomicSite::SharedHeapCursorReserve,
         AtomicSite::SharedHeapVendAdvance,
     };
-    Check(nonempty.trace.record_count == 4, "nonempty reserve writes four atomic records");
+    Check(nonempty.trace.record_count == 2, "nonempty reserve writes two atomic records");
     Check(
-        nonempty.result.atomic_trace_calls == 4,
-        "nonempty reserve counts four logical atomic calls"
+        nonempty.result.atomic_trace_calls == 2,
+        "nonempty reserve counts two logical atomic calls"
     );
-    for (uint32_t index = 0; index < 4 && index < nonempty.trace.record_count; ++index) {
+    for (uint32_t index = 0; index < 2 && index < nonempty.trace.record_count; ++index) {
         const TraceRecord &record = nonempty.records[index];
         const AtomicSite site = expected_sites[index];
         Check(
@@ -327,7 +325,7 @@ void TestAlignmentAndShardTail() {
     );
 }
 
-void TestBoundaryZeroAndPreflightFailures() {
+void TestBoundaryZeroAndTerminalFailures() {
     auto map = std::make_unique<SharedTensorMapSidecar>();
     ResetHeapState(*map);
     const uint64_t heap_size =
@@ -387,9 +385,18 @@ void TestBoundaryZeroAndPreflightFailures() {
         "failed reservation returns a cleared result"
     );
     Check(
-        SameSnapshot(*map, full_snapshot),
-        "capacity failure changes no heap state"
+        map->shared_heap_cursor[0].value ==
+                full_snapshot.cursor[0] +
+                    static_cast<int64_t>(kOutputAlignment) &&
+            map->shared_heap_vend.value == full_snapshot.vend,
+        "terminal shard-capacity failure retains cursor overrun evidence"
     );
+
+    // 下列可在任何 RMW 前判定的静态非法输入仍不得改变 allocator；先恢复
+    // 上一个成功 reservation 的合法状态，避免把 terminal 现场混入断言。
+    ResetHeapState(*map);
+    map->shared_heap_cursor[0].value = full_snapshot.cursor[0];
+    map->shared_heap_vend.value = full_snapshot.vend;
 
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
@@ -425,7 +432,6 @@ void TestBoundaryZeroAndPreflightFailures() {
     );
 
     map->shared_heap_cursor[1].value = 1;
-    const HeapSnapshot unaligned_cursor = Snapshot(*map);
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
             *map, 1, 1024, heap_size, failed
@@ -433,13 +439,14 @@ void TestBoundaryZeroAndPreflightFailures() {
         "unaligned cursor is rejected"
     );
     Check(
-        SameSnapshot(*map, unaligned_cursor),
-        "invalid cursor preflight changes no heap state"
+        map->shared_heap_cursor[1].value ==
+                1 + static_cast<int64_t>(kOutputAlignment) &&
+            map->shared_heap_vend.value == full_snapshot.vend,
+        "invalid cursor retains the failed RMW interval as terminal evidence"
     );
 
     ResetHeapState(*map);
     map->shared_heap_vend.value = -1;
-    const HeapSnapshot negative_vend = Snapshot(*map);
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
             *map, 0, 1024, heap_size, failed
@@ -447,13 +454,15 @@ void TestBoundaryZeroAndPreflightFailures() {
         "negative aggregate vend is rejected"
     );
     Check(
-        SameSnapshot(*map, negative_vend),
-        "negative aggregate vend changes no heap state"
+        map->shared_heap_cursor[0].value ==
+                static_cast<int64_t>(kOutputAlignment) &&
+            map->shared_heap_vend.value ==
+                -1 + static_cast<int64_t>(kOutputAlignment),
+        "negative aggregate vend retains both terminal RMW results"
     );
 
     ResetHeapState(*map);
     map->shared_heap_vend.value = 1;
-    const HeapSnapshot unaligned_vend = Snapshot(*map);
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
             *map, 0, 1024, heap_size, failed
@@ -461,14 +470,16 @@ void TestBoundaryZeroAndPreflightFailures() {
         "unaligned aggregate vend is rejected"
     );
     Check(
-        SameSnapshot(*map, unaligned_vend),
-        "unaligned aggregate vend changes no heap state"
+        map->shared_heap_cursor[0].value ==
+                static_cast<int64_t>(kOutputAlignment) &&
+            map->shared_heap_vend.value ==
+                1 + static_cast<int64_t>(kOutputAlignment),
+        "unaligned aggregate vend retains terminal RMW evidence"
     );
 
     ResetHeapState(*map);
     map->shared_heap_vend.value =
         static_cast<int64_t>(heap_size + kOutputAlignment);
-    const HeapSnapshot oversized_vend = Snapshot(*map);
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
             *map, 0, 1024, heap_size, failed
@@ -476,13 +487,17 @@ void TestBoundaryZeroAndPreflightFailures() {
         "aggregate vend beyond heap capacity is rejected"
     );
     Check(
-        SameSnapshot(*map, oversized_vend),
-        "oversized aggregate vend changes no heap state"
+        map->shared_heap_cursor[0].value ==
+                static_cast<int64_t>(kOutputAlignment) &&
+            map->shared_heap_vend.value ==
+                static_cast<int64_t>(
+                    heap_size + 2 * kOutputAlignment
+                ),
+        "oversized aggregate vend retains terminal RMW evidence"
     );
 
     ResetHeapState(*map);
     map->shared_heap_vend.value = static_cast<int64_t>(heap_size);
-    const HeapSnapshot exhausted_vend = Snapshot(*map);
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
             *map, 1, 1024, heap_size, failed
@@ -490,13 +505,17 @@ void TestBoundaryZeroAndPreflightFailures() {
         "aggregate capacity exhaustion is rejected despite free target shard"
     );
     Check(
-        SameSnapshot(*map, exhausted_vend),
-        "aggregate capacity failure changes no heap state"
+        map->shared_heap_cursor[1].value ==
+                static_cast<int64_t>(kOutputAlignment) &&
+            map->shared_heap_vend.value ==
+                static_cast<int64_t>(
+                    heap_size + kOutputAlignment
+                ),
+        "aggregate capacity failure retains terminal RMW evidence"
     );
 
     ResetHeapState(*map);
     map->shared_heap_cursor[2].value = -1;
-    const HeapSnapshot negative_cursor = Snapshot(*map);
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
             *map, 2, 1024, heap_size, failed
@@ -504,13 +523,14 @@ void TestBoundaryZeroAndPreflightFailures() {
         "negative shard cursor is rejected"
     );
     Check(
-        SameSnapshot(*map, negative_cursor),
-        "negative shard cursor changes no heap state"
+        map->shared_heap_cursor[2].value ==
+                -1 + static_cast<int64_t>(kOutputAlignment) &&
+            map->shared_heap_vend.value == 0,
+        "negative shard cursor retains its terminal RMW result"
     );
 
     ResetHeapState(*map);
     map->shared_heap_cursor[2].value = 5120;
-    const HeapSnapshot oversized_cursor = Snapshot(*map);
     Check(
         !ReserveSharedOutputHeap<HeapTestOps>(
             *map, 2, 1024, heap_size, failed
@@ -518,8 +538,9 @@ void TestBoundaryZeroAndPreflightFailures() {
         "shard cursor beyond its span is rejected"
     );
     Check(
-        SameSnapshot(*map, oversized_cursor),
-        "oversized shard cursor changes no heap state"
+        map->shared_heap_cursor[2].value == 6144 &&
+            map->shared_heap_vend.value == 0,
+        "oversized shard cursor retains its terminal RMW result"
     );
 
     ResetHeapState(*map);
@@ -661,7 +682,7 @@ void TestInterleavingAndTerminalCapacityRace() {
         ReserveSharedOutputHeap<HeapInterleaveOps>(
             *map, 0, 1024, kHeapBytes, reservation
         ),
-        "stale preflight snapshot accepts a legal concurrent reservation"
+        "direct RMW accepts a legal concurrent reservation"
     );
     Check(
         reservation.task_base == kOutputAlignment &&
@@ -683,8 +704,8 @@ void TestInterleavingAndTerminalCapacityRace() {
         "resumed competitor closes final cursor and vend byte sums"
     );
 
-    // 两个 caller 都从 shard 尾部看到一份余量；竞争者先占满，当前
-    // FetchAdd 随后越过 no-wrap 边界。此时必须 terminal fail 并保留
+    // 竞争者紧邻当前 cursor FetchAdd 前先占满余量，当前 FetchAdd 随后
+    // 越过 no-wrap 边界。此时必须 terminal fail 并保留
     // 5KiB cursor 现场，绝不能 Exchange 回 3KiB 覆盖竞争者的合法 1KiB。
     ResetHeapState(*map);
     const uint64_t heap_size = kSharedHeapShards * 4096;
@@ -719,7 +740,7 @@ int main() {
     TestPaCase(1);
     TestPaCase(kDefaultBatches);
     TestAlignmentAndShardTail();
-    TestBoundaryZeroAndPreflightFailures();
+    TestBoundaryZeroAndTerminalFailures();
     TestConcurrentReservations();
     TestInterleavingAndTerminalCapacityRace();
     if (g_failures != 0) {

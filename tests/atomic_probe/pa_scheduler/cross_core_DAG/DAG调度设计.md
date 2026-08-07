@@ -254,8 +254,15 @@ atomic-only line 不执行 payload DCCI。泳道记录必须覆盖真实 atomic 
 - shard 由 task id 确定；
 - task 的所有 fresh output 在一个连续 reservation 中分配；
 - aggregate vend 只表示全局完成进度，不是物理地址；
+- 非空 task 直接用 shard cursor 与 aggregate vend 的两次 `FetchAdd` 返回旧值
+  确定唯一物理区间和累计进度，不先做无法证明随后 RMW 结果的竞态预读；
 - fresh `TensorDesc` 直接构造在最终 task-indexed shared output cell；
 - 不先写 worker descriptor 再跨核复制第二次。
+
+两次 `FetchAdd` 都是返回型 atomic，旧值参与边界校验。静态非法输入必须在
+RMW 前拒绝；若 RMW 已经线性化后才发现容量或状态异常，则发布 terminal
+fatal 并保留控制字现场，不能回滚覆盖并发 builder 的合法进度。零输出 task
+不推进 cursor/vend，但仍读取 aggregate vend 作为该 task 的完成进度。
 
 该语义与 SIMT G0 一致，允许 host 使用同一套 heap interval、descriptor 和
 completion-vend oracle 比较两种实现。
@@ -346,6 +353,7 @@ Scalar 真实负载时间直接相减。
 - DAG 结果直接生成 writer delta 后：`932.310 us`；
 - 固定容量对象只初始化有效前缀后：`914.937 us`；
 - schema 直接求解最近 ordinary writer 后：`818.782 us`；
+- shared heap 直接消费两次 RMW 旧值后：`793.086 us`；
 - 第一门槛：DAG 实现必须低于 `0.82 ms`；
 - 最终目标：达到 `0.60 ms`。
 
