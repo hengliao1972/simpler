@@ -4262,8 +4262,9 @@ inline TensorDesc LoadCrossCorePayloadTensor(
     TensorDesc tensor{};
     uint64_t representation[cross_core_dag::kExecTensorDescWords] = {};
     const uint32_t source_word =
-        layout.tensor_word_offset +
-        tensor_index * cross_core_dag::kExecTensorDescWords;
+        cross_core_dag::ExecTensorPayloadWordOffset(
+            tensor_index, layout.tensor_reference_mask
+        );
     // payload 是 uint64_t word arena，TensorDesc 是另一种 C++ 对象。
     // 不能通过 reinterpret_cast<uint64_t *> 写 TensorDesc：那会违反
     // strict-aliasing，并可能让优化后的 host 比较器对同一字段前后读出
@@ -4277,6 +4278,78 @@ inline TensorDesc LoadCrossCorePayloadTensor(
     }
     std::memcpy(&tensor, representation, sizeof(tensor));
     return tensor;
+}
+
+inline uint32_t ExpectedCrossCorePayloadReferenceMask(TaskKind kind) {
+    switch (kind) {
+        case TaskKind::Qk:
+            return 0x08U;
+        case TaskKind::Sf:
+            return 0x0fU;
+        case TaskKind::Pv:
+            return 0x09U;
+        case TaskKind::Up:
+            return 0x3fU;
+        case TaskKind::Alloc:
+        case TaskKind::Count:
+            return 0;
+    }
+    return 0;
+}
+
+inline const TensorDesc *ExpectedCrossCorePayloadReference(
+    const SchedulerState &state,
+    const SharedHostPlannedTask &task,
+    uint32_t tensor_index
+) {
+    const auto shared_output = [&state](
+        uint32_t producer, uint32_t slot
+    ) -> const TensorDesc * {
+        if (producer >= kMaxTasks ||
+            slot >= kSharedOutputMaxPerTask) {
+            return nullptr;
+        }
+        return &state.shared_map.shared_outputs[producer]
+                    .tensors[slot];
+    };
+
+    switch (task.kind) {
+        case TaskKind::Qk:
+            return tensor_index == 3
+                ? shared_output(task.task_id, 0) : nullptr;
+        case TaskKind::Sf:
+            return tensor_index == 0
+                ? shared_output(task.task_id - 1U, 0)
+                : (tensor_index <= 3
+                       ? shared_output(
+                             task.task_id, tensor_index - 1U
+                         )
+                       : nullptr);
+        case TaskKind::Pv:
+            if (tensor_index == 0) {
+                return shared_output(task.task_id - 1U, 0);
+            }
+            return tensor_index == 3
+                ? shared_output(task.task_id, 0) : nullptr;
+        case TaskKind::Up:
+            if (tensor_index <= 1) {
+                return shared_output(
+                    task.task_id - 2U, tensor_index + 1U
+                );
+            }
+            if (tensor_index == 2) {
+                return shared_output(task.task_id - 1U, 0);
+            }
+            return tensor_index >= 3 && tensor_index <= 5
+                ? shared_output(
+                      task.batch_start, 5U - tensor_index
+                  )
+                : nullptr;
+        case TaskKind::Alloc:
+        case TaskKind::Count:
+            return nullptr;
+    }
+    return nullptr;
 }
 
 inline bool ExpectedCrossCorePayloadTensor(
@@ -4416,7 +4489,8 @@ struct CrossCoreExecPayloadValidation {
 inline CrossCoreExecPayloadValidation
 ValidateCrossCoreExecPayloads(
     const SchedulerState &state,
-    const SharedHostTaskPlan &plan
+    const SharedHostTaskPlan &plan,
+    uint64_t runtime_state_address
 ) {
     CrossCoreExecPayloadValidation validation;
     const auto record = [&validation](
@@ -4451,6 +4525,8 @@ ValidateCrossCoreExecPayloads(
             task.kind == TaskKind::Qk
                 ? 0
                 : (task.kind == TaskKind::Up ? 3 : 1);
+        const uint32_t expected_reference_mask =
+            ExpectedCrossCorePayloadReferenceMask(task.kind);
         const cross_core_dag::ExecEngineClass expected_engine =
             task.kind == TaskKind::Qk ||
                     task.kind == TaskKind::Pv
@@ -4464,7 +4540,7 @@ ValidateCrossCoreExecPayloads(
         const bool layout_ok =
             cross_core_dag::ComputeExecPayloadLayout(
                 expected_tensors, expected_scalars,
-                expected_fanin, layout
+                expected_fanin, expected_reference_mask, layout
             );
         record(layout_ok, task.task_id, "layout");
         record(
@@ -4481,7 +4557,7 @@ ValidateCrossCoreExecPayloads(
         );
         record(
             (cell.payload.words[0] >> 32U) == 0 &&
-                cell.payload.words[6] == 0 &&
+                cell.payload.words[6] == expected_reference_mask &&
                 cell.payload.words[7] == 0 &&
                 header.task_id == task.task_id &&
                 header.function_address == 0 &&
@@ -4495,6 +4571,8 @@ ValidateCrossCoreExecPayloads(
                 header.tensor_count == expected_tensors &&
                 header.scalar_count == expected_scalars &&
                 header.fanin_count == expected_fanin &&
+                header.tensor_reference_mask ==
+                    expected_reference_mask &&
                 header.engine_class == expected_engine &&
                 header.flags == 0 &&
                 header.multicore_group_id == 0 &&
@@ -4510,18 +4588,62 @@ ValidateCrossCoreExecPayloads(
                 ExpectedCrossCorePayloadTensor(
                     state, plan, task, tensor, &expected
                 );
-            const TensorDesc actual =
-                LoadCrossCorePayloadTensor(
+            const bool is_reference =
+                (expected_reference_mask &
+                 (uint32_t{1} << tensor)) != 0;
+            const TensorDesc *reference =
+                ExpectedCrossCorePayloadReference(
+                    state, task, tensor
+                );
+            const uint32_t payload_word =
+                cross_core_dag::ExecTensorPayloadWordOffset(
+                    tensor, expected_reference_mask
+                );
+            const uint64_t host_state_address =
+                static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(&state)
+                );
+            const uint64_t effective_runtime_state_address =
+                runtime_state_address == 0
+                    ? host_state_address
+                    : runtime_state_address;
+            const uint64_t expected_reference_address =
+                reference == nullptr
+                    ? 0
+                    : effective_runtime_state_address +
+                          static_cast<uint64_t>(
+                              reinterpret_cast<uintptr_t>(reference)
+                          ) -
+                          host_state_address;
+            const bool reference_ok =
+                is_reference
+                    ? reference != nullptr &&
+                          cell.payload.words[payload_word] ==
+                              expected_reference_address
+                    : reference == nullptr;
+            TensorDesc actual{};
+            if (is_reference && reference != nullptr) {
+                // D2H 快照中的 encoded word 仍是 device GM 地址，不能在
+                // host 解引用。先独立证明它精确指向同一 SchedulerState
+                // offset，再从对应 host 快照位置比较完整 descriptor。
+                actual = *reference;
+            } else if (!is_reference) {
+                actual = LoadCrossCorePayloadTensor(
                     cell, layout, tensor
                 );
+            }
             const char *mismatch = expected_ok
                 ? TensorDescFirstMismatch(actual, expected)
                 : "expected_descriptor";
-            const bool tensor_ok = expected_ok && mismatch == nullptr;
+            const bool tensor_ok =
+                expected_ok && reference_ok && mismatch == nullptr;
             if (!tensor_ok &&
                 validation.first_bad_task == UINT32_MAX) {
                 validation.first_bad_tensor = tensor;
-                validation.first_bad_tensor_field = mismatch;
+                validation.first_bad_tensor_field =
+                    !reference_ok
+                        ? "reference_address"
+                        : mismatch;
                 validation.first_actual_tensor = actual;
                 validation.first_expected_tensor = expected;
             }
@@ -5099,7 +5221,8 @@ inline bool PerfClockObserverFieldsAreZero(const WorkerResult &result) {
 inline Metrics Validate(
     const SchedulerState &state, uint32_t run, double host_us,
     const TraceHeader *trace_header,
-    RawExecTokenSnapshotAuthority raw_exec_token_snapshot_authority
+    RawExecTokenSnapshotAuthority raw_exec_token_snapshot_authority,
+    uint64_t runtime_state_address = 0
 ) {
     Metrics metrics;
     // 每个 worker 都回放全部 task。S5b 中 Alloc 与四种 kernel task
@@ -5612,7 +5735,7 @@ inline Metrics Validate(
     const CrossCoreExecPayloadValidation
         cross_core_exec_payload_validation =
             ValidateCrossCoreExecPayloads(
-                state, shared_plan
+                state, shared_plan, runtime_state_address
             );
     if (!shared_output_validation.protocol_ok) {
         std::printf(

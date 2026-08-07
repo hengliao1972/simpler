@@ -242,6 +242,11 @@ PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
                 }
                 source.tensors[tensor_index].gm_tensor =
                     context.result.tensors[output_ordinal];
+                // fresh descriptor 已经直接落在 task-indexed shared output
+                // cell，发布后本轮不再修改。portable payload 原生支持
+                // descriptor reference；这里只携带稳定 GM 地址，避免 builder
+                // 把刚发布的 128B descriptor 再读回并复制进 execution cell。
+                source.reference_mask |= uint32_t{1} << tensor_index;
                 ++output_ordinal;
             } else {
                 source.tensors[tensor_index].gm_tensor =
@@ -278,6 +283,10 @@ PA_DEVICE bool ResolvePaExecPayloadSourceAfterFanin(
             source.tensors[tensor_index].gm_tensor =
                 &output_cell.tensors[output_slot];
             source.gm_tensor_mask |= uint32_t{1} << tensor_index;
+            // plain SharedOutputRef 指向本轮生命周期内不可变的 descriptor。
+            // executor 会按 portable reference 合同单独 invalidate 这 128B，
+            // 因而无需在 builder 侧制造第二份 GM descriptor 副本。
+            source.reference_mask |= uint32_t{1} << tensor_index;
         } else if (reference.kind == TensorRefKind::GmTensor) {
             if (reference.pointer.gm_tensor == nullptr) {
                 return false;
@@ -368,7 +377,20 @@ PA_DEVICE bool MakePaExecPayloadSpec(
     return ValidateExecPayloadSpec(spec, layout);
 }
 
-template <typename Ops>
+PA_DEVICE bool ApplyPaExecPayloadReferences(
+    const PaExecPayloadSource &source, ExecPayloadSpec &spec
+) {
+    if ((source.reference_mask & ~source.gm_tensor_mask) != 0 ||
+        (spec.tensor_count < kExecMaxTensors &&
+         (source.reference_mask >> spec.tensor_count) != 0)) {
+        return false;
+    }
+    spec.tensor_reference_mask = source.reference_mask;
+    ExecPayloadLayout layout{};
+    return ValidateExecPayloadSpec(spec, layout);
+}
+
+template <typename Ops, bool FreshOutputsFromResult = false>
 PA_DEVICE bool PreparePaExecPublicationAfterFanin(
     PA_GM SchedulerState &state, PA_GM const WorkerState &worker,
     const TaskArgs &args, const SubmitContext &context,
@@ -380,9 +402,12 @@ PA_DEVICE bool PreparePaExecPublicationAfterFanin(
                task_id, kind, function_id, function_address,
                worker, args, context, spec
            ) &&
-           ResolvePaExecPayloadSourceAfterFanin<Ops>(
+           ResolvePaExecPayloadSourceAfterFanin<
+               Ops, FreshOutputsFromResult
+           >(
                state, args, context, task_id, source
-           );
+           ) &&
+           ApplyPaExecPayloadReferences(source, spec);
 }
 
 PA_DEVICE bool BindPaExecutionTokenDispatchAfterClaim(

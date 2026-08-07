@@ -2189,7 +2189,10 @@ int main(int argc, char **argv) {
         const pa_scheduler::host::Metrics metrics = pa_scheduler::host::Validate(
             *state, run, host_us,
             options.trace_enabled ? &trace_header : nullptr,
-            pa_scheduler::host::RawExecTokenSnapshotAuthority::DiagnosticOnly
+            pa_scheduler::host::RawExecTokenSnapshotAuthority::DiagnosticOnly,
+            static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(state_device)
+            )
         );
         all_passed &= metrics.passed;
         const bool workload_passed =

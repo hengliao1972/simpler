@@ -219,7 +219,9 @@ EMPTY -> BUILDING -> BUILT -> CLAIMED -> DONE
 - Alloc 没有 Execute ticket，由 Build owner直接闭合 completion。
 
 control 独占 atomic-only cacheline；immutable payload 从下一条 cacheline
-开始。payload 不得包含 builder 私有指针或本核上下文地址。
+开始。payload 不得包含 builder 私有指针或本核上下文地址；允许携带已经完成
+发布、在本轮内不再修改且生命周期覆盖 Execute 的共享 GM 对象地址，但必须走
+下述 descriptor-reference 合同。
 
 ### 5.2 Scalar 发布与取得
 
@@ -246,6 +248,22 @@ atomic 取得 CLAIMED
 
 atomic-only line 不执行 payload DCCI。泳道记录必须覆盖真实 atomic 与 DCCI
 调用点，但观察字段不能写入协议 cacheline。
+
+对于已经直接构造在最终共享位置、发布后不可变的 `TensorDesc`，portable
+execution payload 可以按 tensor bit 携带 64-bit GM 引用，而不是再次内联复制
+128B descriptor。该快路必须同时满足：
+
+1. adapter 从真实 reference kind 和对象生命周期判定可引用性，公共层不识别
+   PA task kind 或固定拓扑；
+2. reference mask 只能覆盖 GM tensor，且不能出现超出 `tensor_count` 的 bit；
+3. inline tensor 与 reference tensor 共用同一 tensor ordinal，scalar/fanin offset
+   由公共 layout 计算，不能由算子手写常数；
+4. builder 只 clean-out 缩短后的 payload；executor 取得 `CLAIMED` 后先 invalidate
+   payload，再逐个 invalidate 被引用的 128B descriptor，随后才能绑定参数；
+5. view、仍可能更新的对象、builder 栈对象和 worker-private descriptor 必须继续
+   内联，不得为了缩包把可变对象地址跨核发布；
+6. host oracle 独立检查 reference mask、精确 GM 地址、目标 descriptor 全字段和
+   compact layout，不能只因 kernel 最终跑通就认为引用合法。
 
 ### 5.3 Heap 与 output
 
@@ -354,6 +372,7 @@ Scalar 真实负载时间直接相减。
 - 固定容量对象只初始化有效前缀后：`914.937 us`；
 - schema 直接求解最近 ordinary writer 后：`818.782 us`；
 - shared heap 直接消费两次 RMW 旧值后：`793.086 us`；
+- 不可变共享 descriptor 改为 execution payload GM 引用后：`788.932 us`；
 - 第一门槛：DAG 实现必须低于 `0.82 ms`；
 - 最终目标：达到 `0.60 ms`。
 
@@ -383,3 +402,6 @@ Scalar 真实负载时间直接相减。
 11. 固定容量的本地 DAG/writer 投影只初始化标量边界和随后发布的
     `[0, count)` 有效前缀；所有消费者必须先校验 `count`，不得读取未发布容量，
     也不得依赖未使用槽为零。该约束用于避免在每个 task 上清零整块临时数组。
+12. execution payload 只允许引用已经发布且本轮不可变的共享 GM descriptor；
+    builder 不得发布本核私有地址，executor 必须逐引用 invalidate，host 必须按
+    runtime state 基址核对精确 GM offset。

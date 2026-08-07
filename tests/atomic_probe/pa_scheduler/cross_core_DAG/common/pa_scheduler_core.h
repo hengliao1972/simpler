@@ -4519,7 +4519,8 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
     if (!cross_core_dag::ResolvePaExecPayloadSourceAfterFanin<Ops, true>(
             *state, args, context, task_id, source,
             observer
-        )) {
+        ) ||
+        !cross_core_dag::ApplyPaExecPayloadReferences(source, spec)) {
         PublishCrossCoreRuntimeFailure<Ops>(
             state, stats,
             cross_core_dag::ExecFatalReason::BuildPackFailed,

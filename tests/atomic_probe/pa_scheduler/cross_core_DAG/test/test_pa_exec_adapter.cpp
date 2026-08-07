@@ -281,16 +281,17 @@ struct CaseShape {
     uint16_t tensor_count;
     uint16_t scalar_count;
     uint16_t fanin_count;
+    uint32_t reference_mask;
     uint32_t payload_bytes;
     uint32_t payload_lines;
     ExecEngineClass engine;
 };
 
 constexpr std::array<CaseShape, 4> kCases = {{
-    {TaskKind::Qk, 1, 0, 4, 2, 0, 592, 10, ExecEngineClass::Aic},
-    {TaskKind::Sf, 2, 1, 4, 3, 1, 604, 10, ExecEngineClass::Aiv},
-    {TaskKind::Pv, 3, 2, 4, 2, 1, 596, 10, ExecEngineClass::Aic},
-    {TaskKind::Up, 4, 3, 7, 2, 3, 988, 16, ExecEngineClass::Aiv},
+    {TaskKind::Qk, 1, 0, 4, 2, 0, 0x08, 472, 8, ExecEngineClass::Aic},
+    {TaskKind::Sf, 2, 1, 4, 3, 1, 0x0f, 124, 2, ExecEngineClass::Aiv},
+    {TaskKind::Pv, 3, 2, 4, 2, 1, 0x09, 356, 6, ExecEngineClass::Aic},
+    {TaskKind::Up, 4, 3, 7, 2, 3, 0x3f, 268, 5, ExecEngineClass::Aiv},
 }};
 
 struct CaseFixture {
@@ -299,6 +300,7 @@ struct CaseFixture {
     TensorCreateInfo create_infos[kExecMaxTensors]{};
     TensorDesc local_sources[kExecMaxTensors]{};
     TensorDesc expected_tensors[kExecMaxTensors]{};
+    const TensorDesc *expected_references[kExecMaxTensors]{};
     uint64_t expected_scalars[kExecMaxScalars]{};
     int32_t expected_fanin[kExecMaxFanin]{};
     uint32_t shared_producers[kExecMaxTensors]{};
@@ -401,6 +403,7 @@ void AddSharedArg(
         fixture.args, PlainOutputRef(producer, output_slot), tag
     );
     fixture.expected_tensors[index] = cell.tensors[output_slot];
+    fixture.expected_references[index] = &cell.tensors[output_slot];
     fixture.shared_producers[fixture.shared_source_count] = producer;
     fixture.shared_slots[fixture.shared_source_count] = output_slot;
     ++fixture.shared_source_count;
@@ -414,6 +417,9 @@ void AddOutputArg(
     AddOutput(fixture.args, fixture.create_infos[index]);
     payload.tensors[index] = PatternTensor(seed);
     fixture.expected_tensors[index] = payload.tensors[index];
+    fixture.expected_references[index] = &payload.tensors[index];
+    fixture.context.result.tensors[fixture.context.result.count++] =
+        &payload.tensors[index];
 }
 
 void AddScalarArg(CaseFixture &fixture, uint64_t value) {
@@ -448,6 +454,7 @@ void BuildCaseArgs(
     fixture.context.payload = &payload;
     fixture.context.task_id = static_cast<int32_t>(shape.task_id);
     fixture.context.result.task_id = shape.task_id;
+    fixture.context.result.count = 0;
     fixture.context.joint = false;
     fixture.context.joint_init = false;
     fixture.context.joint_block = -1;
@@ -562,7 +569,7 @@ bool PayloadMatches(
     bool exact =
         ComputeExecPayloadLayout(
             shape.tensor_count, shape.scalar_count,
-            shape.fanin_count, layout
+            shape.fanin_count, shape.reference_mask, layout
         ) &&
         header.task_id == shape.task_id &&
         header.function_address == 0 &&
@@ -572,6 +579,7 @@ bool PayloadMatches(
         header.tensor_count == shape.tensor_count &&
         header.scalar_count == shape.scalar_count &&
         header.fanin_count == shape.fanin_count &&
+        header.tensor_reference_mask == shape.reference_mask &&
         header.engine_class == shape.engine &&
         header.flags == 0 &&
         header.multicore_group_id == 0 &&
@@ -579,16 +587,25 @@ bool PayloadMatches(
         header.multicore_size == 1 &&
         layout.payload_bytes == shape.payload_bytes &&
         layout.payload_lines == shape.payload_lines &&
-        payload.words[6] == 0 && payload.words[7] == 0;
+        payload.words[6] == shape.reference_mask &&
+        payload.words[7] == 0;
 
     for (uint32_t tensor = 0;
          tensor < shape.tensor_count; ++tensor) {
+        const uint32_t word_offset = ExecTensorPayloadWordOffset(
+            tensor, shape.reference_mask
+        );
+        if ((shape.reference_mask & (uint32_t{1} << tensor)) != 0) {
+            exact &= payload.words[word_offset] ==
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                    fixture.expected_references[tensor]
+                ));
+            continue;
+        }
         for (uint32_t word = 0;
              word < kExecTensorDescWords; ++word) {
-            exact &= payload.words[
-                layout.tensor_word_offset +
-                tensor * kExecTensorDescWords + word
-            ] == TensorWord(fixture.expected_tensors[tensor], word);
+            exact &= payload.words[word_offset + word] ==
+                TensorWord(fixture.expected_tensors[tensor], word);
         }
     }
     for (uint32_t scalar = 0;
@@ -637,21 +654,15 @@ void PolluteBuilderSources(
 ) {
     for (uint32_t tensor = 0;
          tensor < shape.tensor_count; ++tensor) {
-        PolluteTensor(fixture.local_sources[tensor], tensor + 1U);
-        PolluteTensor(
-            fixture.context.payload->tensors[tensor],
-            tensor + 41U
-        );
+        if ((shape.reference_mask & (uint32_t{1} << tensor)) == 0) {
+            PolluteTensor(fixture.local_sources[tensor], tensor + 1U);
+            PolluteTensor(
+                fixture.context.payload->tensors[tensor],
+                tensor + 41U
+            );
+        }
     }
-    for (uint32_t index = 0;
-         index < fixture.shared_source_count; ++index) {
-        PolluteTensor(
-            state.shared_map.shared_outputs[
-                fixture.shared_producers[index]
-            ].tensors[fixture.shared_slots[index]],
-            index + 81U
-        );
-    }
+    (void)state;
     for (uint32_t scalar = 0;
          scalar < shape.scalar_count; ++scalar) {
         fixture.args.scalars[scalar] ^=
@@ -710,14 +721,16 @@ bool TokenDispatchMatches(
     const uint64_t *dispatch = ExecutionTokenDispatchArgs(token);
     for (uint32_t tensor = 0;
          tensor < shape.tensor_count; ++tensor) {
-        const uint64_t expected_pointer = static_cast<uint64_t>(
-            reinterpret_cast<uintptr_t>(
-                &payload.words[
-                    layout.tensor_word_offset +
-                    tensor * kExecTensorDescWords
-                ]
-            )
-        );
+        const uint64_t expected_pointer =
+            (shape.reference_mask & (uint32_t{1} << tensor)) != 0
+                ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                      fixture.expected_references[tensor]
+                  ))
+                : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                      &payload.words[ExecTensorPayloadWordOffset(
+                          tensor, shape.reference_mask
+                      )]
+                  ));
         exact &= dispatch[tensor] == expected_pointer;
         for (uint32_t word = 0;
              word < kExecTensorDescWords; ++word) {
@@ -873,6 +886,14 @@ bool ClaimBindingRejectsMalformedShape(
 ) {
     ExecPayloadSpec malformed = valid_spec;
     SetMalformedSpecCount(malformed, field);
+    if (field == ShapeField::Tensor) {
+        // 这一层门槛要验证“portable payload 本身合法、但不符合 PA
+        // function shape”时，Claim 后的适配绑定仍会拒绝。缩短 tensor
+        // 数量后同步裁掉越界 reference bit，避免先被通用 layout 校验
+        // 拒绝，从而没有真正覆盖到 adapter 的 shape 门槛。
+        malformed.tensor_reference_mask &=
+            ExecTensorMaskForCount(malformed.tensor_count);
+    }
     SharedExecCell cell{};
     SharedExecFatalControl fatal{};
     ExecutionToken token{};
@@ -1028,7 +1049,7 @@ bool RunCase(SchedulerState &state, const CaseShape &shape) {
     ExecPayloadSpec spec{};
     PaExecPayloadSource source{};
     const bool prepared =
-        PreparePaExecPublicationAfterFanin<AdapterTestOps>(
+        PreparePaExecPublicationAfterFanin<AdapterTestOps, true>(
             state, builder, fixture.args, fixture.context,
             shape.task_id, shape.kind,
             static_cast<int32_t>(shape.function_id),

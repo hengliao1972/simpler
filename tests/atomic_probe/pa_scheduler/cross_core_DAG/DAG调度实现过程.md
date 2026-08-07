@@ -1084,3 +1084,94 @@ startup 到 FinalDrain 的十次结果为：
 - 相对 S12 `818.782 us` 减少 `25.696 us`，改善 `3.14%`；
 - 相对初始 `2326.268 us` 累计改善 `65.91%`；
 - 距 `0.60 ms` 目标仍约 `193 us`。
+
+## 20. 2026-08-07：S14 execution payload 引用不可变共享 descriptor
+
+### 20.1 从 SIMT 最终对象构造合同提炼改造点
+
+SIMT 路径的重要差异不是简单把 Scalar Build 搬给 AIV，而是 builder 直接形成
+最终可消费对象，避免同一 descriptor 在多个中间表示之间反复搬运。S13 的
+Scalar Build 已经把 fresh output 直接构造到 task-indexed `shared_outputs`，但
+随后又把每个 128B `TensorDesc` 从该共享位置读回，并完整复制到 execution
+payload；Execute 再从 payload 绑定一次。plain `SharedOutputRef` 也有同样重复。
+
+本轮复用 portable execution payload 已有的 `tensor_reference_mask`：
+
+- fresh output descriptor 与 plain `SharedOutputRef` 指向的 descriptor 在发布后
+  本轮不再修改，payload 只保存 64-bit GM 地址；
+- external tensor、local/view 以及无法证明不可变生命周期的 descriptor 继续
+  128B 内联；
+- builder 只 clean-out compact payload；executor 取得 `CLAIMED` 后先 invalidate
+  payload，再逐个 invalidate 引用目标的两条 cache line；
+- reference mask 必须是 GM tensor mask 的子集且不得越过 `tensor_count`；
+- 公共协议只消费 adapter 给出的不可变性判定，不识别 PA 固定 task id、fanin
+  或 DAG 形态。
+
+四种 PA execution payload 的物理形状由公共 layout 精确变为：
+
+| task | reference mask | 旧 payload | 新 payload |
+| ---- | -------------: | ----------: | ----------: |
+| QK | `0x08` | `592 B / 10 lines` | `472 B / 8 lines` |
+| SF | `0x0f` | `604 B / 10 lines` | `124 B / 2 lines` |
+| PV | `0x09` | `596 B / 10 lines` | `356 B / 6 lines` |
+| UP | `0x3f` | `988 B / 16 lines` | `268 B / 5 lines` |
+
+### 20.2 独立 oracle 暴露并修正旧假设
+
+第一轮 A5 执行的 1,024 个 kernel、FinalDrain 和 real-compute 输出均闭合，但
+host payload oracle 正确拒绝了结果。原因不是放宽后即可忽略的“验证器问题”，
+而是旧 oracle 固定假设 `tensor_reference_mask == 0`，并用
+`tensor_index * 16 words` 解码所有 inline descriptor。
+
+修正后的 host oracle 不解引用 D2H 快照中的 device GM 地址，而是：
+
+1. 按 task 访问语义独立得到期望 reference mask；
+2. 用 `runtime SchedulerState` 的 device 基址加 host 对象 offset，精确核对 payload
+   中的 GM 地址；
+3. 在 host 快照的同一 offset 比较完整 `TensorDesc`；
+4. 对 inline tensor 继续按 compact layout 的实际 word offset 解码；
+5. 同时检查 header、payload lines、scalar、fanin、route 和 terminal state。
+
+CPU adapter 门槛还覆盖了四种实际 shape、引用地址、builder 源污染后的 payload
+不变性，以及“portable shape 合法但不符合 PA function shape”时绑定必须拒绝。
+
+### 20.3 正确性与端到端性能
+
+- `git diff --check` PASS；
+- CPU perf-clock 全量门槛 PASS；
+- AIC/AIV CCEC、mixed ELF、ABI、强符号、无 relocation 和 manifest PASS；
+- A5 B256、默认 `6,28,4,1` 十轮全部
+  `execution/semantic/postprocess` PASS。
+
+startup 到 FinalDrain 的十次结果为：
+
+```text
+785.527  795.271  789.765  780.751  787.438 us
+788.099  775.384  799.326  790.455  791.748 us
+```
+
+- 最快：`775.384 us`；
+- 中位数：`788.932 us`；
+- 最慢：`799.326 us`；
+- 相对 S13 `793.086 us` 减少 `4.154 us`，改善 `0.52%`；
+- 相对初始 `2326.268 us` 累计改善 `66.09%`；
+- 距 `0.60 ms` 目标仍约 `189 us`。
+
+### 20.4 泳道解释
+
+重新编译后的完整泳道位于：
+
+```text
+outputs/pa_scheduler_cross_core_dag_swimlane_20260807_132840_3887751/ccec/
+```
+
+该次观察构建的 startup 到 FinalDrain 为 `860.809 us`。与 S13 的观察构建比较，
+聚合 `WinnerBuild` core-time 从 `9.238 ms` 降到 `5.735 ms`，减少约
+`3.503 ms / 37.9%`；`Submit union` 从 `62.842 ms` 降到 `54.497 ms`。
+这证明 builder 侧确实删除了重复 descriptor copy 和 payload clean-out，而不是
+只靠端到端噪声得出结论。
+
+端到端只改善 `0.52%` 的原因也很明确：executor 仍必须 invalidate 并读取相同
+descriptor，且 AIC kernel compute 已接近关键路径下限；缩短的是 96 核聚合
+Build 工作，不会等比例缩短最慢 AIC 的串行关键链。该结果仍保留，因为合同
+通用、删除了真实重复搬运且所有 oracle 闭合，但它不能单独通向 `0.60 ms`。
