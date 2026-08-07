@@ -68,3 +68,70 @@ descriptor 搬运。
 
 下一阶段先复制现有 Scalar `cross_core` 的最小 CPU/公共实现到独立目录，删除
 旧的 host writer bitset 前驱合同，增加动态 per-symbol 前驱和乱序交错测试。
+
+## 2. 2026-08-07：S0a 独立 Scalar 基线
+
+### 2.1 迁移范围
+
+只复制原 `cross_core` 已跟踪的以下内容：
+
+- `common/`；
+- `cpu/`；
+- `ccec/`；
+- `test/`；
+- `run.sh`。
+
+没有复制 `build/`、`outputs/`、旧过程文档或方案提案。C++ 命名空间从
+`pa_scheduler::cross_core` 机械改为 `pa_scheduler::cross_core_dag`，执行扫描
+测试和泳道输出也使用 DAG 独立名称，防止两套 standalone 产物混淆。
+
+Atomic/DCCI 源码覆盖脚本已复制到本目录，CPU/CCEC 构建不再调用
+`same_core/` 内的脚本。源码扫描确认，除设计文档用于说明来源的链接外，
+当前文件没有 include 或运行时访问 `cross_core/`、`same_core/`、
+`simt_cross_core/`。
+
+### 2.2 CPU 工具链记录
+
+首次显式指定用户态 `g++-15` 时，GCC 15 生成了 binutils 2.42 不识别的
+`.base64` 汇编伪指令，构建在首个独立测试的汇编阶段停止，尚未运行协议代码。
+
+CPU 语义模型不依赖 GCC 15 特性，因此按脚本默认值改用系统
+`g++ 13.3.0`。CCEC 和 ACL host 后续仍使用各自既有固定工具链，不由这次
+CPU 选择外推。
+
+### 2.3 行为不变基线
+
+执行命令：
+
+```bash
+source .venv/bin/activate
+PYTHON=.venv/bin/python \
+  tests/atomic_probe/pa_scheduler/cross_core_DAG/run.sh \
+  build-perf-clock cpu
+```
+
+结果为 PASS，覆盖：
+
+- Atomic/DCCI 源码覆盖；
+- `PollBatch`；
+- 稀疏 metadata-writer completion；
+- host task plan 和 random-access args；
+- 96 worker 中央 Build dispatch 10 轮；
+- ordinary region ring 的 32/64/128/256/16384 五档容量；
+- compact/sparse trace；
+- shared output、writer intent 和 8 路 shared heap；
+- execution payload adapter；
+- AIC/AIV 双 Execute cursor、两项 ticket 和 FinalDrain；
+- 完整 ordered-submit 交错。
+
+动态 Build 测试每轮均闭合 1,280 个 task、1,024 次 Execute 和 256 个旧式
+全局 metadata writer。该结果只证明机械隔离没有改变旧协议；256 个 writer
+仍由全局 writer 链串行，尚未实现本目录目标的 per-symbol DAG。
+
+### 2.4 当前阶段状态
+
+- 独立文件与构建目录：完成。
+- 旧行为 CPU 基线：完成。
+- 动态 per-symbol DAG：NOT RUN。
+- CCEC 构建：NOT RUN。
+- 真实 A5：NOT RUN。
