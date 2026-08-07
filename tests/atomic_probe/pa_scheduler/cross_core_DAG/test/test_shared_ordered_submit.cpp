@@ -782,14 +782,7 @@ bool RunSharedBuildFatalPollCadenceTest() {
     return ok;
 }
 
-enum class InvalidImmutablePlanSummary : uint32_t {
-    MetadataWriter = 0,
-    ExecuteRoleCount = 1,
-};
-
-bool RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
-    InvalidImmutablePlanSummary invalid_summary
-) {
+bool RunInvalidExecutePlanSummaryRejectedBeforeBuildTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
         return false;
@@ -803,20 +796,11 @@ bool RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
     pa_scheduler::host::InitializeState(state, options);
     pa_scheduler::host::ConfigureTrace(state, options, nullptr);
 
-    // Build/Execute dispatch header 都是 host 在 launch 前发布、device 只读
-    // 的算子通用计划。无论破坏 writer union 还是 engine role 总数，所有
-    // worker 都必须在领取第一张 ticket 前终止；正式热路随后才可以复用
-    // 这份入口证明，不在每次 progress 中重复读取同一摘要。
-    const char *summary_name = nullptr;
-    if (invalid_summary == InvalidImmutablePlanSummary::MetadataWriter) {
-        state->build_dispatch.metadata_writer_count =
-            state->build_dispatch.task_count + 1U;
-        summary_name = "metadata";
-    } else {
-        state->exec_dispatch.aic_task_count =
-            state->build_dispatch.task_count + 1U;
-        summary_name = "execute-role";
-    }
+    // Execute dispatch header 是 host 在 launch 前发布、device 只读的角色
+    // 计划。metadata DAG 已改为 Build 时动态推导，不再存在可破坏的 host
+    // writer 摘要；这里只证明 engine role 总数损坏会在首张 ticket 前终止。
+    state->exec_dispatch.aic_task_count =
+        state->build_dispatch.task_count + 1U;
 
     std::vector<std::thread> workers;
     workers.reserve(kWorkers);
@@ -846,9 +830,8 @@ bool RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
         state->exec_dispatch.aiv_next.value == 0 &&
         completed_submits == 0 && all_workers_returned;
     std::printf(
-        "[ORDERED_SUBMIT] invalid_%s_summary_pre_dispatch=%s "
+        "[ORDERED_SUBMIT] invalid_execute_role_summary_pre_dispatch=%s "
         "cursor=%lld submits=%llu all_workers_returned=%u\n",
-        summary_name,
         ok ? "PASS" : "FAIL",
         static_cast<long long>(
             state->build_dispatch.next_task.value
@@ -1011,14 +994,10 @@ bool DispatchAndInsertEvidenceMatches(
                     ) == 0;
             const SharedClaimTournamentTask &tournament =
                 state.claim_tournament[task_id];
+            // host oracle 独立按 workload schema 判断 writer，不能再读取
+            // 已删除的 device metadata bitset 形成同错校验。
             const bool publishes_metadata =
-                ((state.build_dispatch.metadata_writer_bits[
-                      task_id / 64U
-                  ] >> (task_id % 64U)) & uint64_t{1}) != 0;
-            // PA host plan 在这个生产组合中只标记 UP；
-            // 通用 device 热路只消费 immutable bit，不解码 kind。
-            exact &= publishes_metadata ==
-                (task.kind == TaskKind::Up);
+                task.kind == TaskKind::Up;
             exact &= tournament.root.owner.value == -1;
             for (uint32_t group = 0;
                  group < kSharedClaimTournamentMaxGroups;
@@ -1731,9 +1710,7 @@ bool RunInsertReleaseBeforeBuildTest() {
     for (uint32_t task = 0; task < kTaskCount; ++task) {
         all_tasks_ready &= state->tasks[task].flag == 1;
         const bool publishes_metadata =
-            ((state->build_dispatch.metadata_writer_bits[
-                  task / 64U
-              ] >> (task % 64U)) & uint64_t{1}) != 0;
+            SharedPaTaskKindFromOffset(task) == TaskKind::Up;
         claim_cells_match &=
             state->claim_tournament[task]
                     .root.insert_completion.value ==
@@ -2033,14 +2010,8 @@ int main() {
         RunB256BuildTicketBudgetContractTest();
     const bool build_fatal_poll_cadence_ok =
         RunSharedBuildFatalPollCadenceTest();
-    const bool invalid_metadata_summary_ok =
-        RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
-            InvalidImmutablePlanSummary::MetadataWriter
-        );
     const bool invalid_exec_summary_ok =
-        RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
-            InvalidImmutablePlanSummary::ExecuteRoleCount
-        );
+        RunInvalidExecutePlanSummaryRejectedBeforeBuildTest();
     const bool task_id_prefix_ok =
         RunSplitReplayTaskIdPrefixTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
@@ -2059,7 +2030,6 @@ int main() {
         RunRemoteFatalCadenceClosureTest();
     if (!claim_accounting_ok || !build_ticket_budget_ok ||
         !build_fatal_poll_cadence_ok ||
-        !invalid_metadata_summary_ok ||
         !invalid_exec_summary_ok ||
         !task_id_prefix_ok || !loser_ok ||
         !output_prepare_ok ||

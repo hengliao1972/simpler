@@ -385,6 +385,33 @@ def _parse_cpp_dcci_site_ops(sites: Mapping[str, int]) -> dict[int, int]:
 class AtomicDcciSourceCoverageTest(unittest.TestCase):
     maxDiff = None
 
+    def test_host_metadata_writer_plan_cannot_return(self) -> None:
+        """metadata 前驱必须来自 Build 时 schema，不能退回 host bitset。"""
+
+        forbidden = (
+            "metadata_writer_bits",
+            "metadata_writer_count",
+            "ordinary_metadata_writer_count",
+            "symbol_metadata_writer_count",
+            "DecodeSharedMetadataWriterPlan",
+            "ValidateSharedMetadataWriterSummary",
+        )
+        checked = (
+            MODEL,
+            HOST_SUPPORT,
+            COMMON / "pa_scheduler_core.h",
+            COMMON / "pa_shared_submit_path.h",
+        )
+        violations: list[str] = []
+        for path in checked:
+            source = _strip_cpp_comments_and_literals(path.read_text(encoding="utf-8"))
+            for identifier in forbidden:
+                for match in re.finditer(rf"\b{identifier}\b", source):
+                    line = source.count("\n", 0, match.start()) + 1
+                    violations.append(f"{path.relative_to(ROOT)}:{line}: {identifier}")
+        if violations:
+            self.fail("发现重新引入的 host metadata DAG 权威：\n  " + "\n  ".join(violations))
+
     def test_production_headers_have_no_bare_controlled_ops(self) -> None:
         violations: list[SourceCall] = []
         heap_fallback_counts = {operation: 0 for operation in SHARED_HEAP_FALLBACKS}

@@ -231,3 +231,41 @@ DAG 权威；task identity 与 AIC/AIV Execute route 仍作为 launch 级计划�
 审视，不能与 metadata DAG 混为一谈。
 
 CCEC 构建、A5 B1/B256、A5 端到端性能和泳道仍为 `NOT RUN`。
+
+## 5. 2026-08-07：S0d 删除 host metadata DAG 权威
+
+### 5.1 删除范围
+
+`SharedBuildDispatchState` 已删除：
+
+- metadata writer union count；
+- ordinary/symbol writer 分类 count；
+- 每 task metadata writer bitset；
+- `DecodeSharedMetadataWriterPlan()`；
+- `ValidateSharedMetadataWriterSummary()`。
+
+host 不再初始化或校验上述字段，设备入口也不再读取 writer 摘要。Build
+dispatch 只剩 task identity、task/batch/executable 数以及独立的 Execute
+route；它们用于随机访问构参和 engine 路由，不提供 DAG 前驱。
+
+删除 69 个 `uint64_t` bitset word 和行尾对齐后，cross-core execution tail
+从 `19,493,824 B` 减为 `19,493,248 B`，减少 `576 B`。
+
+### 5.2 门槛修正
+
+- host-plan 测试只验证 task identity 与 Execute route，不再复刻一份 writer
+  bitset decoder；
+- random-access G1 测试直接用真实 `TaskArgs` 与 PA schema adapter 构建
+  动态 DAG，四个 UP 各有三个 writer，跨 batch dependency task 数为 0；
+- 96-thread Build dispatch 每个 ticket 动态构建 DAG，B256 闭合 1,280 个
+  Build、1,024 个 Execute 和 256 个 writer completion；
+- ordered-submit 的 host oracle 按独立 workload plan 判断 UP writer，不读取
+  device 计划形成同错校验；
+- 源码门槛新增禁止标识符列表，防止 count/bitset 及旧 Decode/Validate
+  接口以后悄悄回流生产头。
+
+完整 `build-perf-clock cpu` 和 CPU B256 再次 PASS。B256 单次约
+`75.202 ms`，仍只作为 CPU 协议证据，不与前一轮 host 调度时间比较，也不
+冒充 A5 收益。
+
+CCEC 构建、A5 B1/B256、A5 端到端性能和泳道仍为 `NOT RUN`。

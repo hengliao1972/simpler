@@ -85,7 +85,6 @@ struct RunEvidence {
     std::atomic<uint32_t> published_metadata_writers{0};
     std::atomic<uint32_t> built_tasks{0};
     std::atomic<uint32_t> executed_tasks{0};
-    std::atomic<uint32_t> metadata_writer_order{0};
     std::atomic<uint32_t> ticket_fetch_adds{0};
     std::atomic<uint32_t> exec_ticket_fetch_adds{0};
     std::atomic<uint32_t> retire_fetch_adds{0};
@@ -93,19 +92,6 @@ struct RunEvidence {
     std::atomic<uint32_t> later_built_before_task0{0};
     std::atomic<bool> abort{false};
 };
-
-uint32_t MetadataWriterCountBefore(
-    const SharedBuildDispatchState &dispatch, uint32_t task_id
-) {
-    uint32_t count = 0;
-    for (uint32_t task = 0; task < task_id; ++task) {
-        count += static_cast<uint32_t>(
-            (dispatch.metadata_writer_bits[task / 64U] >>
-             (task % 64U)) & uint64_t{1}
-        );
-    }
-    return count;
-}
 
 void RecordFailure(RunEvidence &evidence);
 bool DecodeDispatchIdentity(
@@ -461,43 +447,43 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
                     break;
                 }
 
-                bool publishes_metadata = false;
-                int32_t previous_metadata_writer = -1;
-                bool metadata_prefix_required = false;
-                if (!DecodeSharedMetadataWriterPlan(
-                        state.build_dispatch, task_id,
-                        publishes_metadata,
-                        previous_metadata_writer
+                const SharedPaDagSchema dag_schema{
+                    &state.build_dispatch
+                };
+                SharedMetadataDag metadata_dag{};
+                if (!ValidateSharedDagTaskArgs(
+                        dag_schema, task_id, args
                     ) ||
-                    !SharedTaskNeedsMetadataPrefix(
-                        args, static_cast<int32_t>(task_id),
-                        publishes_metadata,
-                        previous_metadata_writer,
-                        state.build_dispatch
-                                .ordinary_metadata_writer_count != 0,
-                        metadata_prefix_required
+                    !BuildSharedMetadataDag(
+                        dag_schema, task_id, metadata_dag
                     )) {
                     RecordFailure(evidence);
                     break;
                 }
-                if (metadata_prefix_required &&
-                    previous_metadata_writer >= 0) {
+                for (uint32_t dependency_index = 0;
+                     dependency_index <
+                         metadata_dag.dependency_count;
+                     ++dependency_index) {
+                    const int32_t expected_predecessor =
+                        metadata_dag.dependencies[
+                            dependency_index
+                        ];
                     while (!evidence.abort.load(std::memory_order_acquire)) {
                         evidence.predecessor_loads.fetch_add(1, std::memory_order_relaxed);
-                        const int64_t predecessor = TestOps::Load(
+                        const int64_t observed = TestOps::Load(
                             &insert_completion[
                                  static_cast<uint32_t>(
-                                     previous_metadata_writer
+                                     expected_predecessor
                                  )
                              ].value
                         );
-                        if (predecessor == previous_metadata_writer) {
+                        if (observed == expected_predecessor) {
                             break;
                         }
-                        if (predecessor !=
+                        if (observed !=
                             SharedInsertCompletionInitialValue(
                                 static_cast<uint32_t>(
-                                    previous_metadata_writer
+                                    expected_predecessor
                                 )
                             )) {
                             RecordFailure(evidence);
@@ -509,16 +495,15 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
                         break;
                     }
                 }
+                if (evidence.abort.load(std::memory_order_acquire)) {
+                    break;
+                }
 
+                const bool publishes_metadata =
+                    metadata_dag.writer_count != 0 ||
+                    metadata_dag.ordinary_writer;
                 if (publishes_metadata) {
-                    const uint32_t order =
-                        evidence.metadata_writer_order.fetch_add(
-                            1, std::memory_order_acq_rel
-                        );
-                    if (order != MetadataWriterCountBefore(
-                                     state.build_dispatch, task_id
-                                 ) ||
-                        TestOps::CompareExchange(
+                    if (TestOps::CompareExchange(
                             &insert_completion[task_id].value,
                             SharedInsertCompletionInitialValue(
                                 task_id
@@ -535,9 +520,8 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
                     );
                 }
 
-                // task 0 已完成本 task 的 metadata 计划处理后继续延迟
-                // Build。后续 task 必须能继续发布 writer 并完成 Build，
-                // 证明严格 writer 链没有错误扩张到按 task-id 保序 Build。
+                // task 0 完成动态 DAG 处理后继续延迟 Build。后续 task 必须
+                // 仍能完成 Build，证明逻辑前驱没有错误扩张为 task-id 全序。
                 if (task_id == 0 && !WaitForAtLeast(evidence.built_tasks, kDelayedBuildEvidence, evidence)) {
                     break;
                 }
@@ -561,10 +545,7 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
                 if (evidence.prepared_tasks.load(std::memory_order_acquire) != plan.size() ||
                     evidence.published_metadata_writers.load(
                         std::memory_order_acquire
-                    ) != MetadataWriterCountBefore(
-                        state.build_dispatch,
-                        static_cast<uint32_t>(plan.size())
-                    ) ||
+                    ) != kDispatchBatches ||
                     evidence.built_tasks.load(std::memory_order_acquire) != plan.size()) {
                     RecordFailure(evidence);
                 }
@@ -596,18 +577,9 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
               evidence.prepared_tasks.load(std::memory_order_acquire) == plan.size() &&
               evidence.published_metadata_writers.load(
                   std::memory_order_acquire
-              ) == MetadataWriterCountBefore(
-                  state.build_dispatch,
-                  static_cast<uint32_t>(plan.size())
-              ) &&
+              ) == kDispatchBatches &&
               evidence.built_tasks.load(std::memory_order_acquire) == plan.size() &&
               evidence.executed_tasks.load(std::memory_order_acquire) == plan.size() - kDispatchBatches &&
-              evidence.metadata_writer_order.load(
-                  std::memory_order_acquire
-              ) == MetadataWriterCountBefore(
-                  state.build_dispatch,
-                  static_cast<uint32_t>(plan.size())
-              ) &&
               evidence.later_built_before_task0.load(std::memory_order_acquire) >= kDelayedBuildEvidence &&
               TestOps::Load(&control.retired_workers.value) == static_cast<int64_t>(kDispatchWorkers) &&
               TestOps::Load(&control.production_closed.value) == 1;
@@ -622,16 +594,14 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
         ok &= task_evidence[task].owner.load(std::memory_order_acquire) >= 0;
         ok &= task_evidence[task].prepare_count.load(std::memory_order_acquire) == 1;
         ok &= task_evidence[task].build_count.load(std::memory_order_acquire) == 1;
+        SharedPaTaskMeta meta{};
+        ok &= DecodeDispatchIdentity(plan[task], task, static_cast<uint32_t>(plan.size()), meta);
         const bool publishes_metadata =
-            ((state.build_dispatch.metadata_writer_bits[
-                  task / 64U
-              ] >> (task % 64U)) & uint64_t{1}) != 0;
+            meta.kind == TaskKind::Up;
         ok &= TestOps::Load(&insert_completion[task].value) ==
             (publishes_metadata
                  ? static_cast<int64_t>(task)
                  : SharedInsertCompletionInitialValue(task));
-        SharedPaTaskMeta meta{};
-        ok &= DecodeDispatchIdentity(plan[task], task, static_cast<uint32_t>(plan.size()), meta);
         const int32_t build_owner = task_evidence[task].owner.load(std::memory_order_acquire);
         const int32_t execute_owner = task_evidence[task].execute_owner.load(std::memory_order_acquire);
         if (meta.kind == TaskKind::Alloc) {
@@ -680,7 +650,7 @@ bool RunDispatchOnce(SchedulerState &state, const std::vector<DispatchTaskIdenti
 
     std::printf(
         "[BUILD_DISPATCH] run=%u status=%s active_workers=%u tickets=%u "
-        "exec_tickets=%u metadata_writer_cas=%u executes=%u "
+        "exec_tickets=%u metadata_completions=%u executes=%u "
         "later_before_task0=%u predecessor_loads=%u\n",
         run, ok ? "PASS" : "FAIL", active_workers, evidence.ticket_fetch_adds.load(std::memory_order_relaxed),
         evidence.exec_ticket_fetch_adds.load(std::memory_order_relaxed),

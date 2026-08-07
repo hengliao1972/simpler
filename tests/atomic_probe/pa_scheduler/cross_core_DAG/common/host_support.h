@@ -868,37 +868,6 @@ inline bool PopulateSharedBuildDispatchPlan(
         identity.batch = static_cast<uint16_t>(task.batch);
         identity.encoded_meta = encoded;
         identity.exec_route = exec_route;
-        if (task.publishes_metadata !=
-                (task.publishes_ordinary_metadata ||
-                 task.publishes_symbol_metadata)) {
-            if (error != nullptr) {
-                *error =
-                    "shared metadata-writer classification is inconsistent";
-            }
-            std::memset(
-                &state->build_dispatch, 0,
-                sizeof(state->build_dispatch)
-            );
-            std::memset(
-                &state->exec_dispatch, 0,
-                sizeof(state->exec_dispatch)
-            );
-            return false;
-        }
-        if (task.publishes_metadata) {
-            state->build_dispatch.metadata_writer_bits[
-                task.task_id / 64U
-            ] |= uint64_t{1} << (task.task_id % 64U);
-            ++state->build_dispatch.metadata_writer_count;
-        }
-        if (task.publishes_ordinary_metadata) {
-            ++state->build_dispatch
-                  .ordinary_metadata_writer_count;
-        }
-        if (task.publishes_symbol_metadata) {
-            ++state->build_dispatch
-                  .symbol_metadata_writer_count;
-        }
         if (executable) {
             const uint32_t function_id =
                 EncodeSharedHostExecFunctionId(task.kind);
@@ -1453,9 +1422,9 @@ static_assert(
     // 96 * sizeof(ExecutionToken) = 55296B。S6.71 四 token 再追加
     // 96 * sizeof(ExecutionToken) = 55296B。未保留无稳定收益的双 Execute
     // cursor 128B 空槽，因此 task-indexed payload 与其 DCCI 发布边界之外
-    // 只增加一个 owner-local token。稀疏 metadata-writer 计划再追加
-    // 69 个 uint64 word 和 24B 行尾对齐，共 576B。
-    CrossCoreExecStateBytes() == 19493824,
+    // 只增加一个 owner-local token。动态 DAG 删除了 host 的 69-word
+    // metadata bitset 与行尾对齐，tail range 相应减少 576B。
+    CrossCoreExecStateBytes() == 19493248,
     "cross-core execution state transfer size changed"
 );
 static_assert(
@@ -5556,41 +5525,17 @@ inline Metrics Validate(
     bool shared_metadata_writer_completions_ok = true;
     bool legacy_task_completion_canary_ok = true;
     uint32_t shared_completed_metadata_writers = 0;
-    uint32_t expected_metadata_writers = 0;
-    uint32_t expected_ordinary_metadata_writers = 0;
-    uint32_t expected_symbol_metadata_writers = 0;
-    for (const SharedHostPlannedTask &planned_task :
-         shared_plan.tasks) {
-        expected_metadata_writers +=
-            planned_task.publishes_metadata ? 1U : 0U;
-        expected_ordinary_metadata_writers +=
-            planned_task.publishes_ordinary_metadata ? 1U : 0U;
-        expected_symbol_metadata_writers +=
-            planned_task.publishes_symbol_metadata ? 1U : 0U;
-    }
-    shared_metadata_writer_completions_ok &=
-        state.build_dispatch.metadata_writer_count ==
-            expected_metadata_writers &&
-        state.build_dispatch.ordinary_metadata_writer_count ==
-            expected_ordinary_metadata_writers &&
-        state.build_dispatch.symbol_metadata_writer_count ==
-            expected_symbol_metadata_writers;
     for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
         const SharedHostPlannedTask *planned_task =
             shared_plan.TaskAt(task_id);
         const bool planned_writer =
             planned_task != nullptr &&
             planned_task->publishes_metadata;
-        const bool encoded_writer =
-            ((state.build_dispatch.metadata_writer_bits[
-                  task_id / 64U
-              ] >> (task_id % 64U)) & uint64_t{1}) != 0;
         const int64_t expected_completion = planned_writer
             ? static_cast<int64_t>(task_id)
             : SharedInsertCompletionInitialValue(task_id);
         const bool task_completion_ok =
             planned_task != nullptr &&
-            encoded_writer == planned_writer &&
             state.claim_tournament[task_id]
                     .root.insert_completion.value ==
                 expected_completion;

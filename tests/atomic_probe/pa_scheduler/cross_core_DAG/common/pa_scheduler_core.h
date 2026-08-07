@@ -6685,13 +6685,9 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // ticket 流共用这一 task_count，不再由任一 worker 的本地 replay
     // 前缀反推。
     const uint32_t task_count = state->build_dispatch.task_count;
-    // header/plan 在 launch 前一次发布、运行期只读。摘要完整性只需每个
-    // worker 在领取首张 Build ticket 前校验一次，不能在每个逻辑 task 的
-    // Finish 中重复读取同一条 GM cache line。
+    // header/plan 在 launch 前一次发布、运行期只读。这里只校验 task 与
+    // Execute route 摘要；metadata writer DAG 不再由 host 提供。
     if (task_count == 0 || task_count > kMaxTasks ||
-        !ValidateSharedMetadataWriterSummary(
-            state->build_dispatch
-        ) ||
         state->build_dispatch.executable_task_count > task_count ||
         state->exec_dispatch.aic_task_count > task_count ||
         state->exec_dispatch.aiv_task_count > task_count ||

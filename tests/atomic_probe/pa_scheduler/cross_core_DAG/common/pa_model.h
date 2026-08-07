@@ -1446,23 +1446,6 @@ static_assert(
     "shared Build dispatch task identity must remain compact"
 );
 
-// operator/host 在 launch 前明确标注哪些 task 会产生
-// TensorMap ordinary/symbol writer metadata。这是算子无关的只读
-// 计划：公共调度器只消费 task-id bit，不解码 PA kind。
-constexpr uint32_t kSharedMetadataWriterWordCount =
-    (kMaxTasks + 63U) / 64U;
-constexpr uint32_t kSharedBuildDispatchTailPadding =
-    64U - static_cast<uint32_t>(
-        (sizeof(SharedBuildDispatchTaskIdentity) * kMaxTasks +
-         sizeof(uint64_t) * kSharedMetadataWriterWordCount) % 64U
-    );
-static_assert(
-    kSharedMetadataWriterWordCount != 0 &&
-        kSharedBuildDispatchTailPadding >= 1U &&
-        kSharedBuildDispatchTailPadding <= 64U,
-    "shared metadata-writer plan sizing is invalid"
-);
-
 struct alignas(64) SharedBuildDispatchState {
     // next_task 是本结构唯一的 device 可写字段，并独占第一条 cache line。
     // 后续 header/plan 均由 host 在 launch 前一次写定，device 只读。
@@ -1472,22 +1455,10 @@ struct alignas(64) SharedBuildDispatchState {
     // 由 host 计划逐 task 统计，不允许 FinalDrain 用 PA 的
     // task_count-batches 形状反推。0 是合法值，可覆盖纯 metadata 计划。
     uint32_t executable_task_count;
-    // host/operator 在 launch 前发布 metadata writer 分类计数。当前热路
-    // 只消费 ordinary==0 的通用快路径：若全计划没有 ordinary writer，
-    // Gm/LocalTensor lookup 不必等待无关的 symbol-writer 前缀。总 writer
-    // 的 bitset 及逐 task delta 交叉校验仍决定严格插入链，计数不授予
-    // writer 资格。
-    uint32_t metadata_writer_count;
-    uint32_t ordinary_metadata_writer_count;
-    uint32_t symbol_metadata_writer_count;
-    uint8_t header_padding[64 - 6 * sizeof(uint32_t)];
+    // metadata DAG 必须由 Build owner 从 schema 动态推导；host header
+    // 不再携带 writer count、bitset 或前驱权威。
+    uint8_t header_padding[64 - 3 * sizeof(uint32_t)];
     SharedBuildDispatchTaskIdentity tasks[kMaxTasks];
-    uint64_t metadata_writer_bits[
-        kSharedMetadataWriterWordCount
-    ];
-    uint8_t plan_tail_padding[
-        kSharedBuildDispatchTailPadding
-    ];
 };
 static_assert(
     offsetof(SharedBuildDispatchState, tasks) == 128,
@@ -1498,17 +1469,8 @@ static_assert(
     "shared Build dispatch executable count offset changed"
 );
 static_assert(
-    offsetof(
-        SharedBuildDispatchState,
-        ordinary_metadata_writer_count
-    ) == 80,
-    "shared Build dispatch ordinary-writer count offset changed"
-);
-static_assert(
     sizeof(SharedBuildDispatchState) ==
-        128 + sizeof(SharedBuildDispatchTaskIdentity) * kMaxTasks +
-        sizeof(uint64_t) * kSharedMetadataWriterWordCount +
-        kSharedBuildDispatchTailPadding,
+        128 + sizeof(SharedBuildDispatchTaskIdentity) * kMaxTasks,
     "shared Build dispatch state size changed"
 );
 static_assert(
