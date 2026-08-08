@@ -118,6 +118,13 @@ class TestSimpleOrchSmoke(SceneTestCase):
             "params": {"n": 3, "delta": 59, "mixed": 4},
         },
         {
+            "name": "A5OnboardBd32CompeteFirstAicDelta61",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 3, "delta": 61, "mixed": 4},
+        },
+        {
             "name": "A5SimBd36RepeatedMixedDelta29",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},

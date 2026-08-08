@@ -28,6 +28,16 @@
 
 #include "dist_engine/common/target.h"
 
+// `shared TensorMap` 是后端存储合同，不能等同于 legacy same-core PA
+// 的专用回放协议。只有 same_core + shared 才使用固定 Case1、
+// SharedOutputRef 和角色特化的快路径；跨核调度器必须走通用 Submit
+// 接口，才能让构建 owner、执行 owner 和输出描述符协议保持算子无关。
+#if PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE == 0
+#define PTO_FDWIC_SAME_CORE_SHARED_PA_PATH 1
+#else
+#define PTO_FDWIC_SAME_CORE_SHARED_PA_PATH 0
+#endif
+
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
 #if PTO_FDWIC_SHARED_PA_BUILD_ROLE == 0
 #define PTO_FDWIC_SHARED_PA_EMIT_ORCHESTRATION 1
@@ -70,7 +80,7 @@ constexpr uint64_t kPaOrchestrationProfSysCntFreq = 50000000;  // 50 MHz
 
 PTO_DEVICE_FUNC inline uint64_t min_u64(uint64_t a, uint64_t b) { return a < b ? a : b; }
 
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
 PTO_DEVICE_FUNC inline void init_shared_pa_create_info(
     TensorCreateInfo &info, const uint32_t shapes[], uint32_t ndims, DataType dtype
 ) {
@@ -191,7 +201,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 
     CYCLE_COUNT_START();
 
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
     // Runtime attach owns the authoritative AIC/AIV identity. Snapshot it
     // exactly once per replay; all 1,280 shared Claim calls reuse these
     // scalar fields instead of loading DistCore identity from GM.
@@ -220,7 +230,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 
     // key_cache: shape=[total_blocks, block_size, kv_head_num, head_dim]
     uint64_t block_size = orch_args.tensor(1).ref().shapes[1];
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
     // The build/scene gate rejects every non-Case1 selection before compile.
     // Repeat the exact data contract here so a custom caller cannot bypass
     // that gate and run this specialized image with an unsupported shape.
@@ -243,7 +253,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     uint64_t q_head_num = num_heads;
     uint64_t q_tile = min_u64(num_heads, static_cast<uint64_t>(128));
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
     // Phase-1 shared PA has one fixed five-task group per batch:
     // Alloc -> QK -> SF -> PV -> UP.  Reject shapes that would submit a
     // second q-head group or exceed the fixed shared task table.
@@ -283,7 +293,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
     Tensor context_lens =
         make_tensor_external(orch_args.tensor(4).ref().data_as<void>(), cl_shapes, 1, DataType::INT32, false);
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
     // The standalone shared fast path carries the same immutable contiguous
     // backing pointer explicitly. Avoid rebuilding a Tensor scalar-access
     // request on every batch and every replay actor; each iteration still
@@ -306,7 +316,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
     // Shared callbacks consume this object synchronously and every winner
     // resets it before building args. Keep one replay-local instance instead
     // of value-initializing the fixed tag array once per batch on all 96
@@ -314,14 +324,14 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     L0TaskArgs params;
 #endif
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
         uint64_t cur_seq = static_cast<uint64_t>(context_lens_data[b_idx]);
 #else
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
         uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
 #endif
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
         // N_UNROLL is 64, so this also guarantees exactly one block group and
         // therefore exactly five shared tasks for this batch.
         if (bn_this_batch == 0 || bn_this_batch > N_UNROLL) {
@@ -333,7 +343,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
             CYCLE_COUNT_LAP(prof_scope_and_loop);
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
             // The phase-1 shared backend owns its complete task lifetime and
             // its AICore scope hooks are deliberate no-ops. Keep only the C++
             // lifetime block instead of crossing the empty scope ABI 256 times
@@ -342,7 +352,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #else
             PTO2_SCOPE() {
 #endif
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                 // Shared PA constructs task-local views only in the Claim
                 // winner callback. These descriptors remain in the enclosing
                 // scope until the synchronous Finish consumes them.
@@ -370,7 +380,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                 Tensor out_view = Tensor::view(out, out_view_shapes, out_view_offsets, true);
 #endif
 #ifdef ENABLE_PROFILING
-#if !PTO_FDWIC_SHARED_MAP
+#if !PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                 prof_view_count += 2;
 #endif
                 CYCLE_COUNT_LAP(prof_tensor_view);
@@ -379,11 +389,11 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                 // the eager argument builder, then consume params in Finish.
                 // Private mode retains its replay-wide argument construction;
                 // shared mode invokes the builder only on the Claim winner.
-#if !PTO_FDWIC_SHARED_MAP
+#if !PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                 L0TaskArgs params;
 #endif
                 CYCLE_COUNT_LAP(prof_param_setup);
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                 SharedTaskOutputs alloc_outs =
                     PTO_FDWIC_SHARED_PA_ALLOC_CALL(shared_pa_alloc_tensors_compete_first)(
                         replay, PTO_FDWIC_SHARED_PA_ALLOC_IDENTITY(shared_batch_task_start)
@@ -433,7 +443,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
-#if !PTO_FDWIC_SHARED_MAP
+#if !PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                     uint64_t n_blocks = min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
 
                     // Valid length for last block in this group
@@ -443,7 +453,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 
                     // === Task 1: Batched QK matmul ===
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                     TensorCreateInfo sij_buf_ci;
 #else
                     uint32_t sij_buf_shapes[2] = {
@@ -456,7 +466,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 #endif
 
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                     SharedTaskOutputs qk_outs = PTO_FDWIC_SHARED_PA_TASK_CALL(
                         shared_pa_submit_aic_compete_first, DistSharedPaTaskKind::Qk
                     )(
@@ -528,7 +538,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 
                     // === Task 2: Two-pass softmax over all blocks in group ===
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                     TensorCreateInfo pij_buf_ci;
 #else
                     uint32_t pij_buf_shapes[2] = {
@@ -541,7 +551,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 #endif
 
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                     SharedTaskOutputs sf_outs = PTO_FDWIC_SHARED_PA_TASK_CALL(
                         shared_pa_submit_aiv_compete_first, DistSharedPaTaskKind::Sf
                     )(
@@ -621,7 +631,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 
                     // === Task 3: SplitK PV matmul (accumulated P @ V) ===
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                     SharedTaskOutputs pv_outs = PTO_FDWIC_SHARED_PA_TASK_CALL(
                         shared_pa_submit_aic_compete_first, DistSharedPaTaskKind::Pv
                     )(
@@ -682,13 +692,13 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 
                     // === Task 4: Online update (per-group) ===
-#if !PTO_FDWIC_SHARED_MAP
+#if !PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
                     CYCLE_COUNT_LAP(prof_param_setup);
 #endif
 
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
                     SharedTaskOutputs up_outs = PTO_FDWIC_SHARED_PA_TASK_CALL(
                         shared_pa_submit_aiv_compete_first, DistSharedPaTaskKind::Up
                     )(
@@ -833,3 +843,4 @@ aicpu_orchestration_entry_aiv(const L2TaskArgs &orch_args) {
 #endif  // PTO_FDWIC_SHARED_PA_EMIT_ORCHESTRATION
 
 #undef PTO_FDWIC_SHARED_PA_EMIT_ORCHESTRATION
+#undef PTO_FDWIC_SAME_CORE_SHARED_PA_PATH

@@ -461,6 +461,15 @@ PTO_DEVICE_FUNC ExecEngineClass dist_cross_core_executor_engine(__gm__ DistCore 
 PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngineClass task_engine) {
     const ExecEngineClass executor_engine = dist_cross_core_executor_engine(ctx.self);
     if (executor_engine != task_engine) return true;
+    // 每个同 engine worker 只做一次动态 owner CAS；只有首个到达者
+    // 等待 BUILT。CAS 位于 task-private 独占行，不与 builder 的
+    // SharedExecCell::control 发生竞争。这与固定 task-id 路由不同：
+    // 忙核不会被预先指定，Build/Execute owner 也仍然可以不同。
+    __gm__ volatile int64_t &owner_word =
+        g_dist.cross_core_ordinary.execute_owner[static_cast<uint32_t>(ctx.task_id)].state;
+    const int64_t desired_owner = static_cast<int64_t>(ctx.self->core_idx) + 1;
+    const int64_t observed_owner = DistCrossCoreAicoreOps::CompareExchange(&owner_word, 0, desired_owner);
+    if (observed_owner != 0 && observed_owner != desired_owner) return true;
     __gm__ SharedExecCell &cell = g_dist.cross_core_ordinary.tasks[static_cast<uint32_t>(ctx.task_id)];
     uint32_t polls = 0;
     while (true) {

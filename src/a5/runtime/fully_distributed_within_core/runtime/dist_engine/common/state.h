@@ -464,16 +464,27 @@ constexpr uint32_t kFdwicCrossCoreOrdinaryTaskCapacity = 2048;
 struct alignas(kCacheLine) CrossCoreOrdinaryState {
     fdwic::cross_core::SharedExecControl fatal;
     fdwic::cross_core::SharedExecControl heap_cursor;
+    // Build owner 发布 BUILT 之前，同 engine 的 worker 先在这条
+    // task-private cache line 上动态选出唯一 Execute waiter。这使
+    // Build/Execute owner 保持解耦，又避免 32/64 核反复轮询
+    // SharedExecCell::control 而阻塞 BUILT 发布。
+    fdwic::cross_core::SharedExecControl execute_owner[kFdwicCrossCoreOrdinaryTaskCapacity];
     fdwic::cross_core::SharedExecCell tasks[kFdwicCrossCoreOrdinaryTaskCapacity];
     fdwic::cross_core::CrossCoreOutputCell<Tensor> outputs[kFdwicCrossCoreOrdinaryTaskCapacity];
     fdwic::cross_core::CrossCoreTensorMapState tensor_map;
 };
 static_assert(offsetof(CrossCoreOrdinaryState, fatal) == 0);
 static_assert(offsetof(CrossCoreOrdinaryState, heap_cursor) == kCacheLine);
-static_assert(offsetof(CrossCoreOrdinaryState, tasks) == 2 * kCacheLine);
+static_assert(offsetof(CrossCoreOrdinaryState, execute_owner) == 2 * kCacheLine);
+static_assert(
+    offsetof(CrossCoreOrdinaryState, tasks) ==
+    2 * kCacheLine + kFdwicCrossCoreOrdinaryTaskCapacity * sizeof(fdwic::cross_core::SharedExecControl)
+);
 static_assert(
     offsetof(CrossCoreOrdinaryState, outputs) ==
-    2 * kCacheLine + kFdwicCrossCoreOrdinaryTaskCapacity * sizeof(fdwic::cross_core::SharedExecCell)
+    2 * kCacheLine +
+        kFdwicCrossCoreOrdinaryTaskCapacity *
+            (sizeof(fdwic::cross_core::SharedExecControl) + sizeof(fdwic::cross_core::SharedExecCell))
 );
 static_assert(
     offsetof(CrossCoreOrdinaryState, tensor_map) ==
@@ -485,7 +496,8 @@ static_assert(
     sizeof(CrossCoreOrdinaryState) ==
         2 * kCacheLine +
             kFdwicCrossCoreOrdinaryTaskCapacity *
-                (sizeof(fdwic::cross_core::SharedExecCell) + sizeof(fdwic::cross_core::CrossCoreOutputCell<Tensor>)) +
+                (sizeof(fdwic::cross_core::SharedExecControl) + sizeof(fdwic::cross_core::SharedExecCell) +
+                 sizeof(fdwic::cross_core::CrossCoreOutputCell<Tensor>)) +
             sizeof(fdwic::cross_core::CrossCoreTensorMapState),
     "cross-core ordinary state size changed"
 );

@@ -71,8 +71,11 @@ class TestPagedAttentionUnroll(SceneTestCase):
     CASES = [
         {
             "name": "CaseB1",
-            "platforms": ["a5"],
-            "config": {"aicpu_thread_num": 4},
+            # 保留一个单 batch 的模拟器/真机共同门槛。跨核协议出现停滞时，
+            # 模拟器 watchdog 可以导出逐核 task、slot 与未满足 fanin，避免
+            # 只能依赖真机流超时反推状态。
+            "platforms": ["a5sim", "a5"],
+            "config": {"aicpu_thread_num": 4, "fdwic_shared_block_dim": 32},
             "manual": True,
             "params": {
                 "batch": 1,

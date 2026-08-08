@@ -7136,3 +7136,75 @@ batch、context length、输出槽或统计结果。
 CCEC Finish relocation 数用于锁定当前测试产物形状。它们都不参与公共调度
 决策，不能复制成其他算子的运行时特判；其他算子只需发布自己的 immutable
 task、engine/function 和 metadata-writer 计划。
+
+## 2026-08-08：迁入 simpler 真实 Submit 链路
+
+### 迁移边界
+
+本阶段只闭合五种构建模式中的第一种 `cross_core_ordinary`。`shared TensorMap`
+仅表示共享依赖元数据的存储合同，不等同于旧的 same-core PA 专用回放协议。
+因此 PA 编排入口现在明确分成两条路径：
+
+- `same_core + shared` 继续使用固定 Case1、`SharedOutputRef` 和角色特化快路径；
+- `cross_core_ordinary + shared` 走通用 `TaskOutputTensors`、动态 Submit、通用
+  有序 TensorMap、共享输出发布和不可变执行包协议。
+
+该分界避免把 PA 的五任务形状、固定输出槽或 AIC/AIV 角色表带入公共调度器。
+
+### 32-block 停滞的取证结果
+
+最初的 B1 在 32 个完整 block 上会停滞，而较小 block 数能够通过。逐步缩小
+观察范围后，停滞任务稳定留在 `ExecPhase::Building`；出问题的 Build owner
+先后出现于多个 AIV0/AIV1 core，排除了单个核、单个函数地址或 Tensor ABI
+错误。
+
+根因是旧版 `dist_cross_core_bind_execution()` 允许所有 engine 匹配 worker
+反复返回型读取同一 `SharedExecCell::control`：
+
+- AIC task 最多有 32 个 waiter；
+- AIV task 最多有 64 个 waiter；
+- Build owner 完成 payload 与 DCCI 后，还必须对同一 control 执行最终 BUILT
+  CAS；
+- A5 上同地址返回型 atomic 的高并发会把 builder 的发布 CAS 长时间压在竞争
+  之后，表现为任务永久停在 Building。
+
+曾用“把诊断读取改成每字 atomic”观察 payload，B1 可通过但整轮膨胀到约
+80 ms，明显改变竞争时序，不能作为正确性证据或正式修复。固定按 task-id
+路由唯一 waiter 能稳定通过，证明了竞争根因，但固定 owner 可能正忙，也没有
+作为最终协议保留。
+
+### 保留的动态 Execute owner 协议
+
+最终为每个 task 增加一条独占 cache line 的 `execute_owner`：
+
+1. engine 不匹配的 worker 直接离开；
+2. engine 匹配的 worker 各自只在 `execute_owner[task]` 上尝试一次 CAS；
+3. 第一个到达者成为动态 Execute waiter，其余 worker 立即离开；
+4. 唯一 waiter 才轮询 `SharedExecCell::control`，等待 BUILT 后领取不可变执行包；
+5. Build owner 仍由原 Build 竞争产生，因此 Build 与 Execute owner 没有绑定。
+
+owner 仲裁与 BUILT 发布位于不同 cache line，既消除了 32/64 核持续压同一
+control 的竞争，又没有退化为“预先指定一个可能正忙的核”。当前协议仍是功能
+迁移版本：每 task 存在一次 owner CAS 突发，后续性能阶段再与 standalone 的
+中央 Execute ticket 比较，不在本阶段宣称性能对齐。
+
+### 跨镜像 ABI 约束
+
+`CrossCoreOrdinaryState` 新增 `execute_owner[2048]` 后，AICPU、AIC 与 AIV
+必须看到完全相同的 `DistGlobal` 布局。场景测试只重编译编排 kernel 时，旧的
+baseline runtime 不会自动感知头文件 ABI 变化，曾表现为真机立即返回 13、
+A5sim 无输出。完整重建对应 scheduler mode 的 runtime 后问题消失。
+
+因此后续四模式迁移固定增加一条门槛：任何 shared state 字段、容量、顺序或
+对齐变化后，必须先重建 A5sim 与 A5 baseline runtime，再运行场景用例；不能
+把新编排 kernel 与旧 runtime 的 ABI 错配误判成调度协议错误。
+
+### 本阶段验证
+
+- C++：state/register/exec/output/TensorMap 五组协议测试共 30 项通过；
+- A5sim：PA CaseB1 通过；
+- A5：PA CaseB1 连续 10 次通过；
+- A5：PA Case1 B256 通过并与 golden 一致。
+
+这些结果证明第一种模式已经进入真实 PA 动态 Submit 链路并闭合功能正确性；
+尚未完成与 standalone 的端到端性能对齐，也不代表后三种模式已经接通。

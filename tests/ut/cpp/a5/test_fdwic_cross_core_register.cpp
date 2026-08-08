@@ -82,10 +82,11 @@ protected:
 TEST_F(FdwicCrossCoreRegisterTest, AcceptsOneCompleteBlockAndActualHeapCapacity) {
     g_dist_fallback.cross_core_ordinary.fatal.state = 91;
     g_dist_fallback.cross_core_ordinary.heap_cursor.state = 92;
-    g_dist_fallback.cross_core_ordinary.tasks[0].control.state = 93;
-    g_dist_fallback.cross_core_ordinary.outputs[0].control.state = 94;
-    g_dist_fallback.cross_core_ordinary.tensor_map.tails[0].state = 95;
-    g_dist_fallback.cross_core_ordinary.tensor_map.slots[0].sequence.state = 96;
+    g_dist_fallback.cross_core_ordinary.execute_owner[0].state = 93;
+    g_dist_fallback.cross_core_ordinary.tasks[0].control.state = 94;
+    g_dist_fallback.cross_core_ordinary.outputs[0].control.state = 95;
+    g_dist_fallback.cross_core_ordinary.tensor_map.tails[0].state = 96;
+    g_dist_fallback.cross_core_ordinary.tensor_map.slots[0].sequence.state = 97;
 
     ASSERT_EQ(register_runtime(), 0);
 
@@ -97,6 +98,7 @@ TEST_F(FdwicCrossCoreRegisterTest, AcceptsOneCompleteBlockAndActualHeapCapacity)
     EXPECT_EQ(g_dist.layout[2].lane, LANE_AIV1);
     EXPECT_EQ(g_dist.cross_core_ordinary.fatal.state, 0);
     EXPECT_EQ(g_dist.cross_core_ordinary.heap_cursor.state, 0);
+    EXPECT_EQ(g_dist.cross_core_ordinary.execute_owner[0].state, 0);
     EXPECT_EQ(g_dist.cross_core_ordinary.tasks[0].control.state, 0);
     EXPECT_EQ(g_dist.cross_core_ordinary.outputs[0].control.state, 0);
     EXPECT_EQ(g_dist.cross_core_ordinary.tensor_map.tails[0].state, 0);

@@ -38,11 +38,17 @@ TEST(FdwicCrossCoreOrdinaryState, AppendsWithoutMovingTheExistingSharedState) {
     EXPECT_EQ(kFdwicCrossCoreOrdinaryTaskCapacity, 2048U);
     EXPECT_EQ(offsetof(CrossCoreOrdinaryState, fatal), 0U);
     EXPECT_EQ(offsetof(CrossCoreOrdinaryState, heap_cursor), 64U);
-    EXPECT_EQ(offsetof(CrossCoreOrdinaryState, tasks), 128U);
-    EXPECT_EQ(offsetof(CrossCoreOrdinaryState, outputs), 128U + 2048U * sizeof(SharedExecCell));
+    EXPECT_EQ(offsetof(CrossCoreOrdinaryState, execute_owner), 128U);
+    EXPECT_EQ(offsetof(CrossCoreOrdinaryState, tasks), 128U + 2048U * sizeof(SharedExecControl));
+    EXPECT_EQ(
+        offsetof(CrossCoreOrdinaryState, outputs),
+        128U + 2048U * (sizeof(SharedExecControl) + sizeof(SharedExecCell))
+    );
     EXPECT_EQ(
         sizeof(CrossCoreOrdinaryState),
-        128U + 2048U * (sizeof(SharedExecCell) + sizeof(CrossCoreOutputCell<Tensor>)) + sizeof(CrossCoreTensorMapState)
+        128U +
+            2048U * (sizeof(SharedExecControl) + sizeof(SharedExecCell) + sizeof(CrossCoreOutputCell<Tensor>)) +
+            sizeof(CrossCoreTensorMapState)
     );
     EXPECT_EQ(offsetof(DistGlobal, shared_pa), kFdwicSharedTensorMapOffset);
     EXPECT_EQ(offsetof(DistGlobal, cross_core_ordinary), kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState));
@@ -58,6 +64,7 @@ TEST(FdwicCrossCoreOrdinaryState, ResetTouchesOnlyAtomicPublicationControls) {
     EXPECT_EQ(state->fatal.state, 0);
     EXPECT_EQ(state->heap_cursor.state, 0);
     for (uint32_t task = 0; task < kFdwicCrossCoreOrdinaryTaskCapacity; ++task) {
+        EXPECT_EQ(state->execute_owner[task].state, 0) << "task=" << task;
         EXPECT_EQ(state->tasks[task].control.state, 0) << "task=" << task;
         EXPECT_EQ(state->outputs[task].control.state, 0) << "task=" << task;
         EXPECT_TRUE(BytesEqual(
