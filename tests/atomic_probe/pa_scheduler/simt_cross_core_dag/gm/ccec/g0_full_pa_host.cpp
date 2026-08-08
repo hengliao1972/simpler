@@ -12,6 +12,8 @@
 #include "../common/g0_full_pa.h"
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
 #include "../common/g0_swimlane.h"
+#elif defined(SIMT_CROSS_CORE_U2)
+#include "../../ubuf/common/u2_full_pa.h"
 #endif
 
 #include "acl/acl.h"
@@ -35,14 +37,19 @@
 
 namespace {
 
-namespace g0 = pa_scheduler::simt_cross_core_ordinary::g0;
+namespace g0 = pa_scheduler::simt_cross_core::g0;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-namespace g0_swimlane = pa_scheduler::simt_cross_core_ordinary::g0_swimlane;
+namespace g0_swimlane = pa_scheduler::simt_cross_core::g0_swimlane;
+#elif defined(SIMT_CROSS_CORE_U2)
+namespace u2 = pa_scheduler::simt_cross_core::u2;
+namespace ubuf_staging = pa_scheduler::simt_cross_core::ubuf_staging;
 #endif
-using pa_scheduler::simt_cross_core_ordinary::g0::FullPaState;
-using pa_scheduler::simt_cross_core_ordinary::g0::kWorkloadBytes;
+using pa_scheduler::simt_cross_core::g0::FullPaState;
+using pa_scheduler::simt_cross_core::g0::kWorkloadBytes;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-using LaunchState = pa_scheduler::simt_cross_core_ordinary::g0_swimlane::G0SwimlaneState;
+using LaunchState = pa_scheduler::simt_cross_core::g0_swimlane::G0SwimlaneState;
+#elif defined(SIMT_CROSS_CORE_U2)
+using LaunchState = pa_scheduler::simt_cross_core::u2::U2FullPaState;
 #else
 using LaunchState = FullPaState;
 #endif
@@ -62,7 +69,7 @@ struct Options {
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     std::string swimlane_json;
 #endif
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
     std::string acl_config;
 #endif
 };
@@ -100,10 +107,7 @@ static_assert(
     "host maximum SIMT report capacity disagrees with the device ABI"
 );
 static_assert(g0::kTensorDescBytes == kHostTensorDescBytes, "host TensorDesc size disagrees with the device ABI");
-static_assert(
-    g0::kTokensPerOwner >= 1U && g0::kTokensPerOwner <= 4U,
-    "G0 execution-token depth must remain in 1..4"
-);
+static_assert(g0::kTokensPerOwner == 4U, "G0 must retain exactly four execution tokens per owner");
 static_assert(
     kWorkloadBytes == static_cast<uint64_t>(kHostWorkloadTiles) * kHostWorkloadTileElements * sizeof(float),
     "host workload layout disagrees with the device ABI"
@@ -311,42 +315,56 @@ int32_t HostLatestMetadataWriterBefore(
 }
 
 uint32_t HostMetadataWriterPredecessorCount(uint32_t task_id) {
-    if (HostMetadataWriterIntentCount(task_id) == 0U) {
-        return 0U;
-    }
-    uint32_t candidate = task_id;
-    while (candidate != 0U) {
-        --candidate;
-        if (HostMetadataWriterIntentCount(candidate) != 0U) {
-            return 1U;
+    const uint32_t writer_count = HostMetadataWriterIntentCount(task_id);
+    uint32_t predecessor_count = 0U;
+    for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+        HostSharedWriterIntent intent{};
+        if (!HostMetadataWriterIntentAt(task_id, writer, &intent)) {
+            return 0U;
         }
+        const uint32_t predecessor =
+            static_cast<uint32_t>(HostLatestMetadataWriterBefore(task_id, intent.producer_task, intent.output_slot));
+        if (predecessor == intent.producer_task) {
+            continue;
+        }
+        bool duplicate = false;
+        for (uint32_t earlier = 0U; earlier < writer; ++earlier) {
+            HostSharedWriterIntent earlier_intent{};
+            if (!HostMetadataWriterIntentAt(task_id, earlier, &earlier_intent)) {
+                return 0U;
+            }
+            const uint32_t earlier_predecessor = static_cast<uint32_t>(
+                HostLatestMetadataWriterBefore(task_id, earlier_intent.producer_task, earlier_intent.output_slot)
+            );
+            duplicate = duplicate ||
+                        (earlier_predecessor != earlier_intent.producer_task && earlier_predecessor == predecessor);
+        }
+        predecessor_count += duplicate ? 0U : 1U;
     }
-    return 0U;
+    return predecessor_count;
 }
 
 uint32_t HostLatestMetadataPredecessorTask(uint32_t task_id) {
-    if (HostMetadataWriterIntentCount(task_id) == 0U) {
-        return UINT32_MAX;
-    }
-    uint32_t candidate = task_id;
-    while (candidate != 0U) {
-        --candidate;
-        if (HostMetadataWriterIntentCount(candidate) != 0U) {
-            return candidate;
+    const uint32_t writer_count = HostMetadataWriterIntentCount(task_id);
+    uint32_t latest = UINT32_MAX;
+    for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+        HostSharedWriterIntent intent{};
+        if (!HostMetadataWriterIntentAt(task_id, writer, &intent)) {
+            return UINT32_MAX;
+        }
+        const uint32_t predecessor =
+            static_cast<uint32_t>(HostLatestMetadataWriterBefore(task_id, intent.producer_task, intent.output_slot));
+        if (predecessor != intent.producer_task && (latest == UINT32_MAX || predecessor > latest)) {
+            latest = predecessor;
         }
     }
-    return UINT32_MAX;
+    return latest;
 }
 
 uint64_t HostMetadataInsertContract(uint32_t task_id) {
+    constexpr uint64_t kPresent = uint64_t{1} << 63U;
     const uint32_t writer_count = HostMetadataWriterIntentCount(task_id);
-    if (writer_count == 0U) {
-        return 0U;
-    }
-    const uint32_t predecessor = HostLatestMetadataPredecessorTask(task_id);
-    const uint64_t encoded_predecessor = predecessor == UINT32_MAX ? 0U : static_cast<uint64_t>(predecessor) + 1U;
-    return g0::kMetadataInsertContractPresent | writer_count |
-           (encoded_predecessor << g0::kMetadataInsertPreviousWriterShift);
+    return writer_count == 0U ? 0U : kPresent | writer_count;
 }
 
 uint64_t ExpectedBuilderChecksum(
@@ -368,10 +386,13 @@ uint64_t ExpectedBuilderChecksum(
     return value ^ (value >> 31U);
 }
 
-uint32_t ExpectedExecutionTaskId(HostEngine engine, uint32_t ticket_index, uint32_t batches) {
-    return engine == HostEngine::Aic ?
-               g0::AicDispatchTaskId(ticket_index, batches) :
-               g0::AivDispatchTaskId(ticket_index, batches);
+uint32_t ExpectedExecutionTaskId(HostEngine engine, uint32_t ticket_index) {
+    const uint32_t batch = ticket_index / 2U;
+    const uint32_t within_batch = ticket_index % 2U;
+    if (engine == HostEngine::Aic) {
+        return batch * kHostTasksPerBatch + (within_batch == 0U ? 1U : 3U);
+    }
+    return batch * kHostTasksPerBatch + (within_batch == 0U ? 2U : 4U);
 }
 
 uint64_t ExpectedHeapBytes(uint32_t batches) {
@@ -606,17 +627,7 @@ void InitializeState(
         }
         std::memset(&task.execution_witness, 0xD3, sizeof(task.execution_witness));
         if (task_id < task_count && BuildHostTaskOracle(task_id).engine != HostEngine::None) {
-            const HostTaskOracle expected = BuildHostTaskOracle(task_id);
             task.execution_witness.state = 0;
-            task.execution_witness.launch_nonce = nonce;
-            task.execution_witness.witness_magic = UINT64_C(0x5749544E45535330);
-            task.execution_witness.task_id = task_id;
-            task.execution_witness.kind = static_cast<g0::TaskKind>(expected.kind);
-            task.execution_witness.execute_owner = UINT32_MAX;
-            task.execution_witness.execution_count = 0U;
-            task.execution_witness.completion_sequence = 0U;
-            task.execution_witness.output_checksum = 0U;
-            task.execution_witness.fanin_ready_prefix = 0U;
         }
     }
 
@@ -637,8 +648,8 @@ void InitializeState(
     state->exec_dispatch.aic_task_count = batches * 2U;
     state->exec_dispatch.aiv_task_count = batches * 2U;
     for (uint32_t index = 0U; index < batches * 2U; ++index) {
-        state->exec_dispatch.aic_task_ids[index] = ExpectedExecutionTaskId(HostEngine::Aic, index, batches);
-        state->exec_dispatch.aiv_task_ids[index] = ExpectedExecutionTaskId(HostEngine::Aiv, index, batches);
+        state->exec_dispatch.aic_task_ids[index] = ExpectedExecutionTaskId(HostEngine::Aic, index);
+        state->exec_dispatch.aiv_task_ids[index] = ExpectedExecutionTaskId(HostEngine::Aiv, index);
     }
     for (uint32_t shard = 0U; shard < g0::kSharedHeapShards; ++shard) {
         InitializeAtomic(&state->heap.shard_cursors[shard], 0);
@@ -660,6 +671,51 @@ void InitializeState(
     }
 }
 
+#if defined(SIMT_CROSS_CORE_U2)
+void InitializeU2Guard(u2::U2Guard *guard, uint64_t nonce, uint32_t guard_id) {
+    for (uint32_t word = 0U; word < ubuf_staging::kWordsPerLine; ++word) {
+        guard->words[word] = u2::ExpectedGuardWord(nonce, guard_id, word);
+    }
+}
+
+void InitializeU2Staging(u2::U2StagingState *staging, uint64_t nonce, uint32_t batches) {
+    std::memset(staging, 0xA5, sizeof(*staging));
+    staging->control.magic = u2::kProbeMagic;
+    staging->control.version = u2::kProbeVersion;
+    staging->control.launch_nonce = nonce;
+    staging->control.batch_count = batches;
+    staging->control.task_count = g0::TaskCount(batches);
+    staging->control.kernel_task_count = g0::KernelTaskCount(batches);
+    staging->control.builder_count = u2::kBuilderCount;
+    staging->control.slot_count = ubuf_staging::kSlotCount;
+    staging->control.max_payload_lines = ubuf_staging::kMaxPayloadLines;
+    staging->control.words_per_line = ubuf_staging::kWordsPerLine;
+    staging->control.alignment_bytes = ubuf_staging::kAlignmentBytes;
+    staging->control.transport_kind = ubuf_staging::TransportKind::SimtUbufReadToGmWordStore;
+    staging->control.reserved16 = 0U;
+    staging->control.slot_stride_bytes = ubuf_staging::kSlotStrideBytes;
+    staging->control.region_bytes = ubuf_staging::kRegionBytes;
+    staging->control.payload_offset_bytes = ubuf_staging::kPayloadOffsetBytes;
+
+    InitializeU2Guard(&staging->guard_before_slots, nonce, u2::kGuardBeforeSlots);
+    InitializeU2Guard(&staging->guard_after_slots, nonce, u2::kGuardAfterSlots);
+    InitializeU2Guard(&staging->guard_before_reports, nonce, u2::kGuardBeforeReports);
+    InitializeU2Guard(&staging->guard_after_reports, nonce, u2::kGuardAfterReports);
+    for (uint32_t slot = 0U; slot < ubuf_staging::kSlotCount; ++slot) {
+        InitializeAtomic(&staging->slot_states[slot], static_cast<int64_t>(ubuf_staging::SlotFreeState(0U)));
+        InitializeAtomic(&staging->slot_acquire_count[slot], 0);
+        InitializeAtomic(&staging->slot_release_count[slot], 0);
+    }
+    InitializeAtomic(&staging->global_busy_depth, 0);
+    InitializeAtomic(&staging->global_max_busy_depth, 0);
+    InitializeAtomic(&staging->anchor_staged_count, 0);
+    InitializeAtomic(&staging->anchor_staged_mask, 0);
+    InitializeAtomic(&staging->guard_check_count, 0);
+    InitializeAtomic(&staging->ubuf_words_written, 0);
+    InitializeAtomic(&staging->gm_words_stored, 0);
+    std::memset(staging->reports, 0xD3, sizeof(staging->reports));
+}
+#endif
 
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
 void InitializeSwimlaneTrace(g0_swimlane::TraceState *trace, uint64_t nonce, uint32_t batches, uint32_t builder_count) {
@@ -683,7 +739,7 @@ void InitializeSwimlaneTrace(g0_swimlane::TraceState *trace, uint64_t nonce, uin
 #endif
 
 FullPaState &FullPaView(LaunchState &state) {
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
     return state.full_pa;
 #else
     return state;
@@ -691,7 +747,7 @@ FullPaState &FullPaView(LaunchState &state) {
 }
 
 const FullPaState &FullPaView(const LaunchState &state) {
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
     return state.full_pa;
 #else
     return state;
@@ -710,6 +766,8 @@ void InitializeLaunchState(
     full_pa.control.up_repeats = workload_repeats[3];
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     InitializeSwimlaneTrace(&state->trace, nonce, batches, builder_count);
+#elif defined(SIMT_CROSS_CORE_U2)
+    InitializeU2Staging(&state->staging, nonce, batches);
 #endif
 }
 
@@ -819,16 +877,9 @@ HostTensorDesc LoadPayloadTensor(const g0::SharedExecCell &cell, uint32_t tensor
     return tensor;
 }
 
-uint64_t HostExecutionWitnessState(
-    uint64_t nonce, uint32_t task_id, HostTaskKind kind, uint32_t owner, uint32_t execution_count,
-    uint64_t completion_sequence, uint64_t output_checksum, uint32_t fanin_ready_prefix
-) {
+uint64_t HostExecutionWitnessState(uint64_t nonce, uint32_t task_id, HostTaskKind kind, uint32_t owner) {
     uint64_t value = UINT64_C(0x5749544E45535330) ^ nonce ^ (static_cast<uint64_t>(task_id) << 17U) ^
                      (static_cast<uint64_t>(kind) << 49U) ^ (static_cast<uint64_t>(owner) << 1U);
-    value ^= output_checksum ^ (output_checksum << 13U) ^ (output_checksum >> 7U);
-    value ^= (completion_sequence << 5U) ^ (completion_sequence >> 11U);
-    value ^= static_cast<uint64_t>(fanin_ready_prefix) << 37U;
-    value ^= static_cast<uint64_t>(execution_count) << 57U;
     value ^= value >> 23U;
     value *= UINT64_C(0xD6E8FEB86659FD93);
     value ^= value >> 32U;
@@ -858,6 +909,172 @@ bool AtomicPaddingMatches(const g0::AtomicLine &actual, const g0::AtomicLine &in
     return std::memcmp(actual.padding, initial.padding, sizeof(actual.padding)) == 0;
 }
 
+#if defined(SIMT_CROSS_CORE_U2)
+bool ValidateU2Atomic(
+    const g0::AtomicLine &actual, const g0::AtomicLine &initial, int64_t expected_value, const char *value_reason,
+    const char *padding_reason, uint32_t index, ValidationFailure *failure
+) {
+    return RecordCheck(
+               actual.value == expected_value, failure, value_reason, UINT32_MAX, UINT32_MAX, index,
+               static_cast<uint64_t>(expected_value), static_cast<uint64_t>(actual.value)
+           ) &&
+           RecordCheck(AtomicPaddingMatches(actual, initial), failure, padding_reason, UINT32_MAX, UINT32_MAX, index);
+}
+
+bool ValidateU2Guard(const u2::U2Guard &actual, uint64_t nonce, uint32_t guard_id, ValidationFailure *failure) {
+    for (uint32_t word = 0U; word < ubuf_staging::kWordsPerLine; ++word) {
+        const uint64_t expected = u2::ExpectedGuardWord(nonce, guard_id, word);
+        if (!RecordCheck(
+                actual.words[word] == expected, failure, "u2-guard-mutated", UINT32_MAX, UINT32_MAX,
+                guard_id * ubuf_staging::kWordsPerLine + word, expected, actual.words[word]
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint64_t ExpectedU2PayloadChecksum(const FullPaState &state, uint64_t nonce, uint32_t task_id, uint32_t words) {
+    uint64_t checksum = u2::PayloadChecksumSeed(nonce, task_id, words);
+    for (uint32_t word = 0U; word < words; ++word) {
+        checksum = u2::FoldPayloadChecksum(checksum, state.tasks[task_id].exec.payload.words[word]);
+    }
+    return checksum;
+}
+
+bool ValidateU2Staging(
+    const LaunchState &state, const LaunchState &initial, uint64_t nonce, uint32_t batches, ValidationFailure *failure
+) {
+    const u2::U2StagingState &staging = state.staging;
+    const u2::U2StagingState &initial_staging = initial.staging;
+    if (!RecordCheck(
+            std::memcmp(&staging.control, &initial_staging.control, sizeof(staging.control)) == 0, failure,
+            "u2-control-mutated"
+        ) ||
+        !ValidateU2Guard(staging.guard_before_slots, nonce, u2::kGuardBeforeSlots, failure) ||
+        !ValidateU2Guard(staging.guard_after_slots, nonce, u2::kGuardAfterSlots, failure) ||
+        !ValidateU2Guard(staging.guard_before_reports, nonce, u2::kGuardBeforeReports, failure) ||
+        !ValidateU2Guard(staging.guard_after_reports, nonce, u2::kGuardAfterReports, failure)) {
+        return false;
+    }
+
+    for (uint32_t slot = 0U; slot < ubuf_staging::kSlotCount; ++slot) {
+        if (!ValidateU2Atomic(
+                staging.slot_states[slot], initial_staging.slot_states[slot],
+                static_cast<int64_t>(ubuf_staging::SlotFreeState(batches)), "u2-slot-final-state",
+                "u2-slot-padding-mutated", slot, failure
+            ) ||
+            !ValidateU2Atomic(
+                staging.slot_acquire_count[slot], initial_staging.slot_acquire_count[slot], batches,
+                "u2-slot-acquire-count", "u2-slot-acquire-padding-mutated", slot, failure
+            ) ||
+            !ValidateU2Atomic(
+                staging.slot_release_count[slot], initial_staging.slot_release_count[slot], batches,
+                "u2-slot-release-count", "u2-slot-release-padding-mutated", slot, failure
+            )) {
+            return false;
+        }
+    }
+
+    const uint64_t kernel_tasks = g0::KernelTaskCount(batches);
+    const uint64_t expected_words = u2::ExpectedWordsPerBatch() * batches;
+    struct AtomicExpectation {
+        const g0::AtomicLine *actual;
+        const g0::AtomicLine *initial;
+        int64_t expected;
+        const char *reason;
+    };
+    const AtomicExpectation atomics[] = {
+        {&staging.global_busy_depth, &initial_staging.global_busy_depth, 0, "u2-global-busy-depth"},
+        {&staging.global_max_busy_depth, &initial_staging.global_max_busy_depth,
+         static_cast<int64_t>(ubuf_staging::kSlotCount), "u2-global-max-busy-depth"},
+        {&staging.anchor_staged_count, &initial_staging.anchor_staged_count, static_cast<int64_t>(u2::kAnchorTaskCount),
+         "u2-anchor-count"},
+        {&staging.anchor_staged_mask, &initial_staging.anchor_staged_mask, static_cast<int64_t>(u2::kAnchorMask),
+         "u2-anchor-mask"},
+        {&staging.guard_check_count, &initial_staging.guard_check_count, static_cast<int64_t>(kernel_tasks),
+         "u2-guard-check-count"},
+        {&staging.ubuf_words_written, &initial_staging.ubuf_words_written, static_cast<int64_t>(expected_words),
+         "u2-ubuf-words-written"},
+        {&staging.gm_words_stored, &initial_staging.gm_words_stored, static_cast<int64_t>(expected_words),
+         "u2-gm-words-stored"},
+    };
+    for (uint32_t index = 0U; index < sizeof(atomics) / sizeof(atomics[0]); ++index) {
+        if (!ValidateU2Atomic(
+                *atomics[index].actual, *atomics[index].initial, atomics[index].expected, atomics[index].reason,
+                "u2-counter-padding-mutated", index, failure
+            )) {
+            return false;
+        }
+    }
+
+    const uint32_t report_count = g0::KernelTaskCount(batches);
+    for (uint32_t report_index = 0U; report_index < report_count; ++report_index) {
+        const uint32_t task_id =
+            (report_index / g0::kKernelsPerBatch) * g0::kTasksPerBatch + report_index % g0::kKernelsPerBatch + 1U;
+        const uint32_t expected_words_for_task = u2::PayloadWrittenWords(g0::TaskKindAt(task_id));
+        const u2::U2TaskStagingReport &report = staging.reports[report_index];
+        const uint64_t expected_checksum =
+            ExpectedU2PayloadChecksum(state.full_pa, nonce, task_id, expected_words_for_task);
+        if (!RecordCheck(
+                report.task_id == task_id, failure, "u2-report-task", task_id, UINT32_MAX, report_index, task_id,
+                report.task_id
+            ) ||
+            !RecordCheck(
+                report.slot_id == u2::SlotForTask(task_id), failure, "u2-report-slot", task_id, UINT32_MAX,
+                report_index, u2::SlotForTask(task_id), report.slot_id
+            ) ||
+            !RecordCheck(
+                report.generation == u2::ExpectedGeneration(task_id), failure, "u2-report-generation", task_id,
+                UINT32_MAX, report_index, u2::ExpectedGeneration(task_id), report.generation
+            ) ||
+            !RecordCheck(
+                report.phase_bits == u2::kExpectedTransportPhaseBits, failure, "u2-report-phase", task_id, UINT32_MAX,
+                report_index, u2::kExpectedTransportPhaseBits, report.phase_bits
+            ) ||
+            !RecordCheck(
+                report.ubuf_words_written == expected_words_for_task, failure, "u2-report-ubuf-words", task_id,
+                UINT32_MAX, report_index, expected_words_for_task, report.ubuf_words_written
+            ) ||
+            !RecordCheck(
+                report.gm_words_stored == expected_words_for_task, failure, "u2-report-gm-words", task_id, UINT32_MAX,
+                report_index, expected_words_for_task, report.gm_words_stored
+            ) ||
+            !RecordCheck(
+                report.guard_check_count == 1U && report.acquire_count == 1U && report.release_count == 1U, failure,
+                "u2-report-exact-counts", task_id, UINT32_MAX, report_index, UINT64_C(0x0000000100010001),
+                (static_cast<uint64_t>(report.guard_check_count) << 32U) |
+                    (static_cast<uint64_t>(report.acquire_count) << 16U) | report.release_count
+            ) ||
+            !RecordCheck(
+                report.reserved32[0] == 0U && report.reserved32[1] == 0U && report.reserved32[2] == 0U, failure,
+                "u2-report-reserved", task_id, UINT32_MAX, report_index
+            ) ||
+            !RecordCheck(
+                report.launch_nonce == nonce, failure, "u2-report-nonce", task_id, UINT32_MAX, report_index, nonce,
+                report.launch_nonce
+            ) ||
+            !RecordCheck(
+                report.payload_checksum == expected_checksum, failure, "u2-report-payload-checksum", task_id,
+                UINT32_MAX, report_index, expected_checksum, report.payload_checksum
+            )) {
+            return false;
+        }
+    }
+    for (uint32_t report_index = report_count; report_index < u2::kMaxTransportReports; ++report_index) {
+        if (!RecordCheck(
+                std::memcmp(
+                    &staging.reports[report_index], &initial_staging.reports[report_index],
+                    sizeof(staging.reports[report_index])
+                ) == 0,
+                failure, "u2-inactive-report-mutated", UINT32_MAX, UINT32_MAX, report_index
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
 
 bool ValidateFixedRegions(
     const FullPaState &state, const FullPaState &initial, uint64_t nonce, uint32_t batches, ValidationFailure *failure
@@ -1467,22 +1684,9 @@ bool ValidateTask(
     }
 
     const g0::FullPaExecutionWitness &witness = task.execution_witness;
-    const g0::FullPaExecutionWitness &initial_witness = initial_task.execution_witness;
-    const uint64_t expected_witness_state = HostExecutionWitnessState(
-        nonce, task_id, expected.kind, decoded.execute_owner, 1U, UINT64_C(0x0102030405),
-        ExpectedWitnessChecksum(expected.kind), expected.fanin_count
-    );
+    const uint64_t expected_witness_state =
+        HostExecutionWitnessState(nonce, task_id, expected.kind, decoded.execute_owner);
     return RecordCheck(
-               initial_witness.state == 0 && initial_witness.launch_nonce == nonce &&
-                   initial_witness.witness_magic == UINT64_C(0x5749544E45535330) &&
-                   initial_witness.task_id == task_id &&
-                   static_cast<uint32_t>(initial_witness.kind) == static_cast<uint32_t>(expected.kind) &&
-                   initial_witness.execute_owner == UINT32_MAX && initial_witness.execution_count == 0U &&
-                   initial_witness.completion_sequence == 0U && initial_witness.output_checksum == 0U &&
-                   initial_witness.fanin_ready_prefix == 0U,
-               failure, "initial-witness-identity", task_id
-           ) &&
-           RecordCheck(
                static_cast<uint64_t>(witness.state) == expected_witness_state, failure, "witness-state", task_id,
                decoded.execute_owner, UINT32_MAX, expected_witness_state, static_cast<uint64_t>(witness.state)
            ) &&
@@ -1504,12 +1708,25 @@ bool ValidateTask(
                static_cast<uint32_t>(witness.kind)
            ) &&
            RecordCheck(
-               witness.execute_owner == initial_witness.execute_owner &&
-                   witness.execution_count == initial_witness.execution_count &&
-                   witness.completion_sequence == initial_witness.completion_sequence &&
-                   witness.output_checksum == initial_witness.output_checksum &&
-                   witness.fanin_ready_prefix == initial_witness.fanin_ready_prefix,
-               failure, "witness-dynamic-fields-must-remain-encoded-only", task_id, decoded.execute_owner
+               witness.execute_owner == decoded.execute_owner, failure, "witness-owner", task_id, decoded.execute_owner,
+               UINT32_MAX, decoded.execute_owner, witness.execute_owner
+           ) &&
+           RecordCheck(
+               witness.execution_count == 1U, failure, "witness-execution-count", task_id, decoded.execute_owner,
+               UINT32_MAX, 1U, witness.execution_count
+           ) &&
+           RecordCheck(
+               witness.completion_sequence == UINT64_C(0x0102030405), failure, "witness-completion-sequence", task_id,
+               decoded.execute_owner, UINT32_MAX, UINT64_C(0x0102030405), witness.completion_sequence
+           ) &&
+           RecordCheck(
+               witness.output_checksum == ExpectedWitnessChecksum(expected.kind), failure, "witness-output-checksum",
+               task_id, decoded.execute_owner, UINT32_MAX, ExpectedWitnessChecksum(expected.kind),
+               witness.output_checksum
+           ) &&
+           RecordCheck(
+               witness.fanin_ready_prefix == expected.fanin_count, failure, "witness-fanin-ready-prefix", task_id,
+               decoded.execute_owner, UINT32_MAX, expected.fanin_count, witness.fanin_ready_prefix
            );
 }
 
@@ -1755,12 +1972,8 @@ bool ValidateRetainedTokenDispatch(
             static_cast<uint32_t>(owner_engine), static_cast<uint32_t>(task.engine)
         ) ||
         !RecordCheck(
-            static_cast<uint64_t>(state.tasks[task_id].execution_witness.state) ==
-                HostExecutionWitnessState(
-                    state.control.launch_nonce, task_id, task.kind, owner, 1U, UINT64_C(0x0102030405),
-                    ExpectedWitnessChecksum(task.kind), task.fanin_count
-                ),
-            failure, "token-retained-witness-owner", task_id, owner, slot
+            state.tasks[task_id].execution_witness.execute_owner == owner, failure, "token-retained-witness-owner",
+            task_id, owner, slot, owner, state.tasks[task_id].execution_witness.execute_owner
         ) ||
         !RecordCheck(
             (*retained_tasks)[task_id] == 0U, failure, "token-retained-task-duplicate", task_id, owner, slot, 0U,
@@ -1893,8 +2106,8 @@ bool ValidateDispatchAndTokens(
         return false;
     }
     for (uint32_t index = 0U; index < engine_tasks; ++index) {
-        const uint32_t expected_aic = ExpectedExecutionTaskId(HostEngine::Aic, index, batches);
-        const uint32_t expected_aiv = ExpectedExecutionTaskId(HostEngine::Aiv, index, batches);
+        const uint32_t expected_aic = ExpectedExecutionTaskId(HostEngine::Aic, index);
+        const uint32_t expected_aiv = ExpectedExecutionTaskId(HostEngine::Aiv, index);
         if (!RecordCheck(
                 state.exec_dispatch.aic_task_ids[index] == expected_aic, failure, "aic-dispatch-id", expected_aic,
                 UINT32_MAX, index, expected_aic, state.exec_dispatch.aic_task_ids[index]
@@ -2015,9 +2228,7 @@ bool ValidateRolesAndDrain(
                 role.claim_lost_count
             ) ||
             !RecordCheck(
-                has_ticket ?
-                    (role.max_busy_tokens >= 1U && role.max_busy_tokens <= g0::kTokensPerOwner) :
-                    role.max_busy_tokens == 0U,
+                has_ticket ? (role.max_busy_tokens >= 1U && role.max_busy_tokens <= 4U) : role.max_busy_tokens == 0U,
                 failure, "role-max-busy", UINT32_MAX, owner, UINT32_MAX, has_ticket ? 1U : 0U, role.max_busy_tokens
             ) ||
             !RecordCheck(
@@ -2047,13 +2258,17 @@ bool ValidateRolesAndDrain(
             )) {
             return false;
         }
-        for (uint32_t reserved = 2U; reserved < sizeof(role.reserved) / sizeof(role.reserved[0]); ++reserved) {
-            if (!RecordCheck(
-                    role.reserved[reserved] == 0U, failure, "role-reserved", UINT32_MAX, owner, reserved, 0U,
-                    role.reserved[reserved]
-                )) {
-                return false;
-            }
+        const bool lifecycle_timing_valid =
+            role.reserved[2] != 0U &&
+            (owner == g0::kBuilderOwner ?
+                 role.reserved[3] > role.reserved[2] :
+                 role.reserved[3] == 0U) &&
+            role.reserved[4] == 0U;
+        if (!RecordCheck(
+                lifecycle_timing_valid, failure, "role-lifecycle-timing", UINT32_MAX,
+                owner, UINT32_MAX, 1U, lifecycle_timing_valid ? 1U : 0U
+            )) {
+            return false;
         }
         total_execute += role.execute_count;
         total_tickets += role.ticket_count;
@@ -2095,20 +2310,21 @@ bool ValidateRolesAndDrain(
             UINT32_MAX, 1U, static_cast<uint64_t>(drain_value(state.drain.builder_finished))
         ) ||
         !RecordCheck(
-            drain_value(state.drain.done_count) == 0, failure, "drain-done-count-retired", UINT32_MAX,
-            UINT32_MAX, UINT32_MAX, 0U, static_cast<uint64_t>(drain_value(state.drain.done_count))
+            drain_value(state.drain.done_count) == static_cast<int64_t>(expected_kernel_tasks), failure,
+            "drain-done-count", UINT32_MAX, UINT32_MAX, UINT32_MAX, expected_kernel_tasks,
+            static_cast<uint64_t>(drain_value(state.drain.done_count))
         ) ||
         !RecordCheck(
-            drain_value(state.drain.alloc_done) == 0, failure, "drain-alloc-done-retired",
-            UINT32_MAX, UINT32_MAX, UINT32_MAX, 0U, static_cast<uint64_t>(drain_value(state.drain.alloc_done))
+            drain_value(state.drain.alloc_done) == static_cast<int64_t>(batches), failure, "drain-alloc-done",
+            UINT32_MAX, UINT32_MAX, UINT32_MAX, batches, static_cast<uint64_t>(drain_value(state.drain.alloc_done))
         ) ||
         !RecordCheck(
-            drain_value(state.drain.aic_done) == 0, failure, "drain-aic-done-retired", UINT32_MAX, UINT32_MAX,
-            UINT32_MAX, 0U, static_cast<uint64_t>(drain_value(state.drain.aic_done))
+            drain_value(state.drain.aic_done) == static_cast<int64_t>(batches * 2U), failure, "drain-aic-done",
+            UINT32_MAX, UINT32_MAX, UINT32_MAX, batches * 2U, static_cast<uint64_t>(drain_value(state.drain.aic_done))
         ) ||
         !RecordCheck(
-            drain_value(state.drain.aiv_done) == 0, failure, "drain-aiv-done-retired", UINT32_MAX, UINT32_MAX,
-            UINT32_MAX, 0U, static_cast<uint64_t>(drain_value(state.drain.aiv_done))
+            drain_value(state.drain.aiv_done) == static_cast<int64_t>(batches * 2U), failure, "drain-aiv-done",
+            UINT32_MAX, UINT32_MAX, UINT32_MAX, batches * 2U, static_cast<uint64_t>(drain_value(state.drain.aiv_done))
         ) ||
         !RecordCheck(
             drain_value(state.drain.root_finished) == 1, failure, "drain-root-finished", UINT32_MAX, UINT32_MAX,
@@ -2719,7 +2935,7 @@ const char *TraceAtomicSiteName(g0_swimlane::AtomicSite site) {
     case g0_swimlane::AtomicSite::SimtProducerTaskBasePoll:
         return "simt_producer_task_base_poll";
     case g0_swimlane::AtomicSite::SimtInsertPredecessorPoll:
-        return "simt_global_insert_predecessor_poll";
+        return "simt_insert_predecessor_poll";
     case g0_swimlane::AtomicSite::SimtMetadataLastWriterCommit:
         return "simt_metadata_last_writer_commit";
     case g0_swimlane::AtomicSite::SimtInsertCompletionPublish:
@@ -3132,7 +3348,6 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path, double
     std::array<uint64_t, g0::kMaxBuilderCount> simt_raw_end{};
     simt_raw_begin.fill(UINT64_MAX);
     const uint32_t task_count = state.full_pa.control.task_count;
-    const uint32_t metadata_writer_tasks = g0::MetadataWriterTaskCount(task_count);
     for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
         const g0_swimlane::BuilderTaskTrace &builder = trace.builders[task_id];
         const uint32_t builder_instance = builder.build_owner - g0::kBuilderOwner;
@@ -3180,7 +3395,7 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path, double
         return false;
     }
     const double device_trace_span_us = static_cast<double>(finish - origin) / 1000.0;
-    output << "{\"schema\":\"simt_cross_core_ordinary_g0_swimlane_v1\",\"raw_trace_abi\":"
+    output << "{\"schema\":\"simt_cross_core_g0_swimlane_v13\",\"raw_trace_abi\":"
            << g0_swimlane::kTraceVersion
            << ",\"clock\":\"Scalar get_sys_cnt: 1 ns/tick; SIMT CLOCK64: raw ticks\","
               "\"simt_alignment\":\"per_builder_affine_to_own_scalar_vf_envelope_for_display_only\","
@@ -3200,15 +3415,6 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path, double
               "\"end_to_end_alignment\":\"duration_reference_only; ACL event and get_sys_cnt have no exposed shared absolute epoch\","
               "\"instrumented\":true,\"batches\":"
            << state.full_pa.control.batch_count << ",\"tasks\":" << state.full_pa.control.task_count
-           << ",\"builder_count\":" << builder_count
-           << ",\"builder_warps_per_aiv\":" << g0::kBuilderWarpCount
-           << ",\"execution_tokens_per_owner\":" << g0::kTokensPerOwner
-           << ",\"dispatch_window_batches\":" << g0::kDispatchWindowBatches
-           << ",\"metadata_insert_order\":\"global_sparse_task_id_writer_chain\""
-           << ",\"metadata_last_writer_publish\":\"serialized_noncacheable_store\""
-           << ",\"metadata_writer_tasks\":" << metadata_writer_tasks
-           << ",\"metadata_insert_predecessor_edges\":"
-           << (metadata_writer_tasks == 0U ? 0U : metadata_writer_tasks - 1U)
            << ",\"workload_repeats\":{\"qk\":" << state.full_pa.control.qk_repeats
            << ",\"sf\":" << state.full_pa.control.sf_repeats << ",\"pv\":"
            << state.full_pa.control.pv_repeats << ",\"up\":" << state.full_pa.control.up_repeats
@@ -3726,12 +3932,9 @@ bool WriteSwimlaneJson(const LaunchState &state, const std::string &path, double
             &output, &first, "prepare", "simt_build", simt_pid, simt_tid, claim_end, prepare_end, origin, task_id,
             builder.build_owner
         );
-        const bool publishes_metadata = g0::MetadataWriterIntentCount(task_id) != 0U;
         WriteTraceEvent(
-            &output, &first,
-            publishes_metadata ? "serial_metadata_insert" : "publish_without_metadata_insert",
-            "simt_build", simt_pid, simt_tid, commit_begin, commit_end, origin, task_id,
-            builder.build_owner, builder.insert_poll_count
+            &output, &first, "ordered_insert", "simt_build", simt_pid, simt_tid, commit_begin, commit_end, origin,
+            task_id, builder.build_owner, builder.insert_poll_count
         );
         WriteTraceEvent(
             &output, &first, "build_report_publish", "simt_build", simt_pid, simt_tid, commit_end, report_end,
@@ -3826,6 +4029,8 @@ bool ValidateLaunchRun(
     }
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     return ValidateSwimlaneTrace(state, initial, nonce, batches, builder_count, failure);
+#elif defined(SIMT_CROSS_CORE_U2)
+    return ValidateU2Staging(state, initial, nonce, batches, failure);
 #else
     return true;
 #endif
@@ -3909,6 +4114,11 @@ bool ParseOptions(int argc, char **argv, Options *options) {
                 );
                 return false;
             }
+#elif defined(SIMT_CROSS_CORE_U2)
+            if (!ParseUnsigned(argv[++index], u2::kBuilderCount, &value) || value != u2::kBuilderCount) {
+                std::fprintf(stderr, "invalid --builders value: %s (U2 requires 1)\n", argv[index]);
+                return false;
+            }
 #else
             if (!ParseUnsigned(argv[++index], g0::kMaxBuilderCount, &value) ||
                 !g0::BuilderCountValid(static_cast<uint32_t>(value))) {
@@ -3942,7 +4152,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
                 return false;
             }
 #endif
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
         } else if (std::strcmp(argv[index], "--acl-config") == 0 && index + 1 < argc) {
             options->acl_config = argv[++index];
             if (options->acl_config.empty()) {
@@ -3951,7 +4161,11 @@ bool ParseOptions(int argc, char **argv, Options *options) {
             }
 #endif
         } else {
+#if defined(SIMT_CROSS_CORE_U2)
+            const std::string builder_usage = "1";
+#else
             const std::string builder_usage = "1.." + std::to_string(g0::kMaxBuilderCount);
+#endif
             std::fprintf(
                 stderr,
                 "usage: %s --kernel FILE [--device N] [--batches 1|256] [--runs N] [--builders %s]"
@@ -3959,7 +4173,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
                 " [--swimlane-json FILE]"
 #endif
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
                 " --acl-config FILE"
 #endif
                 "\n",
@@ -3972,9 +4186,13 @@ bool ParseOptions(int argc, char **argv, Options *options) {
         std::fprintf(stderr, "--kernel FILE is required\n");
         return false;
     }
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
     if (options->acl_config.empty()) {
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
         std::fprintf(stderr, "G0 swimlane requires --acl-config FILE for its measured SIMT/DVG stack sizes\n");
+#else
+        std::fprintf(stderr, "U2 requires --acl-config FILE for its measured SIMT/DVG stack sizes\n");
+#endif
         return false;
     }
 #endif
@@ -4173,7 +4391,7 @@ int main(int argc, char **argv) {
     AclSession session;
     if (!session.Initialize(
             options.device, binary_data,
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) || defined(SIMT_CROSS_CORE_U2)
             options.acl_config.c_str()
 #else
             nullptr
@@ -4208,6 +4426,7 @@ int main(int argc, char **argv) {
     std::vector<double> kernel_times_us;
     std::vector<double> builder_envelope_times_us;
     std::vector<double> builder_max_vf_times_us;
+    std::vector<double> lifecycle_times_us;
     uint32_t passes = 0U;
     for (uint32_t run = 0U; run < options.runs; ++run) {
         const uint64_t nonce = UINT64_C(0xA550000000000000) ^ (static_cast<uint64_t>(options.batches) << 32U) ^
@@ -4328,6 +4547,15 @@ int main(int argc, char **argv) {
         const double builder_max_vf_us = static_cast<double>(builder_max_vf_ticks) / 1000.0;
         builder_envelope_times_us.push_back(builder_envelope_us);
         builder_max_vf_times_us.push_back(builder_max_vf_us);
+        uint64_t lifecycle_begin = UINT64_MAX;
+        for (uint32_t owner = 0U; owner < g0::kOwnerCount; ++owner) {
+            lifecycle_begin = std::min(lifecycle_begin, full_pa.roles[owner].reserved[2]);
+        }
+        const uint64_t lifecycle_end =
+            full_pa.roles[g0::kBuilderOwner].reserved[3];
+        const double lifecycle_us =
+            static_cast<double>(lifecycle_end - lifecycle_begin) / 1000.0;
+        lifecycle_times_us.push_back(lifecycle_us);
         std::array<uint32_t, g0::kMaxBuilderCount> builder_wins{};
         uint64_t insert_poll_sum = 0U;
         uint32_t insert_poll_max = 0U;
@@ -4363,6 +4591,17 @@ int main(int argc, char **argv) {
             "off",
 #endif
             options.builder_count, builder_envelope_us, builder_max_vf_us
+        );
+        std::printf(
+            "[LIFECYCLE_PERF] run=%u scope=earliest_role_startup_to_root_final_drain_end "
+            "clock=get_sys_cnt_1ns trace=%s span_us=%.3f\n",
+            run + 1U,
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            "on",
+#else
+            "off",
+#endif
+            lifecycle_us
         );
     }
     if (!kernel_times_us.empty()) {
@@ -4416,8 +4655,37 @@ int main(int argc, char **argv) {
             max_vf_sum / static_cast<long double>(count), builder_max_vf_times_us.back()
         );
     }
+    if (!lifecycle_times_us.empty()) {
+        std::sort(lifecycle_times_us.begin(), lifecycle_times_us.end());
+        long double sum = 0.0L;
+        for (double value : lifecycle_times_us) {
+            sum += value;
+        }
+        const size_t count = lifecycle_times_us.size();
+        const double median = count % 2U == 0U ?
+                                  (lifecycle_times_us[count / 2U - 1U] +
+                                   lifecycle_times_us[count / 2U]) /
+                                      2.0 :
+                                  lifecycle_times_us[count / 2U];
+        std::printf(
+            "[LIFECYCLE_PERF_SUMMARY] scope=earliest_role_startup_to_root_final_drain_end "
+            "clock=get_sys_cnt_1ns trace=%s samples=%zu min_us=%.3f median_us=%.3f "
+            "avg_us=%.3Lf max_us=%.3f\n",
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+            "on",
+#else
+            "off",
+#endif
+            count, lifecycle_times_us.front(), median,
+            sum / static_cast<long double>(count), lifecycle_times_us.back()
+        );
+    }
     std::printf(
+#if defined(SIMT_CROSS_CORE_U2)
+        "[SUMMARY] U2 builders=%u B%u passes=%u/%u fresh_initialization=yes same_address_reuse=%s\n",
+#else
         "[SUMMARY] GM builders=%u B%u passes=%u/%u fresh_initialization=yes same_address_reuse=%s\n",
+#endif
         options.builder_count, options.batches, passes, options.runs,
         options.runs > 1U ? "validated" : "not-requested"
     );

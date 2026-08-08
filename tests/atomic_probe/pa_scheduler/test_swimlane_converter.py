@@ -426,6 +426,9 @@ def _v5_shared_register_atomic_capture(
         metadata_writer_tasks=[0, 4],
         metadata_prefix_tasks=metadata_prefix_tasks,
     )
+    metadata = capture["metadata"]
+    assert isinstance(metadata, dict)
+    metadata["submit_topology"] = "central_ticket"
     capture["l2_swimlane_level"] = 4
     capture_rows = capture["fdwic_events"]
     assert isinstance(capture_rows, list)
@@ -467,8 +470,8 @@ def _v5_shared_register_atomic_capture(
                 ]
             )
         if task_id in (0, 4):
-            # 只有真实 writer 才以 source-issue FetchAdd 发布独占
-            # completion；空 writer task 保持 task-specific pending。
+            # central-ticket 只有真实 writer 才用不消费返回值的 FetchAdd
+            # 推进稀疏 writer completion；空 writer task 不参与该链。
             capture_rows.append(
                 [
                     0,
@@ -820,7 +823,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
 
         parent = next(event for event in events if event.get("name") == "register#0")
         flat_child_names = (
-            "register.enter_tensormap_writer_chain#0",
+            "register.enter_tensormap_insert_chain#0",
             "register.publish_writer_metadata"
             "[ordinary_tensormap_entries=0]#0",
             "register.publish_task_outputs#0",
@@ -862,13 +865,13 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 set(child), {"ph", "name", "pid", "tid", "ts", "dur"}
             )
         self.assertEqual(
-            children["register.enter_tensormap_writer_chain#0"]["ts"],
+            children["register.enter_tensormap_insert_chain#0"]["ts"],
             parent["ts"],
         )
         self.assertAlmostEqual(
-            children["register.enter_tensormap_writer_chain#0"]["ts"]
+            children["register.enter_tensormap_insert_chain#0"]["ts"]
             + children[
-                "register.enter_tensormap_writer_chain#0"
+                "register.enter_tensormap_insert_chain#0"
             ]["dur"],
             children[
                 "register.publish_writer_metadata"
@@ -983,7 +986,10 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             # writer metadata 子区间。
             [0, 0, 0, 0, -1, "Atomic", 130, 131, 0x54, 27],
             [0, 0, 0, 0, -1, "Dcci", 131, 132, 0x10D, 1],
-            [0, 0, 0, 0, -1, "Atomic", 136, 137, 0x02, 20],
+            [0, 0, 0, 0, -1, "Atomic", 136, 137, 0x54, 20],
+            # all-worker-replay 已由逐 task completion 链证明 producer
+            # 发布完成；这里是一条协议校验 Load，而不是等待 PollBatch。
+            [0, 0, 0, 0, -1, "Atomic", 137, 138, 0x50, 23],
             [0, 0, 0, 0, -1, "AllocComplete", 140, 145, 0, 0],
             [0, 0, 0, 0, -1, "Submit", 100, 150, 1, 1],
             [0, 0, 0, -1, -1, "ClockBaseline", 10, 11, 0, 0],
@@ -1021,7 +1027,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             names,
         )
         self.assertIn(
-            "register.enter_tensormap_writer_chain#0", names
+            "register.enter_tensormap_insert_chain#0", names
         )
         self.assertIn(
             "register.publish_writer_metadata"
@@ -1034,6 +1040,11 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         self.assertIn(
             "atomic.return_ready.shared_output_ref_last_writer_commit"
             ".compare_exchange#0",
+            names,
+        )
+        self.assertIn(
+            "atomic.return_ready."
+            "shared_output_ref_fanin_output_published_load.load#0",
             names,
         )
         self.assertIn(
@@ -2722,7 +2733,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
     def test_shared_register_atomic_sites_require_shared_schema_v4(self) -> None:
         cases = (
             [0, 0, 0, -1, -1, "Atomic", 100, 110, (3 << 8) | 0x90, 19],
-            [0, 0, 0, 0, -1, "Atomic", 100, 110, 0x02, 20],
+            [0, 0, 0, 0, -1, "Atomic", 100, 110, 0x54, 20],
         )
         for row in cases:
             with self.subTest(site=row[9]), tempfile.TemporaryDirectory() as directory:
@@ -2738,7 +2749,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
 
         for site_id, row in (
             (19, [0, 0, 0, -1, -1, "Atomic", 120, 124, (3 << 8) | 0xD0, 19]),
-            (20, [0, 0, 0, 0, -1, "Atomic", 134, 140, 0x02, 20]),
+            (20, [0, 0, 0, 0, -1, "Atomic", 134, 140, 0x54, 20]),
         ):
             with self.subTest(private_v4_site=site_id), tempfile.TemporaryDirectory() as directory:
                 capture = _v5_capture(
@@ -2772,7 +2783,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
     def test_v4_shared_loser_forbids_insert_turn_atomics(self) -> None:
         for site_id, row in (
             (19, [0, 0, 0, -1, -1, "Atomic", 120, 124, (3 << 8) | 0xD0, 19]),
-            (20, [0, 0, 0, 0, -1, "Atomic", 134, 140, 0x02, 20]),
+            (20, [0, 0, 0, 0, -1, "Atomic", 134, 140, 0x54, 20]),
         ):
             with self.subTest(site=site_id), tempfile.TemporaryDirectory() as directory:
                 capture = _v5_capture(

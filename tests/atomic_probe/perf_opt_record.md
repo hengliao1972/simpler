@@ -5692,7 +5692,7 @@ CCEC 双角色编译和 A5 full-swimlane 均通过。
 `9.08 ms` 仍远未达成；下一阶段须以新泳道重新建立差额账本，再分别处理
 剩余执行等待/控制、portable payload、DCCI/DSB、Claim 和 FinalDrain。
 完整实现细节与泳道路径见
-`pa_scheduler/cross_core/PA调度器分离版实现过程.md` 的 S6.1 记录。
+`pa_scheduler/cross_core_ordinary/PA调度器分离版实现过程.md` 的 S6.1 记录。
 
 ### 15.24 cross-core scanner 入口去除重复 fatal 读取：中位降至 7.304 ms
 
@@ -6285,7 +6285,7 @@ B-C/C-B 交错各测 12 次。基线/候选中位分别为
 `1.742%`，12/12 对样本均更快。A5 B256 full-swimlane 的 1280 task、
 1024 kernel 和所有协议终态均 PASS，目标返回型原子从 `1280 -> 0`。
 据此恢复该优化；具体协议边界、风险与完整数据见
-`pa_scheduler/cross_core/PA调度器分离版实现过程.md` 的 S6.46。
+`pa_scheduler/cross_core_ordinary/PA调度器分离版实现过程.md` 的 S6.46。
 
 ### 15.45 用完整周期复审 Fanin 发布位回读
 
@@ -6337,7 +6337,7 @@ unique-ticket 单 CAS 和 startup 两级 G16 均未形成稳定收益，全部�
 旧单 token、旧 Build Claim Tournament、ready-only、descriptor 引用和连续段
 ticket 等候选则已被新架构取代、存在明确大幅回退或有确定协议反例，不再机械
 复跑。完整逐项矩阵见
-`pa_scheduler/cross_core/PA调度器分离版实现过程.md` 的 S6.51。
+`pa_scheduler/cross_core_ordinary/PA调度器分离版实现过程.md` 的 S6.51。
 
 下一阶段转为泛化审计：动态性能收益只能证明“当前 PA 实例更快”，不能证明
 实现可进入公共调度器。每项保留机制还必须用算子无关不变量表达；PA 的

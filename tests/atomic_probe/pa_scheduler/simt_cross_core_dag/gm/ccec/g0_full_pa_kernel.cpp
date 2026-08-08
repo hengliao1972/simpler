@@ -9,10 +9,10 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-// This GM variant keeps the PA task ABI and task graph while moving Build
-// into independent SIMT warp leaders. Only real metadata writers enter one
-// task-id-ordered global insert chain; Main Scalar launches the VF and joins
-// the global drain without building or inserting tasks.
+// G0/G1 keep the PA task ABI and task graph, but move every
+// Build/ordered-insert operation into 64 independent SIMT warp leaders on
+// each configured builder AIV. Main Scalar only launches the VF and
+// participates in the global drain.
 
 #include <pto/common/kernel_meta.hpp>
 #include <pto/pto-inst.hpp>
@@ -28,22 +28,29 @@
 #include "../common/g0_swimlane.h"
 #endif
 #include "full_pa_workloads.h"
+#if defined(SIMT_CROSS_CORE_U2)
+#include "../../ubuf/common/u2_full_pa.h"
+#include "../../ubuf/common/u2_payload_transport.h"
+#endif
 
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE) && defined(SIMT_CROSS_CORE_U2)
+#error "G0 swimlane profiling and U2 transport are separate build variants"
+#endif
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE) && !defined(SIMT_CROSS_CORE_G0_DISABLE_SIMT_ATOMIC_TRACE)
 #define SIMT_CROSS_CORE_G0_SIMT_ATOMIC_TRACE_ENABLED
 #endif
 
 namespace {
 
-using namespace pa_scheduler::simt_cross_core_ordinary::g0;
-using namespace pa_scheduler::simt_cross_core_ordinary::g0::device;
+using namespace pa_scheduler::simt_cross_core::g0;
+using namespace pa_scheduler::simt_cross_core::g0::device;
 using namespace pto;
 
 constexpr int kSingleCacheLine = 0;
 constexpr uint32_t kWatchdogMask = 0x3FFU;
 constexpr uint32_t kDrainExpectedArrivals = 6U;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-namespace g0_swimlane = pa_scheduler::simt_cross_core_ordinary::g0_swimlane;
+namespace g0_swimlane = pa_scheduler::simt_cross_core::g0_swimlane;
 constexpr size_t kG0TraceFromTasksOffsetBytes =
     offsetof(g0_swimlane::G0SwimlaneState, trace) -
     offsetof(g0_swimlane::G0SwimlaneState, full_pa) - offsetof(FullPaState, tasks);
@@ -52,6 +59,20 @@ static_assert(
             offsetof(g0_swimlane::G0SwimlaneState, full_pa) + offsetof(FullPaState, tasks) &&
         kG0TraceFromTasksOffsetBytes % alignof(g0_swimlane::TraceState) == 0U,
     "G0 trace sidecar must remain aligned and forward-addressable from task_words"
+);
+#endif
+#if defined(SIMT_CROSS_CORE_U2)
+constexpr uint32_t kU2AtomicCasAttemptLimit = 4096U;
+constexpr uint32_t kU2UbufGuardFirst = 4U;
+constexpr uintptr_t kU2UbufRegionOffset = 0U;
+namespace u2 = pa_scheduler::simt_cross_core::u2;
+namespace ubuf_staging = pa_scheduler::simt_cross_core::ubuf_staging;
+constexpr uint32_t kU2StagingFromTasksOffsetWords =
+    (offsetof(u2::U2FullPaState, staging) - offsetof(FullPaState, tasks)) / sizeof(uint64_t);
+static_assert(
+    offsetof(u2::U2FullPaState, staging) >= offsetof(FullPaState, tasks) &&
+        (offsetof(u2::U2FullPaState, staging) - offsetof(FullPaState, tasks)) % sizeof(uint64_t) == 0U,
+    "U2 staging must remain word-addressable from FullPaState::tasks"
 );
 #endif
 
@@ -523,6 +544,25 @@ __aicore__ __attribute__((always_inline)) inline void TracePublishFatal(
 #define TracePublishFatal(state, reason, owner, task_id, trace) PublishFatal(state, reason, owner, task_id)
 #endif
 
+#if defined(SIMT_CROSS_CORE_U2)
+__aicore__ __attribute__((always_inline)) inline bool U2ConfigValid(__gm__ const u2::U2FullPaState *state) {
+    const __gm__ FullPaState *full_pa = &state->full_pa;
+    const __gm__ u2::U2Control *control = &state->staging.control;
+    return ConfigValid(full_pa) && full_pa->control.builder_count == u2::kBuilderCount &&
+           control->magic == u2::kProbeMagic && control->version == u2::kProbeVersion &&
+           control->launch_nonce == full_pa->control.launch_nonce &&
+           control->batch_count == full_pa->control.batch_count && control->task_count == full_pa->control.task_count &&
+           control->kernel_task_count == full_pa->control.kernel_task_count &&
+           control->builder_count == u2::kBuilderCount && control->slot_count == ubuf_staging::kSlotCount &&
+           control->max_payload_lines == ubuf_staging::kMaxPayloadLines &&
+           control->words_per_line == ubuf_staging::kWordsPerLine &&
+           control->alignment_bytes == ubuf_staging::kAlignmentBytes &&
+           control->transport_kind == ubuf_staging::TransportKind::SimtUbufReadToGmWordStore &&
+           control->reserved16 == 0U && control->slot_stride_bytes == ubuf_staging::kSlotStrideBytes &&
+           control->region_bytes == ubuf_staging::kRegionBytes &&
+           control->payload_offset_bytes == ubuf_staging::kPayloadOffsetBytes;
+}
+#endif
 
 #if defined(__DAV_VEC__)
 
@@ -703,6 +743,184 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtPublis
     );
 }
 
+#if defined(SIMT_CROSS_CORE_U2)
+constexpr uint32_t kU2SlotStatesOffsetWords = offsetof(u2::U2StagingState, slot_states) / sizeof(uint64_t);
+constexpr uint32_t kU2SlotAcquireOffsetWords = offsetof(u2::U2StagingState, slot_acquire_count) / sizeof(uint64_t);
+constexpr uint32_t kU2SlotReleaseOffsetWords = offsetof(u2::U2StagingState, slot_release_count) / sizeof(uint64_t);
+constexpr uint32_t kU2GlobalBusyOffsetWords = offsetof(u2::U2StagingState, global_busy_depth) / sizeof(uint64_t);
+constexpr uint32_t kU2GlobalMaxBusyOffsetWords = offsetof(u2::U2StagingState, global_max_busy_depth) / sizeof(uint64_t);
+constexpr uint32_t kU2AnchorCountOffsetWords = offsetof(u2::U2StagingState, anchor_staged_count) / sizeof(uint64_t);
+constexpr uint32_t kU2AnchorMaskOffsetWords = offsetof(u2::U2StagingState, anchor_staged_mask) / sizeof(uint64_t);
+constexpr uint32_t kU2GuardChecksOffsetWords = offsetof(u2::U2StagingState, guard_check_count) / sizeof(uint64_t);
+constexpr uint32_t kU2UbufWordsOffsetWords = offsetof(u2::U2StagingState, ubuf_words_written) / sizeof(uint64_t);
+constexpr uint32_t kU2GmWordsOffsetWords = offsetof(u2::U2StagingState, gm_words_stored) / sizeof(uint64_t);
+constexpr uint32_t kU2ReportsOffsetWords = offsetof(u2::U2StagingState, reports) / sizeof(uint64_t);
+constexpr uint32_t kU2AtomicStrideWords = sizeof(AtomicLine) / sizeof(uint64_t);
+constexpr uint32_t kU2ReportStrideWords = sizeof(u2::U2TaskStagingReport) / sizeof(uint64_t);
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t SimtU2SlotFreeState(uint32_t generation) {
+    return static_cast<uint64_t>(generation) << 32U;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
+SimtU2SlotBusyState(uint32_t generation, uint32_t task_id) {
+    return (static_cast<uint64_t>(generation) << 32U) | (static_cast<uint64_t>(task_id) + 1U);
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t
+SimtU2TaskForSlotGeneration(uint32_t slot_id, uint32_t generation) {
+    uint32_t kind =
+        (slot_id + ubuf_staging::kSlotCount - generation % ubuf_staging::kSlotCount) % ubuf_staging::kSlotCount;
+    kind = kind == 0U ? ubuf_staging::kSlotCount : kind;
+    return generation * kTasksPerBatch + kind;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
+SimtU2ExpectedGuardWord(uint64_t nonce, uint32_t guard_id, uint32_t word) {
+    uint64_t value = u2::kGuardMagic ^ nonce ^ (static_cast<uint64_t>(guard_id) << 32U) ^ word;
+    value ^= value >> 27U;
+    value *= 0xD6E8FEB86659FD93ULL;
+    return value ^ (value >> 31U);
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtU2DecrementBusy(__gm__ uint64_t *global_busy
+) {
+    for (uint32_t attempt = 0U; attempt < kU2AtomicCasAttemptLimit; ++attempt) {
+        const uint64_t observed = asc_atomic_add(global_busy, static_cast<uint64_t>(0U));
+        if (observed == 0U) {
+            return false;
+        }
+        if (asc_atomic_cas(global_busy, observed, observed - 1U) == observed) {
+            return true;
+        }
+    }
+    return false;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtU2ReleaseSlot(__gm__ uint64_t *staging, __gm__ uint64_t *fatal, uint32_t task_id, uint32_t generation) {
+    const uint32_t slot_id = task_id % ubuf_staging::kSlotCount;
+    __gm__ uint64_t *slot_state = staging + kU2SlotStatesOffsetWords + slot_id * kU2AtomicStrideWords;
+    __gm__ uint64_t *slot_releases = staging + kU2SlotReleaseOffsetWords + slot_id * kU2AtomicStrideWords;
+    __gm__ uint64_t *global_busy = staging + kU2GlobalBusyOffsetWords;
+    const uint64_t busy_state = SimtU2SlotBusyState(generation, task_id);
+    if (!SimtU2DecrementBusy(global_busy)) {
+        SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, kBuilderOwner, task_id);
+        return false;
+    }
+    if (asc_atomic_cas(slot_state, busy_state, SimtU2SlotFreeState(generation + 1U)) != busy_state) {
+        (void)asc_atomic_add(global_busy, static_cast<uint64_t>(1U));
+        SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, kBuilderOwner, task_id);
+        return false;
+    }
+    (void)asc_atomic_add(slot_releases, static_cast<uint64_t>(1U));
+    return true;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtU2AcquireSlot(
+    __gm__ uint64_t *staging, __gm__ uint64_t *fatal, uint64_t timeout_ticks, uint32_t batches, uint32_t task_id
+) {
+    const uint32_t slot_id = task_id % ubuf_staging::kSlotCount;
+    const uint32_t expected_generation = task_id / kTasksPerBatch;
+    const uint32_t task_count = batches * kTasksPerBatch;
+    __gm__ uint64_t *slot_state = staging + kU2SlotStatesOffsetWords + slot_id * kU2AtomicStrideWords;
+    __gm__ uint64_t *slot_acquires = staging + kU2SlotAcquireOffsetWords + slot_id * kU2AtomicStrideWords;
+    __gm__ uint64_t *global_busy = staging + kU2GlobalBusyOffsetWords;
+    __gm__ uint64_t *global_max_busy = staging + kU2GlobalMaxBusyOffsetWords;
+    const uint64_t begin = clock();
+    uint32_t polls = 0U;
+    while (true) {
+        const uint64_t observed = asc_atomic_add(slot_state, static_cast<uint64_t>(0U));
+        const uint32_t generation = static_cast<uint32_t>(observed >> 32U);
+        const uint32_t task_plus_one = static_cast<uint32_t>(observed);
+        if (generation > batches || generation > expected_generation || task_plus_one > task_count) {
+            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, kBuilderOwner, task_id);
+            return false;
+        }
+        if (task_plus_one != 0U) {
+            const uint32_t owner_task = task_plus_one - 1U;
+            if (generation >= batches || owner_task != SimtU2TaskForSlotGeneration(slot_id, generation)) {
+                SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, kBuilderOwner, task_id);
+                return false;
+            }
+            if (generation == expected_generation) {
+                SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, kBuilderOwner, task_id);
+                return false;
+            }
+        } else if (generation == expected_generation &&
+                   asc_atomic_cas(slot_state, observed, SimtU2SlotBusyState(generation, task_id)) == observed) {
+            break;
+        }
+        ++polls;
+        if ((polls & kWatchdogMask) == 0U) {
+            if (asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
+                return false;
+            }
+            if (clock() - begin > timeout_ticks) {
+                SimtPublishFatal(fatal, ExecFatalReason::Timeout, kBuilderOwner, task_id);
+                return false;
+            }
+        }
+    }
+
+    (void)asc_atomic_add(slot_acquires, static_cast<uint64_t>(1U));
+    const uint64_t current_busy = asc_atomic_add(global_busy, static_cast<uint64_t>(1U)) + 1U;
+    if (current_busy > ubuf_staging::kSlotCount) {
+        (void)SimtU2ReleaseSlot(staging, fatal, task_id, expected_generation);
+        SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, kBuilderOwner, task_id);
+        return false;
+    }
+    (void)asc_atomic_max(global_max_busy, current_busy);
+    return true;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtU2StageAnchor(__gm__ uint64_t *staging, __gm__ uint64_t *fatal, uint32_t task_id) {
+    const uint64_t bit = uint64_t{1U} << (task_id - u2::kAnchorTaskFirst);
+    __gm__ uint64_t *anchor_mask = staging + kU2AnchorMaskOffsetWords;
+    for (uint32_t attempt = 0U; attempt < kU2AtomicCasAttemptLimit; ++attempt) {
+        const uint64_t observed = asc_atomic_add(anchor_mask, static_cast<uint64_t>(0U));
+        if ((observed & ~u2::kAnchorMask) != 0U || (observed & bit) != 0U) {
+            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, kBuilderOwner, task_id);
+            return false;
+        }
+        if (asc_atomic_cas(anchor_mask, observed, observed | bit) == observed) {
+            (void)asc_atomic_add(staging + kU2AnchorCountOffsetWords, static_cast<uint64_t>(1U));
+            return true;
+        }
+    }
+    SimtPublishFatal(fatal, ExecFatalReason::Timeout, kBuilderOwner, task_id);
+    return false;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtU2WaitAnchorGate(__gm__ uint64_t *staging, __gm__ uint64_t *fatal, uint64_t timeout_ticks, uint32_t task_id) {
+    __gm__ uint64_t *anchor_count = staging + kU2AnchorCountOffsetWords;
+    __gm__ uint64_t *anchor_mask = staging + kU2AnchorMaskOffsetWords;
+    const uint64_t begin = clock();
+    uint32_t polls = 0U;
+    while (true) {
+        const uint64_t count = asc_atomic_add(anchor_count, static_cast<uint64_t>(0U));
+        const uint64_t mask = asc_atomic_add(anchor_mask, static_cast<uint64_t>(0U));
+        if (count == u2::kAnchorTaskCount && mask == u2::kAnchorMask) {
+            return true;
+        }
+        if (count > u2::kAnchorTaskCount || (mask & ~u2::kAnchorMask) != 0U) {
+            SimtPublishFatal(fatal, ExecFatalReason::InsertProtocolFailed, kBuilderOwner, task_id);
+            return false;
+        }
+        if (asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
+            return false;
+        }
+        ++polls;
+        if ((polls & kWatchdogMask) == 0U && clock() - begin > timeout_ticks) {
+            SimtPublishFatal(fatal, ExecFatalReason::Timeout, kBuilderOwner, task_id);
+            return false;
+        }
+    }
+}
+
+#endif
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t SimtBuilderReportChecksum(
     uint64_t nonce, uint32_t thread_id, uint32_t task_count, uint32_t wins, uint32_t first_task, uint32_t last_task,
@@ -852,6 +1070,7 @@ SimtExternalDescriptorWord(uint32_t batch_count, uint32_t task_id, uint32_t tens
     );
 }
 
+#if !defined(SIMT_CROSS_CORE_U2)
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtStoreDescriptor(
     __gm__ uint64_t *destination, uint64_t address, uint64_t buffer_size, uint64_t owner_task,
     uint64_t start_offset, uint32_t ndims, uint32_t dtype, bool manual_dep, uint32_t shape0,
@@ -963,6 +1182,114 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline void SimtStoreE
         destination, address, buffer_size, kInvalidTaskId, start_offset, 2U, dtype, manual_dep,
         shape0, shape1
     );
+}
+#endif
+
+constexpr uint32_t kSimtClaimFatal = 0U;
+constexpr uint32_t kSimtClaimWinner = 1U;
+constexpr uint32_t kSimtClaimLost = 2U;
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtBuilderOwnerValid(uint32_t owner, uint32_t builder_count) {
+    return builder_count >= 1U && builder_count <= kMaxBuilderCount && owner >= kBuilderOwner &&
+           owner < kBuilderOwner + builder_count;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
+SimtAllocBuildingState(uint64_t nonce, uint32_t task_id, uint32_t build_owner) {
+    uint64_t value = kAllocBuildingMagic ^ nonce ^ (static_cast<uint64_t>(task_id) << 19U) ^
+                     (static_cast<uint64_t>(build_owner) << 3U);
+    value ^= value >> 23U;
+    value *= 0xD6E8FEB86659FD93ULL;
+    value ^= value >> 31U;
+    value |= uint64_t{1} << 63U;
+    return value;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
+SimtCompetingExecStateValid(uint64_t raw, uint32_t task_id, uint32_t current_owner, uint32_t builder_count) {
+    if ((raw & ~kStateKnownMask) != 0U ||
+        static_cast<uint32_t>((raw >> kStateTaskIdShift) & kStateTaskIdMask) != task_id) {
+        return false;
+    }
+    const uint32_t phase = static_cast<uint32_t>((raw >> kStatePhaseShift) & kStatePhaseMask);
+    const uint32_t build_owner = static_cast<uint32_t>((raw >> kStateBuildOwnerShift) & kStateBuildOwnerMask);
+    const uint32_t execute_owner = static_cast<uint32_t>((raw >> kStateExecuteOwnerShift) & kStateExecuteOwnerMask);
+    const uint32_t engine = static_cast<uint32_t>((raw >> kStateEngineShift) & kStateEngineMask);
+    const uint32_t payload_lines = static_cast<uint32_t>((raw >> kStatePayloadLinesShift) & kStatePayloadLinesMask);
+    if (!SimtBuilderOwnerValid(build_owner, builder_count) || build_owner == current_owner) {
+        return false;
+    }
+    if (phase == static_cast<uint32_t>(ExecPhase::Building)) {
+        return execute_owner == kUnboundOwner && engine == static_cast<uint32_t>(ExecEngineClass::None) &&
+               payload_lines == 0U;
+    }
+    const uint32_t kind = task_id % kTasksPerBatch;
+    const uint32_t expected_engine =
+        kind == static_cast<uint32_t>(TaskKind::Qk) || kind == static_cast<uint32_t>(TaskKind::Pv) ?
+            static_cast<uint32_t>(ExecEngineClass::Aic) :
+            static_cast<uint32_t>(ExecEngineClass::Aiv);
+    const uint32_t expected_lines = kind == static_cast<uint32_t>(TaskKind::Up) ? 16U : 10U;
+    if (engine != expected_engine || payload_lines != expected_lines) {
+        return false;
+    }
+    if (phase == static_cast<uint32_t>(ExecPhase::Built)) {
+        return execute_owner == kUnboundOwner;
+    }
+    if (phase != static_cast<uint32_t>(ExecPhase::Claimed) && phase != static_cast<uint32_t>(ExecPhase::Done)) {
+        return false;
+    }
+    return expected_engine == static_cast<uint32_t>(ExecEngineClass::Aic) ?
+               execute_owner < kAicOwnerCount :
+               execute_owner >= kBuilderOwner + builder_count && execute_owner < kOwnerCount;
+}
+
+__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t SimtTryClaimTask(
+    __gm__ uint64_t *task_words, __gm__ uint64_t *fatal, uint64_t nonce, uint32_t task_id, uint32_t build_owner,
+    uint32_t builder_count G0_SIMT_TRACE_PARAMETER
+) {
+    constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
+    constexpr uint32_t kCompletionOffsetWords = offsetof(FullPaTask, completion) / sizeof(uint64_t);
+    constexpr uint32_t kExecOffsetWords = offsetof(FullPaTask, exec) / sizeof(uint64_t);
+    __gm__ uint64_t *task = task_words + task_id * kTaskStrideWords;
+    if (task_id % kTasksPerBatch == static_cast<uint32_t>(TaskKind::Alloc)) {
+        const uint64_t desired = SimtAllocBuildingState(nonce, task_id, build_owner);
+        const uint64_t observed = G0_TRACE_SIMT_CAS(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBuildClaim,
+            task + kCompletionOffsetWords, static_cast<uint64_t>(0U), desired, true
+        );
+        if (observed == 0U) {
+            return kSimtClaimWinner;
+        }
+        bool legal_loser = observed == 1U;
+        for (uint32_t builder = 0U; builder < builder_count; ++builder) {
+            const uint32_t competing_owner = kBuilderOwner + builder;
+            legal_loser = legal_loser || (competing_owner != build_owner &&
+                                          observed == SimtAllocBuildingState(nonce, task_id, competing_owner));
+        }
+        if (legal_loser) {
+            return kSimtClaimLost;
+        }
+    } else {
+        const uint64_t desired = (static_cast<uint64_t>(ExecPhase::Building) << kStatePhaseShift) |
+                                 (static_cast<uint64_t>(build_owner) << kStateBuildOwnerShift) |
+                                 (static_cast<uint64_t>(kUnboundOwner) << kStateExecuteOwnerShift) |
+                                 (static_cast<uint64_t>(task_id) << kStateTaskIdShift);
+        const uint64_t observed = G0_TRACE_SIMT_CAS(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBuildClaim, task + kExecOffsetWords,
+            static_cast<uint64_t>(0U), desired, true
+        );
+        if (observed == 0U) {
+            return kSimtClaimWinner;
+        }
+        if (SimtCompetingExecStateValid(observed, task_id, build_owner, builder_count)) {
+            return kSimtClaimLost;
+        }
+    }
+    SimtPublishFatal(
+        fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+    );
+    return kSimtClaimFatal;
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtWaitBuilderStart(
@@ -1258,30 +1585,6 @@ SimtTaskTensorCount(uint32_t task_id) {
            (kind == static_cast<uint32_t>(TaskKind::Alloc) ? 0U : 4U);
 }
 
-__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t
-SimtTaskOutputCount(uint32_t task_id) {
-    const uint32_t kind = task_id % kTasksPerBatch;
-    return kind == static_cast<uint32_t>(TaskKind::Alloc) || kind == static_cast<uint32_t>(TaskKind::Sf) ?
-               3U :
-               (kind == static_cast<uint32_t>(TaskKind::Qk) || kind == static_cast<uint32_t>(TaskKind::Pv) ? 1U :
-                                                                                                            0U);
-}
-
-// PA schema adapter for allocator demand.  The bulk-reservation optimization
-// below consumes only this generic per-task byte count; it does not branch on
-// the scheduling identity of any operator stage.
-__simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
-SimtTaskReserveBytes(uint32_t task_id) {
-    const uint32_t kind = task_id % kTasksPerBatch;
-    return kind == static_cast<uint32_t>(TaskKind::Alloc) ?
-               10240U :
-               (kind == static_cast<uint32_t>(TaskKind::Qk) ?
-                    524288U :
-                    (kind == static_cast<uint32_t>(TaskKind::Sf) ?
-                         264192U :
-                         (kind == static_cast<uint32_t>(TaskKind::Pv) ? 8192U : 0U)));
-}
-
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline TensorAccess
 SimtTaskTensorAccessAt(uint32_t task_id, uint32_t tensor_index) {
     const uint32_t kind = task_id % kTasksPerBatch;
@@ -1357,30 +1660,13 @@ SimtPreviousMetadataWriterForSymbol(uint32_t task_id, uint32_t producer_task, ui
     return producer_task;
 }
 
-__simt_callee__ __aicore__ __attribute__((always_inline)) inline int32_t
-SimtPreviousMetadataWriterTask(uint32_t task_id) {
-    if (task_id > kMaxTasks) {
-        return -1;
-    }
-    uint32_t candidate = task_id;
-    while (candidate != 0U) {
-        --candidate;
-        if (SimtMetadataWriterIntentCount(candidate) != 0U) {
-            return static_cast<int32_t>(candidate);
-        }
-    }
-    return -1;
-}
-
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
 SimtMetadataInsertContractForTask(uint32_t task_id) {
     const uint32_t writer_count = SimtMetadataWriterIntentCount(task_id);
     if (writer_count == 0U || writer_count > kWriterHistoryMaxPerTask) {
         return 0U;
     }
-    const int32_t previous = SimtPreviousMetadataWriterTask(task_id);
-    return kMetadataInsertContractPresent | writer_count |
-           (static_cast<uint64_t>(previous + 1) << kMetadataInsertPreviousWriterShift);
+    return kMetadataInsertContractPresent | writer_count;
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool
@@ -1391,13 +1677,6 @@ SimtMetadataInsertContractPresent(uint64_t contract) {
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t
 SimtMetadataInsertWriterCount(uint64_t contract) {
     return static_cast<uint32_t>(contract & kMetadataInsertWriterCountMask);
-}
-
-__simt_callee__ __aicore__ __attribute__((always_inline)) inline int32_t
-SimtMetadataInsertPreviousWriter(uint64_t contract) {
-    return static_cast<int32_t>(
-               (contract & kMetadataInsertPreviousWriterMask) >> kMetadataInsertPreviousWriterShift
-           ) - 1;
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint32_t
@@ -1416,10 +1695,14 @@ SimtDecodeSharedSymbolKey(uint32_t symbol_key, uint32_t *producer_task, uint32_t
     return *producer_task < kMaxTasks && *output_slot < kOutputsPerTask;
 }
 
+#if defined(SIMT_CROSS_CORE_U2)
+__simt_callee__ __aicore__ __attribute__((noinline)) bool SimtPrepareTask(
+#else
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepareTask(
+#endif
     __gm__ uint64_t *task_words, __gm__ uint64_t *heap_words, __gm__ uint64_t *fatal, uint64_t nonce,
     uint64_t timeout_ticks, uint32_t batch_count, uint32_t task_count, uint32_t task_id, uint32_t builder_thread,
-    uint32_t build_owner, uint64_t aggregate_cursor, uint64_t *completion_vend, uint32_t *payload_words_written,
+    uint32_t build_owner, uint64_t *completion_vend, uint32_t *payload_words_written,
     uint32_t *state_access_count G0_SIMT_TRACE_PARAMETER
 ) {
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
@@ -1442,12 +1725,22 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
         kExecOffsetWords + offsetof(SharedExecCell, payload) / sizeof(uint64_t);
     constexpr uint32_t kHeapAtomicStrideWords = sizeof(AtomicLine) / sizeof(uint64_t);
     constexpr uint32_t kAtomicStrideWords = sizeof(AtomicLine) / sizeof(uint64_t);
+    constexpr uint32_t kAggregateVendOffsetWords = offsetof(FullPaHeapControl, aggregate_vend) / sizeof(uint64_t);
 
     __gm__ uint64_t *task = task_words + task_id * kTaskStrideWords;
     const uint32_t kind = task_id % kTasksPerBatch;
     const bool executable = kind != static_cast<uint32_t>(TaskKind::Alloc);
-    const uint32_t output_count = SimtTaskOutputCount(task_id);
-    const uint64_t reserve = SimtTaskReserveBytes(task_id);
+    const uint32_t output_count =
+        kind == static_cast<uint32_t>(TaskKind::Alloc) || kind == static_cast<uint32_t>(TaskKind::Sf) ?
+            3U :
+            (kind == static_cast<uint32_t>(TaskKind::Qk) || kind == static_cast<uint32_t>(TaskKind::Pv) ? 1U : 0U);
+    const uint64_t reserve = kind == static_cast<uint32_t>(TaskKind::Alloc) ?
+                                 10240U :
+                                 (kind == static_cast<uint32_t>(TaskKind::Qk) ?
+                                      524288U :
+                                      (kind == static_cast<uint32_t>(TaskKind::Sf) ?
+                                           264192U :
+                                           (kind == static_cast<uint32_t>(TaskKind::Pv) ? 8192U : 0U)));
     uint32_t tensor_count = 0U;
     uint32_t scalar_count = 0U;
     uint32_t fanin_count = 0U;
@@ -1485,25 +1778,43 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
 
     const uint32_t shard = task_id & (kSharedHeapShards - 1U);
     uint64_t task_base = 0U;
-    uint64_t vend = aggregate_cursor;
+    uint64_t vend = 0U;
     if (reserve != 0U) {
         const uint64_t cursor = G0_TRACE_SIMT_ADD(
             simt_trace, task_id, g0_swimlane::AtomicSite::SimtHeapShardReserve,
             heap_words + shard * kHeapAtomicStrideWords, reserve, true
         );
-        if (cursor > kHeapShardSpan - reserve || aggregate_cursor > kHeapBytes - reserve) {
+        const uint64_t observed_vend = G0_TRACE_SIMT_ADD(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtHeapVendReserve,
+            heap_words + kAggregateVendOffsetWords, reserve, true
+        );
+        if (cursor > kHeapShardSpan - reserve || observed_vend > kHeapBytes - reserve) {
             SimtPublishFatal(
                 fatal, ExecFatalReason::HeapReservationFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
             );
             return false;
         }
         task_base = static_cast<uint64_t>(shard) * kHeapShardSpan + cursor;
-        vend = aggregate_cursor + reserve;
+        vend = observed_vend + reserve;
+    } else {
+        vend = G0_TRACE_SIMT_ADD(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtHeapVendLoad,
+            heap_words + kAggregateVendOffsetWords, static_cast<uint64_t>(0U), true
+        );
     }
-    // 静态分片已经证明每个 task 只有一个 builder。allocation report 是
-    // 单写、多读的 immutable 发布，不需要再用 CAS 重复争夺所有权。
-    asc_stcg(task + kBaseReportOffsetWords, task_base + 1U);
-    asc_stcg(task + kVendReportOffsetWords, vend + 1U);
+    if (G0_TRACE_SIMT_CAS(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBasePublish,
+            task + kBaseReportOffsetWords, 0U, task_base + 1U, true
+        ) != 0U ||
+        G0_TRACE_SIMT_CAS(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtCompletionVendReportPublish,
+            task + kVendReportOffsetWords, 0U, vend + 1U, true
+        ) != 0U) {
+        SimtPublishFatal(
+            fatal, ExecFatalReason::HeapReservationFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+        );
+        return false;
+    }
     *completion_vend = vend;
 
     __gm__ uint64_t *plan = task + kPlanOffsetWords;
@@ -1559,25 +1870,69 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
 
     __gm__ uint64_t *output_tensors = task + kOutputTensorOffsetWords;
     for (uint32_t output = 0U; output < output_count; ++output) {
+#if defined(SIMT_CROSS_CORE_U2)
+        for (uint32_t word = 0U; word < kTensorDescWords; ++word) {
+            output_tensors[output * kTensorDescWords + word] =
+                SimtOutputDescriptorWord(task_id, output, task_base, word);
+        }
+#else
         SimtStoreOutputDescriptor(
             output_tensors + output * kTensorDescWords, task_id, output, task_base
         );
+#endif
     }
-    // Fresh output descriptor/initial last_writer 同样是静态 owner 单写。
-    // 先写 descriptor 和 initial last_writer，fence 后才发布 published；这样
-    // metadata writer 一旦观察到 published，就不会与初始化 last_writer 竞争。
-    for (uint32_t output = 0U; output < output_count; ++output) {
-        __gm__ uint64_t *last_writer = task + kLastWriterOffsetWords + output * kAtomicStrideWords;
-        asc_stcg(last_writer, static_cast<uint64_t>(task_id));
-    }
+    // Fresh outputs are independent across tasks.  Publish each descriptor as
+    // soon as this warp leader has completed it; do not pull this work into the
+    // ordered metadata-writer predecessor chain below.
     asc_threadfence();
     for (uint32_t output = 0U; output < output_count; ++output) {
         __gm__ uint64_t *published = task + kPublishedOffsetWords + output * kAtomicStrideWords;
-        asc_stcg(published, static_cast<uint64_t>(task_id));
+        __gm__ uint64_t *last_writer = task + kLastWriterOffsetWords + output * kAtomicStrideWords;
+        if (G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtOutputPublishedPublish,
+                published, UINT64_MAX, task_id, true
+            ) != UINT64_MAX ||
+            G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtOutputLastWriterPublish,
+                last_writer, UINT64_MAX, task_id, true
+            ) != UINT64_MAX) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
     }
 
     if (executable) {
         __gm__ uint64_t *payload = task + kExecPayloadOffsetWords;
+#if defined(SIMT_CROSS_CORE_U2)
+        __gm__ uint64_t *u2_staging = task_words + kU2StagingFromTasksOffsetWords;
+        const uint32_t slot_id = task_id % ubuf_staging::kSlotCount;
+        if (!SimtU2AcquireSlot(u2_staging, fatal, timeout_ticks, batch_count, task_id)) {
+            return false;
+        }
+        const uint32_t generation = task_id / kTasksPerBatch;
+        __ubuf__ volatile uint64_t *slot_region =
+            reinterpret_cast<__ubuf__ volatile uint64_t *>(kU2UbufRegionOffset) +
+            slot_id * ubuf_staging::kSlotStrideWords;
+        __ubuf__ volatile uint64_t *staging_payload = slot_region + ubuf_staging::kPayloadOffsetWords;
+        __ubuf__ volatile uint64_t *guard_after = slot_region + ubuf_staging::kGuardAfterOffsetWords;
+        const uint32_t guard_before_id = kU2UbufGuardFirst + 2U * slot_id;
+        const uint32_t guard_after_id = guard_before_id + 1U;
+        for (uint32_t word = 0U; word < ubuf_staging::kWordsPerLine; ++word) {
+            slot_region[word] = SimtU2ExpectedGuardWord(nonce, guard_before_id, word);
+            guard_after[word] = SimtU2ExpectedGuardWord(nonce, guard_after_id, word);
+        }
+        staging_payload[0] = task_id;
+        staging_payload[1] = 0U;
+        staging_payload[2] = vend;
+        staging_payload[3] = static_cast<uint64_t>(kind - 1U) | (static_cast<uint64_t>(payload_bytes) << 32U);
+        staging_payload[4] = static_cast<uint64_t>(tensor_count) | (static_cast<uint64_t>(scalar_count) << 16U) |
+                             (static_cast<uint64_t>(fanin_count) << 32U) | (static_cast<uint64_t>(engine) << 48U);
+        staging_payload[5] = static_cast<uint64_t>(1U) << 48U;
+        staging_payload[6] = 0U;
+        staging_payload[7] = 0U;
+#else
         payload[0] = task_id;
         payload[1] = 0U;
         payload[2] = vend;
@@ -1587,13 +1942,16 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
         payload[5] = static_cast<uint64_t>(1U) << 48U;
         payload[6] = 0U;
         payload[7] = 0U;
+#endif
 
         uint32_t destination = kPayloadHeaderWords;
+#if !defined(SIMT_CROSS_CORE_U2)
         // PA-UP 的 producer 顺序为 PV,PV,SF,Alloc,Alloc,Alloc。相邻 tensor
         // 引用同一 producer 时复用刚取得的 task base，避免对同一只读发布字
         // 重复发起 GM atomic-load；producer 切换后仍重新观察其权威发布值。
         uint32_t cached_producer = UINT32_MAX;
         uint64_t cached_producer_base = 0U;
+#endif
         for (uint32_t tensor = 0U; tensor < tensor_count; ++tensor) {
             const uint32_t producer = SimtTensorSourceTask(task_id, tensor);
             uint64_t producer_base = 0U;
@@ -1601,23 +1959,39 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
                 if (producer == task_id) {
                     producer_base = task_base;
                 }
+#if !defined(SIMT_CROSS_CORE_U2)
                 else if (producer == cached_producer) {
                     producer_base = cached_producer_base;
                 }
+#endif
                 else if (!SimtLoadTaskBase(
                                task_words, producer, fatal, timeout_ticks, task_id, build_owner,
                                &producer_base, state_access_count G0_SIMT_TRACE_ARGUMENT
                            )) {
+#if defined(SIMT_CROSS_CORE_U2)
+                    (void)SimtU2ReleaseSlot(u2_staging, fatal, task_id, generation);
+#endif
                     SimtPublishFatal(
                         fatal, ExecFatalReason::Timeout, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
                     );
                     return false;
                 }
+#if !defined(SIMT_CROSS_CORE_U2)
                 else {
                     cached_producer = producer;
                     cached_producer_base = producer_base;
                 }
+#endif
             }
+#if defined(SIMT_CROSS_CORE_U2)
+            for (uint32_t word = 0U; word < kTensorDescWords; ++word) {
+                const uint64_t value =
+                    producer == UINT32_MAX ?
+                        SimtExternalDescriptorWord(batch_count, task_id, tensor, word) :
+                        SimtOutputDescriptorWord(producer, SimtTensorOutputSlot(task_id, tensor), producer_base, word);
+                staging_payload[destination++] = value;
+            }
+#else
             if (producer == UINT32_MAX) {
                 SimtStoreExternalDescriptor(payload + destination, batch_count, task_id, tensor);
             } else {
@@ -1626,6 +2000,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
                 );
             }
             destination += kTensorDescWords;
+#endif
         }
         for (uint32_t scalar = 0U; scalar < scalar_count; ++scalar) {
             uint64_t value = 0U;
@@ -1637,7 +2012,11 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
             } else {
                 value = 1U;
             }
+#if defined(SIMT_CROSS_CORE_U2)
+            staging_payload[destination++] = value;
+#else
             payload[destination++] = value;
+#endif
         }
         for (uint32_t fanin = 0U; fanin < fanin_count; fanin += 2U) {
             uint32_t low = 0U;
@@ -1652,18 +2031,62 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtPrepar
                     high = 0U;
                 }
             }
+#if defined(SIMT_CROSS_CORE_U2)
+            staging_payload[destination++] = static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32U);
+#else
             payload[destination++] = static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32U);
+#endif
         }
+#if defined(SIMT_CROSS_CORE_U2)
+        bool guards_valid = true;
+        for (uint32_t word = 0U; word < ubuf_staging::kWordsPerLine; ++word) {
+            const bool guard_before_valid =
+                slot_region[word] == SimtU2ExpectedGuardWord(nonce, guard_before_id, word);
+            const bool guard_after_valid =
+                guard_after[word] == SimtU2ExpectedGuardWord(nonce, guard_after_id, word);
+            guards_valid = guards_valid & guard_before_valid & guard_after_valid;
+        }
+        if (!guards_valid) {
+            (void)SimtU2ReleaseSlot(u2_staging, fatal, task_id, generation);
+            SimtPublishFatal(fatal, ExecFatalReason::BuildPackFailed, build_owner, task_id);
+            return false;
+        }
+        (void)asc_atomic_add(u2_staging + kU2GuardChecksOffsetWords, static_cast<uint64_t>(1U));
+
+        if (task_id - u2::kAnchorTaskFirst < u2::kAnchorTaskCount) {
+            if (!SimtU2StageAnchor(u2_staging, fatal, task_id) ||
+                !SimtU2WaitAnchorGate(u2_staging, fatal, timeout_ticks, task_id)) {
+                (void)SimtU2ReleaseSlot(u2_staging, fatal, task_id, generation);
+                return false;
+            }
+        }
+        if (asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
+            (void)SimtU2ReleaseSlot(u2_staging, fatal, task_id, generation);
+            return false;
+        }
+
+        u2::SimtCopyPayloadWordsToGm(staging_payload, payload, destination);
+        (void)asc_atomic_add(u2_staging + kU2UbufWordsOffsetWords, destination);
+        (void)asc_atomic_add(u2_staging + kU2GmWordsOffsetWords, destination);
+#endif
         *payload_words_written = destination;
     } else {
         *payload_words_written = 0U;
     }
     asc_threadfence();
+#if defined(SIMT_CROSS_CORE_U2)
+    if (executable && asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
+        (void)SimtU2ReleaseSlot(
+            task_words + kU2StagingFromTasksOffsetWords, fatal, task_id, task_id / kTasksPerBatch
+        );
+        return false;
+    }
+#endif
     return true;
 }
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommitTask(
-    __gm__ uint64_t *task_words, __gm__ uint64_t *fatal,
+    __gm__ uint64_t *task_words, __gm__ uint64_t *alloc_done, __gm__ uint64_t *fatal, uint64_t nonce,
     uint64_t timeout_ticks, uint32_t task_id, uint32_t build_owner, uint64_t completion_vend,
     uint32_t *insert_poll_count, uint32_t *predecessor_wait_count, int64_t *predecessor_observed G0_SIMT_TRACE_PARAMETER
 ) {
@@ -1682,13 +2105,11 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
     const uint64_t metadata_insert_contract = task[kPlanOffsetWords + 7U];
     const bool publishes_metadata = SimtMetadataInsertContractPresent(metadata_insert_contract);
     const uint32_t writer_count = SimtMetadataInsertWriterCount(metadata_insert_contract);
-    const int32_t previous_metadata_writer = SimtMetadataInsertPreviousWriter(metadata_insert_contract);
     __gm__ uint64_t *history = task + kHistoryOffsetWords;
     if ((metadata_insert_contract & ~kMetadataInsertContractAllowedMask) != 0U ||
         (!publishes_metadata && metadata_insert_contract != 0U) ||
         (publishes_metadata &&
          (writer_count == 0U || writer_count > kWriterHistoryMaxPerTask ||
-          previous_metadata_writer >= static_cast<int32_t>(task_id) ||
           history[0] != (static_cast<uint64_t>(kWriterHistoryMagic) | (static_cast<uint64_t>(task_id) << 32U)) ||
           static_cast<uint32_t>(history[1]) != writer_count || static_cast<uint32_t>(history[1] >> 32U) != 0U))) {
         SimtPublishFatal(
@@ -1729,8 +2150,38 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
         }
     }
     *predecessor_observed = -1;
-    if (previous_metadata_writer >= 0) {
-        const uint32_t predecessor_task = static_cast<uint32_t>(previous_metadata_writer);
+    for (uint32_t writer = 0U; writer < writer_count; ++writer) {
+        const uint32_t symbol_key = static_cast<uint32_t>(history[2U + writer]);
+        const uint32_t predecessor_task = static_cast<uint32_t>(history[2U + writer] >> 32U);
+        uint32_t producer = 0U;
+        uint32_t output_slot = 0U;
+        if (!SimtDecodeSharedSymbolKey(symbol_key, &producer, &output_slot)) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
+        if (predecessor_task == producer) {
+            continue;
+        }
+        bool duplicate_predecessor = false;
+        for (uint32_t earlier = 0U; earlier < writer; ++earlier) {
+            const uint32_t earlier_key = static_cast<uint32_t>(history[2U + earlier]);
+            const uint32_t earlier_predecessor = static_cast<uint32_t>(history[2U + earlier] >> 32U);
+            uint32_t earlier_producer = 0U;
+            uint32_t earlier_slot = 0U;
+            if (!SimtDecodeSharedSymbolKey(earlier_key, &earlier_producer, &earlier_slot)) {
+                SimtPublishFatal(
+                    fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+                );
+                return false;
+            }
+            duplicate_predecessor = duplicate_predecessor || (earlier_predecessor != earlier_producer &&
+                                                              earlier_predecessor == predecessor_task);
+        }
+        if (duplicate_predecessor) {
+            continue;
+        }
         ++*predecessor_wait_count;
         __gm__ uint64_t *predecessor = task_words + predecessor_task * kTaskStrideWords + kInsertOffsetWords;
         uint32_t polls = 0U;
@@ -1752,6 +2203,7 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
     }
     for (uint32_t writer = 0U; writer < writer_count; ++writer) {
         const uint32_t symbol_key = static_cast<uint32_t>(history[2U + writer]);
+        const uint64_t previous = history[2U + writer] >> 32U;
         uint32_t producer = 0U;
         uint32_t output_slot = 0U;
         if (!SimtDecodeSharedSymbolKey(symbol_key, &producer, &output_slot)) {
@@ -1762,27 +2214,56 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
         }
         __gm__ uint64_t *last_writer = task_words + producer * kTaskStrideWords + kLastWriterOffsetWords +
                                        output_slot * kAtomicStrideWords;
-        // ordinary TensorMap 的全局 predecessor 已保证这里只有一个 writer。
-        // last_writer 是串行插入产生的派生元数据，用 non-cacheable store
-        // 发布即可；继续做 per-symbol CAS 只会把同一顺序重复串行化。
-        asc_stcg(last_writer, static_cast<uint64_t>(task_id));
-    }
-    if (publishes_metadata) {
-        asc_threadfence();
+        if (G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtMetadataLastWriterCommit,
+                last_writer, previous, task_id, true
+            ) != previous) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
     }
 
     if (publishes_metadata) {
-        // 静态 task owner 与全局 predecessor turn 共同证明 completion cell
-        // 只有当前 writer 写入；non-cacheable store 即可完成 baton 发布。
-        asc_stcg(task + kInsertOffsetWords, static_cast<uint64_t>(task_id));
+        const uint64_t expected_insert = static_cast<uint64_t>(task_id - 1U);
+        const uint64_t insert_observed = G0_TRACE_SIMT_ADD(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtInsertCompletionPublish,
+            task + kInsertOffsetWords, static_cast<uint64_t>(1U), true
+        );
+        if (insert_observed != expected_insert) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::InsertProtocolFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
     }
 
     if (kind == static_cast<uint32_t>(TaskKind::Alloc)) {
-        // The static residue partition gives this task exactly one builder.
-        // Publish immutable vend before the release flag; no claim/CAS is needed.
-        asc_stcg(task + kCompletionOffsetWords + 1U, completion_vend);
+        if (G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtAllocCompletionVendPublish,
+                task + kCompletionOffsetWords + 1U, 0U, completion_vend, true
+            ) != 0U) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::CompletionPublishFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
         asc_threadfence();
-        asc_stcg(task + kCompletionOffsetWords, static_cast<uint64_t>(1U));
+        const uint64_t alloc_building = SimtAllocBuildingState(nonce, task_id, build_owner);
+        if (G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtAllocCompletionFlagPublish,
+                task + kCompletionOffsetWords, alloc_building, 1U, true
+            ) != alloc_building) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::CompletionPublishFailed, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
+        (void)G0_TRACE_SIMT_ADD(
+            simt_trace, task_id, g0_swimlane::AtomicSite::SimtAllocDoneIncrement,
+            alloc_done, static_cast<uint64_t>(1U), false
+        );
     } else {
         uint32_t tensor_count = kind == static_cast<uint32_t>(TaskKind::Up) ? 7U : 4U;
         uint32_t scalar_count = kind == static_cast<uint32_t>(TaskKind::Sf) ? 3U : 2U;
@@ -1795,27 +2276,50 @@ __simt_callee__ __aicore__ __attribute__((always_inline)) inline bool SimtCommit
             kind == static_cast<uint32_t>(TaskKind::Qk) || kind == static_cast<uint32_t>(TaskKind::Pv) ?
                 static_cast<uint32_t>(ExecEngineClass::Aic) :
                 static_cast<uint32_t>(ExecEngineClass::Aiv);
+        const uint64_t building = (static_cast<uint64_t>(ExecPhase::Building) << kStatePhaseShift) |
+                                  (static_cast<uint64_t>(build_owner) << kStateBuildOwnerShift) |
+                                  (static_cast<uint64_t>(kUnboundOwner) << kStateExecuteOwnerShift) |
+                                  (static_cast<uint64_t>(task_id) << kStateTaskIdShift);
         const uint64_t built = (static_cast<uint64_t>(ExecPhase::Built) << kStatePhaseShift) |
                                (static_cast<uint64_t>(build_owner) << kStateBuildOwnerShift) |
                                (static_cast<uint64_t>(kUnboundOwner) << kStateExecuteOwnerShift) |
                                (static_cast<uint64_t>(engine) << kStateEngineShift) |
                                (static_cast<uint64_t>(payload_lines) << kStatePayloadLinesShift) |
                                (static_cast<uint64_t>(task_id) << kStateTaskIdShift);
-        // completion.vend is immutable build output.  Publish it with BUILT so
-        // the unique executor only has to release completion.flag after work.
-        asc_stcg(task + kCompletionOffsetWords + 1U, completion_vend);
         asc_threadfence();
-        asc_stcg(task + kExecOffsetWords, built);
+#if defined(SIMT_CROSS_CORE_U2)
+        if (asc_atomic_add(fatal, static_cast<uint64_t>(0U)) != 0U) {
+            return false;
+        }
+#endif
+        if (G0_TRACE_SIMT_CAS(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtExecBuiltPublish,
+                task + kExecOffsetWords, building, built, true
+            ) != building) {
+            SimtPublishFatal(
+                fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+            );
+            return false;
+        }
     }
     return true;
 }
 
-static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuildTasks(
-    __gm__ uint64_t *task_words, __gm__ uint64_t *heap_words,
+#if defined(SIMT_CROSS_CORE_U2)
+static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void U2SimtBuildTasks(
+    __gm__ uint64_t *task_words, __gm__ uint64_t *heap_words, __gm__ uint64_t *alloc_done,
     __gm__ uint64_t *builder_started, __gm__ uint64_t *builder_finished, __gm__ uint64_t *fatal,
     __gm__ uint64_t *thread_report_words, uint64_t nonce, uint64_t timeout_ticks, uint32_t batch_count,
     uint32_t task_count, uint32_t builder_instance, uint32_t builder_count, uint32_t build_owner
 )
+#else
+static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuildTasks(
+    __gm__ uint64_t *task_words, __gm__ uint64_t *heap_words, __gm__ uint64_t *alloc_done,
+    __gm__ uint64_t *builder_started, __gm__ uint64_t *builder_finished, __gm__ uint64_t *fatal,
+    __gm__ uint64_t *thread_report_words, uint64_t nonce, uint64_t timeout_ticks, uint32_t batch_count,
+    uint32_t task_count, uint32_t builder_instance, uint32_t builder_count, uint32_t build_owner
+)
+#endif
 {
     const uint32_t thread = static_cast<uint32_t>(threadIdx.x);
     const uint32_t warp = thread / kWarpSize;
@@ -1823,8 +2327,6 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
     const bool active = lane == 0U && warp < kBuilderWarpCount;
     const uint32_t global_thread = builder_instance * kBuilderThreadCount + thread;
     const uint32_t global_warp = builder_instance * kBuilderWarpCount + warp;
-    const uint32_t first_assigned_task = builder_instance * kBuilderWarpCount + warp;
-    const uint32_t task_stride = builder_count * kBuilderWarpCount;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     // 保持与生产 G0 完全相同的 async_invoke 参数形状。CCEC 会把
     // VF 参数打包到 UB，额外的 trace pointer 会触发 A5 未对齐访问；
@@ -1864,46 +2366,47 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
     constexpr uint32_t kTaskStrideWords = sizeof(FullPaTask) / sizeof(uint64_t);
     constexpr uint32_t kBuildReportOffsetWords = offsetof(FullPaTask, build_report) / sizeof(uint64_t);
     constexpr uint32_t kThreadReportStrideWords = sizeof(FullPaBuilderThreadReport) / sizeof(uint64_t);
+#if defined(SIMT_CROSS_CORE_U2)
+    constexpr uint32_t kExecPayloadOffsetWords =
+        (offsetof(FullPaTask, exec) + offsetof(SharedExecCell, payload)) / sizeof(uint64_t);
+    __gm__ uint64_t *u2_staging = task_words + kU2StagingFromTasksOffsetWords;
+#endif
     const bool start_ready =
         SimtWaitBuilderStart(
             builder_started, fatal, timeout_ticks, thread, build_owner, builder_count,
             active G0_SIMT_TRACE_ARGUMENT
         );
-    bool build_ready = start_ready;
-    uint64_t aggregate_cursor = 0U;
-    if (active && build_ready) {
-        constexpr uint32_t kAggregateVendOffsetWords =
-            offsetof(FullPaHeapControl, aggregate_vend) / sizeof(uint64_t);
-        uint64_t aggregate_reserve = 0U;
+    if (active && start_ready) {
+        const uint32_t first_assigned_task = builder_instance * kBuilderWarpCount + warp;
+        const uint32_t task_stride = builder_count * kBuilderWarpCount;
         for (uint32_t task_id = first_assigned_task; task_id < task_count; task_id += task_stride) {
-            aggregate_reserve += SimtTaskReserveBytes(task_id);
-        }
-        aggregate_cursor = G0_TRACE_SIMT_ADD(
-            simt_trace, g0_swimlane::kTraceNoTask,
-            aggregate_reserve == 0U ? g0_swimlane::AtomicSite::SimtHeapVendLoad :
-                                      g0_swimlane::AtomicSite::SimtHeapVendReserve,
-            heap_words + kAggregateVendOffsetWords, aggregate_reserve, true
-        );
-        if (aggregate_reserve > kHeapBytes || aggregate_cursor > kHeapBytes - aggregate_reserve) {
-            SimtPublishFatal(
-                fatal, ExecFatalReason::HeapReservationFailed, build_owner,
-                first_assigned_task G0_SIMT_TRACE_ARGUMENT
-            );
-            build_ready = false;
-        }
-    }
-    if (active && build_ready) {
-        for (uint32_t task_id = first_assigned_task; task_id < task_count; task_id += task_stride) {
-            // Static ownership gives this leader an independent task stream.
-            // SimtPrepareTask/SimtCommitTask propagate local errors, and every
-            // blocking wait already samples the shared fatal word through its
-            // watchdog.  A same-address atomic fatal read before every healthy
-            // task only serialized all builder warps; the CPU protocol model
-            // likewise has no unconditional per-task fatal read.
+            if (G0_TRACE_SIMT_ADD(
+                    simt_trace, task_id, g0_swimlane::AtomicSite::FatalLoad, fatal,
+                    static_cast<uint64_t>(0U), true
+                ) != 0U) {
+                break;
+            }
             ++attempts;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
             const uint64_t trace_attempt_begin = clock();
 #endif
+            __gm__ uint64_t *report = task_words + task_id * kTaskStrideWords + kBuildReportOffsetWords;
+#if defined(SIMT_CROSS_CORE_U2)
+            (void)G0_TRACE_SIMT_ADD(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBuildAttemptIncrement,
+                report + 6U, static_cast<uint64_t>(1U), false
+            );
+#endif
+            const uint32_t claim = SimtTryClaimTask(
+                task_words, fatal, nonce, task_id, build_owner, builder_count G0_SIMT_TRACE_ARGUMENT
+            );
+            if (claim == kSimtClaimLost) {
+                ++claim_losses;
+                continue;
+            }
+            if (claim != kSimtClaimWinner) {
+                break;
+            }
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
             __gm__ g0_swimlane::BuilderTaskTrace *builder_trace = builder_traces + task_id;
             builder_trace->attempt_begin = trace_attempt_begin;
@@ -1912,33 +2415,51 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             builder_trace->builder_thread = global_thread;
             builder_trace->build_owner = build_owner;
 #endif
+#if defined(SIMT_CROSS_CORE_U2)
+            (void)G0_TRACE_SIMT_ADD(
+                simt_trace, task_id, g0_swimlane::AtomicSite::SimtTaskBuildPreparedIncrement,
+                report + 6U, static_cast<uint64_t>(1U) << 32U, false
+            );
+#endif
             uint64_t completion_vend = 0U;
             uint32_t payload_words = 0U;
             if (!SimtPrepareTask(
                     task_words, heap_words, fatal, nonce, timeout_ticks, batch_count, task_count, task_id,
-                    global_thread, build_owner, aggregate_cursor, &completion_vend, &payload_words,
+                    global_thread, build_owner, &completion_vend, &payload_words,
                     &producer_base_polls G0_SIMT_TRACE_ARGUMENT
                 )) {
                 break;
             }
-            aggregate_cursor = completion_vend;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
             builder_trace->prepare_end = clock();
             builder_trace->commit_begin = clock();
 #endif
             ++prepared;
+            const uint32_t kind = task_id % kTasksPerBatch;
             uint32_t task_insert_polls = 0U;
             uint32_t task_predecessor_waits = 0U;
             int64_t predecessor_observed = -1;
             if (!SimtCommitTask(
-                    task_words, fatal, timeout_ticks, task_id, build_owner, completion_vend,
+                    task_words, alloc_done, fatal, nonce, timeout_ticks, task_id, build_owner, completion_vend,
                     &task_insert_polls, &task_predecessor_waits, &predecessor_observed G0_SIMT_TRACE_ARGUMENT
                 )) {
+#if defined(SIMT_CROSS_CORE_U2)
+                if (task_id % kTasksPerBatch != static_cast<uint32_t>(TaskKind::Alloc)) {
+                    (void)SimtU2ReleaseSlot(u2_staging, fatal, task_id, task_id / kTasksPerBatch);
+                }
+#endif
                 break;
             }
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
             builder_trace->commit_end = clock();
             builder_trace->insert_poll_count = task_insert_polls;
+#endif
+#if defined(SIMT_CROSS_CORE_U2)
+            if (task_id % kTasksPerBatch != static_cast<uint32_t>(TaskKind::Alloc)) {
+                if (!SimtU2ReleaseSlot(u2_staging, fatal, task_id, task_id / kTasksPerBatch)) {
+                    break;
+                }
+            }
 #endif
             insert_waits += task_predecessor_waits;
             ++committed;
@@ -1948,11 +2469,14 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             }
             last_task = task_id;
 
-            const uint32_t kind = task_id % kTasksPerBatch;
-            const uint32_t output_count = SimtTaskOutputCount(task_id);
+            const uint32_t output_count =
+                kind == static_cast<uint32_t>(TaskKind::Alloc) || kind == static_cast<uint32_t>(TaskKind::Sf) ?
+                    3U :
+                    (kind == static_cast<uint32_t>(TaskKind::Qk) || kind == static_cast<uint32_t>(TaskKind::Pv) ? 1U :
+                                                                                                                  0U);
             uint32_t phases = kBuildPreparedBit | kBuildOutputsPublishedBit | kBuildInsertCommittedBit;
             phases |= kind == static_cast<uint32_t>(TaskKind::Alloc) ? kBuildAllocCompletedBit : kBuildExecPublishedBit;
-            __gm__ uint64_t *report = task_words + task_id * kTaskStrideWords + kBuildReportOffsetWords;
+#if !defined(SIMT_CROSS_CORE_U2)
             asc_stcg(
                 report,
                 static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(global_thread) << 32U)
@@ -1970,6 +2494,58 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kBuilderThreadCount) void G0SimtBuild
             asc_stcg(report + 5U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U));
             asc_stcg(report + 6U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U));
             asc_stcg(report + 7U, nonce);
+#else
+            if (!SimtPublishBuildReportWord(
+                    report, static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(global_thread) << 32U),
+                    task_id G0_SIMT_TRACE_ARGUMENT
+                ) ||
+                !SimtPublishBuildReportWord(
+                    report + 1U, static_cast<uint64_t>(global_warp), task_id G0_SIMT_TRACE_ARGUMENT
+                ) ||
+                !SimtPublishBuildReportWord(
+                    report + 2U, static_cast<uint64_t>(phases) | (static_cast<uint64_t>(output_count) << 32U),
+                    task_id G0_SIMT_TRACE_ARGUMENT
+                ) ||
+                !SimtPublishBuildReportWord(
+                    report + 3U,
+                    static_cast<uint64_t>(payload_words) | (static_cast<uint64_t>(task_insert_polls) << 32U),
+                    task_id G0_SIMT_TRACE_ARGUMENT
+                ) ||
+                !SimtPublishBuildReportWord(
+                    report + 4U, static_cast<uint64_t>(predecessor_observed), task_id G0_SIMT_TRACE_ARGUMENT
+                ) ||
+                !SimtPublishBuildReportWord(
+                    report + 5U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U),
+                    task_id G0_SIMT_TRACE_ARGUMENT
+                ) ||
+                !SimtPublishBuildReportWord(report + 7U, nonce, task_id G0_SIMT_TRACE_ARGUMENT)) {
+                SimtPublishFatal(
+                    fatal, ExecFatalReason::ControlPublishConflict, build_owner, task_id G0_SIMT_TRACE_ARGUMENT
+                );
+                break;
+            }
+#endif
+#if defined(SIMT_CROSS_CORE_U2)
+            if (kind != static_cast<uint32_t>(TaskKind::Alloc)) {
+                const uint32_t report_index = (task_id / kTasksPerBatch) * kKernelsPerBatch + kind - 1U;
+                __gm__ uint64_t *u2_report = u2_staging + kU2ReportsOffsetWords + report_index * kU2ReportStrideWords;
+                u2_report[0] =
+                    static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(task_id % ubuf_staging::kSlotCount) << 32U);
+                u2_report[1] = static_cast<uint64_t>(task_id / kTasksPerBatch) |
+                               (static_cast<uint64_t>(u2::kExpectedTransportPhaseBits) << 32U);
+                u2_report[2] = static_cast<uint64_t>(payload_words) | (static_cast<uint64_t>(payload_words) << 32U);
+                u2_report[3] = static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U);
+                u2_report[4] = 1U;
+                u2_report[5] = 0U;
+                u2_report[6] = nonce;
+                checksum = u2::PayloadChecksumSeed(nonce, task_id, payload_words);
+                __gm__ uint64_t *payload = task_words + task_id * kTaskStrideWords + kExecPayloadOffsetWords;
+                for (uint32_t word = 0U; word < payload_words; ++word) {
+                    checksum = u2::FoldPayloadChecksum(checksum, payload[word]);
+                }
+                u2_report[7] = checksum;
+            }
+#endif
             asc_threadfence();
             if (task_id + 1U == task_count) {
                 if (G0_TRACE_SIMT_CAS(
@@ -2102,7 +2678,7 @@ InvalidatePayloadLines(
 }
 
 __aicore__ __attribute__((always_inline)) inline bool
-BindPublishedPayload(
+ValidatePayloadAndBind(
     __gm__ FullPaState *state, uint32_t owner, __gm__ ExecutionToken *token G0_SCALAR_TRACE_PARAMETER
 ) {
     const uint32_t task_id = token->control.task_id;
@@ -2133,21 +2709,47 @@ BindPublishedPayload(
         return false;
     }
 
-    // BUILT is the release publication for an immutable payload.  Executors
-    // validate the layout-bearing header before using any offsets, then bind
-    // the published descriptor/scalar storage directly.  Reconstructing and
-    // comparing every descriptor, scalar and fan-in here duplicated the full
-    // independent host oracle after the kernel and added work to every task's
-    // Scalar critical path.  The host oracle remains exhaustive; this hot path
-    // retains the checks required for safe, signature-driven parsing.
     for (uint32_t tensor_index = 0U; tensor_index < shape.tensor_count; ++tensor_index) {
+        TensorDesc expected{};
+        uint32_t producer = 0U;
+        uint32_t output_slot = 0U;
+        if (PayloadTensorOutputSource(task_id, tensor_index, producer, output_slot)) {
+            const uint64_t base_plus_one = G0_TRACE_SCALAR_LOAD(
+                trace, task_id, g0_swimlane::AtomicSite::ScalarProducerTaskBaseLoad,
+                &state->tasks[producer].allocation.task_base_plus_one.value, true
+            );
+            if (base_plus_one == 0U) {
+                return false;
+            }
+            expected = MakeTaskOutputDescriptor(producer, output_slot, base_plus_one - 1U);
+        } else if (!ResolveExternalPayloadTensor(state->control.batch_count, task_id, tensor_index, expected)) {
+            return false;
+        }
+        const uint64_t *expected_words = reinterpret_cast<const uint64_t *>(&expected);
         const uint32_t offset = layout.tensor_word_offset + tensor_index * kTensorDescWords;
+        for (uint32_t word = 0U; word < kTensorDescWords; ++word) {
+            if (PayloadWord(task, offset + word) != expected_words[word]) {
+                return false;
+            }
+        }
         token->dispatch.args[tensor_index] =
             reinterpret_cast<uint64_t>(const_cast<__gm__ uint64_t *>(&task->exec.payload.words[offset]));
     }
     for (uint32_t scalar = 0U; scalar < shape.scalar_count; ++scalar) {
         const uint64_t value = PayloadWord(task, layout.scalar_word_offset + scalar);
+        if (value != TaskScalar(task_id, scalar)) {
+            return false;
+        }
         token->dispatch.args[shape.tensor_count + scalar] = value;
+    }
+    for (uint32_t edge = 0U; edge < shape.fanin_count; ++edge) {
+        const uint64_t packed = PayloadWord(task, layout.fanin_word_offset + edge / 2U);
+        const int32_t actual = static_cast<int32_t>(
+            (edge & 1U) == 0U ? static_cast<uint32_t>(packed) : static_cast<uint32_t>(packed >> 32U)
+        );
+        if (actual != TaskFanin(task_id, edge)) {
+            return false;
+        }
     }
 
     token->control.payload_lines = layout.payload_lines;
@@ -2207,25 +2809,24 @@ FaninReady(
     return true;
 }
 
-__aicore__ __attribute__((always_inline)) inline void PublishExecutionWitness(
+__aicore__ __attribute__((always_inline)) inline bool PublishExecutionWitness(
     __gm__ FullPaState *state, uint32_t owner, uint32_t task_id, TaskKind kind, uint64_t output_checksum,
     uint32_t fanin_ready_prefix G0_SCALAR_TRACE_PARAMETER
 ) {
     __gm__ FullPaExecutionWitness *witness = &state->tasks[task_id].execution_witness;
-    // words[1..3] are immutable identity and words[4..7] remain the host
-    // initialized zero image.  A single terminal hash binds every dynamic
-    // witness component, avoiding four redundant GM stores and a standalone
-    // fence per task.  The caller's release fence orders this state before
-    // completion.flag.
-    // The global dispatch ticket assigns exactly one executor to each task.
-    // Publish the terminal witness word last; no competing writer exists.
-    StoreDev64(
-        reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&witness->state)),
-        ExecutionWitnessState(
-            state->control.launch_nonce, task_id, kind, owner, 1U,
-            kCompletionSequenceWorkloadWitnessVendFlagDone, output_checksum, fanin_ready_prefix
-        )
-    );
+    __gm__ uint64_t *words = reinterpret_cast<__gm__ uint64_t *>(witness);
+    StoreDev64(words + 1U, state->control.launch_nonce);
+    StoreDev64(words + 2U, kExecutionWitnessMagic);
+    StoreDev64(words + 3U, static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(kind) << 32U));
+    StoreDev64(words + 4U, static_cast<uint64_t>(owner) | (static_cast<uint64_t>(1U) << 32U));
+    StoreDev64(words + 5U, kCompletionSequenceWorkloadWitnessVendFlagDone);
+    StoreDev64(words + 6U, output_checksum);
+    StoreDev64(words + 7U, fanin_ready_prefix);
+    dsb(DSB_ALL);
+    return G0_TRACE_SCALAR_CAS(
+               trace, task_id, g0_swimlane::AtomicSite::ScalarExecutionWitnessPublish,
+               &witness->state, 0U, ExecutionWitnessState(state->control.launch_nonce, task_id, kind, owner), true
+           ) == 0U;
 }
 
 __aicore__ __attribute__((always_inline)) inline bool
@@ -2287,29 +2888,56 @@ RunClaimedWorkload(
         );
         return false;
     }
-    PublishExecutionWitness(
-        state, owner, task_id, kind, checksum,
-        token->control.fanin_ready_prefix G0_SCALAR_TRACE_ARGUMENT
-    );
+    if (!PublishExecutionWitness(
+            state, owner, task_id, kind, checksum,
+            token->control.fanin_ready_prefix G0_SCALAR_TRACE_ARGUMENT
+        )) {
+        TracePublishFatal(
+            state, ExecFatalReason::CompletionPublishFailed, owner, task_id, trace
+        );
+        return false;
+    }
 
     __gm__ FullPaTask *task = &state->tasks[task_id];
-    // completion.flag is the release boundary consumed by fan-in polling.
-    // Make workload output and dynamic witness globally visible first; vend
-    // was already published before BUILT by the unique task builder.
-    dsb(DSB_ALL);
-    StoreDev64(
-        reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&task->completion.flag)), 1U
+    if (G0_TRACE_SCALAR_EXCHANGE(
+            trace, task_id, g0_swimlane::AtomicSite::ScalarCompletionVendPublish,
+            reinterpret_cast<__gm__ volatile int64_t *>(const_cast<__gm__ uint64_t *>(&task->completion.vend)),
+            token->control.completion_vend, true
+        ) != 0U ||
+        G0_TRACE_SCALAR_EXCHANGE(
+            trace, task_id, g0_swimlane::AtomicSite::ScalarCompletionFlagPublish,
+            &task->completion.flag, 1U, true
+        ) != 0U) {
+        TracePublishFatal(
+            state, ExecFatalReason::CompletionPublishFailed, owner, task_id, trace
+        );
+        return false;
+    }
+    const uint64_t claimed = ClaimedState(task_id, token->control.build_owner, owner);
+    if (G0_TRACE_SCALAR_CAS(
+            trace, task_id, g0_swimlane::AtomicSite::ScalarExecDonePublish,
+            &task->exec.control.state, claimed, DoneState(task_id, token->control.build_owner, owner), true
+        ) != claimed) {
+        TracePublishFatal(
+            state, ExecFatalReason::CompletionStateConflict, owner, task_id, trace
+        );
+        return false;
+    }
+    (void)G0_TRACE_SCALAR_FETCH_ADD(
+        trace, task_id, g0_swimlane::AtomicSite::ScalarDoneCountIncrement,
+        &state->drain.done_count.value, 1U, false
     );
-    StoreDev64(
-        reinterpret_cast<__gm__ uint64_t *>(
-            const_cast<__gm__ int64_t *>(&task->exec.control.state)
-        ),
-        DoneState(task_id, token->control.build_owner, owner)
-    );
-    // Per-task done/aic_done/aiv_done increments duplicated the exact
-    // completion total already encoded in every owner's drain contribution.
-    // Keeping only that canonical final-drain accounting removes three shared
-    // atomic hot spots without weakening end-of-kernel validation.
+    if (TaskEngine(kind) == ExecEngineClass::Aic) {
+        (void)G0_TRACE_SCALAR_FETCH_ADD(
+            trace, task_id, g0_swimlane::AtomicSite::ScalarEngineDoneIncrement,
+            &state->drain.aic_done.value, 1U, false
+        );
+    } else {
+        (void)G0_TRACE_SCALAR_FETCH_ADD(
+            trace, task_id, g0_swimlane::AtomicSite::ScalarEngineDoneIncrement,
+            &state->drain.aiv_done.value, 1U, false
+        );
+    }
     return true;
 }
 
@@ -2358,16 +2986,21 @@ AdvanceToken(
         ScalarTraceFlushPoll(trace, built_episode);
 #endif
         token->control.build_owner = decoded.build_owner;
-        // The atomic dispatch cursor returns every table ticket once.  No
-        // observer consumes an intermediate CLAIMED value, so keep BUILT until
-        // the unique executor publishes terminal DONE instead of writing the
-        // same control word twice per task.
+        const uint64_t claimed = ClaimedState(task_id, decoded.build_owner, owner);
+        if (G0_TRACE_SCALAR_CAS(
+                trace, task_id, g0_swimlane::AtomicSite::ScalarExecClaim,
+                &task->exec.control.state, observed, claimed, true
+            ) != observed) {
+            ++result->claim_lost_count;
+            TracePublishFatal(state, ExecFatalReason::ControlPublishConflict, owner, task_id, trace);
+            return false;
+        }
         ++result->claim_count;
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
         TraceExecutorClaim(state, owner, task_id);
 #endif
         token->control.phase = ExecTokenPhase::Binding;
-        if (!BindPublishedPayload(state, owner, token G0_SCALAR_TRACE_ARGUMENT)) {
+        if (!ValidatePayloadAndBind(state, owner, token G0_SCALAR_TRACE_ARGUMENT)) {
             TracePublishFatal(state, ExecFatalReason::ClaimedPayloadInvalid, owner, task_id, trace);
             return false;
         }
@@ -2408,14 +3041,23 @@ __aicore__ __attribute__((always_inline)) inline uint32_t
 LoadDispatchTaskId(
     __gm__ const uint32_t *task_ids, uint32_t ticket G0_SCALAR_TRACE_PARAMETER
 ) {
-    // dispatch 表在 launch 前初始化，kernel 内只读。逐 ticket 做整条
-    // cacheline DCCI+DSB 会把同一行重复失效 16 次；一次非缓存 64-bit
-    // device load 同时覆盖相邻两个 id，且不存在 polling writer starvation。
-    const uint32_t pair_ticket = ticket & ~1U;
-    const __gm__ uint64_t *pair_address =
-        reinterpret_cast<__gm__ const uint64_t *>(task_ids + pair_ticket);
-    const uint64_t pair = LoadDev64(pair_address);
-    return (ticket & 1U) == 0U ? static_cast<uint32_t>(pair) : static_cast<uint32_t>(pair >> 32U);
+    __gm__ const uint32_t *line = task_ids + (ticket & ~15U);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t dcci_begin = static_cast<uint64_t>(get_sys_cnt());
+#endif
+    dcci(static_cast<__gm__ void *>(const_cast<__gm__ uint32_t *>(line)), kSingleCacheLine);
+    dsb(DSB_ALL);
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    const uint64_t dcci_end = static_cast<uint64_t>(get_sys_cnt());
+#endif
+    const uint32_t task_id = task_ids[ticket];
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    ScalarTraceDcciRecord(
+        trace, task_id, g0_swimlane::DcciSite::DispatchTaskIdInvalidate,
+        g0_swimlane::DcciOp::Invalidate, dcci_begin, dcci_end, 1U, 1U
+    );
+#endif
+    return task_id;
 }
 
 __aicore__ __attribute__((always_inline)) inline void
@@ -2437,27 +3079,21 @@ RunExecutor(
     // 不对本地聚合数组做动态寻址。CCEC 在这种场景下可能把
     // `&episodes[slot]` 指到 VEC spill 片段，而不是 C++ 对象字段。
     ScalarPollEpisode built_episode0;
-    ScalarPollEpisode fanin_episode0;
-    InitializeScalarPollEpisode(&built_episode0);
-    InitializeScalarPollEpisode(&fanin_episode0);
-#if SIMT_CROSS_CORE_G0_TOKENS_PER_OWNER >= 2
     ScalarPollEpisode built_episode1;
-    ScalarPollEpisode fanin_episode1;
-    InitializeScalarPollEpisode(&built_episode1);
-    InitializeScalarPollEpisode(&fanin_episode1);
-#endif
-#if SIMT_CROSS_CORE_G0_TOKENS_PER_OWNER >= 3
     ScalarPollEpisode built_episode2;
-    ScalarPollEpisode fanin_episode2;
-    InitializeScalarPollEpisode(&built_episode2);
-    InitializeScalarPollEpisode(&fanin_episode2);
-#endif
-#if SIMT_CROSS_CORE_G0_TOKENS_PER_OWNER >= 4
     ScalarPollEpisode built_episode3;
+    ScalarPollEpisode fanin_episode0;
+    ScalarPollEpisode fanin_episode1;
+    ScalarPollEpisode fanin_episode2;
     ScalarPollEpisode fanin_episode3;
+    InitializeScalarPollEpisode(&built_episode0);
+    InitializeScalarPollEpisode(&built_episode1);
+    InitializeScalarPollEpisode(&built_episode2);
     InitializeScalarPollEpisode(&built_episode3);
+    InitializeScalarPollEpisode(&fanin_episode0);
+    InitializeScalarPollEpisode(&fanin_episode1);
+    InitializeScalarPollEpisode(&fanin_episode2);
     InitializeScalarPollEpisode(&fanin_episode3);
-#endif
 #endif
     const uint64_t begin = static_cast<uint64_t>(get_sys_cnt());
     uint32_t iterations = 0U;
@@ -2495,24 +3131,18 @@ RunExecutor(
             state, owner, &state->tokens[owner][0U], result,
             &built_episode0, &fanin_episode0, trace
         );
-#if SIMT_CROSS_CORE_G0_TOKENS_PER_OWNER >= 2
         (void)AdvanceToken(
             state, owner, &state->tokens[owner][1U], result,
             &built_episode1, &fanin_episode1, trace
         );
-#endif
-#if SIMT_CROSS_CORE_G0_TOKENS_PER_OWNER >= 3
         (void)AdvanceToken(
             state, owner, &state->tokens[owner][2U], result,
             &built_episode2, &fanin_episode2, trace
         );
-#endif
-#if SIMT_CROSS_CORE_G0_TOKENS_PER_OWNER >= 4
         (void)AdvanceToken(
             state, owner, &state->tokens[owner][3U], result,
             &built_episode3, &fanin_episode3, trace
         );
-#endif
 #else
         for (uint32_t slot = 0U; slot < kTokensPerOwner; ++slot) {
             (void)AdvanceToken(
@@ -2542,18 +3172,12 @@ RunExecutor(
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     ScalarTraceFlushPoll(trace, &built_episode0);
     ScalarTraceFlushPoll(trace, &fanin_episode0);
-#if SIMT_CROSS_CORE_G0_TOKENS_PER_OWNER >= 2
     ScalarTraceFlushPoll(trace, &built_episode1);
     ScalarTraceFlushPoll(trace, &fanin_episode1);
-#endif
-#if SIMT_CROSS_CORE_G0_TOKENS_PER_OWNER >= 3
     ScalarTraceFlushPoll(trace, &built_episode2);
     ScalarTraceFlushPoll(trace, &fanin_episode2);
-#endif
-#if SIMT_CROSS_CORE_G0_TOKENS_PER_OWNER >= 4
     ScalarTraceFlushPoll(trace, &built_episode3);
     ScalarTraceFlushPoll(trace, &fanin_episode3);
-#endif
 #endif
     PublishTerminalTokenState(state, owner, result->ticket_count G0_SCALAR_TRACE_ARGUMENT);
     result->final_busy_tokens = BusyTokenCount(state, owner);
@@ -2702,6 +3326,7 @@ ArriveAndDrain(
     ScalarTraceFlushPoll(trace, &drain_episode);
 #endif
     if (TraceLoadFatal(state, trace) == 0U) {
+        const uint32_t batches = state->control.batch_count;
         const bool valid = completed == state->control.kernel_task_count &&
                            G0_TRACE_SCALAR_LOAD(
                                trace, g0_swimlane::kTraceNoTask,
@@ -2716,8 +3341,29 @@ ArriveAndDrain(
                            G0_TRACE_SCALAR_LOAD(
                                trace, g0_swimlane::kTraceNoTask,
                                g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->drain.done_count.value, true
+                           ) == state->control.kernel_task_count &&
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->drain.alloc_done.value, true
+                           ) == batches &&
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->drain.aic_done.value, true
+                           ) == batches * 2U &&
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
+                               &state->drain.aiv_done.value, true
+                           ) == batches * 2U &&
+                           G0_TRACE_SCALAR_LOAD(
+                               trace, g0_swimlane::kTraceNoTask,
+                               g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
                                &state->exec_dispatch.aic_next.value, true
-                           ) == state->exec_dispatch.aic_task_count + kAicOwnerCount &&
+                           ) ==
+                               state->exec_dispatch.aic_task_count + kAicOwnerCount &&
                            G0_TRACE_SCALAR_LOAD(
                                trace, g0_swimlane::kTraceNoTask,
                                g0_swimlane::AtomicSite::ScalarDrainVerifyLoad,
@@ -2734,6 +3380,15 @@ ArriveAndDrain(
         ) != 0U) {
         TracePublishFatal(state, ExecFatalReason::DrainMismatch, owner, UINT32_MAX, trace);
     }
+    // 与 Scalar cross_core_dag 的 perf-clock 使用同一设备时钟口径：root
+    // 已观察全部执行者到达、完成数校验通过并发布 root_finished 后，才记录
+    // FinalDrain 终点。角色结果在进入 drain 时已经发布，因此这里只旁路写
+    // 一个既有保留槽，避免为了计时重写整份 128B 结果。
+    result->reserved[3] = static_cast<uint64_t>(get_sys_cnt());
+    __gm__ uint64_t *root_result =
+        reinterpret_cast<__gm__ uint64_t *>(&state->roles[owner]);
+    StoreDev64(root_result + 14U, result->reserved[3]);
+    dsb(DSB_ALL);
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     TraceRoleTimestamp(state, owner, 6U);
     TraceRoleTimestamp(state, owner, 7U);
@@ -2744,10 +3399,19 @@ ArriveAndDrain(
 
 #if defined(__DAV_VEC__)
 
-PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_ordinary_g0_0_mix_aiv, 1, 2);
+#if defined(SIMT_CROSS_CORE_U2)
+PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_u2_0_mix_aiv, 1, 2);
 
 extern "C" __global__ __aicore__ void
-simt_cross_core_ordinary_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core_ordinary::g0::FullPaState *state) {
+simt_cross_core_u2_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::u2::U2FullPaState *launch_state) {
+    __gm__ pa_scheduler::simt_cross_core::g0::FullPaState *state = &launch_state->full_pa;
+    dcci(static_cast<__gm__ void *>(&launch_state->staging.control), kSingleCacheLine);
+#else
+PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_g0_0_mix_aiv, 1, 2);
+
+extern "C" __global__ __aicore__ void
+simt_cross_core_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core::g0::FullPaState *state) {
+#endif
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     const uint64_t startup_dcci_begin = static_cast<uint64_t>(get_sys_cnt());
 #endif
@@ -2775,6 +3439,9 @@ simt_cross_core_ordinary_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core_ordin
     const uint32_t owner = kBuilderOwner + aiv_id;
     FullPaRoleResult result;
     InitializeRoleResult(&result, owner, state->control.builder_count, state->control.launch_nonce);
+    // 启动配置已取得、尚未进入合法性检查/Build/Execute；取所有角色的最早
+    // 值作为与 Scalar startup increment 前边界等价的轻量设备起点。
+    result.reserved[2] = static_cast<uint64_t>(get_sys_cnt());
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     TraceRoleEnter(state, owner, result.role, result.physical_block, subblock, startup_dcci_begin);
     alignas(32U) ScalarTraceContext trace;
@@ -2784,7 +3451,11 @@ simt_cross_core_ordinary_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core_ordin
         g0_swimlane::DcciOp::Invalidate, startup_dcci_begin, startup_dcci_end, 3U, 3U
     );
 #endif
+#if defined(SIMT_CROSS_CORE_U2)
+    if (!U2ConfigValid(launch_state)) {
+#else
     if (!ConfigValid(state)) {
+#endif
         TracePublishFatal(state, ExecFatalReason::InvalidBuildInput, owner, 0U, trace);
         ArriveAndDrain(state, owner, &result G0_SCALAR_TRACE_ARGUMENT);
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
@@ -2803,13 +3474,15 @@ simt_cross_core_ordinary_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core_ordin
 #endif
         return;
     }
-#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
-    TraceRoleTimestamp(state, owner, 3U);
-#endif
+#if defined(SIMT_CROSS_CORE_U2)
+    // reserved[0:1] 是 trace-off 也可用的轻量构建墙钟。get_sys_cnt
+    // 在各 AIV 上共用 1 ns 时基；host 取所有 builder 的最早 begin
+    // 到最晚 end，因此同时包含 VF 启动错位和真实 SIMT 构建。
     result.reserved[0] = static_cast<uint64_t>(get_sys_cnt());
-    cce::async_invoke<G0SimtBuildTasks>(
+    cce::async_invoke<U2SimtBuildTasks>(
         cce::dim3{kBuilderThreadCount, 1U, 1U}, reinterpret_cast<__gm__ uint64_t *>(&state->tasks[0]),
         reinterpret_cast<__gm__ uint64_t *>(&state->heap),
+        reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->drain.alloc_done.value)),
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->drain.builder_started.value)),
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->drain.builder_finished.value)),
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->fatal.state)),
@@ -2817,6 +3490,23 @@ simt_cross_core_ordinary_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core_ordin
         state->control.timeout_ticks, state->control.batch_count, state->control.task_count, aiv_id,
         state->control.builder_count, owner
     );
+#else
+#if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
+    TraceRoleTimestamp(state, owner, 3U);
+#endif
+    result.reserved[0] = static_cast<uint64_t>(get_sys_cnt());
+    cce::async_invoke<G0SimtBuildTasks>(
+        cce::dim3{kBuilderThreadCount, 1U, 1U}, reinterpret_cast<__gm__ uint64_t *>(&state->tasks[0]),
+        reinterpret_cast<__gm__ uint64_t *>(&state->heap),
+        reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->drain.alloc_done.value)),
+        reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->drain.builder_started.value)),
+        reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->drain.builder_finished.value)),
+        reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->fatal.state)),
+        reinterpret_cast<__gm__ uint64_t *>(&state->builder_threads[0]), state->control.launch_nonce,
+        state->control.timeout_ticks, state->control.batch_count, state->control.task_count, aiv_id,
+        state->control.builder_count, owner
+    );
+#endif
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
     result.reserved[1] = static_cast<uint64_t>(get_sys_cnt());
@@ -2831,10 +3521,19 @@ simt_cross_core_ordinary_g0_0_mix_aiv(__gm__ pa_scheduler::simt_cross_core_ordin
 
 #else
 
-PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_ordinary_g0_0_mix_aic, 1, 2);
+#if defined(SIMT_CROSS_CORE_U2)
+PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_u2_0_mix_aic, 1, 2);
 
 extern "C" __global__ __aicore__ void
-simt_cross_core_ordinary_g0_0_mix_aic(__gm__ pa_scheduler::simt_cross_core_ordinary::g0::FullPaState *state) {
+simt_cross_core_u2_0_mix_aic(__gm__ pa_scheduler::simt_cross_core::u2::U2FullPaState *launch_state) {
+    __gm__ pa_scheduler::simt_cross_core::g0::FullPaState *state = &launch_state->full_pa;
+    dcci(static_cast<__gm__ void *>(&launch_state->staging.control), kSingleCacheLine);
+#else
+PTO_SYNCALL_MIX_AIC_KERNEL_META(simt_cross_core_g0_0_mix_aic, 1, 2);
+
+extern "C" __global__ __aicore__ void
+simt_cross_core_g0_0_mix_aic(__gm__ pa_scheduler::simt_cross_core::g0::FullPaState *state) {
+#endif
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     const uint64_t startup_dcci_begin = static_cast<uint64_t>(get_sys_cnt());
 #endif
@@ -2854,6 +3553,7 @@ simt_cross_core_ordinary_g0_0_mix_aic(__gm__ pa_scheduler::simt_cross_core_ordin
     const uint32_t owner = static_cast<uint32_t>(get_block_idx());
     FullPaRoleResult result;
     InitializeRoleResult(&result, owner, state->control.builder_count, state->control.launch_nonce);
+    result.reserved[2] = static_cast<uint64_t>(get_sys_cnt());
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)
     TraceRoleEnter(
         state, owner, result.role, result.physical_block, static_cast<uint32_t>(get_subblockid()),
@@ -2866,7 +3566,11 @@ simt_cross_core_ordinary_g0_0_mix_aic(__gm__ pa_scheduler::simt_cross_core_ordin
         g0_swimlane::DcciOp::Invalidate, startup_dcci_begin, startup_dcci_end, 3U, 3U
     );
 #endif
+#if defined(SIMT_CROSS_CORE_U2)
+    if (!U2ConfigValid(launch_state)) {
+#else
     if (!ConfigValid(state)) {
+#endif
         TracePublishFatal(state, ExecFatalReason::InvalidBuildInput, owner, 0U, trace);
     } else {
 #if defined(SIMT_CROSS_CORE_G0_SWIMLANE)

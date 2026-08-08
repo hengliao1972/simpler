@@ -22,13 +22,14 @@ usage() {
     cat <<'EOF'
 Usage:
   ./run.sh build-gm
-  ./run.sh run-gm --builders 1..32 [--device N] [--batches 1|256] [--runs N]
+  ./run.sh run-gm --builders 1..32 [--device N] [--batches 1|256] [--runs N] [--workload-repeats QK,SF,PV,UP]
   ./run.sh build-gm-swimlane
-  ./run.sh run-gm-swimlane --builders 1..32 [--device N] [--batches 1|256] --runs 1 --swimlane-json FILE
+  ./run.sh run-gm-swimlane --builders 1..32 [--device N] [--batches 1|256] --runs 1 --swimlane-json FILE [--workload-repeats QK,SF,PV,UP]
 
-本目录只实现 GM 路径。SIMT builder 与 Scalar executor 沿用 simt_cross_core，
+本目录只实现 GM 路径。SIMT builder 与 Scalar executor 沿用 simt_cross_core_dag，
 但真实 metadata writer 按 task-id 使用一条全局稀疏 TensorMap 插入链。
-真实 PA workload 固定为 QK/SF/PV/UP=6/28/4/1。
+真实 PA workload 默认为 QK/SF/PV/UP=6/28/4/1；诊断对照可用
+--workload-repeats 显式覆盖，设备日志和泳道 JSON 都会保存实际值。
 
 构建时可沿用现有 SIMT_CROSS_CORE_GM_BUILDER_WARPS=1..64 选择每个 builder
 的 warp 数，并用 SIMT_CROSS_CORE_GM_TOKENS_PER_OWNER=1..4 选择每个执行器

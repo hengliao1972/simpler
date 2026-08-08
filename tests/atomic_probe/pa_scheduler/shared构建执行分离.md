@@ -94,11 +94,11 @@ owner 与 Execute owner 是合法且无需绕开的结果。
 2. Register 通过 `previous_metadata_writer(N).completion -> metadata(N) -> writer_completion(N)` 严格保序插入 TensorMap；空 writer task 不发布完成字，实际 writer 仍按 task-id 形成唯一全序；
 3. Execute/Complete 通过 task `vend/flag` 向其他核发布 kernel 完成，fanin reader 跨核读取。
 
-`cross_core` 不应重做这三套协议。它真正新增的是第四类对象：**已构建执行包的跨核发布、唯一领取和生命周期**。因此实现边界应是“保留现有 TensorMap/SharedOutput/completion 合同，扩展 dispatch payload 合同”，而不是重写整个 shared 调度器。
+`cross_core_ordinary` 不应重做这三套协议。它真正新增的是第四类对象：**已构建执行包的跨核发布、唯一领取和生命周期**。因此实现边界应是“保留现有 TensorMap/SharedOutput/completion 合同，扩展 dispatch payload 合同”，而不是重写整个 shared 调度器。
 
-### 2.2 `same_core` 与 `cross_core` 必须相同的合同
+### 2.2 `same_core` 与 `cross_core_ordinary` 必须相同的合同
 
-| 对象/阶段 | 现有 `same_core` 合同 | `cross_core` 决策 |
+| 对象/阶段 | 现有 `same_core` 合同 | `cross_core_ordinary` 决策 |
 | --------- | --------------------- | ----------------- |
 | Build owner | 现有中央 Build ticket 保证每个 task 唯一 Build owner | 原样保留；96 个 Scalar 都可领取 Build task |
 | output 内存 | shared heap 为 task 保留 GM 区域；`TensorDesc` 指向该共享内存 | executor 直接写该 GM 地址，不再发明一套 output “转移所有权”协议 |
@@ -115,7 +115,7 @@ owner 与 Execute owner 是合法且无需绕开的结果。
 
 ### 2.3 两种方式真正不同的点
 
-| 问题 | `same_core` | `cross_core` 新合同 |
+| 问题 | `same_core` | `cross_core_ordinary` 新合同 |
 | ---- | ----------- | ------------------- |
 | dispatch payload 位置 | `WorkerState::LocalSlot` 属于 Build owner 私有 | 先发布到 64B 隔离的 shared execution cell |
 | payload publication | `built` 可早于 payload 填充，因为只有本核读 | payload 全部写完并 `FlushRegion()` 后才 atomic 发布 `BUILT` |
@@ -1286,7 +1286,7 @@ PA task kind 特判冒充支持。
 
 ### S0：冻结 ABI 与合同，不接 PA 业务
 
-- 在 `cross_core/` 内定义独立的 task-indexed `SharedExecCell`，`same_core/` 只作对照；
+- 在 `cross_core_ordinary/` 内定义独立的 task-indexed `SharedExecCell`，`same_core/` 只作对照；
 - 首版 packed state 包含 `phase + owner + engine_class + payload_lines + task_id`，phase 只有 `EMPTY/BUILDING/BUILT/CLAIMED/DONE`，不包含 generation/reclaim；
 - 定义每 executor 固定两个紧凑 execution token，以及 `IDLE/BINDING/WAITING_FANIN/ENGINE_INFLIGHT/COMPLETING/VEND_PUBLISHED/COMPLETION_PUBLISHED/FAULTED` 本地状态；容量固定为 2，不定义无界 pending 数组；
 - 静态断言 control/payload/cell 64B 隔离；
@@ -1638,7 +1638,7 @@ A5 尚未运行；不宣称通用动态池，也不用 CPU 耗时推导 A5 性�
   增加只为 host 观察服务的 DCCI/DSB。
 - `Validate()` 现在要求 runner 显式声明 raw token 观察权威性：CPU coherent
   路径继续严格断言，CCEC 只呈现 `RESET/NON_FINAL`。完整证据和泳道路径记录在
-  [PA调度器分离版实现过程](cross_core/PA调度器分离版实现过程.md)。
+  [PA调度器分离版实现过程](cross_core_ordinary/PA调度器分离版实现过程.md)。
 
 ### 2026-08-02：S3a 泳道暴露全核扫描热点，修正 S3b 发现合同
 
@@ -1677,16 +1677,16 @@ A5 尚未运行；不宣称通用动态池，也不用 CPU 耗时推导 A5 性�
 
 ### 2026-08-02：S0/S1 落地并进入 S2 动态门槛
 
-- `cross_core` 当时形成独立 portable payload、task-indexed cell、每 executor 单 token 和 global fatal 首版；单 token 已在 2026-08-03 的 S6 设计中被两个 token 取代；
+- `cross_core_ordinary` 当时形成独立 portable payload、task-indexed cell、每 executor 单 token 和 global fatal 首版；单 token 已在 2026-08-03 的 S6 设计中被两个 token 取代；
 - packed state 增加 task id；删除无独立生产语义的 `output_task_id`，header 高 32 位改为强制零保留位；
-- CPU 确定性交错、100 次重复、ASan/UBSan、TSan 已通过，详细证据见 [PA调度器分离版实现过程](cross_core/PA调度器分离版实现过程.md)；
+- CPU 确定性交错、100 次重复、ASan/UBSan、TSan 已通过，详细证据见 [PA调度器分离版实现过程](cross_core_ordinary/PA调度器分离版实现过程.md)；
 - AIC/AIV CCEC 编译及 Claim CAS 返回依赖、DCCI/DSB 顺序的自动 IR 门槛已通过；A5 最小探针完成 100 × 32 case，全量覆盖四种跨核方向、四种 payload 大小和两种 acquire 路径，详细证据见实现过程文档；
 - fresh task-indexed cell 上 minimal 返回依赖路径已经闭合，默认不增加前置 DSB；该结论不外推到未来 generation/ring reuse，也不代替完整 PA 验证。
 
-### 2026-08-01：复核 `same_core`/`cross_core` 内存合同
+### 2026-08-01：复核 `same_core`/`cross_core_ordinary` 内存合同
 
 - 纠正“`same_core` 没有跨核内存模型”的隐含误解：SharedOutput、TensorMap 有序插入和 task completion 本来就是跨核合同；
-- 将 `cross_core` 的新证明面收敛为 execution payload 发布/取得、portable binding、completion-vend 交接、唯一 Execute owner 和新 FinalDrain 生命周期；
+- 将 `cross_core_ordinary` 的新证明面收敛为 execution payload 发布/取得、portable binding、completion-vend 交接、唯一 Execute owner 和新 FinalDrain 生命周期；
 - 纠正 atomic 布局表述：硬约束是 atomic-only control 不与 ordinary+DCCI payload 共线，不是所有 atomic 永久一字一行；
 - 依据现有 CCEC helper 修正 consumer 顺序：`InvalidateRegion()` 已内含尾部 DSB 和 compiler barrier，前置 DSB 改为 S2 对照候选，不预设必须；
 - 将 task-indexed 首版与 ring 复用版拆开：首版无 generation/reclaim/ABA，避免不必要的状态和 atomic；
@@ -1930,7 +1930,7 @@ CPU、CCEC、A5 B256 full-swimlane 和 trace-free 十轮已全部通过；完整
 进一步降至 `2.519 ms`，因此该低频最终观察已纳入当前设计合同。
 
 逐阶段代码、泳道与性能数字继续记录在
-[PA调度器分离版实现过程](cross_core/PA调度器分离版实现过程.md)，本文只保存
+[PA调度器分离版实现过程](cross_core_ordinary/PA调度器分离版实现过程.md)，本文只保存
 采用后的架构合同和仍待验证的设计边界。
 
 ### 2026-08-05：已否决的 Register 等待 Execute 检查点
@@ -1978,7 +1978,7 @@ trace-free 端到端从同窗 `996.663 us` 回退到 `2985.751 us`。同步 kern
 因此这一节只保留为已验证反例，不是现行架构合同。生产实现、专用 placement
 和 split finish dispatcher 依赖均撤回；完整证据见
 `test_record/2026-8-6/register_wait_exec_k16_rejected.json` 与
-[Register Wait Execute Checkpoint 方案](cross_core/PA_Register_Wait_Execute_Checkpoint_Design_Proposal.md)。
+[Register Wait Execute Checkpoint 方案](cross_core_ordinary/PA_Register_Wait_Execute_Checkpoint_Design_Proposal.md)。
 
 ### 2026-08-06：已否决的 Register 后 Execute Opportunity
 
@@ -1998,7 +1998,7 @@ continuation 校验和四 token 扫描。机会点还会在同步执行旧 task 
 Build 内增加 Register-wait 或 Register-after 两类 Execute 检查点。只有未来
 出现能明确减少 FinalDrain、或能避免“每 Build 固定付费”的新触发证据时，才
 重新打开这一设计空间。完整数据和泳道见
-[Build Phase-Aware Execute Opportunity](cross_core/PA_Build_Phase_Aware_Execute_Opportunity_Proposal.md)
+[Build Phase-Aware Execute Opportunity](cross_core_ordinary/PA_Build_Phase_Aware_Execute_Opportunity_Proposal.md)
 及 `test_record/2026-8-6/build_phase_opportunity_rejected/`。
 
 ### 2026-08-06：用释放上界约束后续优化顺序

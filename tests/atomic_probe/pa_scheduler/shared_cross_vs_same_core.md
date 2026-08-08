@@ -5,7 +5,7 @@
 本文比较 standalone Shared TensorMap PA 调度器的两种实现：
 
 - `same_core`：同一个 worker 负责 task 的 Build、保存本地执行包，并在后续 `EfDrain/FinalDrain` 中执行；
-- `cross_core`：Build owner 与 Execute owner 分离，Build owner 把执行包发布到 task-indexed GM cell，另一 Scalar 取得并执行。
+- `cross_core_ordinary`：Build owner 与 Execute owner 分离，Build owner 把执行包发布到 task-indexed GM cell，另一 Scalar 取得并执行。
 
 分析不以泳道图代替架构推导。本文采用三层证据：
 
@@ -102,7 +102,7 @@ Build owner 或 Execute owner 换核，不允许改变：
 
 ### 5.1 共同的顺序
 
-[`same_core/common/pa_shared_submit_path.h`](same_core/common/pa_shared_submit_path.h) 与 [`cross_core/common/pa_shared_submit_path.h`](cross_core/common/pa_shared_submit_path.h) 的核心 Register 逻辑保持同构：
+[`same_core/common/pa_shared_submit_path.h`](same_core/common/pa_shared_submit_path.h) 与 [`cross_core_ordinary/common/pa_shared_submit_path.h`](cross_core_ordinary/common/pa_shared_submit_path.h) 的核心 Register 逻辑保持同构：
 
 ```text
 Materialize：并行准备 output descriptor 和 writer delta
@@ -268,7 +268,7 @@ same-core winner 完成 Materialize/Register/Fanin 后，把执行所需的 tens
 
 ### 9.2 cross-core
 
-cross-core 在 [`cross_core/common/shared_exec_protocol.h`](cross_core/common/shared_exec_protocol.h) 中为每个 task 建立 `SharedExecCell`：
+cross-core 在 [`cross_core_ordinary/common/shared_exec_protocol.h`](cross_core_ordinary/common/shared_exec_protocol.h) 中为每个 task 建立 `SharedExecCell`：
 
 ```text
 cacheline 0：packed Atomic control

@@ -2,10 +2,10 @@
 
 ## 1. 目标与边界
 
-本目录验证第五种组合：保留 `simt_cross_core` 的 SIMT Build / Scalar Execute
-分工，但把 metadata 插入顺序恢复为 `cross_core` 已验证的全局稀疏 writer
+本目录验证第五种组合：保留 `simt_cross_core_dag` 的 SIMT Build / Scalar Execute
+分工，但把 metadata 插入顺序恢复为 `cross_core_ordinary` 已验证的全局稀疏 writer
 顺序。为避免与现有 symbol 快路互相污染，本目录独立演进，不从
-`simt_cross_core` 引用源码；只有协议形状和泳道图表达方式沿用已经验证的设计。
+`simt_cross_core_dag` 引用源码；只有协议形状和泳道图表达方式沿用已经验证的设计。
 
 本阶段固定边界如下：
 
@@ -24,15 +24,15 @@
 
 ## 2. 与现有两条路径的准确关系
 
-参考 `../simt_cross_core/simt调度设计.md` 第 2.5 节，现有两条路径为：
+参考 `../simt_cross_core_dag/simt调度设计.md` 第 2.5 节，现有两条路径为：
 
 | 路径 | Build 域 | metadata writer 顺序 | Execute 域 |
 | ---- | -------- | -------------------- | ---------- |
-| `cross_core` | Main Scalar 动态 Build ticket | 256 个真实 writer 的全局 task-id 稀疏链 | 兼容 Main Scalar |
-| `simt_cross_core` | 专职 AIV 的 SIMT warp leader 静态分片 | 每个 symbol 的精确 previous writer；不同 symbol 可并行 | 非 builder Main Scalar |
-| 本目录 | 专职 AIV 的 SIMT warp leader 静态分片 | 与 `cross_core` 相同的全局 task-id 稀疏 writer 链 | 非 builder Main Scalar |
+| `cross_core_ordinary` | Main Scalar 动态 Build ticket | 256 个真实 writer 的全局 task-id 稀疏链 | 兼容 Main Scalar |
+| `simt_cross_core_dag` | 专职 AIV 的 SIMT warp leader 静态分片 | 每个 symbol 的精确 previous writer；不同 symbol 可并行 | 非 builder Main Scalar |
+| 本目录 | 专职 AIV 的 SIMT warp leader 静态分片 | 与 `cross_core_ordinary` 相同的全局 task-id 稀疏 writer 链 | 非 builder Main Scalar |
 
-所以本目录只替换 `simt_cross_core` 的 metadata 排序轴，不把 Scalar Build
+所以本目录只替换 `simt_cross_core_dag` 的 metadata 排序轴，不把 Scalar Build
 重新搬回来，也不退回 `shared_same_core` 的 1280-task 全链。
 
 ## 3. 串行插入合同
@@ -67,7 +67,7 @@ SIMT leader 唯一 Claim task N
 1024 non-writer tasks
 ```
 
-这与 `cross_core` 的核心顺序一致：`W0 -> W1 -> ... -> W255`。它与
+这与 `cross_core_ordinary` 的核心顺序一致：`W0 -> W1 -> ... -> W255`。它与
 `shared_same_core` 的 `task[0] -> ... -> task[1279]` 不同。
 
 ## 4. 为什么保留 per-symbol history，但不重复做 last-writer CAS
@@ -117,7 +117,7 @@ schema adapter 生成；未来接入其他算子时应替换 adapter，而不是
 
 对于真正的 ordinary region/view/alias：在 shared region writer plan 与
 max-overlap oracle 被证明前，不能把 whole-object symbol history 宣称为等价
-实现。该场景仍需 `cross_core` 的保守 metadata-prefix 规则或 private TensorMap
+实现。该场景仍需 `cross_core_ordinary` 的保守 metadata-prefix 规则或 private TensorMap
 回退。
 
 ## 7. 目录与验收

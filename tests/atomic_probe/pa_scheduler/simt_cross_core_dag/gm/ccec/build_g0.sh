@@ -20,21 +20,10 @@ MODEL_SOURCE="$SIMT_ROOT/common/full_pa_model.h"
 HOST_SOURCE="$SCRIPT_DIR/g0_full_pa_host.cpp"
 SWIMLANE_ACL_CONFIG="$SCRIPT_DIR/g0_swimlane_acl.json"
 G0_VARIANT="${SIMT_CROSS_CORE_G0_VARIANT:-base}"
-BUILDER_WARP_COUNT="${SIMT_CROSS_CORE_GM_BUILDER_WARPS:-5}"
-TOKEN_COUNT="${SIMT_CROSS_CORE_GM_TOKENS_PER_OWNER:-1}"
-DISPATCH_WINDOW_BATCHES="${SIMT_CROSS_CORE_GM_DISPATCH_WINDOW_BATCHES:-256}"
+BUILDER_WARP_COUNT="${SIMT_CROSS_CORE_GM_BUILDER_WARPS:-16}"
 if [[ ! "$BUILDER_WARP_COUNT" =~ ^[0-9]+$ ]] ||
    (( BUILDER_WARP_COUNT < 1 || BUILDER_WARP_COUNT > 64 )); then
     echo "SIMT_CROSS_CORE_GM_BUILDER_WARPS must be an integer in 1..64." >&2
-    exit 1
-fi
-if [[ ! "$DISPATCH_WINDOW_BATCHES" =~ ^[0-9]+$ ]] ||
-   (( DISPATCH_WINDOW_BATCHES < 1 || DISPATCH_WINDOW_BATCHES > 256 )); then
-    echo "SIMT_CROSS_CORE_GM_DISPATCH_WINDOW_BATCHES must be an integer in 1..256." >&2
-    exit 1
-fi
-if [[ ! "$TOKEN_COUNT" =~ ^[0-9]+$ ]] || (( TOKEN_COUNT < 1 || TOKEN_COUNT > 4 )); then
-    echo "SIMT_CROSS_CORE_GM_TOKENS_PER_OWNER must be an integer in 1..4." >&2
     exit 1
 fi
 case "$G0_VARIANT" in
@@ -57,17 +46,17 @@ case "$G0_VARIANT" in
         exit 1
         ;;
 esac
-AIC_OBJECT="$BUILD_DIR/simt_cross_core_ordinary_${OUTPUT_TAG}_aic.o"
-AIV_OBJECT="$BUILD_DIR/simt_cross_core_ordinary_${OUTPUT_TAG}_aiv.o"
-AIC_BITCODE="$BUILD_DIR/simt_cross_core_ordinary_${OUTPUT_TAG}_aic.bc"
-AIV_BITCODE="$BUILD_DIR/simt_cross_core_ordinary_${OUTPUT_TAG}_aiv.bc"
-AIC_BITCODE_DUMP="$BUILD_DIR/simt_cross_core_ordinary_${OUTPUT_TAG}_aic.bc.dump"
-AIV_BITCODE_DUMP="$BUILD_DIR/simt_cross_core_ordinary_${OUTPUT_TAG}_aiv.bc.dump"
-KERNEL_ELF="$BUILD_DIR/simt_cross_core_ordinary_${OUTPUT_TAG}_kernel.o"
-HOST_BINARY="$BUILD_DIR/simt_cross_core_ordinary_${OUTPUT_TAG}_host"
+AIC_OBJECT="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aic.o"
+AIV_OBJECT="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aiv.o"
+AIC_BITCODE="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aic.bc"
+AIV_BITCODE="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aiv.bc"
+AIC_BITCODE_DUMP="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aic.bc.dump"
+AIV_BITCODE_DUMP="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_aiv.bc.dump"
+KERNEL_ELF="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_kernel.o"
+HOST_BINARY="$BUILD_DIR/simt_cross_core_${OUTPUT_TAG}_host"
 BUILD_MANIFEST="$BUILD_DIR/${OUTPUT_TAG}_build_manifest.sha256"
-AIC_ENTRY="simt_cross_core_ordinary_g0_0_mix_aic"
-AIV_ENTRY="simt_cross_core_ordinary_g0_0_mix_aiv"
+AIC_ENTRY="simt_cross_core_g0_0_mix_aic"
+AIV_ENTRY="simt_cross_core_g0_0_mix_aiv"
 G0_BUILD_INPUTS=(
     run.sh
     common/full_pa_exec_protocol.h
@@ -151,8 +140,6 @@ mkdir -p "$BUILD_DIR"
 COMMON_DEVICE_FLAGS=(
     -c -O3 -g -x cce -Wall -std=c++17
     "-DSIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT=$BUILDER_WARP_COUNT"
-    "-DSIMT_CROSS_CORE_G0_TOKENS_PER_OWNER=$TOKEN_COUNT"
-    "-DSIMT_CROSS_CORE_G0_DISPATCH_WINDOW_BATCHES=$DISPATCH_WINDOW_BATCHES"
     --cce-aicore-only
     -Wno-logical-op-parentheses
     -Wno-unused-but-set-variable
@@ -175,21 +162,7 @@ COMMON_DEVICE_FLAGS=(
     -I"$SIMT_ROOT/common"
 )
 
-echo "[CHECK] GM source closure, 1..32 independent builders, warps/builder=$BUILDER_WARP_COUNT, tokens/owner=$TOKEN_COUNT, dispatch-window=$DISPATCH_WINDOW_BATCHES batches and publication order (variant=$G0_VARIANT)"
-if [[ "$(grep -Fc 'for (uint32_t iteration = 0U; iteration < repeats; ++iteration) {' "$WORKLOAD_SOURCE")" -ne 2 ]] ||
-   [[ "$(grep -Fc 'TLOAD(input_a_mat, input_a_global);' "$WORKLOAD_SOURCE")" -ne 1 ]] ||
-   [[ "$(grep -Fc 'TLOAD(input_b_mat, input_b_global);' "$WORKLOAD_SOURCE")" -ne 1 ]] ||
-   [[ "$(grep -Fc 'TMOV(input_a_l0, input_a_mat);' "$WORKLOAD_SOURCE")" -ne 1 ]] ||
-   [[ "$(grep -Fc 'TMOV(input_b_l0, input_b_mat);' "$WORKLOAD_SOURCE")" -ne 1 ]] ||
-   [[ "$(grep -Fc 'TMATMUL(output_l0, input_a_l0, input_b_l0);' "$WORKLOAD_SOURCE")" -ne 1 ]] ||
-   [[ "$(grep -Fc 'TSTORE(output_global, output_l0);' "$WORKLOAD_SOURCE")" -ne 1 ]] ||
-   [[ "$(grep -Fc 'set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);' "$WORKLOAD_SOURCE")" -ne 1 ]] ||
-   [[ "$(grep -Fc 'wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);' "$WORKLOAD_SOURCE")" -ne 1 ]] ||
-   grep -Fq 'input_a_mat[2]' "$WORKLOAD_SOURCE" ||
-   grep -Fq 'PIPE_FIX, PIPE_M, EVENT_ID3' "$WORKLOAD_SOURCE"; then
-    echo "G0 Cube duration probe must retain the calibrated, fully serialized per-repeat load/move/matmul/store path." >&2
-    exit 1
-fi
+echo "[CHECK] GM source closure, 1..32 independent builders, warps/builder=$BUILDER_WARP_COUNT and publication order (variant=$G0_VARIANT)"
 if rg -n '#include.*(cross_core_ordinary|ops-nn)' "$SIMT_ROOT" -g '*.h' -g '*.cpp'; then
     echo "G0 must not include cross_core_ordinary or ops-nn source files." >&2
     exit 1
@@ -240,7 +213,7 @@ if [[ "$G0_VARIANT" == "swimlane" ]]; then
        ! grep -Fq 'InitializeScalarPollEpisode(&built_episode0);' "$KERNEL_SOURCE" ||
        ! grep -Fq 'InitializeScalarPollEpisode(&fanin_episode3);' "$KERNEL_SOURCE" ||
        ! grep -Fq 'refusing to overwrite existing swimlane output' "$HOST_SOURCE"; then
-        echo "G0 swimlane must keep the configured 1..4 poll slots explicitly scalar-addressed and refuse output overwrite." >&2
+        echo "G0 swimlane must keep four poll slots explicitly scalar-addressed and refuse output overwrite." >&2
         exit 1
     fi
 fi
@@ -249,30 +222,24 @@ vf_start_line="$(grep -nF 'void G0SimtBuildTasks(' "$KERNEL_SOURCE" | cut -d: -f
 vf_end_line="$(grep -nF '#endif  // defined(__DAV_VEC__)' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
 builder_publish_line="$(grep -nF 'g0_swimlane::AtomicSite::SimtBuilderFinishedPublish' "$KERNEL_SOURCE" | cut -d: -f1)"
 builder_gate_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /const bool start_ready/ {print NR; exit}' "$KERNEL_SOURCE")"
-assignment_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /\+\+attempts;/ {print NR; exit}' "$KERNEL_SOURCE")"
+claim_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /const uint32_t claim = SimtTryClaimTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
 prepare_call_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /if \(!SimtPrepareTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
 commit_call_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /if \(!SimtCommitTask\(/ {print NR; exit}' "$KERNEL_SOURCE")"
-per_task_fatal_load_count="$(awk '
-    /for \(uint32_t task_id = first_assigned_task; task_id < task_count; task_id \+= task_stride\)/ {inside=1; next}
-    inside && /\+\+attempts;/ {inside=0}
-    inside && /AtomicSite::FatalLoad/ {count++}
-    END {print count + 0}
-' "$KERNEL_SOURCE")"
 report_direct_line="$(grep -nF 'asc_stcg(report + 6U' "$KERNEL_SOURCE" | cut -d: -f1)"
 async_line="$(grep -nF 'cce::async_invoke<G0SimtBuildTasks>' "$KERNEL_SOURCE" | cut -d: -f1)"
 builder_wait_line="$(awk '/cce::async_invoke<G0SimtBuildTasks>/ {inside=1} inside && /wait_flag\(PIPE_V, PIPE_S, EVENT_ID0\)/ {print NR; exit}' "$KERNEL_SOURCE")"
 leader_report_guard_line="$(awk '/void G0SimtBuildTasks\(/ {inside=1} inside && /^[[:space:]]*if \(active\) \{$/ {print NR; exit}' "$KERNEL_SOURCE")"
 thread_report_line="$(grep -nF 'thread_report_words + global_thread * kThreadReportStrideWords' "$KERNEL_SOURCE" | cut -d: -f1)"
 if [[ -z "$vf_start_line" || -z "$vf_end_line" || -z "$builder_publish_line" || -z "$builder_gate_line" ||
-      -z "$assignment_line" || -z "$prepare_call_line" || -z "$commit_call_line" || -z "$report_direct_line" ||
-      -z "$async_line" || -z "$builder_wait_line" || "$per_task_fatal_load_count" -ne 0 ||
+      -z "$claim_line" || -z "$prepare_call_line" || -z "$commit_call_line" || -z "$report_direct_line" ||
+      -z "$async_line" || -z "$builder_wait_line" ||
       -z "$leader_report_guard_line" || -z "$thread_report_line" ]] ||
-   ! (( vf_start_line < builder_gate_line && builder_gate_line < assignment_line && assignment_line < prepare_call_line &&
+   ! (( vf_start_line < builder_gate_line && builder_gate_line < claim_line && claim_line < prepare_call_line &&
          prepare_call_line < commit_call_line && commit_call_line < report_direct_line &&
          report_direct_line < builder_publish_line && builder_publish_line < leader_report_guard_line &&
          leader_report_guard_line < thread_report_line && thread_report_line < vf_end_line &&
          vf_end_line < async_line && async_line < builder_wait_line )); then
-    echo "G0/G1 must gate both VFs, assign each static task before writes, publish direct evidence, and finish in SIMT." >&2
+    echo "G0/G1 must gate both VFs, claim before task writes, publish direct diagnostic evidence, and finish in SIMT." >&2
     exit 1
 fi
 if grep -Eq '^[[:space:]]*report\[[0-7](U)?\][[:space:]]*=' "$KERNEL_SOURCE" ||
@@ -281,7 +248,7 @@ if grep -Eq '^[[:space:]]*report\[[0-7](U)?\][[:space:]]*=' "$KERNEL_SOURCE" ||
    ! grep -Fq 'kReportPoisonWord, value, true' "$KERNEL_SOURCE" ||
    ! grep -Fq 'asc_stcg(report + 6U, static_cast<uint64_t>(1U) | (static_cast<uint64_t>(1U) << 32U));' \
        "$KERNEL_SOURCE"; then
-    echo "G0 statically owned build reports must use non-cacheable stores." >&2
+    echo "G0/G1 statically owned build reports must use non-cacheable stores; U2 keeps its separate atomic evidence path." >&2
     exit 1
 fi
 if ! grep -Fq 'plan[4] = static_cast<uint64_t>(encoded_meta)' "$KERNEL_SOURCE" ||
@@ -304,61 +271,39 @@ if grep -Eq 'result(->|\.)build_count[[:space:]]*=[[:space:]]*state->control.tas
     echo "G0/G1 Main Scalar roles must not receive SIMT task build or commit attribution." >&2
     exit 1
 fi
-if rg -q 'SimtTryClaimTask|SimtCompetingExecStateValid|SimtAllocBuildingState|AtomicSite::SimtTaskBuildClaim|AtomicSite::SimtAllocCompletion(Vend|Flag)Publish|AtomicSite::SimtExecBuiltPublish' \
-       "$KERNEL_SOURCE" ||
-   ! grep -Fq 'const uint32_t first_assigned_task = builder_instance * kBuilderWarpCount + warp;' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'const uint32_t task_stride = builder_count * kBuilderWarpCount;' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'asc_stcg(task + kCompletionOffsetWords + 1U, completion_vend);' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'asc_stcg(task + kCompletionOffsetWords, static_cast<uint64_t>(1U));' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'asc_stcg(task + kExecOffsetWords, built);' "$KERNEL_SOURCE"; then
-    echo "G0 statically partitioned tasks must use unique-builder release stores instead of build/publication CAS." >&2
-    exit 1
-fi
-vend_reserve_site_count="$(grep -oF 'g0_swimlane::AtomicSite::SimtHeapVendReserve' "$KERNEL_SOURCE" | wc -l)"
-vend_load_site_count="$(grep -oF 'g0_swimlane::AtomicSite::SimtHeapVendLoad' "$KERNEL_SOURCE" | wc -l)"
-if [[ "$vend_reserve_site_count" -ne 1 || "$vend_load_site_count" -ne 1 ]] ||
-   ! grep -Fq 'aggregate_reserve += SimtTaskReserveBytes(task_id);' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'aggregate_reserve == 0U ? g0_swimlane::AtomicSite::SimtHeapVendLoad' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'heap_words + kAggregateVendOffsetWords, aggregate_reserve, true' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'aggregate_cursor = completion_vend;' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'heap_vend_.fetch_add(aggregate_reserve' "$SIMT_ROOT/gm/test/test_g0_full_pa.cpp"; then
-    echo "G0 must reserve one aggregate-vend chunk per static builder leader, not one global atomic per task." >&2
+if ! grep -Fq 'SimtAllocBuildingState(nonce, task_id, build_owner)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'g0_swimlane::AtomicSite::SimtTaskBuildClaim' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'g0_swimlane::AtomicSite::SimtAllocCompletionFlagPublish' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'SimtCompetingExecStateValid(observed, task_id, build_owner, builder_count)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'return kSimtClaimLost;' "$KERNEL_SOURCE"; then
+    echo "G0/G1 must give Alloc a special flag claim and treat only legal competing task states as a claim loss." >&2
     exit 1
 fi
 if ! grep -Fq '(static_cast<uint64_t>(build_owner) << kStateBuildOwnerShift)' "$KERNEL_SOURCE" ||
    ! grep -Fq 'token->control.build_owner = decoded.build_owner;' "$KERNEL_SOURCE" ||
-   grep -Fq 'ClaimedState(task_id, decoded.build_owner, owner)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'ClaimedState(task_id, token->control.build_owner, owner)' "$KERNEL_SOURCE" ||
    ! grep -Fq 'DoneState(task_id, token->control.build_owner, owner)' "$KERNEL_SOURCE" ||
    ! grep -Fq 'OwnerEngine(owner, state->control.builder_count)' "$KERNEL_SOURCE" ||
    ! grep -Fq 'OwnerRoleAt(owner, builder_count)' "$KERNEL_SOURCE" ||
    ! grep -Fq 'AivExecutorCount(state->control.builder_count)' "$KERNEL_SOURCE"; then
-    echo "G0/G1 must preserve the actual build owner through static publication, token, DONE, roles and runtime drain without a redundant intermediate CLAIMED store." >&2
+    echo "G0/G1 must preserve the actual build owner through claim, token, DONE, roles and runtime drain counts." >&2
     exit 1
 fi
 
 prepare_start_line="$(grep -nF 'inline bool SimtPrepareTask(' "$KERNEL_SOURCE" | cut -d: -f1)"
 descriptor_line="$(awk '/inline bool SimtPrepareTask\(/ {inside=1} inside && /SimtStoreOutputDescriptor\(/ {print NR; exit}' "$KERNEL_SOURCE")"
-fresh_last_writer_line="$(awk '/inline bool SimtPrepareTask\(/ {inside=1} inside && /asc_stcg\(last_writer, static_cast<uint64_t>\(task_id\)\);/ {print NR; exit}' "$KERNEL_SOURCE")"
 descriptor_fence_line="$(awk '/inline bool SimtPrepareTask\(/ {inside=1} inside && /SimtStoreOutputDescriptor\(/ {descriptor=1; next} descriptor && /asc_threadfence\(\);/ {print NR; exit}' "$KERNEL_SOURCE")"
-fresh_publish_line="$(awk '/inline bool SimtPrepareTask\(/ {inside=1} inside && /asc_stcg\(published, static_cast<uint64_t>\(task_id\)\);/ {print NR; exit}' "$KERNEL_SOURCE")"
+fresh_publish_line="$(grep -nF 'g0_swimlane::AtomicSite::SimtOutputPublishedPublish' "$KERNEL_SOURCE" | cut -d: -f1)"
 commit_start_line="$(grep -nF 'inline bool SimtCommitTask(' "$KERNEL_SOURCE" | cut -d: -f1)"
 metadata_output_wait_line="$(awk '/inline bool SimtCommitTask\(/ {inside=1} inside && /if \(!SimtWaitOutputPublished\(/ {print NR; exit}' "$KERNEL_SOURCE")"
 predecessor_wait_line="$(awk '/inline bool SimtCommitTask\(/ {inside=1} inside && /if \(!SimtWaitAtomicValue\(/ {print NR; exit}' "$KERNEL_SOURCE")"
-if [[ -z "$prepare_start_line" || -z "$descriptor_line" || -z "$fresh_last_writer_line" ||
-      -z "$descriptor_fence_line" || -z "$fresh_publish_line" ||
+if [[ -z "$prepare_start_line" || -z "$descriptor_line" || -z "$descriptor_fence_line" || -z "$fresh_publish_line" ||
       -z "$commit_start_line" || -z "$metadata_output_wait_line" || -z "$predecessor_wait_line" ]] ||
-   ! (( prepare_start_line < descriptor_line && descriptor_line < fresh_last_writer_line &&
-         fresh_last_writer_line < descriptor_fence_line && descriptor_fence_line < fresh_publish_line &&
+   ! (( prepare_start_line < descriptor_line && descriptor_line < descriptor_fence_line &&
+         descriptor_fence_line < fresh_publish_line &&
          fresh_publish_line < commit_start_line && commit_start_line < metadata_output_wait_line &&
          metadata_output_wait_line < predecessor_wait_line )); then
-    echo "G0 single-writer fresh outputs must publish descriptor/last_writer before published; sparse metadata writers must acquire their target before the strict writer-predecessor wait." >&2
-    exit 1
-fi
-if ! grep -Fq 'asc_stcg(task + kBaseReportOffsetWords, task_base + 1U);' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'asc_stcg(task + kVendReportOffsetWords, vend + 1U);' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'asc_stcg(task + kInsertOffsetWords, static_cast<uint64_t>(task_id));' "$KERNEL_SOURCE" ||
-   rg -q 'AtomicSite::(SimtTaskBasePublish|SimtCompletionVendReportPublish|SimtOutputPublishedPublish|SimtOutputLastWriterPublish|SimtInsertCompletionPublish)' "$KERNEL_SOURCE"; then
-    echo "G0 statically owned allocation/output/insert publication must use ordered non-cacheable stores, not redundant atomics." >&2
+    echo "G0 fresh outputs must publish after descriptor construction; sparse metadata writers must acquire their target before the strict writer-predecessor wait." >&2
     exit 1
 fi
 if ! grep -Fq 'const uint64_t metadata_insert_contract = task[kPlanOffsetWords + 7U];' "$KERNEL_SOURCE" ||
@@ -373,15 +318,12 @@ if ! grep -Fq 'const uint64_t metadata_insert_contract = task[kPlanOffsetWords +
     echo "G0 metadata commit must consume the generic writer-intent contract; operator-specific TaskKind branches are forbidden." >&2
     exit 1
 fi
-if ! grep -Fq 'SimtPreviousMetadataWriterTask(uint32_t task_id)' "$KERNEL_SOURCE" ||
-   ! grep -Fq '(static_cast<uint64_t>(previous + 1) << kMetadataInsertPreviousWriterShift)' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'SimtMetadataInsertPreviousWriter(metadata_insert_contract)' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'const uint32_t predecessor_task = static_cast<uint32_t>(previous_metadata_writer);' "$KERNEL_SOURCE" ||
+if ! grep -Fq 'SimtPreviousMetadataWriterForSymbol(task_id, producer, output_slot)' "$KERNEL_SOURCE" ||
+   ! grep -Fq '(static_cast<uint64_t>(previous) << 32U)' "$KERNEL_SOURCE" ||
+   ! grep -Fq 'if (predecessor_task == producer)' "$KERNEL_SOURCE" ||
    ! grep -Fq '++*predecessor_wait_count;' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'asc_stcg(last_writer, static_cast<uint64_t>(task_id));' "$KERNEL_SOURCE" ||
-   grep -Fq 'AtomicSite::SimtMetadataLastWriterLoad' "$KERNEL_SOURCE" ||
-   grep -Fq 'AtomicSite::SimtMetadataLastWriterCommit' "$KERNEL_SOURCE"; then
-    echo "G0 ordinary metadata writers must wait one global predecessor, preserve exact symbol history, and publish derived last_writer with a non-cacheable store rather than redundant CAS." >&2
+   grep -Fq 'AtomicSite::SimtMetadataLastWriterLoad' "$KERNEL_SOURCE"; then
+    echo "G0 metadata writers must prepare exact per-symbol predecessors once, wait only real predecessors and CAS without a last-writer atomic load." >&2
     exit 1
 fi
 
@@ -427,74 +369,24 @@ poison_store_line="$(grep -nF 'StoreDev64(reinterpret_cast<__gm__ uint64_t *>(ou
 poison_dsb_line="$(awk '/StoreDev64\(reinterpret_cast<__gm__ uint64_t \*>\(output\), output_poison\);/ {inside=1; next} inside && /dsb\(DSB_ALL\);/ {print NR; exit}' "$KERNEL_SOURCE")"
 first_workload_line="$(grep -nE 'RunG0(VectorAdd|VectorMultiply|CubeMatmul)\(' "$KERNEL_SOURCE" | head -1 | cut -d: -f1)"
 last_workload_line="$(grep -nE 'RunG0(VectorAdd|VectorMultiply|CubeMatmul)\(' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
-witness_line="$(grep -nF 'PublishExecutionWitness(' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
-build_vend_line="$(grep -nF 'asc_stcg(task + kCompletionOffsetWords + 1U, completion_vend);' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
-built_release_line="$(grep -nF 'asc_stcg(task + kExecOffsetWords, built);' "$KERNEL_SOURCE" | cut -d: -f1)"
-flag_line="$(grep -nF 'const_cast<__gm__ int64_t *>(&task->completion.flag)' "$KERNEL_SOURCE" | cut -d: -f1)"
+witness_line="$(grep -nF 'if (!PublishExecutionWitness(' "$KERNEL_SOURCE" | cut -d: -f1)"
+vend_line="$(grep -nF 'token->control.completion_vend' "$KERNEL_SOURCE" | tail -1 | cut -d: -f1)"
+flag_line="$(grep -nF 'g0_swimlane::AtomicSite::ScalarCompletionFlagPublish' "$KERNEL_SOURCE" | cut -d: -f1)"
 done_line="$(grep -nF 'DoneState(task_id, token->control.build_owner, owner)' "$KERNEL_SOURCE" | cut -d: -f1)"
 if [[ -z "$poison_store_line" || -z "$poison_dsb_line" || -z "$first_workload_line" ||
-      -z "$last_workload_line" || -z "$witness_line" || -z "$build_vend_line" ||
-      -z "$built_release_line" || -z "$flag_line" || -z "$done_line" ]] ||
-   ! (( build_vend_line < built_release_line )) ||
+      -z "$last_workload_line" || -z "$witness_line" || -z "$vend_line" || -z "$flag_line" ||
+      -z "$done_line" ]] ||
    ! (( poison_store_line < poison_dsb_line && poison_dsb_line < first_workload_line )) ||
-   ! (( last_workload_line < witness_line && witness_line < flag_line && flag_line < done_line )); then
-    echo "G0 completion vend must precede BUILT; execution must follow poison -> workload -> dynamic witness -> flag -> DONE." >&2
+   ! (( last_workload_line < witness_line && witness_line < vend_line && vend_line < flag_line &&
+         flag_line < done_line )); then
+    echo "G0 completion must poison output before workload, then follow workload -> witness -> vend -> flag -> DONE." >&2
     exit 1
 fi
-for retired_site in \
-    ScalarProducerTaskBaseLoad ScalarExecClaim ScalarExecutionWitnessPublish ScalarCompletionVendPublish \
-    ScalarCompletionFlagPublish ScalarExecDonePublish ScalarDoneCountIncrement ScalarEngineDoneIncrement; do
-    if grep -Fq "g0_swimlane::AtomicSite::$retired_site" "$KERNEL_SOURCE"; then
-        echo "G0 unique-executor publication must not retain redundant atomic site: $retired_site" >&2
-        exit 1
-    fi
-done
-for retired_counter in \
-    '&state->drain.done_count.value' '&state->drain.alloc_done.value' \
-    '&state->drain.aic_done.value' '&state->drain.aiv_done.value'; do
-    if grep -Fq "$retired_counter" "$KERNEL_SOURCE"; then
-        echo "G0 final drain must use canonical encoded owner completions, not $retired_counter." >&2
-        exit 1
-    fi
-done
-witness_dynamic_store_count="$(awk '
-    /inline void PublishExecutionWitness\(/ {inside=1}
-    /RunClaimedWorkload\(/ {inside=0}
-    inside && /StoreDev64\(words \+/ {count++}
-    END {print count + 0}
-' "$KERNEL_SOURCE")"
-if [[ "$witness_dynamic_store_count" -ne 0 ]] ||
-   ! grep -Fq 'const_cast<__gm__ int64_t *>(&witness->state)' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'const_cast<__gm__ int64_t *>(&task->exec.control.state)' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'completed == state->control.kernel_task_count' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'g0_swimlane::AtomicSite::ScalarDispatchTicket' "$KERNEL_SOURCE"; then
-    echo "G0 unique-dispatch stores or canonical completion proof are incomplete." >&2
-    exit 1
-fi
-if ! grep -Fq 'BindPublishedPayload(' "$KERNEL_SOURCE" ||
-   awk '
-       /inline bool/ {candidate=1; next}
-       candidate && /BindPublishedPayload\(/ {inside=1; candidate=0}
-       inside && /FaninReady\(/ {inside=0}
-       inside && /(PayloadTensorOutputSource|ResolveExternalPayloadTensor|MakeTaskOutputDescriptor|TaskScalar\(|TaskFanin\()/ {
-           forbidden=1
-       }
-       END {exit forbidden ? 0 : 1}
-   ' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'ExpectedPayloadTensor(expected, tensor_index, batches, task_bases, &expected_tensor)' "$HOST_SOURCE" ||
-   ! grep -Fq '"payload-tensor"' "$HOST_SOURCE" ||
-   ! grep -Fq '"payload-scalar"' "$HOST_SOURCE" ||
-   ! grep -Fq '"payload-fanin"' "$HOST_SOURCE" ||
-   ! grep -Fq '"payload-tail-mutated"' "$HOST_SOURCE"; then
-    echo "G0 executor hot path must bind the immutable published payload without reconstructing it; the independent host oracle must retain exhaustive payload validation." >&2
-    exit 1
-fi
-if ! grep -Fq 'kCompletionSequenceWorkloadWitnessVendFlagDone, output_checksum, fanin_ready_prefix' "$KERNEL_SOURCE" ||
+if ! grep -Fq 'StoreDev64(words + 7U, fanin_ready_prefix);' "$KERNEL_SOURCE" ||
    ! grep -Fq 'state, owner, task_id, kind, checksum,' "$KERNEL_SOURCE" ||
    ! grep -Fq 'token->control.fanin_ready_prefix G0_SCALAR_TRACE_ARGUMENT' "$KERNEL_SOURCE" ||
-   ! grep -Fq 'witness-dynamic-fields-must-remain-encoded-only' "$HOST_SOURCE" ||
-   ! grep -Fq 'ExpectedWitnessChecksum(expected.kind), expected.fanin_count' "$HOST_SOURCE"; then
-    echo "G0 terminal witness hash must bind runtime owner/count/sequence/checksum/fanin while dynamic witness words remain immutable." >&2
+   ! grep -Fq 'witness.fanin_ready_prefix == expected.fanin_count' "$HOST_SOURCE"; then
+    echo "G0 execution witness must record the runtime token fanin-ready prefix and host must validate it." >&2
     exit 1
 fi
 if ! grep -Fq 'constexpr uint32_t kDrainExpectedArrivals = 6U;' "$KERNEL_SOURCE" ||
@@ -658,8 +550,6 @@ echo "[BUILD] GCC 15 G0 ACL host ($("$GXX15" -dumpfullversion))"
 "$GXX15" -O2 -std=c++17 -Wall -Wextra -Werror \
     -Wno-deprecated-declarations \
     "-DSIMT_CROSS_CORE_G0_BUILDER_WARP_COUNT=$BUILDER_WARP_COUNT" \
-    "-DSIMT_CROSS_CORE_G0_TOKENS_PER_OWNER=$TOKEN_COUNT" \
-    "-DSIMT_CROSS_CORE_G0_DISPATCH_WINDOW_BATCHES=$DISPATCH_WINDOW_BATCHES" \
     "${HOST_VARIANT_FLAGS[@]}" \
     -I"$GM_ROOT/common" \
     -I"$SIMT_ROOT/common" \
@@ -684,8 +574,8 @@ trap 'rm -f -- "$manifest_tmp"' EXIT
     cd "$SIMT_ROOT"
     sha256sum \
         "${G0_BUILD_INPUTS[@]}" \
-        "gm/build/ccec/simt_cross_core_ordinary_${OUTPUT_TAG}_kernel.o" \
-        "gm/build/ccec/simt_cross_core_ordinary_${OUTPUT_TAG}_host"
+        "gm/build/ccec/simt_cross_core_${OUTPUT_TAG}_kernel.o" \
+        "gm/build/ccec/simt_cross_core_${OUTPUT_TAG}_host"
 ) > "$manifest_tmp"
 mv -f -- "$manifest_tmp" "$BUILD_MANIFEST"
 trap - EXIT

@@ -192,7 +192,7 @@ ATOMIC_OP_NAMES = {
 
 # schema-v3/4 的校验表必须与 standalone C++ 的稳定 AtomicSite 编号一致。
 # 0..14 是既有 common/private 站点，15..18 是 shared heap，19/20 是
-# shared Register 插入轮次的等待 Load 与单写者 FetchAdd 发布；真实 PA 的 BlockWon
+# shared Register 插入轮次的等待 Load 与返回型 CompareExchange 发布；真实 PA 的 BlockWon
 # 不属于本用例，不能为了兼容生产 converter 凭空放宽。
 ATOMIC_SITE_OP_IDS = {
     0: 2,
@@ -276,10 +276,7 @@ SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 57))
 SHARED_INSERT_TURN_POLL_SITE_ID = 19
 SHARED_INSERT_TURN_HANDOFF_SITE_ID = 20
 SHARED_OUTPUT_PUBLISHED_POLL_SITE_IDS = {23, 24}
-AGGREGATE_ONLY_POLL_SITE_IDS = {
-    SHARED_INSERT_TURN_POLL_SITE_ID,
-    *SHARED_OUTPUT_PUBLISHED_POLL_SITE_IDS,
-}
+AGGREGATE_ONLY_POLL_SITE_IDS = {SHARED_INSERT_TURN_POLL_SITE_ID}
 SHARED_CLAIM_TOURNAMENT_SITE_IDS = {40, 41}
 
 ATOMIC_RESULT_USED = 1 << 4
@@ -841,6 +838,18 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
             value_zero = bool(flags & ATOMIC_VALUE_ZERO)
             return_ready = bool(flags & ATOMIC_RETURN_READY)
             payload = (flags >> ATOMIC_PAYLOAD_SHIFT) & ATOMIC_PAYLOAD_MASK
+            # central-ticket 的 output-published 站点是真正的等待 episode，
+            # 只能导出聚合 PollBatch；same-core all-worker-replay 已由逐 task
+            # insert-completion 链证明 producer 发布完成，两个站点只是一次
+            # 协议校验 Load，必须允许 direct return-ready 记录。site19 在两种
+            # 拓扑下始终是等待 episode，仍严格禁止逐 Load raw。
+            aggregate_only_poll = (
+                auxiliary in AGGREGATE_ONLY_POLL_SITE_IDS
+                or (
+                    submit_topology == "central_ticket"
+                    and auxiliary in SHARED_OUTPUT_PUBLISHED_POLL_SITE_IDS
+                )
+            )
             if auxiliary in SCHEMA_V5_SHARED_ATOMIC_SITE_IDS and not (
                 trace_schema_version == 5 and tensormap_mode == "shared"
             ):
@@ -849,7 +858,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     f"site={auxiliary}: shared schema-v5 site requires "
                     "shared schema-v5"
                 )
-            if auxiliary in AGGREGATE_ONLY_POLL_SITE_IDS and not poll_batch:
+            if aggregate_only_poll and not poll_batch:
                 raise ValueError(
                     f"fdwic_events[{index}] aggregate-only Atomic site "
                     f"{auxiliary} must use PollBatch"
@@ -858,6 +867,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 return_ready_valid = (
                     not return_ready
                     or auxiliary in AGGREGATE_ONLY_POLL_SITE_IDS
+                    or auxiliary in SHARED_OUTPUT_PUBLISHED_POLL_SITE_IDS
                 )
                 if (
                     trace_schema_version not in (3, 5)
@@ -874,7 +884,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         f"fdwic_events[{index}] has invalid Atomic PollBatch "
                         f"site={auxiliary} flags=0x{flags:x}"
                     )
-                if auxiliary in AGGREGATE_ONLY_POLL_SITE_IDS:
+                if aggregate_only_poll:
                     v3_return_ready_poll_batch_rows.append(
                         (index, core_id, return_ready)
                     )
@@ -883,12 +893,23 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     raise ValueError(
                         f"fdwic_events[{index}] Atomic requires l2_swimlane_level=4"
                     )
+                expected_atomic_op = ATOMIC_SITE_OP_IDS.get(auxiliary)
                 expected_result_used = (
                     auxiliary in ATOMIC_SITE_OP_IDS
                     and auxiliary not in ATOMIC_RESULT_UNUSED_SITE_IDS
                 )
                 if (
-                    ATOMIC_SITE_OP_IDS.get(auxiliary) != atomic_op
+                    auxiliary == SHARED_INSERT_TURN_HANDOFF_SITE_ID
+                    and submit_topology == "all_worker_replay"
+                ):
+                    # Scalar cross-core 的稀疏 metadata-writer 链只由真实
+                    # writer 用非返回型 FetchAdd 推进；same-core 则用返回型
+                    # CAS 发布每 task 的 insert completion。稳定 site 编号
+                    # 相同，但操作与返回值语义由拓扑决定。
+                    expected_atomic_op = 4
+                    expected_result_used = True
+                if (
+                    expected_atomic_op != atomic_op
                     or result_used != expected_result_used
                     or (return_ready and not result_used)
                     or (value_zero and atomic_op != 0)
@@ -1269,6 +1290,11 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
         metadata_prefix_task_set = set(
             shared_metadata_prefix_tasks
         )
+        handoff_task_set = (
+            metadata_prefix_task_set
+            if submit_topology == "all_worker_replay"
+            else writer_task_set
+        )
         unknown_writer_tasks = writer_task_set - set(task_kind_by_id)
         unknown_prefix_tasks = (
             metadata_prefix_task_set - set(task_kind_by_id)
@@ -1293,6 +1319,23 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 raise ValueError(
                     "metadata writers must also require the strict metadata "
                     "prefix"
+                )
+            if (
+                submit_topology == "all_worker_replay"
+                and metadata_prefix_task_set
+                != {
+                    task_id
+                    for (_core_id, task_id), (
+                        _attempted,
+                        won,
+                        _is_alloc,
+                    ) in v4_claims.items()
+                    if won
+                }
+            ):
+                raise ValueError(
+                    "all_worker_replay shared metadata prefix must contain "
+                    "every winning task exactly once"
                 )
         previous_writer_by_task: dict[int, int | None] = {}
         previous_writer: int | None = None
@@ -1513,6 +1556,28 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                                 f"{task_key}: count={len(matching_polls)}"
                             )
                         matched_per_symbol_dag_polls += len(matching_polls)
+                    elif submit_topology == "all_worker_replay":
+                        # same-core shared 仍采用逐 task insert-completion 链：
+                        # task N 等 N-1，并由每个 winner 发布自己的 completion。
+                        # 真正改写 writer metadata 的 task 仍由 writer 列表独立
+                        # 描述，不能把二者混成同一种业务动作。
+                        expected_poll_count = (
+                            1
+                            if task_key[1] in metadata_prefix_task_set
+                            and any(
+                                prefix_task < task_key[1]
+                                for prefix_task in metadata_prefix_task_set
+                            )
+                            else 0
+                        )
+                        if len(matching_polls) != expected_poll_count:
+                            raise ValueError(
+                                "shared schema-v5 all_worker_replay requires "
+                                "one SharedInsertTurnPoll PollBatch for every "
+                                "task after the first insert completion at "
+                                f"{task_key}: count={len(matching_polls)} "
+                                f"expected={expected_poll_count}"
+                            )
                     else:
                         # 全局稀疏链只等待严格早于当前 task 的最近 metadata
                         # writer；host prefix 在该旧协议中是独立结构权威。
@@ -1536,13 +1601,19 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         task_key, []
                     )
                     expected_handoff_count = (
-                        1 if task_key[1] in writer_task_set else 0
+                        1 if task_key[1] in handoff_task_set else 0
                     )
                     if len(handoffs) != expected_handoff_count:
+                        handoff_op = (
+                            "CompareExchange"
+                            if submit_topology == "all_worker_replay"
+                            else "FetchAdd"
+                        )
                         raise ValueError(
                             "shared schema-v5 level4 requires exactly one "
-                            "SharedInsertTurnHandoff direct FetchAdd per "
-                            "metadata writer and none for empty writer tasks at "
+                            "SharedInsertTurnHandoff direct "
+                            f"{handoff_op} per "
+                            "required insert completion and none otherwise at "
                             f"{task_key}: count={len(handoffs)} "
                             f"expected={expected_handoff_count}"
                         )
@@ -1649,6 +1720,33 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                             f"matched_registers={matched_per_symbol_dag_polls} "
                             f"all_winners={winner_count}"
                         )
+                elif submit_topology == "all_worker_replay":
+                    predecessor_wait_winner_count = sum(
+                        1
+                        for (_core_id, task_id), (
+                            _attempted,
+                            won,
+                            _is_alloc,
+                        ) in v4_claims.items()
+                        if won
+                        and task_id in metadata_prefix_task_set
+                        and any(
+                            prefix_task < task_id
+                            for prefix_task in metadata_prefix_task_set
+                        )
+                    )
+                    if (
+                        len(v4_shared_insert_turn_polls)
+                        != predecessor_wait_winner_count
+                    ):
+                        raise ValueError(
+                            "shared schema-v5 all_worker_replay has orphan or "
+                            "duplicate SharedInsertTurnPoll records: "
+                            f"records={len(v4_shared_insert_turn_polls)} "
+                            "expected_predecessor_wait_winners="
+                            f"{predecessor_wait_winner_count} "
+                            f"all_winners={winner_count}"
+                        )
                 else:
                     predecessor_wait_winner_count = sum(
                         1
@@ -1677,12 +1775,12 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     len(items)
                     for items in v4_shared_insert_turn_handoffs.values()
                 )
-                if handoff_count != len(writer_task_set):
+                if handoff_count != len(handoff_task_set):
                     raise ValueError(
                         "shared schema-v5 level4 has orphan or duplicate "
                         "SharedInsertTurnHandoff records: "
                         f"records={handoff_count} "
-                        f"metadata_writers={len(writer_task_set)} "
+                        f"expected_handoffs={len(handoff_task_set)} "
                         f"winners={winner_count}"
                     )
 
@@ -2412,6 +2510,8 @@ def _iter_v5_residual_spans(  # noqa: PLR0912
 def _iter_v5_shared_register_derived_spans(
     rows: list[tuple[Any, ...]],
     metadata_writer_tasks: set[int],
+    metadata_prefix_tasks: set[int],
+    submit_topology: str,
 ) -> Iterator[tuple[int, int, int, int, int, str]]:
     """用 Register 与 metadata 边界补出非 raw 串行段。
 
@@ -2448,14 +2548,31 @@ def _iter_v5_shared_register_derived_spans(
             int(parent[2]),
             int(parent[3]),
         )
-        has_previous_writer = any(
-            writer_task < task_id
-            for writer_task in metadata_writer_tasks
-        )
-        predecessor_span_name = (
-            "register.wait_predecessor_tensormap_writer"
-            if has_previous_writer
-            else "register.enter_tensormap_writer_chain"
+        if submit_topology == "all_worker_replay":
+            has_predecessor = any(
+                prefix_task < task_id
+                for prefix_task in metadata_prefix_tasks
+            )
+            predecessor_span_name = (
+                "register.wait_predecessor_tensormap_insert"
+                if has_predecessor
+                else "register.enter_tensormap_insert_chain"
+            )
+        else:
+            has_previous_writer = any(
+                writer_task < task_id
+                for writer_task in metadata_writer_tasks
+            )
+            predecessor_span_name = (
+                "register.wait_predecessor_tensormap_writer"
+                if has_previous_writer
+                else "register.enter_tensormap_writer_chain"
+            )
+        publishes_metadata = task_id in metadata_writer_tasks
+        publishes_insert_completion = (
+            task_id in metadata_prefix_tasks
+            if submit_topology == "all_worker_replay"
+            else publishes_metadata
         )
         yield (
             core_id,
@@ -2466,7 +2583,6 @@ def _iter_v5_shared_register_derived_spans(
             f"{predecessor_span_name}#{task_id}",
         )
         ordinary_tensormap_entries = int(parent[9])
-        publishes_metadata = task_id in metadata_writer_tasks
         writer_metadata_name = (
             (
                 "register.publish_writer_metadata"
@@ -2510,7 +2626,7 @@ def _iter_v5_shared_register_derived_spans(
             int(parent[7]),
             (
                 "register.publish_tensormap_insert_completion"
-                if publishes_metadata
+                if publishes_insert_completion
                 else "register.metadata_chain_epilogue"
             ) + f"#{task_id}",
         )
@@ -2694,6 +2810,12 @@ def convert(  # noqa: PLR0912, PLR0915
                         "shared_metadata_writer_tasks", []
                     )
                 ),
+                set(
+                    capture_metadata.get(
+                        "shared_metadata_prefix_tasks", []
+                    )
+                ),
+                str(capture_metadata.get("submit_topology", "all_worker_replay")),
             )
         )
         ordered_items.extend(
@@ -2921,7 +3043,11 @@ def convert(  # noqa: PLR0912, PLR0915
                         atomic_call_count = (
                             flags >> ATOMIC_PAYLOAD_SHIFT
                         ) & ATOMIC_PAYLOAD_MASK
-                        if atomic_site_id in AGGREGATE_ONLY_POLL_SITE_IDS:
+                        if (
+                            atomic_site_id in AGGREGATE_ONLY_POLL_SITE_IDS
+                            or atomic_site_id
+                            in SHARED_OUTPUT_PUBLISHED_POLL_SITE_IDS
+                        ):
                             poll_boundary_tag = (
                                 "return_ready"
                                 if flags & ATOMIC_RETURN_READY

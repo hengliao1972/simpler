@@ -469,9 +469,8 @@ def _v4_capture(  # noqa: PLR0912
                         auxiliary=19,
                     )
                 )
-            # 该旧矩形 fixture 的每个 winner（包括 task 0）都用
-            # source-issue FetchAdd 发布本 task completion，使 Register
-            # 后段和父区间保持闭合。
+            # all-worker-replay 用返回型 CAS 发布逐 task completion；
+            # central-ticket 的稀疏 writer 链则用不消费返回值的 FetchAdd。
             rows.append(
                 _row(
                     int(register[0]),
@@ -479,7 +478,11 @@ def _v4_capture(  # noqa: PLR0912
                     "Atomic",
                     publish_end,
                     end,
-                    flags=0x02,
+                    flags=(
+                        0x02
+                        if submit_topology == "central_ticket"
+                        else 0x54
+                    ),
                     auxiliary=20,
                 )
             )

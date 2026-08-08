@@ -4,15 +4,15 @@
 
 - 分支：`fdwic-swimlane-deps`
 - 起点：`678987515baec7fa7dee0adef72050ece66dfb1e`
-- 新目录必须独立，不产生对 `simt_cross_core` 的源码依赖；
-- metadata 串行语义必须参考真实 `cross_core`，不能臆造接口；
+- 新目录必须独立，不产生对 `simt_cross_core_dag` 的源码依赖；
+- metadata 串行语义必须参考真实 `cross_core_ordinary`，不能臆造接口；
 - 只做 GM，不做 UBUF；
 - workload 固定 `QK/SF/PV/UP=6/28/4/1`；
 - 需要真实 PA、泳道图和与 symbol 路径的性能对比。
 
-## 2. 查证得到的真实 `cross_core` 规则
+## 2. 查证得到的真实 `cross_core_ordinary` 规则
 
-`cross_core/common/pa_shared_submit_path.h` 的
+`cross_core_ordinary/common/pa_shared_submit_path.h` 的
 `DecodeSharedMetadataWriterPlan()` 从只读 writer bitset 中求
 `previous_metadata_writer=max(writer<N)`；`FinishSharedWinnerSubmitBody()` 只在
 Register 阶段等待该前驱。非 writer 不交接 baton，真实 writer 才发布自己的
@@ -162,7 +162,7 @@ builder 包络为 `+24.093 µs`（`+2.92%`）。但更重要的是区间关系�
 
 ## 8. 初始闭环结论
 
-新目录已闭合“SIMT 构建 + `cross_core` 全局稀疏 writer 顺序 + Scalar 执行”的
+新目录已闭合“SIMT 构建 + `cross_core_ordinary` 全局稀疏 writer 顺序 + Scalar 执行”的
 真实 GM PA 流程。它与 per-symbol 路径只在 metadata 排序粒度上不同，适合作为
 后续 correctness/performance A/B 基线。当前没有实现 UBUF，也没有把 PA
 whole-object 结果外推成通用 ordinary-region TensorMap 能力。
