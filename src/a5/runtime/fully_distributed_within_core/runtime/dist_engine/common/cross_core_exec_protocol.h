@@ -643,4 +643,26 @@ PublishExecDone(__gm__ SharedExecCell &cell, ExecToken &token, __gm__ SharedExec
     return ExecDoneResult::Done;
 }
 
+template <typename Ops>
+PTO_DEVICE_FUNC ExecDoneResult PublishClaimedExecDone(
+    __gm__ SharedExecCell &cell, uint32_t task_id, uint32_t execute_owner, __gm__ SharedExecControl &fatal
+) {
+    if (Ops::Load(&fatal.state) != 0) return ExecDoneResult::FatalObserved;
+    const int64_t observed_raw = Ops::Load(&cell.control.state);
+    const DecodedExecState observed = DecodeExecState(observed_raw);
+    if (!observed.valid || observed.phase != ExecPhase::Claimed || observed.task_id != task_id ||
+        observed.execute_owner != execute_owner) {
+        (void)PublishExecFatal<Ops>(fatal, ExecFatalReason::CompletionStateConflict, task_id, execute_owner);
+        return ExecDoneResult::StateConflict;
+    }
+    const int64_t done = static_cast<int64_t>(EncodeExecState(
+        ExecPhase::Done, observed.build_owner, execute_owner, observed.engine_class, observed.payload_lines, task_id
+    ));
+    if (Ops::CompareExchange(&cell.control.state, observed_raw, done) != observed_raw) {
+        (void)PublishExecFatal<Ops>(fatal, ExecFatalReason::CompletionStateConflict, task_id, execute_owner);
+        return ExecDoneResult::StateConflict;
+    }
+    return ExecDoneResult::Done;
+}
+
 }  // namespace fdwic::cross_core

@@ -26,6 +26,7 @@ import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from _task_interface import ArgDirection, ChipCallable  # pyright: ignore[reportMissingImports]
@@ -51,6 +52,7 @@ from simpler_setup.scene_test import (
     _fdwic_scheduler_mode,
     _fdwic_tensormap_compile_definitions,
     _fdwic_tensormap_mode,
+    _fdwic_use_shared_pa_unity,
     _profiled_cache_key,
     _render_case_fdwic_submit_pmu,
     _run_swimlane_converter,
@@ -62,6 +64,21 @@ from simpler_setup.scene_test import (
 )
 
 _scene_test_module = importlib.import_module("simpler_setup.scene_test")
+
+
+@pytest.mark.parametrize(
+    ("tensormap_mode", "scheduler_mode", "expected"),
+    [
+        ("private", "same_core", False),
+        ("shared", "same_core", True),
+        ("shared", "cross_core_ordinary", False),
+        ("shared", "cross_core_dag", False),
+        ("shared", "simt_cross_core_ordinary", False),
+        ("shared", "simt_cross_core_dag", False),
+    ],
+)
+def test_shared_pa_unity_is_confined_to_legacy_same_core(tensormap_mode, scheduler_mode, expected):
+    assert _fdwic_use_shared_pa_unity(tensormap_mode, scheduler_mode) is expected
 
 
 @pytest.fixture(autouse=True)
@@ -105,7 +122,7 @@ def test_clear_compile_cache_drops_cached_chip_callables():
     for i in range(3):
         _compile_cache[("t", "plat", f"rt{i}")] = _build_chip_callable(f"n{i}")
     _aicore_override_cache[("t", "plat", "rt0", "private", "none")] = Path("/tmp/fake-aicore.o")
-    _fdwic_build_identity_cache[("t", "plat", "rt0", "private", "same_core", "submit-pmu-none")] = object()
+    _fdwic_build_identity_cache[("t", "plat", "rt0", "private", "same_core", "submit-pmu-none")] = cast(Any, object())
     assert len(_compile_cache) == 3
     assert len(_aicore_override_cache) == 1
     assert len(_fdwic_build_identity_cache) == 1
@@ -219,9 +236,7 @@ def test_fdwic_tensormap_mode_and_compile_definition_contract(monkeypatch):
 def test_fdwic_scheduler_mode_and_compile_definition_contract(monkeypatch):
     monkeypatch.delenv("PTO_FDWIC_SCHEDULER_MODE", raising=False)
     assert _fdwic_scheduler_mode() == "same_core"
-    assert _fdwic_scheduler_compile_definition("a5", "fully_distributed_within_core") == (
-        "PTO_FDWIC_SCHEDULER_MODE=0"
-    )
+    assert _fdwic_scheduler_compile_definition("a5", "fully_distributed_within_core") == ("PTO_FDWIC_SCHEDULER_MODE=0")
 
     monkeypatch.setenv("PTO_FDWIC_TENSORMAP_MODE", "shared")
     monkeypatch.setenv("PTO_FDWIC_SCHEDULER_MODE", "simt_cross_core_dag")
@@ -462,6 +477,7 @@ def test_submit_pmu_override_registers_build_identity_after_elf_gate(
     _fdwic_build_identity_cache.clear()
 
     binary = maybe_build_aicore_override(profiled_key, "a5", runtime, str(orch), [], pto_isa_root="/pto")
+    assert binary is not None
 
     extra_key = binary.parent.name
     expected_build_dir = (
@@ -499,7 +515,7 @@ def test_submit_pmu_render_publishes_bound_provenance_and_html(monkeypatch, tmp_
     report_module = importlib.import_module("simpler_setup.tools.fdwic_submit_pmu_report")
     raw = tmp_path / report_module.DEFAULT_INPUT_NAME
     raw.write_text("{}")
-    identity = object()
+    identity = cast(Any, object())
     called = []
 
     def fake_write_report_with_provenance(input_path, build_identity, output_path):
@@ -562,7 +578,7 @@ def test_submit_pmu_run_resolves_profiled_identity_for_render(monkeypatch, tmp_p
 
     profile = "submit-pmu-none"
     key = (IdentityCase.__qualname__, "a5", IdentityCase._st_runtime, "private", "same_core", profile)
-    identity = object()
+    identity = cast(Any, object())
     rendered = []
     monkeypatch.delenv("PTO_FDWIC_TENSORMAP_MODE", raising=False)
     monkeypatch.setenv("PTO_FDWIC_PROFILE", profile)
@@ -1300,6 +1316,17 @@ def test_standalone_shared_tensormap_rejects_mixed_runtime_or_l3_classes():
         )
     with pytest.raises(ValueError, match=r"FdwicL2::Case2"):
         _validate_fdwic_tensormap_test_classes("shared", {fdwic_l2: [{"name": "Case2"}]})
+
+
+def test_cross_core_shared_tensormap_accepts_generic_l2_fdwic_case(monkeypatch):
+    generic_l2 = type(
+        "GenericFdwicL2",
+        (),
+        {"_st_level": 2, "_st_runtime": "fully_distributed_within_core"},
+    )
+    monkeypatch.setenv("PTO_FDWIC_SCHEDULER_MODE", "cross_core_ordinary")
+
+    _validate_fdwic_tensormap_test_classes("shared", {generic_l2: [{"name": "Simple"}]})
 
 
 def test_shared_tensormap_uses_mode_local_pa_block_dim(monkeypatch):

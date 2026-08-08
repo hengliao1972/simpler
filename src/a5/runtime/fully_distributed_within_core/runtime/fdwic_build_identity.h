@@ -86,9 +86,9 @@ inline constexpr uint32_t kFdwicTensorMapRingCap = static_cast<uint32_t>(PTO_FDW
 inline constexpr uint32_t kFdwicTensorMapRingBuckets = 16384U / kFdwicTensorMapRingCap;
 #endif
 
-// Both artifact families have an executable backend. The shared image is
-// deliberately narrower: only the fixed single-group PA protocol is accepted,
-// while generic shared Submit and unsupported launch shapes fail closed.
+// Every emitted artifact has an executable backend.  The legacy same-core
+// shared image remains PA-specialized; cross-core modes expose their generic
+// dynamic Submit contract as each implementation is enabled.
 inline constexpr bool kFdwicCompiledBackendReady = true;
 
 enum FdwicBuildError : uint32_t {

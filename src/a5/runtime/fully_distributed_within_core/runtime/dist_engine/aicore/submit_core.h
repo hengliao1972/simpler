@@ -188,7 +188,23 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
             complete_executed_task(self, s.task_id);
         }
     } else {
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+        __gm__ fdwic::cross_core::SharedExecCell &exec_cell =
+            g_dist.cross_core_ordinary.tasks[static_cast<uint32_t>(s.task_id)];
+        const uint64_t completion_vend = exec_cell.payload.words[2];
+        store_task_vend(s.task_id, completion_vend);
+        store_barrier();
+        publish_task_flag(s.task_id);
+        if (fdwic::cross_core::PublishClaimedExecDone<DistCrossCoreAicoreOps>(
+                exec_cell, static_cast<uint32_t>(s.task_id), static_cast<uint32_t>(self->core_idx),
+                g_dist.cross_core_ordinary.fatal
+            ) != fdwic::cross_core::ExecDoneResult::Done) {
+            set_fatal_code(PTO2_ERROR_TENSORMAP_PROTOCOL);
+            self->local_index = kFlagCap;
+        }
+#else
         complete_executed_task(self, s.task_id);
+#endif
     }
     TRACE_INSTANT(self, s.task_id, s.func_id, TracePhase::Commit, static_cast<uint32_t>(s.is_multicore ? 1 : 0));
     s.built = false;
@@ -474,15 +490,13 @@ calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout, uint32
 }
 
 #if PTO_FDWIC_SHARED_MAP
-PTO_DEVICE_FUNC bool
-dist_shared_pa_create_info_bytes(const TensorCreateInfo &info, uint64_t &bytes) {
+PTO_DEVICE_FUNC bool dist_shared_pa_create_info_bytes(const TensorCreateInfo &info, uint64_t &bytes) {
     bytes = 0;
     // A no-wrap shared cursor cannot be rolled back safely. Validate the full
     // phase-1 output shape before touching any heap control word.
     if (info.ndims == 0 || info.ndims > MAX_TENSOR_DIMS ||
-        static_cast<uint32_t>(info.dtype) >= static_cast<uint32_t>(DataType::DATA_TYPE_NUM) ||
-        info.has_initial_value || info.start_offset != 0 || !info.is_contiguous ||
-        info.__pad_flags__ != 0) {
+        static_cast<uint32_t>(info.dtype) >= static_cast<uint32_t>(DataType::DATA_TYPE_NUM) || info.has_initial_value ||
+        info.start_offset != 0 || !info.is_contiguous || info.__pad_flags__ != 0) {
         return false;
     }
     uint32_t elements = 1;
@@ -498,16 +512,16 @@ dist_shared_pa_create_info_bytes(const TensorCreateInfo &info, uint64_t &bytes) 
 }
 
 PTO_DEVICE_FUNC bool dist_shared_pa_calculate_output_layout(
-    const L0TaskArgs &args, uint32_t expected_output_count, DistOutputLayout &layout,
-    uint32_t &register_mask, uint32_t &output_mask
+    const L0TaskArgs &args, uint32_t expected_output_count, DistOutputLayout &layout, uint32_t &register_mask,
+    uint32_t &output_mask
 ) {
     layout.total_output_size = 0;
     register_mask = 0;
     output_mask = 0;
     uint32_t output_count = 0;
-    if (args.tensor_count() < 0 || args.tensor_count() > MAX_TENSOR_ARGS ||
-        args.scalar_count() < 0 || args.scalar_count() > MAX_SCALAR_ARGS ||
-        args.has_error || expected_output_count > kFdwicSharedOutputMaxPerTask) {
+    if (args.tensor_count() < 0 || args.tensor_count() > MAX_TENSOR_ARGS || args.scalar_count() < 0 ||
+        args.scalar_count() > MAX_SCALAR_ARGS || args.has_error ||
+        expected_output_count > kFdwicSharedOutputMaxPerTask) {
         return false;
     }
     for (int32_t index = 0; index < args.tensor_count(); ++index) {
@@ -522,25 +536,20 @@ PTO_DEVICE_FUNC bool dist_shared_pa_calculate_output_layout(
             register_mask |= 1U << static_cast<uint32_t>(index);
         }
         if (tag != TensorArgType::OUTPUT) {
-            if (!args.tensor(index).tensor_from_shared_output() &&
-                !args.tensor(index).has_existing_tensor()) {
+            if (!args.tensor(index).tensor_from_shared_output() && !args.tensor(index).has_existing_tensor()) {
                 return false;
             }
             continue;
         }
         if (!args.tensor(index).has_create_info() ||
-            !dist_shared_pa_create_info_bytes(
-                args.tensor(index).create_info(), layout.buffer_sizes[index]
-            )) {
+            !dist_shared_pa_create_info_bytes(args.tensor(index).create_info(), layout.buffer_sizes[index])) {
             return false;
         }
         if (layout.buffer_sizes[index] > UINT64_MAX - (PTO2_PACKED_OUTPUT_ALIGN - 1U)) {
             return false;
         }
-        const uint64_t aligned =
-            PTO2_ALIGN_UP(layout.buffer_sizes[index], PTO2_PACKED_OUTPUT_ALIGN);
-        if (aligned < layout.buffer_sizes[index] ||
-            layout.total_output_size > UINT64_MAX - aligned) {
+        const uint64_t aligned = PTO2_ALIGN_UP(layout.buffer_sizes[index], PTO2_PACKED_OUTPUT_ALIGN);
+        if (aligned < layout.buffer_sizes[index] || layout.total_output_size > UINT64_MAX - aligned) {
             return false;
         }
         layout.total_output_size += aligned;
@@ -551,8 +560,7 @@ PTO_DEVICE_FUNC bool dist_shared_pa_calculate_output_layout(
 }
 #endif
 
-PTO_DEVICE_FUNC bool
-dist_submit_materialize_args(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind) {
+PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.payload == nullptr) return false;
     ctx.tensor_count = args.tensor_count();
     ctx.scalar_count = args.scalar_count();
@@ -561,19 +569,15 @@ dist_submit_materialize_args(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSub
     DistOutputLayout layout;
 #if PTO_FDWIC_SHARED_MAP
     uint32_t output_mask = 0;
-    if (ctx.task_id < 0 ||
-        static_cast<uint32_t>(ctx.task_id) >= kFdwicSharedPaTaskCapacity) {
+    if (ctx.task_id < 0 || static_cast<uint32_t>(ctx.task_id) >= kFdwicSharedPaTaskCapacity) {
         set_fatal_code(PTO2_ERROR_TENSORMAP_PROTOCOL);
         if (ctx.self != nullptr) ctx.self->local_index = kFlagCap;
         return false;
     }
-    const uint32_t expected_output_count =
-        dist_shared_pa_output_count(static_cast<DistSharedPaTaskKind>(
-            static_cast<uint32_t>(ctx.task_id) % kFdwicSharedPaTasksPerBatch
-        ));
-    if (!dist_shared_pa_calculate_output_layout(
-            args, expected_output_count, layout, ctx.register_mask, output_mask
-        )) {
+    const uint32_t expected_output_count = dist_shared_pa_output_count(
+        static_cast<DistSharedPaTaskKind>(static_cast<uint32_t>(ctx.task_id) % kFdwicSharedPaTasksPerBatch)
+    );
+    if (!dist_shared_pa_calculate_output_layout(args, expected_output_count, layout, ctx.register_mask, output_mask)) {
         set_fatal_code(PTO2_ERROR_TENSORMAP_PROTOCOL);
         if (ctx.self != nullptr) ctx.self->local_index = kFlagCap;
         return false;
@@ -592,9 +596,7 @@ dist_submit_materialize_args(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSub
         return false;
     }
     DistSharedPaHeapReservation reservation;
-    if (!dist_shared_pa_reserve_heap(
-            g_dist.shared_pa, ctx.task_id, total, static_cast<uint64_t>(ring), reservation
-        )) {
+    if (!dist_shared_pa_reserve_heap(g_dist.shared_pa, ctx.task_id, total, static_cast<uint64_t>(ring), reservation)) {
         set_fatal_code(PTO2_ERROR_TENSORMAP_CAPACITY);
         if (ctx.self != nullptr) ctx.self->local_index = kFlagCap;
         return false;
@@ -750,25 +752,20 @@ PTO_DEVICE_FUNC void dist_submit_add_fanin(int32_t fanin[], int32_t &fanin_count
 PTO_DEVICE_FUNC bool
 dist_submit_collect_fanin(const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t fanin[], int32_t &fanin_count) {
     int32_t count = 0;
-    if (ctx.self == nullptr || ctx.task_id < 0 ||
-        static_cast<uint32_t>(ctx.task_id) >= kFdwicSharedPaTaskCapacity) {
+    if (ctx.self == nullptr || ctx.task_id < 0 || static_cast<uint32_t>(ctx.task_id) >= kFdwicSharedPaTaskCapacity) {
         return false;
     }
-    const int32_t batch_start =
-        ctx.task_id - (ctx.task_id % static_cast<int32_t>(kFdwicSharedPaTasksPerBatch));
+    const int32_t batch_start = ctx.task_id - (ctx.task_id % static_cast<int32_t>(kFdwicSharedPaTasksPerBatch));
     for (int32_t index = 0; index < ctx.tensor_count; ++index) {
         const TensorArgType tag = args.tag(index);
         if (tag == TensorArgType::OUTPUT) continue;
         if (args.tensor(index).tensor_from_shared_output()) {
-            if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT &&
-                tag != TensorArgType::NO_DEP) {
+            if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT && tag != TensorArgType::NO_DEP) {
                 return false;
             }
             const FdwicOutputRef ref = args.tensor(index).shared_output_ref();
             int32_t writer = -1;
-            if (!dist_shared_pa_resolve_writer(
-                    g_dist.shared_pa, ref, ctx.task_id, g_dist.H, batch_start, writer
-                )) {
+            if (!dist_shared_pa_resolve_writer(g_dist.shared_pa, ref, ctx.task_id, g_dist.H, batch_start, writer)) {
                 return false;
             }
             if (tag != TensorArgType::NO_DEP) dist_submit_add_fanin(fanin, count, writer);

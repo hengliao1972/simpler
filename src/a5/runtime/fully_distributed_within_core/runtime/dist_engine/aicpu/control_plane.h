@@ -27,9 +27,12 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
         return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
     }
 #if PTO_FDWIC_SHARED_MAP
-    // The shared PA backend deliberately supports one fixed deployment shape.
-    // Reject it before writing DistGlobal so a mismatched launch cannot publish
-    // a partially initialized shared backend to any worker.
+    // Validate the complete A5 block topology before writing DistGlobal.  The
+    // legacy same-core shared PA specialization additionally freezes one exact
+    // 32-AIC + 64-AIV deployment and one 256 MiB heap; generic cross-core
+    // schedulers intentionally support every complete 1-AIC + 2-AIV prefix and
+    // account against the actual heap capacity.
+#if PTO_FDWIC_SCHEDULER_MODE == 0
     constexpr int32_t kSharedPaExpectedAicWorkers = 32;
     constexpr int32_t kSharedPaExpectedAivWorkers = 64;
     constexpr int32_t kSharedPaExpectedWorkers = kSharedPaExpectedAicWorkers + kSharedPaExpectedAivWorkers;
@@ -44,6 +47,7 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
         DIST_ERRF("[dist_engine] shared PA requires 96 workers (32 AIC + 64 AIV): workers=%d\n", num_workers);
         return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
     }
+#endif
     int32_t shared_aic_workers = 0;
     int32_t shared_aiv_workers = 0;
     for (int32_t i = 0; i < num_workers; ++i) {
@@ -60,8 +64,9 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
         }
     }
     // The topology builder below maps AIC[n], AIV[2n], and AIV[2n+1] to
-    // block n. Exact 32/64 role counts therefore establish 32 complete
-    // 1-AIC + 2-AIV blocks without changing the existing mapping rule.
+    // block n.  Every accepted deployment must therefore contain complete
+    // blocks; mode 0 further requires all 32 physical blocks.
+#if PTO_FDWIC_SCHEDULER_MODE == 0
     if (shared_aic_workers != kSharedPaExpectedAicWorkers || shared_aiv_workers != kSharedPaExpectedAivWorkers) {
         DIST_ERRF(
             "[dist_engine] shared PA requires 32 complete 1-AIC + 2-AIV blocks: AIC=%d AIV=%d\n", shared_aic_workers,
@@ -69,6 +74,17 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
         );
         return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
     }
+#else
+    if (shared_aic_workers <= 0 || shared_aiv_workers != 2 * shared_aic_workers ||
+        shared_aic_workers + shared_aiv_workers != num_workers) {
+        DIST_ERRF(
+            "[dist_engine] cross-core shared scheduler requires complete 1-AIC + 2-AIV blocks: workers=%d AIC=%d "
+            "AIV=%d\n",
+            num_workers, shared_aic_workers, shared_aiv_workers
+        );
+        return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
+    }
+#endif
 #endif
     int32_t configured_history = kHDefault;
     if (const char *e = getenv("PTO_DIST_H")) {
@@ -79,7 +95,7 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
             return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
         }
     }
-#if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE == 0
     // A phase-1 PA group is Alloc,QK,SF,PV,UP.  UP reads the Alloc symbols at
     // distance four, so a smaller history window would silently omit a real
     // fan-in edge instead of merely reducing retained history.
@@ -126,10 +142,11 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
     g_dist.final_barrier.root_arrival.expected = 0;
     atomic_exchange(g_dist.final_barrier.root_release.v, int64_t{0}, __ATOMIC_RELAXED);
 #if PTO_FDWIC_SHARED_MAP
-    // This is the sole reset point for the global shared PA sidecar. Workers
-    // only attach after AICPU publishes the initialized runtime.
+    // This is the sole reset point for the selected shared scheduler sidecar.
+    // Workers only attach after AICPU publishes the initialized runtime.
+#if PTO_FDWIC_SCHEDULER_MODE == 0
     dist_shared_pa_tensor_map_reset(g_dist.shared_pa);
-#if PTO_FDWIC_SCHEDULER_MODE == 1
+#elif PTO_FDWIC_SCHEDULER_MODE == 1
     dist_cross_core_ordinary_reset(g_dist.cross_core_ordinary);
 #endif
 #endif

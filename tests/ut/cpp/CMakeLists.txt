@@ -717,6 +717,24 @@ target_include_directories(test_fdwic_cross_core_state BEFORE PRIVATE
 )
 set_tests_properties(test_fdwic_cross_core_state PROPERTIES LABELS "no_hardware")
 
+# Compile the production AICPU registration path for the generic cross-core
+# scheduler.  Unlike the legacy shared PA specialization it accepts every
+# complete 1-AIC + 2-AIV block prefix and accounts against the actual heap.
+add_a5_test(test_fdwic_cross_core_register a5/test_fdwic_cross_core_register.cpp)
+target_compile_definitions(test_fdwic_cross_core_register PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_SCHEDULER_MODE=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
+target_include_directories(test_fdwic_cross_core_register BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_cross_core_register PROPERTIES LABELS "no_hardware")
+
 # A5 trb runtime UTs — mirror of a2a3 trb runtime UTs, link against a5_rt_objs.
 # Target names carry the a5_ prefix because hierarchical/test_tensormap (and
 # the unprefixed a2a3 runtime targets test_scheduler_state / test_ready_queue

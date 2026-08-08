@@ -129,8 +129,7 @@ def _fdwic_scheduler_compile_definition(platform: str, runtime: str) -> str | No
     is_fdwic = platform in {"a5", "a5sim"} and runtime == "fully_distributed_within_core"
     if mode != FDWIC_SCHEDULER_MODE_SAME_CORE and not is_fdwic:
         raise ValueError(
-            f"{FDWIC_SCHEDULER_MODE_ENV}={mode} is only supported by "
-            "the a5/a5sim fully_distributed_within_core runtime"
+            f"{FDWIC_SCHEDULER_MODE_ENV}={mode} is only supported by the a5/a5sim fully_distributed_within_core runtime"
         )
     if mode != FDWIC_SCHEDULER_MODE_SAME_CORE and _fdwic_tensormap_mode() != _FDWIC_TENSORMAP_SHARED:
         raise ValueError(f"{FDWIC_SCHEDULER_MODE_ENV}={mode} requires {_FDWIC_TENSORMAP_MODE_ENV}=shared")
@@ -138,7 +137,7 @@ def _fdwic_scheduler_compile_definition(platform: str, runtime: str) -> str | No
 
 
 def _validate_fdwic_tensormap_test_classes(mode: str, selected_by_cls) -> None:
-    """Reject every shared selection outside the explicitly supported PA cases."""
+    """Validate shared-map tests against the selected scheduler contract."""
     if mode != _FDWIC_TENSORMAP_SHARED:
         return
     incompatible = sorted(
@@ -151,6 +150,11 @@ def _validate_fdwic_tensormap_test_classes(mode: str, selected_by_cls) -> None:
             "--fdwic-tensormap shared only accepts level-2 "
             "fully_distributed_within_core tests; incompatible class(es): " + ", ".join(incompatible)
         )
+    # The explicit case allow-list belongs to the legacy same-core shared PA
+    # specialization.  Cross-core modes implement the generic dynamic Submit
+    # API and must be exercised by ordinary level-2 FDWIC callables as well.
+    if _fdwic_scheduler_mode() != FDWIC_SCHEDULER_MODE_SAME_CORE:
+        return
     unsupported = sorted(
         f"{cls.__name__}::{case['name']}"
         for cls, cases in selected_by_cls.items()
@@ -550,9 +554,7 @@ def _assert_fdwic_shared_pa_role_entries(binary: Path) -> None:
     symbol_rows = _fdwic_elf_symbol_rows(binary)
     required = ("aicpu_orchestration_entry_aic", "aicpu_orchestration_entry_aiv")
     definition_counts = {
-        symbol: sum(
-            kind == "FUNC" and ndx != "UND" and name == symbol for kind, ndx, name in symbol_rows
-        )
+        symbol: sum(kind == "FUNC" and ndx != "UND" and name == symbol for kind, ndx, name in symbol_rows)
         for symbol in required
     }
     invalid = [f"{symbol}={definition_counts[symbol]}" for symbol in required if definition_counts[symbol] != 1]
@@ -588,6 +590,11 @@ def _assert_fdwic_shared_pa_role_entries(binary: Path) -> None:
         raise RuntimeError(f"Invalid shared-PA AICore image {binary}: {'; '.join(details)}")
 
 
+def _fdwic_use_shared_pa_unity(tensormap_mode: str, scheduler_mode: str) -> bool:
+    """Keep the legacy PA-only unity image out of generic cross-core modes."""
+    return tensormap_mode == _FDWIC_TENSORMAP_SHARED and scheduler_mode == FDWIC_SCHEDULER_MODE_SAME_CORE
+
+
 def maybe_build_aicore_override(
     cache_key,
     platform: str,
@@ -616,17 +623,19 @@ def maybe_build_aicore_override(
     # Arg layout. Each isolated evidence profile independently removes the dist
     # swimlane/atomic path without changing orchestration/incore ABI.
     tensormap_mode = _fdwic_tensormap_mode()
+    scheduler_mode = _fdwic_scheduler_mode()
+    shared_pa_unity = _fdwic_use_shared_pa_unity(tensormap_mode, scheduler_mode)
     compile_definitions = list(_fdwic_compile_definitions(profile) or ())
-    if tensormap_mode == _FDWIC_TENSORMAP_SHARED:
-        # Shared phase 1 admits only the explicitly declared PA callable.
-        # Its CCEC image uses one AIC-owned unity source that emits both role
-        # bodies; the AIV orchestration translation unit is intentionally empty.
-        # The runtime dispatches to two distinct role entry symbols after attach.
+    if shared_pa_unity:
+        # The legacy same-core shared PA path still needs its role-specialized
+        # unity image.  Generic cross-core schedulers compile dist_engine as an
+        # ordinary independent TU and must retain the generic orchestration
+        # entry and runtime symbols.
         compile_definitions.append("PTO_FDWIC_SHARED_PA_UNITY=1")
     builder = RuntimeBuilder(
         platform,
         fdwic_tensormap_mode=tensormap_mode,
-        fdwic_scheduler_mode=_fdwic_scheduler_mode(),
+        fdwic_scheduler_mode=scheduler_mode,
     )
     binary = builder.build_aicore_with_extra_sources(
         runtime,
@@ -635,7 +644,7 @@ def maybe_build_aicore_override(
         pto_isa_root=pto_isa_root,
         compile_definitions=compile_definitions,
     )
-    if platform == "a5" and tensormap_mode == _FDWIC_TENSORMAP_SHARED:
+    if platform == "a5" and shared_pa_unity:
         _assert_fdwic_shared_pa_role_entries(binary)
     if profile in _FDWIC_PERF_CLOCK_PROFILES:
         _assert_fdwic_perf_clock_elf(binary, profile)
@@ -1833,6 +1842,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
             if enable_scope_stats:
                 _plot_case_scope_stats(case_label, prefix)
             if case_succeeded and fdwic_profile in _FDWIC_SUBMIT_PMU_PROFILES:
+                assert submit_pmu_build_identity is not None
                 _render_case_fdwic_submit_pmu(case_label, prefix, submit_pmu_build_identity)
             if case_succeeded and fdwic_profile in _FDWIC_PERF_CLOCK_PROFILES:
                 _validate_case_fdwic_perf_clock(case_label, prefix, fdwic_profile)
@@ -1997,7 +2007,7 @@ class SceneTestCase:
         cache_key = (cls.__qualname__, platform, cls._st_runtime)
         cls.compile_chip_callable(platform)
         aicore_override = get_aicore_path_override(cache_key)
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "fdwic_tensormap_mode": _fdwic_tensormap_mode(),
             "fdwic_scheduler_mode": _fdwic_scheduler_mode(),
         }
@@ -2420,9 +2430,7 @@ class SceneTestCase:
 
             pytest.skip(f"No cases matched {cls_name} (platform={st_platform}, manual={manual_mode})")
 
-        _validate_fdwic_tensormap_test_classes(
-            _fdwic_tensormap_mode(), {type(self): matched}
-        )
+        _validate_fdwic_tensormap_test_classes(_fdwic_tensormap_mode(), {type(self): matched})
         callable_obj = self.build_callable(st_platform)
         sub_handles = getattr(type(self), "_st_sub_handles", {})
         # For L3, use registered chip handles instead of raw ChipCallable

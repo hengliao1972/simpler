@@ -62,9 +62,7 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
         ctx.claim_attempted = true;
 #if PTO_FDWIC_SHARED_MAP
         ctx.won = claim(
-            g_dist.shared_pa
-                .shared_vector_cursor[ctx.task_id % static_cast<int32_t>(kFdwicSharedVectorCursorShards)]
-                .v,
+            g_dist.shared_pa.shared_vector_cursor[ctx.task_id % static_cast<int32_t>(kFdwicSharedVectorCursorShards)].v,
             ctx.task_id
         );
 #else
@@ -138,12 +136,9 @@ PTO_DEVICE_FUNC void dist_submit_wait_slot_capacity(__gm__ DistCore *self, int32
         // Fatal is a failure-only escape from a full ring. Throttle the global
         // load so the successful dependency wait does not serialize on it.
         ++no_progress_polls;
-        if ((no_progress_polls & 1023U) == 0 &&
-            fdwic_trace_is_fatal(task_id)) {
+        if ((no_progress_polls & 1023U) == 0 && fdwic_trace_is_fatal(task_id)) {
             fdwic_atomic_poll_region_end(slot_poll_region);
-            TRACE_SPAN_END(
-                ring_bp_trace, self, task_id, -1, TracePhase::RingBp, 0, 0
-            );
+            TRACE_SPAN_END(ring_bp_trace, self, task_id, -1, TracePhase::RingBp, 0, 0);
             self->local_index = kFlagCap;
             return false;
         }
@@ -262,8 +257,7 @@ PTO_DEVICE_FUNC int32_t wait_alloc_won_slot(__gm__ DistCore *self, int32_t block
     return won_slot;
 }
 
-PTO_DEVICE_FUNC bool
-dist_submit_build_winner_slot(DistSubmitCtx &ctx, const L0TaskArgs &args, __gm__ RingSlot *slot) {
+PTO_DEVICE_FUNC bool dist_submit_build_winner_slot(DistSubmitCtx &ctx, const L0TaskArgs &args, __gm__ RingSlot *slot) {
     if (slot == nullptr || ctx.payload == nullptr) return false;
     const int32_t sub_block_id = ctx.self != nullptr && ctx.self->lane == LANE_AIV1 ? 1 : 0;
     const uint64_t fn_addr = dist_aicore_slot_function_addr(g_dist.runtime, ctx.kernel_id);
@@ -468,6 +462,7 @@ dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uin
 #endif
 
 #include "dist_engine/aicore/shared_submit_path.h"
+#include "dist_engine/aicore/cross_core_submit_path.h"
 
 #include "dist_engine/aicore/run_state.h"
 
@@ -825,30 +820,25 @@ PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_invalid_ticket(DistCompete
 }
 
 PTO_DEVICE_FUNC bool dist_shared_pa_validate_finish(
-    DistSharedPaReplayContext replay, const DistCompeteFirstTicket &ticket,
-    DistSharedPaTaskKind kind, const MixedKernels *mixed, const L0TaskArgs *winner_args
+    DistSharedPaReplayContext replay, const DistCompeteFirstTicket &ticket, DistSharedPaTaskKind kind,
+    const MixedKernels *mixed, const L0TaskArgs *winner_args
 ) {
     __gm__ DistCore *self = g_self;
     const bool replay_ok = replay.ready() && self != nullptr;
     const bool ticket_ok =
-        replay_ok && ticket.ready == 1 && ticket.won <= 1 &&
-        ticket.task_id >= 0 &&
-        static_cast<uint32_t>(ticket.task_id) < kFdwicSharedPaTaskCapacity &&
-        self->local_index == ticket.task_id + 1 &&
-        dist_shared_pa_kind_matches_task(ticket.task_id, kind) &&
-        ((ticket.won != 0) == (winner_args != nullptr));
+        replay_ok && ticket.ready == 1 && ticket.won <= 1 && ticket.task_id >= 0 &&
+        static_cast<uint32_t>(ticket.task_id) < kFdwicSharedPaTaskCapacity && self->local_index == ticket.task_id + 1 &&
+        dist_shared_pa_kind_matches_task(ticket.task_id, kind) && ((ticket.won != 0) == (winner_args != nullptr));
     const bool kernel_ok = kind == DistSharedPaTaskKind::Alloc ?
-            (mixed == nullptr && ticket.kernel_id == INVALID_KERNEL_ID) :
-            (mixed != nullptr && dist_shared_pa_kernel_shape(*mixed, kind) &&
-             (ticket.won != 0 ?
-                  ticket.kernel_id == dist_shared_pa_expected_kernel_id(*mixed, kind) :
-                  ticket.kernel_id == INVALID_KERNEL_ID));
+                               (mixed == nullptr && ticket.kernel_id == INVALID_KERNEL_ID) :
+                               (mixed != nullptr && dist_shared_pa_kernel_shape(*mixed, kind) &&
+                                (ticket.won != 0 ? ticket.kernel_id == dist_shared_pa_expected_kernel_id(*mixed, kind) :
+                                                   ticket.kernel_id == INVALID_KERNEL_ID));
     // The replay token removes repeated role/block GM loads from Claim.
     // Re-read authoritative identity only for the 1,280 winners before they
     // publish any shared state; losers are already closed inside Begin.
     const bool winner_identity_ok =
-        ticket.won == 0 ||
-        (replay_ok && self->role == replay.role() && self->block_id == replay.block_id());
+        ticket.won == 0 || (replay_ok && self->role == replay.role() && self->block_id == replay.block_id());
     if (ticket_ok && kernel_ok && winner_identity_ok) return true;
     return dist_shared_pa_fail(self, PTO2_ERROR_TENSORMAP_PROTOCOL);
 }
@@ -856,13 +846,20 @@ PTO_DEVICE_FUNC bool dist_shared_pa_validate_finish(
 }  // namespace
 
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
-dist_submit_impl(PTO2Runtime *, const MixedKernels &, const L0TaskArgs &) {
+dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+    return dist_cross_core_submit_kernel(mixed, args);
+#else
     return dist_shared_pa_reject_generic_submit();
+#endif
 }
 
-DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
-dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &) {
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+    return dist_cross_core_alloc(args);
+#else
     return dist_shared_pa_reject_generic_submit();
+#endif
 }
 
 DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket
@@ -889,8 +886,7 @@ dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &, c
 
 #if !PTO_FDWIC_SHARED_PA_UNITY
 DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_submit_begin(
-    PTO2Runtime *, DistSharedPaReplayContext replay,
-    const MixedKernels &mixed, DistSharedPaTaskKind kind
+    PTO2Runtime *, DistSharedPaReplayContext replay, const MixedKernels &mixed, DistSharedPaTaskKind kind
 ) {
     if (kind == DistSharedPaTaskKind::Alloc || kind == DistSharedPaTaskKind::Count) {
         set_fatal_code(PTO2_ERROR_TENSORMAP_PROTOCOL);
@@ -902,8 +898,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_submit_begin
 #endif
 
 DIST_API_ATTR PTO_DEVICE_FUNC bool dist_shared_pa_submit_finish(
-    PTO2Runtime *, DistSharedPaReplayContext replay,
-    const MixedKernels &mixed, DistSharedPaTaskKind kind,
+    PTO2Runtime *, DistSharedPaReplayContext replay, const MixedKernels &mixed, DistSharedPaTaskKind kind,
     const DistCompeteFirstTicket &ticket, const L0TaskArgs *winner_args
 ) {
     if (!dist_shared_pa_validate_finish(replay, ticket, kind, &mixed, winner_args)) return false;
@@ -914,28 +909,22 @@ DIST_API_ATTR PTO_DEVICE_FUNC bool dist_shared_pa_submit_finish(
 }
 
 #if !PTO_FDWIC_SHARED_PA_UNITY
-DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_alloc_begin(
-    PTO2Runtime *, DistSharedPaReplayContext replay
-) {
+DIST_API_ATTR
+PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_alloc_begin(PTO2Runtime *, DistSharedPaReplayContext replay) {
     return dist_shared_pa_begin_ticket(replay, DistSharedPaTaskKind::Alloc, nullptr);
 }
 #endif
 
 DIST_API_ATTR PTO_DEVICE_FUNC bool dist_shared_pa_alloc_finish(
-    PTO2Runtime *, DistSharedPaReplayContext replay,
-    const DistCompeteFirstTicket &ticket, const L0TaskArgs *winner_args
+    PTO2Runtime *, DistSharedPaReplayContext replay, const DistCompeteFirstTicket &ticket, const L0TaskArgs *winner_args
 ) {
-    if (!dist_shared_pa_validate_finish(
-            replay, ticket, DistSharedPaTaskKind::Alloc, nullptr, winner_args
-        )) {
+    if (!dist_shared_pa_validate_finish(replay, ticket, DistSharedPaTaskKind::Alloc, nullptr, winner_args)) {
         return false;
     }
     if (ticket.won == 0) return true;
     DistSubmitCtx ctx;
     dist_shared_pa_restore_winner_ticket(ticket, ctx);
-    return dist_shared_pa_finish_winner(
-        ctx, ticket, nullptr, DistSharedPaTaskKind::Alloc, *winner_args
-    );
+    return dist_shared_pa_finish_winner(ctx, ticket, nullptr, DistSharedPaTaskKind::Alloc, *winner_args);
 }
 
 #endif

@@ -274,4 +274,24 @@ TEST(FdwicCrossCoreExecProtocol, CorruptedPayloadCannotExecuteOrBeClaimedAgain) 
     );
 }
 
+TEST(FdwicCrossCoreExecProtocol, ExecutorCanCompleteFromTheTaskIndexedClaimedCell) {
+    SharedExecCell cell{};
+    SharedExecControl fatal{};
+    PayloadSource source;
+    ExecToken token{};
+    ResetExecToken(token);
+    HostOps::Reset();
+
+    ASSERT_EQ(BuildAndPublishExecPayload<HostOps>(cell, 6, MakeSpec(), source, fatal), ExecBuildResult::Published);
+    ASSERT_EQ(
+        AcquireExecPayload<HostOps>(cell, 9, 18, ExecEngineClass::Aic, token, fatal), ExecAcquireResult::Acquired
+    );
+    EXPECT_EQ(PublishClaimedExecDone<HostOps>(cell, 9, 18, fatal), ExecDoneResult::Done);
+    const DecodedExecState done = DecodeExecState(cell.control.state);
+    ASSERT_TRUE(done.valid);
+    EXPECT_EQ(done.phase, ExecPhase::Done);
+    EXPECT_EQ(done.execute_owner, 18U);
+    EXPECT_EQ(PublishClaimedExecDone<HostOps>(cell, 9, 18, fatal), ExecDoneResult::StateConflict);
+}
+
 }  // namespace
