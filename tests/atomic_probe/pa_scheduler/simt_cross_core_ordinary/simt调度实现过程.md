@@ -424,6 +424,8 @@ AIV 尾部虽然最终执行最后的 UP，但 UP 自身约 2 µs；泳道图里
 
 ## 14. 真实 Simpler 迁移：动态 Build Request 协议
 
+### 14.1 通用动态请求 ABI
+
 standalone 的 SIMT builder 可以随机访问预先生成的 PA task plan；真实 Simpler 的
 `Submit()` 参数则由 Scalar 在运行过程中动态构造。生产迁移不能把 PA 的五类 task
 或 `task_id % warp` 静态映射带入公共 runtime，因此先建立如下通用桥接：
@@ -460,5 +462,38 @@ standalone 的 SIMT builder 可以随机访问预先生成的 PA task plan；真
 | immediate task 与错误输入拒绝 | PASS |
 | A5 动态功能与性能 | NOT RUN（本阶段尚未接入 builder） |
 
-下一阶段将在独立 mode 3 runtime state 中加入 request cells 和 builder 生命周期控制，
-由 AICPU 明确复位；完成 CPU 状态合同后，才接入真实 `cce::async_invoke`。
+上述 ABI 先作为独立协议落地；状态布局和复位在下一小节闭合后，才允许接入真实
+`cce::async_invoke`。
+
+### 14.2 独立状态与复位合同
+
+mode 3 复用 mode 1/2 已验证的跨核执行、输出、heap 与 ordinary TensorMap 状态，
+随后追加三条彼此隔离的 builder 生命周期控制和 2048 个 Build Request：
+
+```text
+CrossCoreRuntimeState
+SimtBuilderLifecycleState
+  builder_started
+  sealed_task_count     // -1 表示动态 Submit 尚未封口
+  builder_finished
+SimtBuildRequestCell requests[2048]
+```
+
+这里没有新增全局 build ticket。后续每个 SIMT warp 按
+`global_warp + k * total_warps` 消费固定请求流；请求尚未发布时只需同时观察本 cell
+与 sealed task count。这样保留 standalone 的分布式 builder 归属，又不会在动态
+Submit 路径制造一个所有 warp 都竞争的返回型 atomic。
+
+AICPU 是唯一复位方：公共 runtime 控制复用既有 reset，三条生命周期控制分别置为
+`0/-1/0`，每个 request control 置零。不可变 payload 不清零；只有对应 control 在
+新一轮重新发布后才允许读取，旧字节可继续用于错误诊断。
+
+验证结果：
+
+| 验证 | 结果 |
+| ---- | ---- |
+| mode 3 状态偏移、64 B 对齐与 arena 上界 | PASS |
+| 2048 个 request control 完整复位 | PASS |
+| request payload 在复位时保持不变 | PASS |
+| mode 1 ordinary 与 mode 2 DAG 状态回归 | PASS |
+| A5 builder 启动 | NOT RUN（下一阶段） |

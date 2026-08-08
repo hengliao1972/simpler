@@ -17,6 +17,7 @@
 #include "dist_engine/common/cross_core_dag_protocol.h"
 #include "dist_engine/common/cross_core_exec_protocol.h"
 #include "dist_engine/common/cross_core_output_protocol.h"
+#include "dist_engine/common/cross_core_simt_request_protocol.h"
 #include "dist_engine/common/cross_core_tensor_map_protocol.h"
 #include "dist_engine/common/shared_pa_atomic_layout.h"
 #include "dist_engine/common/target.h"
@@ -455,21 +456,21 @@ static_assert(offsetof(SharedPaTensorMapState, insert_completion) % kFdwicShared
 static_assert(sizeof(SharedPaTensorMapState) == 9094784, "shared PA TensorMap sidecar size changed");
 static_assert(alignof(SharedPaTensorMapState) == kCacheLine, "shared PA TensorMap alignment changed");
 
-#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
-// Scalar cross-core backends keep one immutable execution cell per logical
-// task for the entire invocation. The common prefix owns execution, output,
-// heap and conservative TensorMap contracts; mode-specific state only appends
-// after it, so ordinary and DAG paths can reuse the proven wire protocols.
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3
+// Cross-core backends keep one immutable execution cell per logical task for
+// the entire invocation. The common prefix owns execution, output, heap and
+// conservative TensorMap contracts; mode-specific state only appends after
+// it, so Scalar and SIMT builders reuse the proven execution wire protocol.
 constexpr uint32_t kFdwicCrossCoreTaskCapacity = 2048;
 constexpr uint32_t kFdwicCrossCoreOrdinaryTaskCapacity = kFdwicCrossCoreTaskCapacity;
 
 struct alignas(kCacheLine) CrossCoreRuntimeState {
     fdwic::cross_core::SharedExecControl fatal;
     fdwic::cross_core::SharedExecControl heap_cursor;
-    // Build owner 发布 BUILT 之前，同 engine 的 worker 先在这条
-    // task-private cache line 上动态选出唯一 Execute waiter。这使
-    // Build/Execute owner 保持解耦，又避免 32/64 核反复轮询
-    // SharedExecCell::control 而阻塞 BUILT 发布。
+    // Before the build owner publishes BUILT, same-engine workers elect one
+    // execute waiter on this task-private cache line. Build and execute owners
+    // remain independent without making every compatible worker poll the
+    // SharedExecCell control and delay its publication.
     fdwic::cross_core::SharedExecControl execute_owner[kFdwicCrossCoreTaskCapacity];
     fdwic::cross_core::SharedExecCell tasks[kFdwicCrossCoreTaskCapacity];
     fdwic::cross_core::CrossCoreOutputCell<Tensor> outputs[kFdwicCrossCoreTaskCapacity];
@@ -485,9 +486,8 @@ static_assert(
 );
 static_assert(
     offsetof(CrossCoreOrdinaryState, outputs) ==
-    2 * kCacheLine +
-        kFdwicCrossCoreTaskCapacity *
-            (sizeof(fdwic::cross_core::SharedExecControl) + sizeof(fdwic::cross_core::SharedExecCell))
+    2 * kCacheLine + kFdwicCrossCoreTaskCapacity *
+                         (sizeof(fdwic::cross_core::SharedExecControl) + sizeof(fdwic::cross_core::SharedExecCell))
 );
 static_assert(
     offsetof(CrossCoreOrdinaryState, tensor_map) ==
@@ -515,9 +515,38 @@ static_assert(offsetof(CrossCoreDagState, metadata) == sizeof(CrossCoreRuntimeSt
 static_assert(alignof(CrossCoreDagState) == kCacheLine);
 static_assert(
     sizeof(CrossCoreDagState) ==
-        sizeof(CrossCoreRuntimeState) +
-            kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::DagTaskMetadataCell),
+        sizeof(CrossCoreRuntimeState) + kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::DagTaskMetadataCell),
     "cross-core DAG state size changed"
+);
+#elif PTO_FDWIC_SCHEDULER_MODE == 3
+// Dynamic Submit has no random-access host task plan. Scalar publishers fill
+// task-indexed immutable requests, while persistent SIMT warp leaders consume
+// fixed strided task streams. The three lifecycle words are deliberately
+// isolated so start, seal and finish traffic cannot share an atomic unit.
+struct alignas(kCacheLine) SimtBuilderLifecycleState {
+    fdwic::cross_core::SharedExecControl builder_started;
+    fdwic::cross_core::SharedExecControl sealed_task_count;
+    fdwic::cross_core::SharedExecControl builder_finished;
+};
+static_assert(sizeof(SimtBuilderLifecycleState) == 3 * kCacheLine);
+static_assert(alignof(SimtBuilderLifecycleState) == kCacheLine);
+
+struct alignas(kCacheLine) SimtCrossCoreOrdinaryState {
+    CrossCoreRuntimeState runtime;
+    SimtBuilderLifecycleState lifecycle;
+    fdwic::cross_core::SimtBuildRequestCell requests[kFdwicCrossCoreTaskCapacity];
+};
+static_assert(offsetof(SimtCrossCoreOrdinaryState, runtime) == 0);
+static_assert(offsetof(SimtCrossCoreOrdinaryState, lifecycle) == sizeof(CrossCoreRuntimeState));
+static_assert(
+    offsetof(SimtCrossCoreOrdinaryState, requests) == sizeof(CrossCoreRuntimeState) + sizeof(SimtBuilderLifecycleState)
+);
+static_assert(alignof(SimtCrossCoreOrdinaryState) == kCacheLine);
+static_assert(
+    sizeof(SimtCrossCoreOrdinaryState) ==
+        sizeof(CrossCoreRuntimeState) + sizeof(SimtBuilderLifecycleState) +
+            kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::SimtBuildRequestCell),
+    "SIMT cross-core ordinary state size changed"
 );
 #endif
 #endif
@@ -613,6 +642,8 @@ struct DistGlobal {
     CrossCoreOrdinaryState cross_core_ordinary;
 #elif PTO_FDWIC_SCHEDULER_MODE == 2
     CrossCoreDagState cross_core_dag;
+#elif PTO_FDWIC_SCHEDULER_MODE == 3
+    SimtCrossCoreOrdinaryState simt_cross_core_ordinary;
 #endif
 #endif
 };
@@ -658,6 +689,16 @@ static_assert(
 static_assert(
     sizeof(DistGlobal) == kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState) + sizeof(CrossCoreDagState),
     "cross-core DAG DistGlobal size changed"
+);
+#elif PTO_FDWIC_SCHEDULER_MODE == 3
+static_assert(
+    offsetof(DistGlobal, simt_cross_core_ordinary) == kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState),
+    "SIMT cross-core ordinary state must append after the existing shared TensorMap state"
+);
+static_assert(
+    sizeof(DistGlobal) ==
+        kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState) + sizeof(SimtCrossCoreOrdinaryState),
+    "SIMT cross-core ordinary DistGlobal size changed"
 );
 #else
 static_assert(
