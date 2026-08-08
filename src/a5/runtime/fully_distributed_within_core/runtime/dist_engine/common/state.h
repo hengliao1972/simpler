@@ -15,6 +15,7 @@
 #include <cstdint>
 
 #include "dist_engine/common/cross_core_exec_protocol.h"
+#include "dist_engine/common/cross_core_output_protocol.h"
 #include "dist_engine/common/shared_pa_atomic_layout.h"
 #include "dist_engine/common/target.h"
 #include "dist_engine/common/swimlane_types.h"
@@ -461,14 +462,22 @@ constexpr uint32_t kFdwicCrossCoreOrdinaryTaskCapacity = 2048;
 
 struct alignas(kCacheLine) CrossCoreOrdinaryState {
     fdwic::cross_core::SharedExecControl fatal;
+    fdwic::cross_core::SharedExecControl heap_cursor;
     fdwic::cross_core::SharedExecCell tasks[kFdwicCrossCoreOrdinaryTaskCapacity];
+    fdwic::cross_core::CrossCoreOutputCell<Tensor> outputs[kFdwicCrossCoreOrdinaryTaskCapacity];
 };
 static_assert(offsetof(CrossCoreOrdinaryState, fatal) == 0);
-static_assert(offsetof(CrossCoreOrdinaryState, tasks) == kCacheLine);
+static_assert(offsetof(CrossCoreOrdinaryState, heap_cursor) == kCacheLine);
+static_assert(offsetof(CrossCoreOrdinaryState, tasks) == 2 * kCacheLine);
+static_assert(
+    offsetof(CrossCoreOrdinaryState, outputs) ==
+    2 * kCacheLine + kFdwicCrossCoreOrdinaryTaskCapacity * sizeof(fdwic::cross_core::SharedExecCell)
+);
 static_assert(alignof(CrossCoreOrdinaryState) == kCacheLine);
 static_assert(
     sizeof(CrossCoreOrdinaryState) ==
-        kCacheLine + kFdwicCrossCoreOrdinaryTaskCapacity * sizeof(fdwic::cross_core::SharedExecCell),
+        2 * kCacheLine + kFdwicCrossCoreOrdinaryTaskCapacity * (sizeof(fdwic::cross_core::SharedExecCell) +
+                                                                sizeof(fdwic::cross_core::CrossCoreOutputCell<Tensor>)),
     "cross-core ordinary state size changed"
 );
 #endif

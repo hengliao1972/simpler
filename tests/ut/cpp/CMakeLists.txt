@@ -672,6 +672,21 @@ target_include_directories(test_fdwic_cross_core_exec_protocol BEFORE PRIVATE
 )
 set_tests_properties(test_fdwic_cross_core_exec_protocol PROPERTIES LABELS "no_hardware")
 
+add_a5_test(test_fdwic_cross_core_output_protocol a5/test_fdwic_cross_core_output_protocol.cpp)
+target_compile_definitions(test_fdwic_cross_core_output_protocol PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_SCHEDULER_MODE=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
+target_include_directories(test_fdwic_cross_core_output_protocol BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_cross_core_output_protocol PROPERTIES LABELS "no_hardware")
+
 add_a5_test(test_fdwic_cross_core_state a5/test_fdwic_cross_core_state.cpp)
 target_compile_definitions(test_fdwic_cross_core_state PRIVATE
     __CPU_SIM=1

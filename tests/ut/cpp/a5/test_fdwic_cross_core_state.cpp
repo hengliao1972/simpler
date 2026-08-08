@@ -37,8 +37,12 @@ TEST(FdwicCrossCoreOrdinaryState, AppendsWithoutMovingTheExistingSharedState) {
     static_assert(PTO_FDWIC_SCHEDULER_MODE == 1);
     EXPECT_EQ(kFdwicCrossCoreOrdinaryTaskCapacity, 2048U);
     EXPECT_EQ(offsetof(CrossCoreOrdinaryState, fatal), 0U);
-    EXPECT_EQ(offsetof(CrossCoreOrdinaryState, tasks), 64U);
-    EXPECT_EQ(sizeof(CrossCoreOrdinaryState), 64U + 2048U * sizeof(SharedExecCell));
+    EXPECT_EQ(offsetof(CrossCoreOrdinaryState, heap_cursor), 64U);
+    EXPECT_EQ(offsetof(CrossCoreOrdinaryState, tasks), 128U);
+    EXPECT_EQ(offsetof(CrossCoreOrdinaryState, outputs), 128U + 2048U * sizeof(SharedExecCell));
+    EXPECT_EQ(
+        sizeof(CrossCoreOrdinaryState), 128U + 2048U * (sizeof(SharedExecCell) + sizeof(CrossCoreOutputCell<Tensor>))
+    );
     EXPECT_EQ(offsetof(DistGlobal, shared_pa), kFdwicSharedTensorMapOffset);
     EXPECT_EQ(offsetof(DistGlobal, cross_core_ordinary), kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState));
     EXPECT_LE(sizeof(DistGlobal), kDistEngineGlobalStateSize);
@@ -51,10 +55,17 @@ TEST(FdwicCrossCoreOrdinaryState, ResetTouchesOnlyAtomicPublicationControls) {
     dist_cross_core_ordinary_reset(*state);
 
     EXPECT_EQ(state->fatal.state, 0);
+    EXPECT_EQ(state->heap_cursor.state, 0);
     for (uint32_t task = 0; task < kFdwicCrossCoreOrdinaryTaskCapacity; ++task) {
         EXPECT_EQ(state->tasks[task].control.state, 0) << "task=" << task;
+        EXPECT_EQ(state->outputs[task].control.state, 0) << "task=" << task;
         EXPECT_TRUE(BytesEqual(
             &state->tasks[task], offsetof(SharedExecCell, payload), sizeof(ExecPayloadStorage), kPayloadPattern
+        )) << "task="
+           << task;
+        EXPECT_TRUE(BytesEqual(
+            &state->outputs[task], offsetof(CrossCoreOutputCell<Tensor>, descriptors),
+            sizeof(state->outputs[task].descriptors), kPayloadPattern
         )) << "task="
            << task;
     }

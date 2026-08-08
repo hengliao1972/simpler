@@ -19,8 +19,10 @@ namespace {
 #if PTO_FDWIC_SCHEDULER_MODE == 1
 inline void dist_cross_core_ordinary_reset(CrossCoreOrdinaryState &state) {
     atomic_exchange(state.fatal.state, int64_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(state.heap_cursor.state, int64_t{0}, __ATOMIC_RELAXED);
     for (uint32_t task = 0; task < kFdwicCrossCoreOrdinaryTaskCapacity; ++task) {
         atomic_exchange(state.tasks[task].control.state, int64_t{0}, __ATOMIC_RELAXED);
+        atomic_exchange(state.outputs[task].control.state, int64_t{0}, __ATOMIC_RELAXED);
     }
 }
 #endif
