@@ -1336,3 +1336,214 @@ Materialize、四种真实 PA payload 和 Execute completion。A5 十轮中全�
 该结果证明删除诊断性共享状态是有效方向，但也证明单独消减 heap 全局原子
 只能回收约 8 us。下一阶段必须继续找能减少 Build 发布链或 Execute 关键路径
 GM 往返的通用机制，不能把剩余约 182 us 归因给这一条原子。
+
+## 23. 2026-08-07：拒绝把 SIMT 的确定性 Execute shard 直接作为 Scalar owner
+
+### 23.1 候选与局部收益
+
+本轮只借鉴 SIMT 的确定性映射，不改 B256、`6,28,4,1`、task/DAG、
+TensorMap 插入、kernel 或 FinalDrain：host 已按 function 对 AIC/AIV 计划做
+两项条带，候选进一步按同角色 worker rank round-robin 分配两项 shard，并删除
+AIC/AIV 两条中央 Execute ticket。Build 仍由 96 个 Scalar 动态领取。
+
+同一窗口的原中央 Execute ticket 十轮中位数为 `780.854 us`。候选分三步取证：
+
+1. 保留 ticket atomic、只按静态 shard 均衡：中位数 `773.459 us`；
+2. 再删除 ticket atomic：中位数 `769.107 us`；
+3. 将 shard 推导 helper 外提为 noinline，减少调用者热代码：十轮为
+   `758.992, 758.706, 779.160, 773.051, 770.383, 768.180, 760.845,
+   761.270, 757.829, 758.748 us`，中位数 `761.058 us`。
+
+观察构建中，32 个 AIC 都精确执行 16 个 task，且均为 8 QK + 8 PV；每核
+kernel compute 收敛到 `575.880..596.040 us`。这证明确定性映射确实消除了
+中央 cursor 先到先得造成的 PA AIC 负载离散，数字本身有效。
+
+### 23.2 为什么仍然撤回
+
+CPU 的 `independent_kernel_overlap` 定向交错让一个 Build owner 在 task 4
+完成 TensorMap 插入后暂停，等待与它无依赖的 task 6 执行。静态 shard 恰好
+把 task 6 固定给同一个 Scalar，于是：
+
+```text
+该 Scalar 暂停在 Build(task 4)
+  -> task 6 已可由其他 builder 发布 BUILT
+  -> 其他 AIC 无权接管 task 6
+  -> task 4 的测试等待与 task 6 的固定 owner 形成闭环
+```
+
+最终 hook 超时，task 6 只能等暂停解除后才执行。旧中央 Execute ticket 不会
+出现该闭环，因为任意兼容 Scalar 都能动态取得 task 6。该反例不依赖 PA 固定
+DAG；任何算子只要 Build 时延有离散，静态 owner 都可能把慢 builder 的停顿
+固化到本来独立的 Execute 关键路径。
+
+因此不能为了约 `19.8 us / 2.54%` 的中位数收益修改测试合同，也不能宣称
+`0.761 ms` 已成为新主线。候选代码已完整撤回，S16 仍是当前基线。后续可以
+保留的原则是“用确定性信息改善均衡”，但必须同时满足：
+
+- Execute owner 仍可由其他同 engine Scalar 动态接管；
+- `BUILT -> CLAIMED` 继续是唯一执行线性化点；
+- 无需永久绑定 worker 的静态 shard；
+- 不引入逐 task PA 特例或破坏严格 TensorMap 插入链。
+
+### 23.3 单项动态 ticket 也不能解决问题
+
+为保留完整动态接管能力，另把 Execute ticket 从两项缩为单项。该候选不改
+owner 协议，只用更多返回型 RMW 换取更细的任务均衡。CCEC/A5 B256 正确性
+闭合，但一次完整周期为 `910.725 us`，相对 S16 约回退 `16.5%`；物理
+Execute ticket 从约 `606` 次增至 `1118` 次，`fanin_not_ready` 增至
+`29057` 次。说明 A5 上不能靠继续缩小中央 atomic 粒度解决执行空洞。
+
+代码已撤回。下一候选必须同时减少“领取未 BUILT task 后的等待”和中央返回型
+RMW，而不是在两者之间仅做批次大小交换。
+
+### 23.4 Build owner 就地 Execute 只叠加仲裁，未删除中央工作
+
+为避免静态 owner 的不可接管问题，本阶段又验证了一个更保守的 SIMT 借鉴：
+
+- Build owner 发布本 task 的 `BUILT` 后，若自身 engine 兼容且有空 token，
+  立即参与同一个 `BUILT -> CLAIMED` CAS；
+- 原 AIC/AIV 中央 Execute ticket 完整保留，作为所有 task 的动态兜底；
+- 中央 token 观察到合法 `CLAIMED/DONE` 时只释放，不重复执行；
+- TensorMap、fanin、payload DCCI、kernel、FinalDrain 和工作量均不变。
+
+CPU 全量门槛通过。CCEC 首次实现还被构建审计发现把真实 kernel dispatcher
+带入了 finish 冷 TU；没有放宽审计，而是把就地仲裁移回 orchestration TU，
+并将 helper 外提为 noinline，最终 AIC/AIV 强符号、三处 finish relocation、
+mixed ELF 和无最终 relocation 门槛全部通过。
+
+A5 B256、`6,28,4,1` 十轮全部正确闭合，结果为：
+
+```text
+816.024  805.612  815.219  789.404  813.338 us
+817.505  820.406  810.767  811.716  799.049 us
+```
+
+- 中位数：`812.527 us`；
+- 最快/最慢：`789.404 / 820.406 us`；
+- 相对 S16 同口径 `781.623 us` 回退 `30.904 us / 3.95%`。
+
+该候选没有减少中央 ticket 的 `FetchAdd`，反而让兼容 builder 额外读取 cell、
+参与 CAS，并让随后到达的兜底 token 再读取一次 `CLAIMED/DONE`。提前少量 kernel
+不足以抵消这套重复仲裁，`fanin_not_ready` 仍有 `14285..17399` 次。因此它是
+“新增提示源”而不是“删除调度工作”，代码已完整撤回；后续候选必须替换或跳过
+可证明冗余的中央工作，不能继续叠加第二条 owner 路径。
+
+### 23.5 不能把 function striping 改成阶段或 ticket 块排布
+
+为验证 SIMT 中“按任务块局部化处理”是否能减少 Scalar kernel 之间的
+空洞，先后只修改了 host 的通用 Execute 表排布，device ticket、token、
+TensorMap、DAG、工作量和 FinalDrain 均不变：
+
+1. 每个 engine 先排完一个 function，再排下一个 function。一次 A5 B256
+   为 `815.794 us`，`fanin_not_ready=24948`，明显劣于 S16。
+2. 按 Execute ticket 宽度两项分块后轮转，即同一 function 每次连续排两项。
+   五次 A5 为 `1035.070, 987.444, 1026.257, 1011.862, 1012.353 us`，
+   中位数 `1012.353 us`；`fanin_not_ready` 为 `43754..46457`，落到
+   FinalDrain 的 kernel 为 `454..481`。
+
+原因不是任务数或核数变了，而是 QK/PV、SF/UP 这样的前后级 function
+被成块投放后，中央 cursor 先产生前级洪峰，再产生后级洪峰。四 token
+窗口很快被未 ready 的后续工作占住，返而比现有“每个 function 各取一项”
+更难维持跨阶段流水。这也说明 function 分块不是通用 DAG 拓扑优先级；
+它仅按 function id 分组，对任意算子都不能推断依赖方向。
+
+两个候选均已撤回。后续不再从 host function 顺序猜测 ready；若要借鉴
+SIMT 的确定性排布，必须消费 device 已经计算出的真实 DAG/BUILT 状态，同时
+保留延迟 owner 被其他同 engine Scalar 接管的能力。
+
+### 23.6 完整 execution fanin 冻结到动态 DAG 没有端到端收益
+
+当前 Build 先从不可变 schema 求出每个 symbol 的精确历史 writer，
+Register 后又从 runtime `published/last_writer/history` 重建 execution
+fanin。候选借鉴 SIMT 的“逻辑 DAG 只求一次”边界：
+
+- DAG 保留 fresh producer 与中间 writer 的完整 execution fanin；
+- Register 只等当前 writer 需要的中间 writer，不把 fresh producer
+  误加到 metadata 串行链；
+- symbol-only 任务直接把 DAG fanin 复制到 execution payload；
+- ordinary region/view/alias 仍保留真实 TensorMap 重叠查询回退；
+- builder 只封装不可变 descriptor 地址，executor 在 fanin ready 后
+  invalidate 并消费。
+
+CPU 全量门槛和 CCEC 审计全部通过，A5 B256 `6,28,4,1`
+十轮为：
+
+```text
+782.230  784.531  782.411  781.569  782.200 us
+785.710  789.095  779.193  779.510  761.530 us
+```
+
+中位数 `782.215 us`，相对 S16 `781.623 us` 回退
+`0.592 us / 0.076%`。一次 `761.530 us` 是分布尾部，不能代替
+中位数。这说明删除 runtime symbol 查询的收益，被更大的本地
+DAG 状态、分支与复制工作抵消。整体候选已撤回。
+
+### 23.7 单独删除 builder descriptor invalidate 也是中性结果
+
+为避免上一候选的本地 DAG 膨胀混入判断，又只删除
+`ResolvePaExecPayloadSourceAfterFanin()` 中 builder 对 SharedOutputRef
+descriptor 的 128B invalidate，保留原 runtime fanin 解析和 executor
+消费前 invalidate。CPU/CCEC 仍全部通过，A5 十轮为：
+
+```text
+786.060  787.180  779.443  786.752  781.746 us
+780.901  774.102  781.118  781.798  791.433 us
+```
+
+中位数 `781.772 us`，比 S16 慢 `0.149 us / 0.019%`。这不是
+可证明的性能收益，且原 builder invalidate 还作为 Build 端的显式
+可见性边界；因此代码也已撤回。
+
+### 23.8 SIMT 式静态 Build 分片不适合直接替换 Scalar 中央顺序
+
+候选删除同地址中央 Build-ticket `FetchAdd`，改为 96 个 Scalar
+按 `task_id % 96` 确定性分片。每个 task 仍只有一个 builder，
+TensorMap writer 链、Execute ticket、fanin 和 FinalDrain 均不变；CPU
+全量正确性也能闭合。
+
+但 A5 B256 首轮已达 `1977.501 us`，`fanin_loads=33234`，
+`FinalDrain=291`；同期中央顺序基线约 `0.782 ms`、fanin load 约
+`15k`、FinalDrain 约 `217`。回退足够大，未继续浪费十轮。
+
+原因是中央单调 ticket 不只是 owner 仲裁，还隐式保留了接近
+task-id 的生产波前。96 路静态分片在首轮同时投放 task 0..95，
+大量 builder 过早占住仍等 producer/metadata 的后续 task，把原子消减
+换成更多 GM poll 和尾部执行。候选已撤回。若再借鉴 SIMT 静态
+builder，必须同时具备有界的 DAG-ready 投放窗口，不能只替换 owner
+分配公式。
+
+### 23.9 确定性 Execute primary 的 BUILT 门控仍未打赢动态基线
+
+为补齐 23.2 静态 owner 反例之外的性能证据，又试验了“确定性 primary，
+仅在 cell 已经发布 `BUILT` 时才领取”的变体。它删除 AIC/AIV 两个中央
+Execute cursor；未发布的 primary 不占 token，也不越过本核 ordinal。
+Build、TensorMap、DAG、payload、kernel、completion 和 FinalDrain 均未改变。
+
+第一版直接按 `rank + round × role_workers` 从现有 function-striped 表取任务。
+这会在 32/64 个同角色 worker 都为偶数时，把一半 AIC 永久固定到 QK、另一半
+固定到 PV；AIV 同理固定到 SF 或 UP。两个单轮结果分别为：
+
+```text
+未加 BUILT 前置门控：889.872 us，fanin_loads=44796，FinalDrain=469
+增加 BUILT 前置门控：894.440 us，fanin_loads=43309，FinalDrain=463
+```
+
+随后把每个 round 内的 worker rank 循环平移一位。每轮映射仍是双射，每个
+task 恰好只有一个 primary；同一 worker 则能跨轮轮换相邻 function。该公式
+不读取 PA task kind。A5 B256、`6,28,4,1` 单轮正确性全部闭合，结果为：
+
+```text
+825.365 us，fanin_loads=19741，FinalDrain=185
+```
+
+轮转把错误函数分工造成的约 `69 us` 回退收回来了，但仍比 S16 中位数
+`781.623 us` 慢 `43.742 us / 5.60%`，没有继续浪费十轮。根因是静态 primary
+虽然去掉中央 ticket，却把“某核当前 ordinal 尚未 BUILT”变成本核顺序门；
+其他同 engine Scalar 不能利用这个已经空闲的执行能力。若增加全表扫描，又会
+恢复大量 GM 读取和重复 CAS，不能把它当作无代价的动态接管。
+
+以上三种代码均已完整撤回。到本阶段停止时，**当前保留的正确且最快版本仍为
+S16**：B256、`6,28,4,1`、96 workers、startup 起点到 FinalDrain 结束十轮
+中位数 `781.623 us`，范围 `780.425..791.447 us`，对应提交 `fd2a8ca8`。
+23.1 的 `761.058 us` 只证明静态均衡的局部上限，因动态接管反例未闭合，不能
+作为可保留性能版本。
