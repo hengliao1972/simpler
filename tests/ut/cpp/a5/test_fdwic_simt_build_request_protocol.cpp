@@ -1,0 +1,182 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+
+#include "dist_engine/common/cross_core_simt_request_protocol.h"
+
+namespace {
+
+using namespace fdwic::cross_core;
+
+struct HostOps {
+    static inline uint32_t flush_count = 0;
+    static inline uint32_t invalidate_count = 0;
+    static inline uint64_t last_bytes = 0;
+
+    static void Reset() {
+        flush_count = 0;
+        invalidate_count = 0;
+        last_bytes = 0;
+    }
+
+    static int64_t Load(volatile int64_t *address) { return __atomic_load_n(address, __ATOMIC_ACQUIRE); }
+
+    static int64_t CompareExchange(volatile int64_t *address, int64_t expected, int64_t desired) {
+        int64_t observed = expected;
+        (void)__atomic_compare_exchange_n(address, &observed, desired, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        return observed;
+    }
+
+    static void StorePayloadWord(volatile uint64_t *address, uint64_t value) { *address = value; }
+
+    static void FlushRegion(const volatile void *, uint64_t bytes) {
+        ++flush_count;
+        last_bytes = bytes;
+        std::atomic_thread_fence(std::memory_order_release);
+    }
+
+    static void InvalidateRegion(const volatile void *, uint64_t bytes) {
+        ++invalidate_count;
+        last_bytes = bytes;
+        std::atomic_thread_fence(std::memory_order_acquire);
+    }
+};
+
+struct RequestSource {
+    uint64_t tensors[2][kExecTensorDescWords]{};
+    uint64_t scalars[2]{};
+    uint64_t dependencies[2]{};
+    TensorArgType tags[2]{TensorArgType::INPUT, TensorArgType::OUTPUT};
+
+    uint64_t TensorWord(uint32_t tensor, uint32_t word) const { return tensors[tensor][word]; }
+    uint64_t Scalar(uint32_t scalar) const { return scalars[scalar]; }
+    uint64_t ExplicitDependency(uint32_t dependency) const { return dependencies[dependency]; }
+    TensorArgType TensorTag(uint32_t tensor) const { return tags[tensor]; }
+};
+
+SimtBuildRequestSpec KernelSpec(uint32_t task_id = 9) {
+    return SimtBuildRequestSpec{
+        task_id, 0x123456780ULL, 17, 2, 2, 2, ExecEngineClass::Aiv, 0,
+    };
+}
+
+TEST(FdwicSimtBuildRequestProtocol, AtomicControlAndVariablePayloadHaveStableLayout) {
+    EXPECT_EQ(sizeof(SimtBuildRequestHeader), 64U);
+    EXPECT_EQ(offsetof(SimtBuildRequestCell, payload), 64U);
+    EXPECT_EQ(sizeof(SimtBuildRequestStorage), kSimtRequestMaxPayloadBytes);
+    EXPECT_EQ(sizeof(SimtBuildRequestCell), 64U + kSimtRequestMaxPayloadBytes);
+    EXPECT_EQ(alignof(SimtBuildRequestCell), 64U);
+}
+
+TEST(FdwicSimtBuildRequestProtocol, ReservationElectsOneScalarPublisher) {
+    SimtBuildRequestCell cell{};
+    SharedExecControl fatal{};
+    EXPECT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 11, 7, fatal), SimtRequestReserveResult::Reserved);
+    EXPECT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 11, 8, fatal), SimtRequestReserveResult::CellUnavailable);
+    const DecodedSimtRequestControl state = DecodeSimtRequestControl(cell.control.state);
+    ASSERT_TRUE(state.valid);
+    EXPECT_EQ(state.phase, SimtRequestPhase::Reserved);
+    EXPECT_EQ(state.task_id, 11U);
+    EXPECT_EQ(state.publisher_owner, 7U);
+    EXPECT_EQ(state.payload_lines, 0U);
+}
+
+TEST(FdwicSimtBuildRequestProtocol, PublisherFlushesPackedPayloadBeforePublishedControl) {
+    SimtBuildRequestCell cell{};
+    SharedExecControl fatal{};
+    RequestSource source{};
+    for (uint32_t word = 0; word < kExecTensorDescWords; ++word) {
+        source.tensors[0][word] = 0x1000U + word;
+        source.tensors[1][word] = 0x2000U + word;
+    }
+    source.scalars[0] = 0xAA;
+    source.scalars[1] = 0xBB;
+    source.dependencies[0] = 3;
+    source.dependencies[1] = 7;
+    const SimtBuildRequestSpec spec = KernelSpec();
+
+    HostOps::Reset();
+    ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(cell, spec.task_id, 5, fatal), SimtRequestReserveResult::Reserved);
+    EXPECT_EQ(
+        PublishReservedSimtBuildRequest<HostOps>(cell, 5, spec, source, fatal), SimtRequestPublishResult::Published
+    );
+    EXPECT_EQ(HostOps::flush_count, 1U);
+
+    const DecodedSimtRequestControl control = DecodeSimtRequestControl(cell.control.state);
+    ASSERT_TRUE(control.valid);
+    EXPECT_EQ(control.phase, SimtRequestPhase::Published);
+    EXPECT_EQ(control.payload_lines, 6U);
+    EXPECT_EQ(HostOps::last_bytes, 6U * kExecCacheLineBytes);
+
+    SimtBuildRequestHeader header{};
+    SimtBuildRequestLayout layout{};
+    EXPECT_EQ(
+        AcquireSimtBuildRequest<HostOps>(cell, spec.task_id, header, layout, fatal), SimtRequestAcquireResult::Acquired
+    );
+    EXPECT_EQ(HostOps::invalidate_count, 1U);
+    EXPECT_EQ(header.task_id, spec.task_id);
+    EXPECT_EQ(header.function_address, spec.function_address);
+    EXPECT_EQ(header.function_id, spec.function_id);
+    EXPECT_EQ(header.engine_class, ExecEngineClass::Aiv);
+    EXPECT_EQ(header.tensor_tags[0], static_cast<uint8_t>(TensorArgType::INPUT));
+    EXPECT_EQ(header.tensor_tags[1], static_cast<uint8_t>(TensorArgType::OUTPUT));
+    EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(0)], 0x1000U);
+    EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(1)], 0x2000U);
+    EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(1) + 7U], 0x2007U);
+    for (uint32_t word = 8; word < kExecTensorDescWords; ++word) {
+        EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(1) + word], 0U);
+    }
+    EXPECT_EQ(cell.payload.words[layout.scalar_word_offset], 0xAAU);
+    EXPECT_EQ(cell.payload.words[layout.scalar_word_offset + 1U], 0xBBU);
+    EXPECT_EQ(cell.payload.words[layout.explicit_dep_word_offset], 3U);
+    EXPECT_EQ(cell.payload.words[layout.explicit_dep_word_offset + 1U], 7U);
+}
+
+TEST(FdwicSimtBuildRequestProtocol, ImmediateRequestUsesTheSamePortablePayload) {
+    SimtBuildRequestCell cell{};
+    SharedExecControl fatal{};
+    RequestSource source{};
+    source.tags[0] = TensorArgType::OUTPUT;
+    const SimtBuildRequestSpec spec{
+        4, 0, kExecInvalidFunctionId, 1, 0, 0, ExecEngineClass::Immediate, 0,
+    };
+    ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 4, 3, fatal), SimtRequestReserveResult::Reserved);
+    EXPECT_EQ(
+        PublishReservedSimtBuildRequest<HostOps>(cell, 3, spec, source, fatal), SimtRequestPublishResult::Published
+    );
+}
+
+TEST(FdwicSimtBuildRequestProtocol, InvalidShapeOrMismatchedPublisherFailsClosed) {
+    SimtBuildRequestCell cell{};
+    SharedExecControl fatal{};
+    RequestSource source{};
+    SimtBuildRequestSpec spec = KernelSpec(6);
+    ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 6, 2, fatal), SimtRequestReserveResult::Reserved);
+    EXPECT_EQ(
+        PublishReservedSimtBuildRequest<HostOps>(cell, 3, spec, source, fatal),
+        SimtRequestPublishResult::PublishConflict
+    );
+
+    SimtBuildRequestCell invalid_cell{};
+    spec.tensor_count = kExecMaxTensors + 1U;
+    ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(invalid_cell, 6, 2, fatal), SimtRequestReserveResult::Reserved);
+    EXPECT_EQ(
+        PublishReservedSimtBuildRequest<HostOps>(invalid_cell, 2, spec, source, fatal),
+        SimtRequestPublishResult::InvalidInput
+    );
+}
+
+}  // namespace

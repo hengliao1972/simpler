@@ -118,12 +118,16 @@ trace-off。最初一组 11 次 A/B 得到 943.790/950.283 µs，但后续复跑
 binary 的 builder 包络也会跨窗口漂移约 15 µs，因此最终采用每条路径 3 个
 独立 21-sample 窗口，并只比较窗口中位数。
 
+<!-- markdownlint-disable MD013 MD060 -->
+
 | 21-sample 窗口 | per-symbol kernel median | per-symbol builder median | global-writer kernel median | global-writer builder median |
-| --------------- | ------------------------ | ------------------------- | --------------------------- | ---------------------------- |
-| 1 | 934.874 µs | 846.130 µs | 931.939 µs | 850.042 µs |
-| 2 | 931.673 µs | 826.004 µs | 940.614 µs | 864.150 µs |
-| 3 | 935.272 µs | 826.058 µs | 938.615 µs | 850.151 µs |
-| 三个窗口中位数的中位数 | 934.874 µs | 826.058 µs | 938.615 µs | 850.151 µs |
+| -------------- | ------------------------ | ------------------------- | --------------------------- | ---------------------------- |
+| 1              | 934.874 µs               | 846.130 µs                | 931.939 µs                  | 850.042 µs                   |
+| 2              | 931.673 µs               | 826.004 µs                | 940.614 µs                  | 864.150 µs                   |
+| 3              | 935.272 µs               | 826.058 µs                | 938.615 µs                  | 850.151 µs                   |
+| 三个窗口中位数的中位数 | 934.874 µs               | 826.058 µs                | 938.615 µs                  | 850.151 µs                   |
+
+<!-- markdownlint-enable MD013 MD060 -->
 
 按最后一行计算，global-writer 的 kernel E2E 为 `+3.741 µs`（`+0.40%`），
 builder 包络为 `+24.093 µs`（`+2.92%`）。但更重要的是区间关系：
@@ -250,6 +254,8 @@ builder/warp 不是越多越好；最终仍保持 B9/W5。
 
 ## 10. 验证过但未保留的路线
 
+<!-- markdownlint-disable MD013 -->
+
 | 实验 | 结果 | 未保留原因 |
 | ---- | ---- | ---------- |
 | dispatch window 128 | 877.560 µs | 上游窗口过小，重新引入下游占 token |
@@ -257,6 +263,8 @@ builder/warp 不是越多越好；最终仍保持 B9/W5。
 | writer poll backoff 16/64 | 无改善 | 延迟 baton 接力，没有减少关键路径 |
 | 所有 writer 先 prepare、再分布式 commit | 约 1.012 ms，poll 约 1.16 万次 | 大量 writer 同时等待同一串行链 |
 | 单一 SIMT sequencer 提交全部 writer | 约 2.214 ms，Build 约 2.172 ms | 单 SIMT thread 上的 atomic/store 延迟完全暴露 |
+
+<!-- markdownlint-enable MD013 -->
 
 上述实验代码均已从最终实现删除；保留这些数据是为了避免后续重复走同一条回退
 路线。
@@ -288,6 +296,8 @@ builder warp、token、dispatch window 和 last-writer 发布方式，避免只�
 
 最终回归结果：
 
+<!-- markdownlint-disable MD013 -->
+
 | 验证 | 最终配置结果 |
 | ---- | ------------ |
 | CPU optimized | builder 1..32、B1/B256、4 rounds，PASS |
@@ -298,6 +308,8 @@ builder warp、token、dispatch window 和 last-writer 发布方式，避免只�
 | 真实 A5 | B1 3/3、B9 性能窗口 31/31、最终重建短回归 5/5、swimlane 1/1，PASS |
 | 最终 JSON | 1280 Build、256 serial insert、1024 non-writer、1024 execute；配置自描述字段与 oracle 一致 |
 | 脚本/产物 | `bash -n`、4 份 JSON 解析、base/swimlane manifest hash，PASS |
+
+<!-- markdownlint-enable MD013 -->
 
 ## 12. 最终结论
 
@@ -367,26 +379,34 @@ unlocked 环境下解释成稳定架构差异。可信结论是：固定 task �
 新泳道图仍有插桩放大，只用于分解结构，不用它替代 trace-off E2E。256 个 QK 与
 256 个 PV 的 AIC workload 数据为：
 
-| task 类别 | 数量 | 平均时间 | 总 AIC 时间 |
-| --------- | ---- | -------- | ------------ |
-| QK | 256 | 45.395 µs | 11621.072 µs |
-| PV | 256 | 27.681 µs | 7086.220 µs |
-| 合计 | 512 | - | 18707.292 µs |
+<!-- markdownlint-disable MD060 -->
+
+| task 类别 | 数量 | 平均时间  | 总 AIC 时间  |
+| --------- | ---- | --------- | ------------- |
+| QK        | 256  | 45.395 µs | 11621.072 µs |
+| PV        | 256  | 27.681 µs | 7086.220 µs  |
+| 合计      | 512  | -         | 18707.292 µs |
+
+<!-- markdownlint-enable MD060 -->
 
 32 个 AIC 的平均工作量下界已经是 `18707.292 / 32 = 584.603 µs`。实际关键 AIC
 owner 28 执行 8 个 QK 和 8 个 PV：workload 589.352 µs，task 间 Scalar 间隙
 51.231 µs，连续活跃区间共 640.583 µs。其 51.231 µs 间隙完整分解为：
 
-| 关键 AIC 非 workload 项 | 时间 |
-| ------------------------ | ---- |
-| `scalar.task_prepare_engine` | 19.385 µs |
-| `scalar.task_complete` | 10.082 µs |
-| payload DCCI | 6.139 µs |
-| BUILT/exec-state wait | 6.026 µs |
-| payload bind | 3.727 µs |
-| dispatch atomic | 3.689 µs |
-| fan-in flag wait | 2.183 µs |
-| 合计 | 51.231 µs |
+<!-- markdownlint-disable MD060 -->
+
+| 关键 AIC 非 workload 项        | 时间      |
+| ------------------------------ | --------- |
+| `scalar.task_prepare_engine`   | 19.385 µs |
+| `scalar.task_complete`         | 10.082 µs |
+| payload DCCI                   | 6.139 µs  |
+| BUILT/exec-state wait          | 6.026 µs  |
+| payload bind                   | 3.727 µs  |
+| dispatch atomic               | 3.689 µs  |
+| fan-in flag wait              | 2.183 µs  |
+| 合计                           | 51.231 µs |
+
+<!-- markdownlint-enable MD060 -->
 
 因此第一瓶颈是固定的 AIC task 服务时间，而不是 TensorMap writer、atomic 或 DCCI。
 关键 AIC 活跃区间约 92% 是 workload、8% 是 Scalar 调度间隙。AIC task 数量也有
@@ -401,3 +421,44 @@ AIV 尾部虽然最终执行最后的 UP，但 UP 自身约 2 µs；泳道图里
 是在等待上游 PV/Build，不是可直接删除的 atomic 计算。真正可继续优化的调度部分，
 主要是关键 AIC 的约 51 µs Scalar 间隙和 15/16/17 task 的负载不均；不能再通过
 缩短那约 589 µs 的模拟 workload 来达标。
+
+## 14. 真实 Simpler 迁移：动态 Build Request 协议
+
+standalone 的 SIMT builder 可以随机访问预先生成的 PA task plan；真实 Simpler 的
+`Submit()` 参数则由 Scalar 在运行过程中动态构造。生产迁移不能把 PA 的五类 task
+或 `task_id % warp` 静态映射带入公共 runtime，因此先建立如下通用桥接：
+
+```text
+动态 Submit
+  -> 唯一 Scalar publisher 保留 task-indexed request
+  -> 复制 L0TaskArgs 的 tensor/create-info、scalar 和 explicit dependency
+  -> 只刷新实际写入的完整 cache line
+  -> Published atomic 交接
+  -> SIMT builder invalidate 后获取不可变 request
+```
+
+首阶段只锁定 ABI 和发布合同，尚未把 persistent SIMT builder 接入 A5 kernel：
+
+- 控制字单独占用 64 B，区分 `Empty / Reserved / Published`；
+- payload 首 cache line 保存 task/function/engine/count 和 32 个 tensor tag；
+- 每个 tensor 固定占 128 B：已有 Tensor 保存完整描述符，`OUTPUT` 只保存 64 B
+  `TensorCreateInfo` 并清零其余 64 B；
+- scalar 与 explicit dependency 紧随 tensor 区域，最大 payload 为 4416 B；
+- 发布者只 flush 实际 payload line，消费者按控制字记录的 line 数 invalidate；
+- immediate task 与 AIC/AIV kernel task共用同一请求格式；
+- 协议不含 PA task kind、固定 task 数或固定 TensorMap writer 位置。
+
+验证结果：
+
+| 验证 | 结果 |
+| ---- | ---- |
+| mode 3 Host/AICPU/AICore 构建身份 | PASS |
+| 单一 Scalar publisher 保留 | PASS |
+| payload 打包、flush、Published 交接 | PASS |
+| SIMT 侧 invalidate、header/layout 校验 | PASS |
+| OUTPUT create-info 64 B 复制与后半清零 | PASS |
+| immediate task 与错误输入拒绝 | PASS |
+| A5 动态功能与性能 | NOT RUN（本阶段尚未接入 builder） |
+
+下一阶段将在独立 mode 3 runtime state 中加入 request cells 和 builder 生命周期控制，
+由 AICPU 明确复位；完成 CPU 状态合同后，才接入真实 `cce::async_invoke`。
