@@ -863,25 +863,41 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
 }
 
 DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket
-dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &) {
+dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &mixed) {
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+    return dist_cross_core_submit_compete_first_begin(mixed);
+#else
     (void)dist_shared_pa_reject_generic_submit();
     return dist_shared_pa_invalid_ticket(DistCompeteFirstKind::Kernel);
+#endif
 }
 
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_compete_first_finish(
-    PTO2Runtime *, const MixedKernels &, const DistCompeteFirstTicket &, const L0TaskArgs &
+    PTO2Runtime *, const MixedKernels &mixed, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args
 ) {
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+    return dist_cross_core_submit_compete_first_finish(mixed, ticket, args);
+#else
     return dist_shared_pa_reject_generic_submit();
+#endif
 }
 
 DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_begin(PTO2Runtime *) {
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+    return dist_cross_core_alloc_compete_first_begin();
+#else
     (void)dist_shared_pa_reject_generic_submit();
     return dist_shared_pa_invalid_ticket(DistCompeteFirstKind::Alloc);
+#endif
 }
 
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
-dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &, const L0TaskArgs &) {
+dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args) {
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+    return dist_cross_core_alloc_compete_first_finish(ticket, args);
+#else
     return dist_shared_pa_reject_generic_submit();
+#endif
 }
 
 #if !PTO_FDWIC_SHARED_PA_UNITY

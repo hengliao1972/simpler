@@ -104,6 +104,33 @@ TEST(FdwicCrossCoreOutputProtocol, EmptyOutputListPublishesWithoutPayloadDcci) {
     EXPECT_EQ(HostOps::invalidate_count, 0U);
 }
 
+TEST(FdwicCrossCoreOutputProtocol, CompeteFirstLoserDiscoversPublishedOutputCount) {
+    CrossCoreOutputCell<TestDescriptor> cell{};
+    SharedExecControl fatal{};
+    HostOps::Reset();
+    cell.descriptors[0].words[0] = 0x1234;
+    cell.descriptors[1].words[0] = 0x5678;
+    ASSERT_EQ(PublishTaskOutputs<HostOps>(cell, 21, 7, 2, fatal), OutputPublishResult::Published);
+
+    uint32_t output_count = 99;
+    EXPECT_EQ(AcquirePublishedTaskOutputs<HostOps>(cell, 21, output_count, fatal), OutputAcquireResult::Acquired);
+    EXPECT_EQ(output_count, 2U);
+    EXPECT_EQ(HostOps::invalidate_count, 1U);
+    EXPECT_EQ(HostOps::last_bytes, 2U * sizeof(TestDescriptor));
+}
+
+TEST(FdwicCrossCoreOutputProtocol, DynamicAcquireRejectsWrongTaskBeforeInvalidatingDescriptors) {
+    CrossCoreOutputCell<TestDescriptor> cell{};
+    SharedExecControl fatal{};
+    HostOps::Reset();
+    ASSERT_EQ(PublishTaskOutputs<HostOps>(cell, 21, 7, 2, fatal), OutputPublishResult::Published);
+
+    uint32_t output_count = 99;
+    EXPECT_EQ(AcquirePublishedTaskOutputs<HostOps>(cell, 20, output_count, fatal), OutputAcquireResult::InvalidControl);
+    EXPECT_EQ(output_count, 0U);
+    EXPECT_EQ(HostOps::invalidate_count, 0U);
+}
+
 TEST(FdwicCrossCoreOutputProtocol, WrongTaskOrCountCannotAliasAPublishedCell) {
     CrossCoreOutputCell<TestDescriptor> cell{};
     SharedExecControl fatal{};

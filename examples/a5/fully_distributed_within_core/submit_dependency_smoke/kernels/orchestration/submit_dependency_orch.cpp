@@ -374,6 +374,53 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         return;
     }
 
+    if (mode == 32) {
+        TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
+        L0TaskArgs left_args;
+        TaskOutputTensors left_out = rt_submit_aic_task_compete_first(
+            FUNC_MAKE_LEFT_AIC, left_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                submit_args.add_input(input);
+                submit_args.add_output(scratch_ci);
+                submit_args.add_scalar(n);
+            }
+        );
+        __gm__ const Tensor &left = left_out.get_ref(0);
+
+        L0TaskArgs fanin_args;
+        fanin_args.add_input(left);
+        fanin_args.add_input(left);
+        fanin_args.add_input(left);
+        fanin_args.add_inout(output);
+        fanin_args.add_scalar(n);
+        rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        return;
+    }
+
+    if (mode == 33) {
+        TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
+        L0TaskArgs alloc_args;
+        TaskOutputTensors seed_out =
+            alloc_tensors_compete_first(alloc_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                submit_args.add_output(scratch_ci);
+            });
+        __gm__ const Tensor &seed = seed_out.get_ref(0);
+
+        L0TaskArgs fill_args;
+        fill_args.add_input(input);
+        fill_args.add_inout(seed);
+        fill_args.add_scalar(n);
+        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+
+        L0TaskArgs fanin_args;
+        fanin_args.add_input(seed);
+        fanin_args.add_input(seed);
+        fanin_args.add_input(seed);
+        fanin_args.add_inout(output);
+        fanin_args.add_scalar(n);
+        rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        return;
+    }
+
     if (mode == 15) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs left_args;

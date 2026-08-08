@@ -187,4 +187,30 @@ PTO_DEVICE_FUNC OutputAcquireResult AcquireTaskOutputs(
     return OutputAcquireResult::Acquired;
 }
 
+// Compete-first losers deliberately do not construct L0TaskArgs, so they do
+// not know the number of fresh outputs before the Build owner publishes it.
+// Read the count from the same atomic control word that publishes the task id,
+// then invalidate exactly that immutable descriptor prefix.
+template <typename Ops, typename Descriptor>
+PTO_DEVICE_FUNC OutputAcquireResult AcquirePublishedTaskOutputs(
+    __gm__ CrossCoreOutputCell<Descriptor> &cell, uint32_t task_id, uint32_t &output_count,
+    __gm__ SharedExecControl &fatal
+) {
+    static_assert(sizeof(Descriptor) == kExecTensorDescBytes, "cross-core output descriptor size changed");
+    output_count = 0;
+    if (Ops::Load(&fatal.state) != 0) return OutputAcquireResult::FatalObserved;
+    const int64_t observed_raw = Ops::Load(&cell.control.state);
+    if (observed_raw == 0) return OutputAcquireResult::NotPublished;
+    const DecodedOutputState observed = DecodeOutputState(observed_raw);
+    if (!observed.valid || observed.phase != OutputPhase::Published || observed.task_id != task_id) {
+        return OutputAcquireResult::InvalidControl;
+    }
+    if (observed.output_count != 0) {
+        Ops::InvalidateRegion(cell.descriptors, static_cast<uint64_t>(observed.output_count) * sizeof(Descriptor));
+    }
+    if (Ops::Load(&cell.control.state) != observed_raw) return OutputAcquireResult::InvalidControl;
+    output_count = observed.output_count;
+    return OutputAcquireResult::Acquired;
+}
+
 }  // namespace fdwic::cross_core
