@@ -463,6 +463,7 @@ dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uin
 
 #include "dist_engine/aicore/shared_submit_path.h"
 #include "dist_engine/aicore/cross_core_submit_path.h"
+#include "dist_engine/aicore/simt_cross_core_submit_path.h"
 
 #include "dist_engine/aicore/run_state.h"
 

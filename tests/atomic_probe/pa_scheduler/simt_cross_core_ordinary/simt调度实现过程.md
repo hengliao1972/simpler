@@ -497,3 +497,31 @@ AICPU 是唯一复位方：公共 runtime 控制复用既有 reset，三条生�
 | request payload 在复位时保持不变 | PASS |
 | mode 1 ordinary 与 mode 2 DAG 状态回归 | PASS |
 | A5 builder 启动 | NOT RUN（下一阶段） |
+
+### 14.3 真实 L0TaskArgs 快照
+
+动态请求发布端已直接适配生产 `L0TaskArgs`，不保存其中的 `TensorRef`、create-info
+指针或显式依赖数组指针：
+
+- `INPUT/INOUT/OUTPUT_EXISTING/NO_DEP` 复制完整 128 B Tensor；
+- `OUTPUT` 复制 64 B `TensorCreateInfo`，协议层清零固定 128 B 槽的后半；
+- scalar 和 `PTO2TaskId::raw` 按值复制；
+- 发布前拒绝错误 args、错误 tag、空引用、shared-output 专用引用、未来依赖和非零
+  ring 依赖；
+- AIC/AIV 的 function id、function address 和 engine 分类继续复用现有单 lane
+  `MixedKernels` 合同；Alloc 使用 immediate engine。
+
+mode 1/2 与 mode 3 的 kernel 分类已收敛到同一公共 helper，避免两份逻辑随后漂移。
+mode 3 同时具备请求保留和发布 helper，但本阶段没有打开 `submit_runtime.h` 的 mode 3
+路由；在 SIMT consumer 闭合前，不能让真实 Submit 发布后无人消费。
+
+验证结果：
+
+| 验证 | 结果 |
+| ---- | ---- |
+| 真实 L0TaskArgs 已有 Tensor 128 B 值复制 | PASS |
+| OUTPUT create-info 64 B 复制与后半清零 | PASS |
+| scalar 与两个显式依赖原值复制 | PASS |
+| 未来依赖与跨 ring 依赖拒绝 | PASS |
+| mode 1/2 状态及 Python 构建选择回归 | PASS |
+| mode 3 A5 动态 Submit | NOT RUN（consumer 尚未接通） |

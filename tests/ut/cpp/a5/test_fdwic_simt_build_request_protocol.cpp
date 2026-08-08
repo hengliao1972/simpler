@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "dist_engine/aicore/cross_core_simt_request_source.h"
 #include "dist_engine/common/cross_core_simt_request_protocol.h"
 
 namespace {
@@ -177,6 +178,59 @@ TEST(FdwicSimtBuildRequestProtocol, InvalidShapeOrMismatchedPublisherFailsClosed
         PublishReservedSimtBuildRequest<HostOps>(invalid_cell, 2, spec, source, fatal),
         SimtRequestPublishResult::InvalidInput
     );
+}
+
+TEST(FdwicSimtBuildRequestProtocol, RealL0TaskArgsAreCopiedByValueWithoutLocalReferences) {
+    uint32_t shape[1] = {16};
+    Tensor input = make_tensor_external(reinterpret_cast<void *>(0x1000), shape, 1, DataType::FLOAT32);
+    TensorCreateInfo output(shape, 1, DataType::FLOAT32);
+    PTO2TaskId dependencies[2] = {PTO2TaskId::make(0, 1), PTO2TaskId::make(0, 3)};
+    L0TaskArgs args;
+    args.add_input(input);
+    args.add_output(output);
+    args.add_scalar(uint64_t{0x1234});
+    args.set_dependencies(dependencies, 2);
+    ASSERT_TRUE(ValidateSimtL0TaskArgs(args, 5));
+
+    SimtBuildRequestCell cell{};
+    SharedExecControl fatal{};
+    const SimtBuildRequestSpec spec{
+        5, 0x123456780ULL, 17, 2, 1, 2, ExecEngineClass::Aiv, 0,
+    };
+    const SimtL0TaskArgsRequestSource source{args};
+    ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 5, 2, fatal), SimtRequestReserveResult::Reserved);
+    ASSERT_EQ(
+        PublishReservedSimtBuildRequest<HostOps>(cell, 2, spec, source, fatal), SimtRequestPublishResult::Published
+    );
+
+    const auto *input_words = reinterpret_cast<const uint64_t *>(&input);
+    for (uint32_t word = 0; word < kExecTensorDescWords; ++word) {
+        EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(0) + word], input_words[word]);
+    }
+    const auto *create_info_words = reinterpret_cast<const uint64_t *>(&output);
+    for (uint32_t word = 0; word < 8; ++word) {
+        EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(1) + word], create_info_words[word]);
+    }
+    for (uint32_t word = 8; word < kExecTensorDescWords; ++word) {
+        EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(1) + word], 0U);
+    }
+    SimtBuildRequestLayout layout{};
+    ASSERT_TRUE(ComputeSimtBuildRequestLayout(2, 1, 2, layout));
+    EXPECT_EQ(cell.payload.words[layout.scalar_word_offset], 0x1234U);
+    EXPECT_EQ(cell.payload.words[layout.explicit_dep_word_offset], dependencies[0].raw);
+    EXPECT_EQ(cell.payload.words[layout.explicit_dep_word_offset + 1U], dependencies[1].raw);
+}
+
+TEST(FdwicSimtBuildRequestProtocol, RealL0TaskArgsRejectFutureOrCrossRingDependencies) {
+    L0TaskArgs args;
+    PTO2TaskId future = PTO2TaskId::make(0, 7);
+    args.set_dependencies(&future, 1);
+    EXPECT_FALSE(ValidateSimtL0TaskArgs(args, 7));
+
+    L0TaskArgs cross_ring;
+    PTO2TaskId dependency = PTO2TaskId::make(1, 2);
+    cross_ring.set_dependencies(&dependency, 1);
+    EXPECT_FALSE(ValidateSimtL0TaskArgs(cross_ring, 7));
 }
 
 }  // namespace

@@ -741,6 +741,7 @@ set_tests_properties(test_fdwic_cross_core_dag_state PROPERTIES LABELS "no_hardw
 # task-indexed request. The protocol test locks the Scalar publication and
 # SIMT acquisition ABI before any persistent builder is wired into A5.
 add_a5_test(test_fdwic_simt_build_request_protocol a5/test_fdwic_simt_build_request_protocol.cpp)
+target_sources(test_fdwic_simt_build_request_protocol PRIVATE stubs/test_stubs.cpp)
 target_compile_definitions(test_fdwic_simt_build_request_protocol PRIVATE
     __CPU_SIM=1
     PTO_FDWIC_SHARED_MAP=1
