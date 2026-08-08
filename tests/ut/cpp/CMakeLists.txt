@@ -654,6 +654,39 @@ add_fdwic_build_identity_test(test_fdwic_build_identity_private 0 0)
 add_fdwic_build_identity_test(test_fdwic_build_identity_shared 1 0)
 add_fdwic_build_identity_test(test_fdwic_build_identity_cross_core_ordinary 1 1)
 
+# The first production cross-core contract is deliberately operator-agnostic:
+# one owner publishes an immutable execution payload and a compatible Scalar
+# acquires it without sharing the builder's local pointers or cache state.
+add_a5_test(test_fdwic_cross_core_exec_protocol a5/test_fdwic_cross_core_exec_protocol.cpp)
+target_compile_definitions(test_fdwic_cross_core_exec_protocol PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_SCHEDULER_MODE=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
+target_include_directories(test_fdwic_cross_core_exec_protocol BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_cross_core_exec_protocol PROPERTIES LABELS "no_hardware")
+
+add_a5_test(test_fdwic_cross_core_state a5/test_fdwic_cross_core_state.cpp)
+target_compile_definitions(test_fdwic_cross_core_state PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_SCHEDULER_MODE=1
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
+target_include_directories(test_fdwic_cross_core_state BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_cross_core_state PROPERTIES LABELS "no_hardware")
+
 # A5 trb runtime UTs — mirror of a2a3 trb runtime UTs, link against a5_rt_objs.
 # Target names carry the a5_ prefix because hierarchical/test_tensormap (and
 # the unprefixed a2a3 runtime targets test_scheduler_state / test_ready_queue

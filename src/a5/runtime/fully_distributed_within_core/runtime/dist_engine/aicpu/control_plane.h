@@ -13,6 +13,7 @@
 // configuration reads and signal-handler installation; AICore images never
 // include this file.
 
+#include "dist_engine/aicpu/cross_core_exec_init.h"
 #include "dist_engine/aicpu/shared_tensor_map_init.h"
 
 int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime) {
@@ -85,8 +86,8 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
     constexpr int32_t kSharedPaMinimumHistory = 4;
     if (configured_history < kSharedPaMinimumHistory) {
         DIST_ERRF(
-            "[dist_engine] shared PA requires PTO_DIST_H >= %d to cover UP -> Alloc: H=%d\n",
-            kSharedPaMinimumHistory, configured_history
+            "[dist_engine] shared PA requires PTO_DIST_H >= %d to cover UP -> Alloc: H=%d\n", kSharedPaMinimumHistory,
+            configured_history
         );
         return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
     }
@@ -128,6 +129,9 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
     // This is the sole reset point for the global shared PA sidecar. Workers
     // only attach after AICPU publishes the initialized runtime.
     dist_shared_pa_tensor_map_reset(g_dist.shared_pa);
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+    dist_cross_core_ordinary_reset(g_dist.cross_core_ordinary);
+#endif
 #endif
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;

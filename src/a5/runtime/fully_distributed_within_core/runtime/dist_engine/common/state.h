@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "dist_engine/common/cross_core_exec_protocol.h"
 #include "dist_engine/common/shared_pa_atomic_layout.h"
 #include "dist_engine/common/target.h"
 #include "dist_engine/common/swimlane_types.h"
@@ -85,8 +86,9 @@ struct MapEntry {
     uint64_t hi;
     int32_t producer;
     uint32_t payload_abi_reserved;
-    // private ring 的 bucket/slot 由连续下标隐式给出，不再保存链指针。
-    // 末 16B 为后续布局演进预留；shared 发布协议不会借用 private 热槽。
+    // The private ring derives bucket/slot from the contiguous index and no
+    // longer stores linked-list pointers. The last 16 bytes remain reserved;
+    // shared publication protocols must not borrow this private hot slot.
     uint8_t abi_reserved[16];
 };
 static_assert(sizeof(MapEntry) == 48, "FDWIC MapEntry ABI size changed");
@@ -99,9 +101,10 @@ constexpr int32_t kTaskWindowMask = kTaskWindow - 1;
 
 struct DistTensorMap {
     MapEntry entries[kMapCap];
-    // 默认 CAP=128 时，前 128 个 head/tail 保持连续固定位置。CAP=32/64
-    // 的额外桶游标从原 32KiB bucket 区域内部切出，所有模式的 map 总尺寸
-    // 和 DistCore 后续字段偏移保持不动。
+    // With the default CAP=128, the first 128 head/tail cursors stay at their
+    // fixed contiguous offsets. CAP=32/64 takes the additional cursors from
+    // the original 32-KiB control area so every mode preserves the total map
+    // size and all following DistCore offsets.
     uint64_t bucket_heads[kMapBaseControlBuckets];
     uint64_t bucket_tails[kMapBaseControlBuckets];
 #if PTO_FDWIC_TENSORMAP_RING_CAP < 128
@@ -109,12 +112,11 @@ struct DistTensorMap {
     uint64_t extra_bucket_tails[kMapBuckets - kMapBaseControlBuckets];
     uint8_t control_abi_reserved[kMapControlBytes - 2 * sizeof(uint64_t) * kMapBuckets];
 #else
-    uint8_t control_abi_reserved[
-        kMapControlBytes - 2 * sizeof(uint64_t) * kMapBaseControlBuckets
-    ];
+    uint8_t control_abi_reserved[kMapControlBytes - 2 * sizeof(uint64_t) * kMapBaseControlBuckets];
 #endif
-    // 旧 task-head/free-list 区只保留物理 ABI，不在默认热路径维护全局 live
-    // 计数。每桶容量由 tail-head 当场判断，auto CAP 由后续静态 planner 负责。
+    // The former task-head/free-list area remains only as physical ABI space.
+    // The default hot path checks each bucket with tail-head instead of
+    // maintaining a global live count; a later static planner owns auto CAP.
     uint8_t task_window_abi_reserved[sizeof(int32_t) * kTaskWindow];
     uint32_t tail_abi_reserved0;
     uint32_t tail_abi_reserved1;
@@ -126,18 +128,14 @@ static_assert(alignof(DistTensorMap) == 8, "FDWIC TensorMap alignment changed");
 static_assert(offsetof(DistTensorMap, bucket_heads) == 786432, "FDWIC TensorMap head offset changed");
 static_assert(offsetof(DistTensorMap, bucket_tails) == 787456, "FDWIC TensorMap tail offset changed");
 #if PTO_FDWIC_TENSORMAP_RING_CAP < 128
+static_assert(offsetof(DistTensorMap, extra_bucket_heads) == 788480, "FDWIC TensorMap extra-head offset changed");
 static_assert(
-    offsetof(DistTensorMap, extra_bucket_heads) == 788480, "FDWIC TensorMap extra-head offset changed"
-);
-static_assert(
-    offsetof(DistTensorMap, extra_bucket_tails) ==
-        788480 + sizeof(uint64_t) * (kMapBuckets - kMapBaseControlBuckets),
+    offsetof(DistTensorMap, extra_bucket_tails) == 788480 + sizeof(uint64_t) * (kMapBuckets - kMapBaseControlBuckets),
     "FDWIC TensorMap extra-tail offset changed"
 );
 #endif
 static_assert(
-    offsetof(DistTensorMap, task_window_abi_reserved) == 819200,
-    "FDWIC TensorMap task-window reserve offset changed"
+    offsetof(DistTensorMap, task_window_abi_reserved) == 819200, "FDWIC TensorMap task-window reserve offset changed"
 );
 static_assert(
     offsetof(DistTensorMap, control_abi_reserved) + sizeof(DistTensorMap::control_abi_reserved) == 819200,
@@ -309,12 +307,8 @@ static_assert(offsetof(DistCore, slots_pad) == 823344, "FDWIC DistCore slot padd
 static_assert(offsetof(DistCore, slots) == 823360, "FDWIC DistCore ring-slot offset changed");
 static_assert(offsetof(DistCore, occupied_count) == 842656, "FDWIC DistCore occupancy offset changed");
 static_assert(offsetof(DistCore, owned_total) == 842660, "FDWIC DistCore owned-total offset changed");
-static_assert(
-    offsetof(DistCore, swimlane_last_cycle) == 842664, "FDWIC DistCore swimlane-clock offset changed"
-);
-static_assert(
-    offsetof(DistCore, task_payloads_pad) == 842672, "FDWIC DistCore payload padding offset changed"
-);
+static_assert(offsetof(DistCore, swimlane_last_cycle) == 842664, "FDWIC DistCore swimlane-clock offset changed");
+static_assert(offsetof(DistCore, task_payloads_pad) == 842672, "FDWIC DistCore payload padding offset changed");
 static_assert(offsetof(DistCore, task_payloads) == 842688, "FDWIC DistCore task-payload offset changed");
 static_assert(sizeof(DistCore) == 9231296, "FDWIC DistCore ABI size changed");
 static_assert(offsetof(DistCore, slots) % 64 == 0, "DistCore slots must be cacheline-aligned");
@@ -355,8 +349,7 @@ static_assert(
 );
 static_assert(kFdwicSharedHeapShardBytes == (32ULL << 20), "shared PA heap shard size changed");
 static_assert(
-    (kFdwicSharedHeapShards & (kFdwicSharedHeapShards - 1U)) == 0,
-    "shared PA heap shards must be a power of two"
+    (kFdwicSharedHeapShards & (kFdwicSharedHeapShards - 1U)) == 0, "shared PA heap shards must be a power of two"
 );
 static_assert(
     (kFdwicSharedVectorCursorShards & (kFdwicSharedVectorCursorShards - 1U)) == 0,
@@ -459,6 +452,27 @@ static_assert(offsetof(SharedPaTensorMapState, insert_completion) % kFdwicShared
 static_assert(sizeof(SharedPaTensorMapState) == 9094784, "shared PA TensorMap sidecar size changed");
 static_assert(alignof(SharedPaTensorMapState) == kCacheLine, "shared PA TensorMap alignment changed");
 
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+// The first production cross-core backend keeps one immutable execution cell
+// per logical task for the entire invocation. It deliberately does not reuse
+// cells yet, so no generation, ABA or payload-reclamation rule is implicit in
+// the initial correctness contract.
+constexpr uint32_t kFdwicCrossCoreOrdinaryTaskCapacity = 2048;
+
+struct alignas(kCacheLine) CrossCoreOrdinaryState {
+    fdwic::cross_core::SharedExecControl fatal;
+    fdwic::cross_core::SharedExecCell tasks[kFdwicCrossCoreOrdinaryTaskCapacity];
+};
+static_assert(offsetof(CrossCoreOrdinaryState, fatal) == 0);
+static_assert(offsetof(CrossCoreOrdinaryState, tasks) == kCacheLine);
+static_assert(alignof(CrossCoreOrdinaryState) == kCacheLine);
+static_assert(
+    sizeof(CrossCoreOrdinaryState) ==
+        kCacheLine + kFdwicCrossCoreOrdinaryTaskCapacity * sizeof(fdwic::cross_core::SharedExecCell),
+    "cross-core ordinary state size changed"
+);
+#endif
+
 struct DistTaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
@@ -517,8 +531,9 @@ struct DistGlobal {
 
     uint8_t fatal_pad[24];
     volatile int32_t fatal;
-    // 首个非零运行时错误码获胜；fatal 仍保留原 offset，后续字段也不移动。
-    // AICPU 在所有 worker 完成后失效并读取整条 cache line。
+    // The first nonzero runtime error wins. fatal keeps its original offset
+    // and no later field moves. AICPU invalidates and reads the complete cache
+    // line after every worker has finished.
     volatile int32_t error_code;
     uint8_t fatal_tail_pad[kCacheLine - 2 * sizeof(int32_t)];
 
@@ -545,6 +560,9 @@ struct DistGlobal {
     // The shared-only state starts at the frozen private tail. Existing
     // AICPU/native fields and per-core offsets remain unchanged.
     SharedPaTensorMapState shared_pa;
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+    CrossCoreOrdinaryState cross_core_ordinary;
+#endif
 #endif
 };
 static_assert(offsetof(DistGlobal, frontier) % 64 == 0, "DistGlobal frontier must be cacheline-aligned");
@@ -558,9 +576,7 @@ static_assert(offsetof(DistGlobal, blocks) % 64 == 0, "DistGlobal blocks must be
 static_assert(offsetof(DistGlobal, replay_done) % 64 == 0, "DistGlobal replay_done must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, started_count) % 64 == 0, "DistGlobal started_count must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, cores) % 64 == 0, "DistGlobal cores must be cacheline-aligned");
-static_assert(
-    offsetof(DistGlobal, final_barrier) % 64 == 0, "DistGlobal final barrier must be cacheline-aligned"
-);
+static_assert(offsetof(DistGlobal, final_barrier) % 64 == 0, "DistGlobal final barrier must be cacheline-aligned");
 
 // 68f51451 froze the private DistGlobal tail. Mode-specific state may append
 // here but must not move the AICPU/native prefix.
@@ -574,10 +590,21 @@ static_assert(
     offsetof(DistGlobal, shared_pa) == kFdwicSharedTensorMapOffset,
     "shared PA TensorMap sidecar must append after the frozen DistGlobal tail"
 );
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+static_assert(
+    offsetof(DistGlobal, cross_core_ordinary) == kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState),
+    "cross-core ordinary state must append after the existing shared TensorMap state"
+);
+static_assert(
+    sizeof(DistGlobal) == kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState) + sizeof(CrossCoreOrdinaryState),
+    "cross-core ordinary DistGlobal size changed"
+);
+#else
 static_assert(
     sizeof(DistGlobal) == 1016120832,
     "shared DistGlobal must contain exactly the phase-1 PA TensorMap and Claim sidecar"
 );
+#endif
 #else
 static_assert(
     sizeof(DistGlobal) == kFdwicSharedTensorMapOffset, "private DistGlobal size changed while adding shared sidecar"
