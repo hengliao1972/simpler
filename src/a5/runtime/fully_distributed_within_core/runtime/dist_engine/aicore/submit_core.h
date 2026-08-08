@@ -188,16 +188,22 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
             complete_executed_task(self, s.task_id);
         }
     } else {
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
 #if PTO_FDWIC_SCHEDULER_MODE == 1
         __gm__ fdwic::cross_core::SharedExecCell &exec_cell =
             g_dist.cross_core_ordinary.tasks[static_cast<uint32_t>(s.task_id)];
+        __gm__ fdwic::cross_core::SharedExecControl &exec_fatal = g_dist.cross_core_ordinary.fatal;
+#else
+        __gm__ fdwic::cross_core::SharedExecCell &exec_cell =
+            g_dist.cross_core_dag.runtime.tasks[static_cast<uint32_t>(s.task_id)];
+        __gm__ fdwic::cross_core::SharedExecControl &exec_fatal = g_dist.cross_core_dag.runtime.fatal;
+#endif
         const uint64_t completion_vend = exec_cell.payload.words[2];
         store_task_vend(s.task_id, completion_vend);
         store_barrier();
         publish_task_flag(s.task_id);
         if (fdwic::cross_core::PublishClaimedExecDone<DistCrossCoreAicoreOps>(
-                exec_cell, static_cast<uint32_t>(s.task_id), static_cast<uint32_t>(self->core_idx),
-                g_dist.cross_core_ordinary.fatal
+                exec_cell, static_cast<uint32_t>(s.task_id), static_cast<uint32_t>(self->core_idx), exec_fatal
             ) != fdwic::cross_core::ExecDoneResult::Done) {
             set_fatal_code(PTO2_ERROR_TENSORMAP_PROTOCOL);
             self->local_index = kFlagCap;

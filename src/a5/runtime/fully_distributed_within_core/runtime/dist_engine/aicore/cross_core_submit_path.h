@@ -11,7 +11,7 @@
 
 #pragma once
 
-#if PTO_FDWIC_SCHEDULER_MODE == 1
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
 
 #include "dist_engine/aicore/tensor_map_common.h"
 
@@ -33,11 +33,19 @@ using fdwic::cross_core::OutputAcquireResult;
 using fdwic::cross_core::OutputPublishResult;
 using fdwic::cross_core::SharedExecCell;
 
+PTO_DEVICE_FUNC __gm__ CrossCoreRuntimeState &dist_cross_core_runtime_state() {
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+    return g_dist.cross_core_ordinary;
+#else
+    return g_dist.cross_core_dag.runtime;
+#endif
+}
+
 PTO_DEVICE_FUNC bool dist_cross_core_fail(int32_t task_id, int32_t error_code) {
     __gm__ DistCore *self = g_self;
     const uint32_t owner = self != nullptr && self->core_idx >= 0 ? static_cast<uint32_t>(self->core_idx) : 0U;
     (void)fdwic::cross_core::PublishExecFatal<DistCrossCoreAicoreOps>(
-        g_dist.cross_core_ordinary.fatal, fdwic::cross_core::ExecFatalReason::InvalidBuildInput,
+        dist_cross_core_runtime_state().fatal, fdwic::cross_core::ExecFatalReason::InvalidBuildInput,
         task_id >= 0 ? static_cast<uint32_t>(task_id) : UINT32_MAX, owner
     );
     set_fatal_code(error_code);
@@ -48,7 +56,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_fail(int32_t task_id, int32_t error_code) {
 PTO_DEVICE_FUNC bool dist_cross_core_task_valid(const DistSubmitCtx &ctx) {
     return ctx.self != nullptr && ctx.self->core_idx >= 0 &&
            static_cast<uint32_t>(ctx.self->core_idx) <= fdwic::cross_core::kExecMaxOwner && ctx.task_id >= 0 &&
-           static_cast<uint32_t>(ctx.task_id) < kFdwicCrossCoreOrdinaryTaskCapacity && ctx.payload != nullptr;
+           static_cast<uint32_t>(ctx.task_id) < kFdwicCrossCoreTaskCapacity && ctx.payload != nullptr;
 }
 
 PTO_DEVICE_FUNC bool dist_cross_core_create_info_bytes(const TensorCreateInfo &info, uint64_t &bytes) {
@@ -137,16 +145,16 @@ PTO_DEVICE_FUNC bool dist_cross_core_materialize_builder(
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
     const HeapReserveResult heap_result = fdwic::cross_core::ReserveOutputHeap<DistCrossCoreAicoreOps>(
-        g_dist.cross_core_ordinary.heap_cursor, static_cast<uint32_t>(ctx.task_id),
+        dist_cross_core_runtime_state().heap_cursor, static_cast<uint32_t>(ctx.task_id),
         static_cast<uint32_t>(ctx.self->core_idx), layout.total_output_size, static_cast<uint64_t>(g_dist.heap_size),
-        reservation, g_dist.cross_core_ordinary.fatal
+        reservation, dist_cross_core_runtime_state().fatal
     );
     if (heap_result != HeapReserveResult::Reserved && heap_result != HeapReserveResult::Empty) {
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_CAPACITY);
     }
 
     __gm__ CrossCoreOutputCell<Tensor> &outputs =
-        g_dist.cross_core_ordinary.outputs[static_cast<uint32_t>(ctx.task_id)];
+        dist_cross_core_runtime_state().outputs[static_cast<uint32_t>(ctx.task_id)];
     uint64_t output_offset = 0;
     uint32_t output_slot = 0;
     for (int32_t index = 0; index < ctx.tensor_count; ++index) {
@@ -167,7 +175,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_materialize_builder(
     if (output_slot != output_count || output_offset != layout.total_output_size) return false;
     if (fdwic::cross_core::PublishTaskOutputs<DistCrossCoreAicoreOps>(
             outputs, static_cast<uint32_t>(ctx.task_id), static_cast<uint32_t>(ctx.self->core_idx), output_count,
-            g_dist.cross_core_ordinary.fatal
+            dist_cross_core_runtime_state().fatal
         ) != OutputPublishResult::Published) {
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
@@ -177,12 +185,12 @@ PTO_DEVICE_FUNC bool dist_cross_core_materialize_builder(
 
 PTO_DEVICE_FUNC bool dist_cross_core_acquire_outputs(DistSubmitCtx &ctx) {
     __gm__ CrossCoreOutputCell<Tensor> &outputs =
-        g_dist.cross_core_ordinary.outputs[static_cast<uint32_t>(ctx.task_id)];
+        dist_cross_core_runtime_state().outputs[static_cast<uint32_t>(ctx.task_id)];
     uint32_t polls = 0;
     uint32_t output_count = 0;
     while (true) {
         const OutputAcquireResult result = fdwic::cross_core::AcquirePublishedTaskOutputs<DistCrossCoreAicoreOps>(
-            outputs, static_cast<uint32_t>(ctx.task_id), output_count, g_dist.cross_core_ordinary.fatal
+            outputs, static_cast<uint32_t>(ctx.task_id), output_count, dist_cross_core_runtime_state().fatal
         );
         if (result == OutputAcquireResult::Acquired) break;
         if (result != OutputAcquireResult::NotPublished) {
@@ -254,7 +262,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_prepare_dependencies(
                 if (!dist_cross_core_make_region(tensor, -1, query)) return false;
                 bool protocol_ok = false;
                 const int32_t producer = fdwic::cross_core::LookupCrossMap<DistCrossCoreAicoreOps>(
-                    g_dist.cross_core_ordinary.tensor_map, query, ctx.task_id, g_dist.H, protocol_ok
+                    dist_cross_core_runtime_state().tensor_map, query, ctx.task_id, g_dist.H, protocol_ok
                 );
                 if (!protocol_ok || !dist_cross_core_add_fanin(ctx.fanin, ctx.fanin_count, producer)) return false;
             }
@@ -281,7 +289,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_prepare_dependencies(
 PTO_DEVICE_FUNC bool
 dist_cross_core_publish_map_task(DistSubmitCtx &ctx, const CrossMapValue writer_entries[], uint32_t writer_count) {
     const MapAppendResult append = fdwic::cross_core::AppendCrossMapTask<DistCrossCoreAicoreOps>(
-        g_dist.cross_core_ordinary.tensor_map, writer_entries, writer_count, ctx.task_id
+        dist_cross_core_runtime_state().tensor_map, writer_entries, writer_count, ctx.task_id
     );
     if (append != MapAppendResult::Appended) {
         return dist_cross_core_fail(
@@ -297,6 +305,75 @@ dist_cross_core_publish_map_task(DistSubmitCtx &ctx, const CrossMapValue writer_
     }
     return true;
 }
+
+#if PTO_FDWIC_SCHEDULER_MODE == 2
+PTO_DEVICE_FUNC bool dist_cross_core_dag_prepare_dependencies(const L0TaskArgs &args, DistSubmitCtx &ctx) {
+    CrossMapValue writer_entries[fdwic::cross_core::kDagMaxWriterRegions];
+    uint32_t writer_count = 0;
+    for (int32_t index = 0; index < ctx.tensor_count; ++index) {
+        if ((ctx.register_mask & (uint32_t{1} << static_cast<uint32_t>(index))) == 0) continue;
+        if (writer_count >= fdwic::cross_core::kDagMaxWriterRegions ||
+            !dist_cross_core_make_region(ctx.payload->tensors[index], ctx.task_id, writer_entries[writer_count])) {
+            return false;
+        }
+        ++writer_count;
+    }
+    __gm__ fdwic::cross_core::DagTaskMetadataCell &metadata =
+        g_dist.cross_core_dag.metadata[static_cast<uint32_t>(ctx.task_id)];
+    if (fdwic::cross_core::PublishDagTaskMetadata<DistCrossCoreAicoreOps>(
+            metadata, static_cast<uint32_t>(ctx.task_id), writer_entries, writer_count
+        ) != fdwic::cross_core::DagMetadataPublishResult::Published) {
+        return false;
+    }
+
+    ctx.fanin_count = 0;
+    for (int32_t index = 0; index < ctx.tensor_count; ++index) {
+        const TensorArgType tag = args.tag(index);
+        if (tag == TensorArgType::OUTPUT) continue;
+        __gm__ const Tensor &tensor = ctx.payload->tensors[index];
+        const uint64_t owner_raw = tensor.owner_task_id.raw;
+        if (owner_raw != UINT64_MAX) {
+            const uint8_t owner_ring = static_cast<uint8_t>(owner_raw >> 32U);
+            const uint32_t owner_local = static_cast<uint32_t>(owner_raw);
+            if (owner_ring != 0 || owner_local >= static_cast<uint32_t>(ctx.task_id) ||
+                !dist_cross_core_add_fanin(ctx.fanin, ctx.fanin_count, static_cast<int32_t>(owner_local))) {
+                return false;
+            }
+        }
+        // OUTPUT_EXISTING remains write-only: register it without a lookup.
+        // Only INPUT and INOUT query the latest overlapping writer.
+        if ((tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) || tensor.manual_dep) continue;
+        CrossMapValue query{};
+        if (!dist_cross_core_make_region(tensor, -1, query)) return false;
+        uint32_t polls = 0;
+        while (true) {
+            int32_t producer = -1;
+            const fdwic::cross_core::DagWriterLookupResult lookup =
+                fdwic::cross_core::FindLatestDagWriter<DistCrossCoreAicoreOps>(
+                    g_dist.cross_core_dag.metadata, kFdwicCrossCoreTaskCapacity, query,
+                    static_cast<uint32_t>(ctx.task_id), static_cast<uint32_t>(g_dist.H), producer
+                );
+            if (lookup == fdwic::cross_core::DagWriterLookupResult::Found) {
+                if (!dist_cross_core_add_fanin(ctx.fanin, ctx.fanin_count, producer)) return false;
+                break;
+            }
+            if (lookup == fdwic::cross_core::DagWriterLookupResult::None) break;
+            if (lookup != fdwic::cross_core::DagWriterLookupResult::Pending) return false;
+            SPIN_WAIT_HINT();
+            if ((++polls & 1023U) == 0 && fdwic_trace_is_fatal(ctx.task_id)) return false;
+        }
+    }
+    for (uint32_t index = 0; index < args.explicit_dep_count(); ++index) {
+        const PTO2TaskId dependency = args.explicit_dep(index);
+        if (!dependency.is_valid() || dependency.ring() != 0 ||
+            dependency.local() >= static_cast<uint32_t>(ctx.task_id) ||
+            !dist_cross_core_add_fanin(ctx.fanin, ctx.fanin_count, static_cast<int32_t>(dependency.local()))) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
 
 struct DistCrossCorePayloadSource {
     __gm__ const DistTaskPayload *payload;
@@ -365,9 +442,9 @@ PTO_DEVICE_FUNC bool dist_cross_core_publish_exec(
         1,
         0,
     };
-    __gm__ SharedExecCell &cell = g_dist.cross_core_ordinary.tasks[static_cast<uint32_t>(ctx.task_id)];
+    __gm__ SharedExecCell &cell = dist_cross_core_runtime_state().tasks[static_cast<uint32_t>(ctx.task_id)];
     if (fdwic::cross_core::PublishReservedExecPayload<DistCrossCoreAicoreOps>(
-            cell, static_cast<uint32_t>(ctx.self->core_idx), spec, source, g_dist.cross_core_ordinary.fatal
+            cell, static_cast<uint32_t>(ctx.self->core_idx), spec, source, dist_cross_core_runtime_state().fatal
         ) != ExecBuildResult::Published) {
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
@@ -378,7 +455,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_publish_exec(
     publish_task_flag(ctx.task_id);
     if (fdwic::cross_core::PublishImmediateExecDone<DistCrossCoreAicoreOps>(
             cell, static_cast<uint32_t>(ctx.task_id), static_cast<uint32_t>(ctx.self->core_idx),
-            g_dist.cross_core_ordinary.fatal
+            dist_cross_core_runtime_state().fatal
         ) != fdwic::cross_core::ExecDoneResult::Done) {
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
@@ -461,16 +538,16 @@ PTO_DEVICE_FUNC ExecEngineClass dist_cross_core_executor_engine(__gm__ DistCore 
 PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngineClass task_engine) {
     const ExecEngineClass executor_engine = dist_cross_core_executor_engine(ctx.self);
     if (executor_engine != task_engine) return true;
-    // 每个同 engine worker 只做一次动态 owner CAS；只有首个到达者
-    // 等待 BUILT。CAS 位于 task-private 独占行，不与 builder 的
-    // SharedExecCell::control 发生竞争。这与固定 task-id 路由不同：
-    // 忙核不会被预先指定，Build/Execute owner 也仍然可以不同。
+    // Each compatible worker attempts the dynamic owner CAS once; only the
+    // first arrival waits for BUILT. The task-private CAS line does not contend
+    // with the builder's SharedExecCell::control. Unlike fixed task-id routing,
+    // this neither preselects a busy core nor couples Build and Execute owners.
     __gm__ volatile int64_t &owner_word =
-        g_dist.cross_core_ordinary.execute_owner[static_cast<uint32_t>(ctx.task_id)].state;
+        dist_cross_core_runtime_state().execute_owner[static_cast<uint32_t>(ctx.task_id)].state;
     const int64_t desired_owner = static_cast<int64_t>(ctx.self->core_idx) + 1;
     const int64_t observed_owner = DistCrossCoreAicoreOps::CompareExchange(&owner_word, 0, desired_owner);
     if (observed_owner != 0 && observed_owner != desired_owner) return true;
-    __gm__ SharedExecCell &cell = g_dist.cross_core_ordinary.tasks[static_cast<uint32_t>(ctx.task_id)];
+    __gm__ SharedExecCell &cell = dist_cross_core_runtime_state().tasks[static_cast<uint32_t>(ctx.task_id)];
     uint32_t polls = 0;
     while (true) {
         const fdwic::cross_core::DecodedExecState state =
@@ -489,7 +566,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
         fdwic::cross_core::ResetExecToken(token);
         const ExecAcquireResult acquired = fdwic::cross_core::AcquireExecPayload<DistCrossCoreAicoreOps>(
             cell, static_cast<uint32_t>(ctx.task_id), static_cast<uint32_t>(ctx.self->core_idx), executor_engine, token,
-            g_dist.cross_core_ordinary.fatal
+            dist_cross_core_runtime_state().fatal
         );
         if (acquired == ExecAcquireResult::Lost) continue;
         if (acquired == ExecAcquireResult::NotBuilt) continue;
@@ -512,10 +589,10 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
 
 PTO_DEVICE_FUNC bool dist_cross_core_reserve_build(DistSubmitCtx &ctx, bool &build_owner) {
     build_owner = false;
-    __gm__ SharedExecCell &cell = g_dist.cross_core_ordinary.tasks[static_cast<uint32_t>(ctx.task_id)];
+    __gm__ SharedExecCell &cell = dist_cross_core_runtime_state().tasks[static_cast<uint32_t>(ctx.task_id)];
     const ExecBuildReserveResult reservation_result = fdwic::cross_core::ReserveExecBuild<DistCrossCoreAicoreOps>(
         cell, static_cast<uint32_t>(ctx.task_id), static_cast<uint32_t>(ctx.self->core_idx),
-        g_dist.cross_core_ordinary.fatal
+        dist_cross_core_runtime_state().fatal
     );
     build_owner = reservation_result == ExecBuildReserveResult::Reserved;
     if (!build_owner && reservation_result != ExecBuildReserveResult::CellUnavailable) {
@@ -536,15 +613,23 @@ PTO_DEVICE_FUNC bool dist_cross_core_finish_builder(
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
     HeapReservation heap{};
-    if (!dist_cross_core_materialize_builder(args, ctx, layout, output_mask, output_count, heap) ||
-        !dist_cross_core_wait_map_turn(ctx)) {
+    if (!dist_cross_core_materialize_builder(args, ctx, layout, output_mask, output_count, heap)) {
         return false;
     }
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+    if (!dist_cross_core_wait_map_turn(ctx)) return false;
     CrossMapValue writer_entries[fdwic::cross_core::kExecMaxTensors];
     uint32_t writer_count = 0;
     if (!dist_cross_core_prepare_dependencies(args, ctx, writer_entries, writer_count) ||
-        !dist_cross_core_publish_map_task(ctx, writer_entries, writer_count) ||
-        !dist_cross_core_publish_exec(ctx, args, engine_class, kernel_id, heap)) {
+        !dist_cross_core_publish_map_task(ctx, writer_entries, writer_count)) {
+        return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+    }
+#else
+    if (!dist_cross_core_dag_prepare_dependencies(args, ctx)) {
+        return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+    }
+#endif
+    if (!dist_cross_core_publish_exec(ctx, args, engine_class, kernel_id, heap)) {
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
     return true;
@@ -635,7 +720,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_restore_ticket(
     ctx.self = g_self;
     ctx.task_id = ticket.task_id;
     ctx.payload = ctx.self != nullptr && ticket.task_id >= 0 &&
-                          static_cast<uint32_t>(ticket.task_id) < kFdwicCrossCoreOrdinaryTaskCapacity ?
+                          static_cast<uint32_t>(ticket.task_id) < kFdwicCrossCoreTaskCapacity ?
                       &ctx.self->task_payloads[ticket.task_id & kTaskPayloadMask] :
                       nullptr;
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ticket.task_id)));
@@ -707,4 +792,4 @@ dist_cross_core_alloc_compete_first_finish(const DistCompeteFirstTicket &ticket,
 
 }  // namespace
 
-#endif  // PTO_FDWIC_SCHEDULER_MODE == 1
+#endif  // PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2

@@ -958,7 +958,7 @@ S11 的旧 swimlane ELF 中，QK/PV 含普通 GM/local 输入，公共 DAG 为�
 两类 task 的 Claim→Materialize 平均耗时随历史长度近似线性增长：
 
 | task | 前 1/4 | 第 2/4 | 第 3/4 | 后 1/4 |
-| ---- | ------: | -----: | -----: | -----: |
+| ---- | -----: | -----: | -----: | -----: |
 | QK | `6.46 us` | `12.72 us` | `20.00 us` | `26.01 us` |
 | PV | `6.97 us` | `12.86 us` | `19.64 us` | `26.29 us` |
 
@@ -1110,7 +1110,7 @@ payload；Execute 再从 payload 绑定一次。plain `SharedOutputRef` 也有�
 四种 PA execution payload 的物理形状由公共 layout 精确变为：
 
 | task | reference mask | 旧 payload | 新 payload |
-| ---- | -------------: | ----------: | ----------: |
+| ---- | -------------: | ---------: | ---------: |
 | QK | `0x08` | `592 B / 10 lines` | `472 B / 8 lines` |
 | SF | `0x0f` | `604 B / 10 lines` | `124 B / 2 lines` |
 | PV | `0x09` | `596 B / 10 lines` | `356 B / 6 lines` |
@@ -1600,3 +1600,84 @@ control 发布后才允许 consumer 读取。新增的 state 测试同时锁定�
 
 mode 2 的 2 项 state 测试、6 项 DAG 协议测试通过；mode 1 的 state/register
 共 6 项也回归通过。本阶段仍未让 mode 2 暴露 Submit API。
+
+## 25. 迁入 simpler：接通真实动态 Submit
+
+### 25.1 生产路径不能照搬 standalone 的只读 task plan
+
+standalone 可以按任意历史 task id 从只读 workload plan 重建 writer intent，
+随后以 `(symbol, previous_writer)` history 和 `last_writer` expected CAS 提交
+per-symbol DAG。真实 simpler 的 Submit 参数由编排代码动态生成，runtime 在
+Build `N` 时没有一份可以随机访问的历史 `L0TaskArgs`，也不能把 PA 的五任务
+形状、固定输出槽或 `TaskKind` 写进公共调度层。
+
+本阶段因此先接通一个不依赖算子形状的生产存储方案：唯一 Build owner 在
+Materialize 后，从真实 `register_mask + TensorDesc` 提取当前 task 的 writer
+region，发布到 task-indexed 不可变 metadata cell。reader 按逻辑 task id 从
+`N-1` 反向查询最近重叠 writer；物理上后到的旧 task 不能被先到的未来 task
+覆盖。
+
+这与 standalone 的最终存储形态存在明确差异：
+
+- standalone 保存 per-symbol history，并以 expected CAS 更新可变
+  `last_writer`；
+- 当前生产首版保存每 task 的不可变 writer region，通过逆序扫描求最新前驱；
+- 逆序扫描遇到任意尚未发布的中间 schema 必须返回 `Pending`，不能跳过缺口
+  误选更早 writer；
+- 当前方案已经闭合逻辑 DAG，却还没有证明其 GM 扫描量或性能与 standalone
+  等价，不能用两种 ELF 的绝对时间直接相减得出机制收益。
+
+后续性能收敛可以在不改变公开 Submit 合同的前提下，为 whole-object symbol
+增加紧凑 history/last-writer 索引；ordinary region/view/alias 仍必须保留
+region 重叠语义，不能为了复刻 standalone PA 快路而降格成单 symbol。
+
+### 25.2 动态 Submit 的阶段顺序
+
+`PTO_FDWIC_SCHEDULER_MODE=2` 现已进入与 mode 1 相同的通用动态 Submit 入口，
+但依赖准备阶段使用独立 DAG 协议：
+
+```text
+ReserveExecBuild(task N)
+  -> Materialize fresh outputs，并发布 task-indexed output cell
+  -> 从 register_mask 提取真实 writer region
+  -> 发布 metadata[N]
+  -> INPUT/INOUT 保留 descriptor owner fanin
+  -> 非 manual INPUT/INOUT 逆查 [N-H, N) 的最近重叠 writer
+  -> 合并并去重 explicit dependency
+  -> 发布不可变 SharedExecCell payload / BUILT
+  -> 兼容 Scalar 动态竞争独立 execute_owner
+  -> invalidate、执行、completion 和 DONE
+```
+
+`OUTPUT_EXISTING` 延续当前 runtime 的 write-only existing 合同：它进入 writer
+metadata，但不执行 lookup。fresh `OUTPUT` 的 creator 关系继续由
+`TensorDesc::owner_task_id` 表达，不重复写入 writer metadata。公共算法只读取
+`TensorArgType`、TensorDesc region、manual dependency 和显式依赖，不识别 PA
+task 类型。
+
+mode 1 和 mode 2 共享已经验证的 output、heap、immutable execution cell、动态
+Execute owner 与 completion 协议；两种模式的 metadata state、复位和依赖查询
+保持独立。该复用只覆盖相同的内存合同，不把两种 TensorMap/DAG 算法堆进运行
+时分支；scheduler mode 仍由编译期固定。
+
+### 25.3 已完成验证
+
+本阶段已经完成以下真实路径验证：
+
+- C++：DAG protocol/state 与 ordinary state/register/exec/output/map 共 38 项
+  通过；
+- A5sim：PA B1 通过；overlap subview 与 existing-INOUT dependency smoke 通过；
+- A5：PA B1 通过；PA Case1 B256 通过并与 golden 一致；
+- A5：24-block dependency smoke 通过；
+- mode 1 ABI 回归：重建对应 runtime 后，A5 PA B1 继续通过；
+- Python 构建/缓存合同：相关三组测试共 184 项通过；5 项失败均来自未修改的
+  A2/A3 编译与既有 payload ABI 静态断言，不属于本轮 A5 mode 2 改动面。
+
+CCEC 首次构建暴露两项真实地址空间约束并已修正：不能把 `__gm__` writer entry
+绑定成本地引用，也不能把 GM 中的 `PTO2TaskId` 对象整体复制到 local。最终版
+在 control acquire 和 payload invalidate 后逐字段形成 owner-local 快照，并只
+读取 task id 的 raw 值后解码。
+
+以上证据只说明第二种模式的功能链路已经闭合。`cross_core_dag` 的独立 B256
+性能、泳道开销、与 standalone 的 per-symbol commit 机制差异仍为 `NOT RUN`，
+应在功能提交之后单独测量和优化。
