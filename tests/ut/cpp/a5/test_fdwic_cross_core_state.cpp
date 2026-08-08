@@ -41,7 +41,8 @@ TEST(FdwicCrossCoreOrdinaryState, AppendsWithoutMovingTheExistingSharedState) {
     EXPECT_EQ(offsetof(CrossCoreOrdinaryState, tasks), 128U);
     EXPECT_EQ(offsetof(CrossCoreOrdinaryState, outputs), 128U + 2048U * sizeof(SharedExecCell));
     EXPECT_EQ(
-        sizeof(CrossCoreOrdinaryState), 128U + 2048U * (sizeof(SharedExecCell) + sizeof(CrossCoreOutputCell<Tensor>))
+        sizeof(CrossCoreOrdinaryState),
+        128U + 2048U * (sizeof(SharedExecCell) + sizeof(CrossCoreOutputCell<Tensor>)) + sizeof(CrossCoreTensorMapState)
     );
     EXPECT_EQ(offsetof(DistGlobal, shared_pa), kFdwicSharedTensorMapOffset);
     EXPECT_EQ(offsetof(DistGlobal, cross_core_ordinary), kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState));
@@ -68,6 +69,16 @@ TEST(FdwicCrossCoreOrdinaryState, ResetTouchesOnlyAtomicPublicationControls) {
             sizeof(state->outputs[task].descriptors), kPayloadPattern
         )) << "task="
            << task;
+    }
+    for (uint32_t bucket = 0; bucket < kCrossMapBuckets; ++bucket) {
+        EXPECT_EQ(state->tensor_map.tails[bucket].state, 0) << "bucket=" << bucket;
+    }
+    for (uint32_t slot = 0; slot < kCrossMapCapacity; ++slot) {
+        EXPECT_EQ(state->tensor_map.slots[slot].sequence.state, -1) << "slot=" << slot;
+        EXPECT_TRUE(BytesEqual(
+            &state->tensor_map.slots[slot], offsetof(CrossMapSlot, payload), sizeof(CrossMapPayload), kPayloadPattern
+        )) << "slot="
+           << slot;
     }
 }
 

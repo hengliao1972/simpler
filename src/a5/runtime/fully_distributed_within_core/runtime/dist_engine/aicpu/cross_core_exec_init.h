@@ -24,6 +24,12 @@ inline void dist_cross_core_ordinary_reset(CrossCoreOrdinaryState &state) {
         atomic_exchange(state.tasks[task].control.state, int64_t{0}, __ATOMIC_RELAXED);
         atomic_exchange(state.outputs[task].control.state, int64_t{0}, __ATOMIC_RELAXED);
     }
+    for (uint32_t bucket = 0; bucket < fdwic::cross_core::kCrossMapBuckets; ++bucket) {
+        atomic_exchange(state.tensor_map.tails[bucket].state, int64_t{0}, __ATOMIC_RELAXED);
+    }
+    for (uint32_t slot = 0; slot < fdwic::cross_core::kCrossMapCapacity; ++slot) {
+        atomic_exchange(state.tensor_map.slots[slot].sequence.state, int64_t{-1}, __ATOMIC_RELAXED);
+    }
 }
 #endif
 
