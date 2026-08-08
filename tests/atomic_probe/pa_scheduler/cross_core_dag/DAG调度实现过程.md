@@ -1580,3 +1580,23 @@ CPU 新增 6 项定向测试，覆盖布局隔离、payload-before-control、零
 DCCI、重复/非法发布、最近重叠 writer 和乱序发布缺口；mode 2 的跨镜像构建
 身份 4 项测试也通过。本阶段没有宣称 `cross_core_dag` 已经能运行真实算子，
 下一步才把该协议接入独立 state、AICPU reset 与动态 Submit。
+
+### 24.3 D1：独立 state 与跨镜像复位
+
+`cross_core_ordinary` 已验证的 execution/output/heap/TensorMap 布局抽成
+`CrossCoreRuntimeState` 公共前缀，mode 1 继续以类型别名保持原字段偏移和大小。
+mode 2 新增 `CrossCoreDagState`：公共前缀位于 offset 0，2048 个 DAG metadata
+cell 只追加在尾部。这样第二模式可以复用已通过真机验证的执行包和输出协议，
+又不会把 DAG schema 塞进 mode 1 的内存与 cache 工作集。
+
+AICPU 为 mode 2 增加独立 reset：先清 execution/output/TensorMap 的全部发布
+control，再清每个 metadata control；payload 不做无意义的整块清零，只有新一轮
+control 发布后才允许 consumer 读取。新增的 state 测试同时锁定：
+
+- DAG tail 不移动公共 runtime prefix；
+- `DistGlobal` 仍在预留 arena 容量内；
+- execution owner、task、output、map 和 DAG control 全部复位；
+- 未发布 payload 保留原字节，不能被误当成有效数据。
+
+mode 2 的 2 项 state 测试、6 项 DAG 协议测试通过；mode 1 的 state/register
+共 6 项也回归通过。本阶段仍未让 mode 2 暴露 Submit API。

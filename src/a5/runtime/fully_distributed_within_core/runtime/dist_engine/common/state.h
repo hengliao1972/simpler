@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "dist_engine/common/cross_core_dag_protocol.h"
 #include "dist_engine/common/cross_core_exec_protocol.h"
 #include "dist_engine/common/cross_core_output_protocol.h"
 #include "dist_engine/common/cross_core_tensor_map_protocol.h"
@@ -454,53 +455,71 @@ static_assert(offsetof(SharedPaTensorMapState, insert_completion) % kFdwicShared
 static_assert(sizeof(SharedPaTensorMapState) == 9094784, "shared PA TensorMap sidecar size changed");
 static_assert(alignof(SharedPaTensorMapState) == kCacheLine, "shared PA TensorMap alignment changed");
 
-#if PTO_FDWIC_SCHEDULER_MODE == 1
-// The first production cross-core backend keeps one immutable execution cell
-// per logical task for the entire invocation. It deliberately does not reuse
-// cells yet, so no generation, ABA or payload-reclamation rule is implicit in
-// the initial correctness contract.
-constexpr uint32_t kFdwicCrossCoreOrdinaryTaskCapacity = 2048;
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
+// Scalar cross-core backends keep one immutable execution cell per logical
+// task for the entire invocation. The common prefix owns execution, output,
+// heap and conservative TensorMap contracts; mode-specific state only appends
+// after it, so ordinary and DAG paths can reuse the proven wire protocols.
+constexpr uint32_t kFdwicCrossCoreTaskCapacity = 2048;
+constexpr uint32_t kFdwicCrossCoreOrdinaryTaskCapacity = kFdwicCrossCoreTaskCapacity;
 
-struct alignas(kCacheLine) CrossCoreOrdinaryState {
+struct alignas(kCacheLine) CrossCoreRuntimeState {
     fdwic::cross_core::SharedExecControl fatal;
     fdwic::cross_core::SharedExecControl heap_cursor;
     // Build owner 发布 BUILT 之前，同 engine 的 worker 先在这条
     // task-private cache line 上动态选出唯一 Execute waiter。这使
     // Build/Execute owner 保持解耦，又避免 32/64 核反复轮询
     // SharedExecCell::control 而阻塞 BUILT 发布。
-    fdwic::cross_core::SharedExecControl execute_owner[kFdwicCrossCoreOrdinaryTaskCapacity];
-    fdwic::cross_core::SharedExecCell tasks[kFdwicCrossCoreOrdinaryTaskCapacity];
-    fdwic::cross_core::CrossCoreOutputCell<Tensor> outputs[kFdwicCrossCoreOrdinaryTaskCapacity];
+    fdwic::cross_core::SharedExecControl execute_owner[kFdwicCrossCoreTaskCapacity];
+    fdwic::cross_core::SharedExecCell tasks[kFdwicCrossCoreTaskCapacity];
+    fdwic::cross_core::CrossCoreOutputCell<Tensor> outputs[kFdwicCrossCoreTaskCapacity];
     fdwic::cross_core::CrossCoreTensorMapState tensor_map;
 };
+using CrossCoreOrdinaryState = CrossCoreRuntimeState;
 static_assert(offsetof(CrossCoreOrdinaryState, fatal) == 0);
 static_assert(offsetof(CrossCoreOrdinaryState, heap_cursor) == kCacheLine);
 static_assert(offsetof(CrossCoreOrdinaryState, execute_owner) == 2 * kCacheLine);
 static_assert(
     offsetof(CrossCoreOrdinaryState, tasks) ==
-    2 * kCacheLine + kFdwicCrossCoreOrdinaryTaskCapacity * sizeof(fdwic::cross_core::SharedExecControl)
+    2 * kCacheLine + kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::SharedExecControl)
 );
 static_assert(
     offsetof(CrossCoreOrdinaryState, outputs) ==
     2 * kCacheLine +
-        kFdwicCrossCoreOrdinaryTaskCapacity *
+        kFdwicCrossCoreTaskCapacity *
             (sizeof(fdwic::cross_core::SharedExecControl) + sizeof(fdwic::cross_core::SharedExecCell))
 );
 static_assert(
     offsetof(CrossCoreOrdinaryState, tensor_map) ==
     offsetof(CrossCoreOrdinaryState, outputs) +
-        kFdwicCrossCoreOrdinaryTaskCapacity * sizeof(fdwic::cross_core::CrossCoreOutputCell<Tensor>)
+        kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::CrossCoreOutputCell<Tensor>)
 );
 static_assert(alignof(CrossCoreOrdinaryState) == kCacheLine);
 static_assert(
     sizeof(CrossCoreOrdinaryState) ==
         2 * kCacheLine +
-            kFdwicCrossCoreOrdinaryTaskCapacity *
+            kFdwicCrossCoreTaskCapacity *
                 (sizeof(fdwic::cross_core::SharedExecControl) + sizeof(fdwic::cross_core::SharedExecCell) +
                  sizeof(fdwic::cross_core::CrossCoreOutputCell<Tensor>)) +
             sizeof(fdwic::cross_core::CrossCoreTensorMapState),
     "cross-core ordinary state size changed"
 );
+
+#if PTO_FDWIC_SCHEDULER_MODE == 2
+struct alignas(kCacheLine) CrossCoreDagState {
+    CrossCoreRuntimeState runtime;
+    fdwic::cross_core::DagTaskMetadataCell metadata[kFdwicCrossCoreTaskCapacity];
+};
+static_assert(offsetof(CrossCoreDagState, runtime) == 0);
+static_assert(offsetof(CrossCoreDagState, metadata) == sizeof(CrossCoreRuntimeState));
+static_assert(alignof(CrossCoreDagState) == kCacheLine);
+static_assert(
+    sizeof(CrossCoreDagState) ==
+        sizeof(CrossCoreRuntimeState) +
+            kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::DagTaskMetadataCell),
+    "cross-core DAG state size changed"
+);
+#endif
 #endif
 
 struct DistTaskCell {
@@ -592,6 +611,8 @@ struct DistGlobal {
     SharedPaTensorMapState shared_pa;
 #if PTO_FDWIC_SCHEDULER_MODE == 1
     CrossCoreOrdinaryState cross_core_ordinary;
+#elif PTO_FDWIC_SCHEDULER_MODE == 2
+    CrossCoreDagState cross_core_dag;
 #endif
 #endif
 };
@@ -628,6 +649,15 @@ static_assert(
 static_assert(
     sizeof(DistGlobal) == kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState) + sizeof(CrossCoreOrdinaryState),
     "cross-core ordinary DistGlobal size changed"
+);
+#elif PTO_FDWIC_SCHEDULER_MODE == 2
+static_assert(
+    offsetof(DistGlobal, cross_core_dag) == kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState),
+    "cross-core DAG state must append after the existing shared TensorMap state"
+);
+static_assert(
+    sizeof(DistGlobal) == kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState) + sizeof(CrossCoreDagState),
+    "cross-core DAG DistGlobal size changed"
 );
 #else
 static_assert(

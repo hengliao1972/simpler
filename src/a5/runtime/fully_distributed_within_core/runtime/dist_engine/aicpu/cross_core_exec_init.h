@@ -16,8 +16,8 @@
 
 namespace {
 
-#if PTO_FDWIC_SCHEDULER_MODE == 1
-inline void dist_cross_core_ordinary_reset(CrossCoreOrdinaryState &state) {
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
+inline void dist_cross_core_runtime_reset(CrossCoreRuntimeState &state) {
     atomic_exchange(state.fatal.state, int64_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(state.heap_cursor.state, int64_t{0}, __ATOMIC_RELAXED);
     for (uint32_t task = 0; task < kFdwicCrossCoreOrdinaryTaskCapacity; ++task) {
@@ -32,6 +32,17 @@ inline void dist_cross_core_ordinary_reset(CrossCoreOrdinaryState &state) {
         atomic_exchange(state.tensor_map.slots[slot].sequence.state, int64_t{-1}, __ATOMIC_RELAXED);
     }
 }
+
+#if PTO_FDWIC_SCHEDULER_MODE == 1
+inline void dist_cross_core_ordinary_reset(CrossCoreOrdinaryState &state) { dist_cross_core_runtime_reset(state); }
+#else
+inline void dist_cross_core_dag_reset(CrossCoreDagState &state) {
+    dist_cross_core_runtime_reset(state.runtime);
+    for (uint32_t task = 0; task < kFdwicCrossCoreTaskCapacity; ++task) {
+        atomic_exchange(state.metadata[task].control.state, int64_t{0}, __ATOMIC_RELAXED);
+    }
+}
+#endif
 #endif
 
 }  // namespace

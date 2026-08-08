@@ -148,6 +148,8 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
     dist_shared_pa_tensor_map_reset(g_dist.shared_pa);
 #elif PTO_FDWIC_SCHEDULER_MODE == 1
     dist_cross_core_ordinary_reset(g_dist.cross_core_ordinary);
+#elif PTO_FDWIC_SCHEDULER_MODE == 2
+    dist_cross_core_dag_reset(g_dist.cross_core_dag);
 #endif
 #endif
     g_dist.orch_args = orch_args;
