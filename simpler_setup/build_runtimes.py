@@ -41,6 +41,11 @@ _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root))
 sys.path.insert(0, str(_project_root / "python"))
 
+from simpler_setup.fdwic_build_config import (  # noqa: E402
+    FDWIC_SCHEDULER_MODE_SAME_CORE,
+    FDWIC_SCHEDULER_MODES,
+    normalize_fdwic_scheduler_mode,
+)
 from simpler_setup.platform_info import PROJECT_ROOT, discover_runtimes, parse_platform  # noqa: E402
 from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: E402
 from simpler_setup.sanitizers import SANITIZER_PRESETS, resolve, validate  # noqa: E402
@@ -80,13 +85,31 @@ def _normalize_fdwic_tensormap_modes(modes: Optional[list[str]]) -> tuple[str, .
     return tuple(normalized)
 
 
+def _normalize_fdwic_scheduler_modes(modes: Optional[list[str]]) -> tuple[str, ...]:
+    """Validate and de-duplicate explicitly requested scheduler backends."""
+
+    requested = [FDWIC_SCHEDULER_MODE_SAME_CORE] if modes is None else modes
+    if isinstance(requested, str):
+        raise ValueError("fdwic_scheduler_modes must be a list of scheduler mode values")
+    normalized: list[str] = []
+    for raw_mode in requested:
+        mode = normalize_fdwic_scheduler_mode(raw_mode)
+        if mode not in normalized:
+            normalized.append(mode)
+    if not normalized:
+        raise ValueError("fdwic_scheduler_modes must contain at least one mode")
+    return tuple(normalized)
+
+
 def _collect_runtime_build_tasks(
     platforms: list[str],
     fdwic_tensormap_modes: Optional[list[str]],
-) -> list[tuple[str, str, str]]:
-    """Collect builds while applying TensorMap mode only to A5 FDWIC."""
-    tasks: list[tuple[str, str, str]] = []
+    fdwic_scheduler_modes: Optional[list[str]] = None,
+) -> list[tuple[str, str, str, str]]:
+    """Collect valid TensorMap/scheduler build identities for A5 FDWIC."""
+    tasks: list[tuple[str, str, str, str]] = []
     selected_fdwic_modes: Optional[tuple[str, ...]] = None
+    selected_scheduler_modes: Optional[tuple[str, ...]] = None
     for platform in platforms:
         arch, _ = parse_platform(platform)
         runtimes = discover_runtimes(arch)
@@ -99,9 +122,19 @@ def _collect_runtime_build_tasks(
             if arch == "a5" and runtime_name == _FDWIC_RUNTIME:
                 if selected_fdwic_modes is None:
                     selected_fdwic_modes = _normalize_fdwic_tensormap_modes(fdwic_tensormap_modes)
-                tasks.extend((platform, runtime_name, mode) for mode in selected_fdwic_modes)
+                if selected_scheduler_modes is None:
+                    selected_scheduler_modes = _normalize_fdwic_scheduler_modes(fdwic_scheduler_modes)
+                valid_pairs = [
+                    (tensormap_mode, scheduler_mode)
+                    for tensormap_mode in selected_fdwic_modes
+                    for scheduler_mode in selected_scheduler_modes
+                    if tensormap_mode == "shared" or scheduler_mode == FDWIC_SCHEDULER_MODE_SAME_CORE
+                ]
+                if not valid_pairs:
+                    raise ValueError("non-same-core FDWIC scheduler modes require TensorMap mode 'shared'")
+                tasks.extend((platform, runtime_name, tm, scheduler) for tm, scheduler in valid_pairs)
             else:
-                tasks.append((platform, runtime_name, "private"))
+                tasks.append((platform, runtime_name, "private", FDWIC_SCHEDULER_MODE_SAME_CORE))
     return tasks
 
 
@@ -141,6 +174,7 @@ def build_all(
     sanitizer: str = "none",
     pto_isa_commit: Optional[str] = None,
     fdwic_tensormap_modes: Optional[list[str]] = None,
+    fdwic_scheduler_modes: Optional[list[str]] = None,
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -161,6 +195,9 @@ def build_all(
             defaults to ``private``. Passing ``["private", "shared"]`` builds
             both isolated artifact families. This selection applies only to the A5
             ``fully_distributed_within_core`` runtime.
+        fdwic_scheduler_modes: Scheduler backends to pre-build. ``None``
+            defaults to ``same_core``. Non-same-core modes are emitted only
+            for a selected shared TensorMap family.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -210,7 +247,11 @@ def build_all(
     if platforms:
         logger.info("Building simpler_log (process-global)...")
         try:
-            RuntimeBuilder(platform=platforms[0], fdwic_tensormap_mode="private").ensure_simpler_log(build=True)
+            RuntimeBuilder(
+                platform=platforms[0],
+                fdwic_tensormap_mode="private",
+                fdwic_scheduler_mode=FDWIC_SCHEDULER_MODE_SAME_CORE,
+            ).ensure_simpler_log(build=True)
         except Exception as e:
             logger.error(f"Failed to build simpler_log: {e}")
             raise
@@ -219,7 +260,11 @@ def build_all(
         if sim_platforms:
             logger.info("Building cpu_sim_context (process-global)...")
             try:
-                RuntimeBuilder(platform=sim_platforms[0], fdwic_tensormap_mode="private").ensure_sim_context(build=True)
+                RuntimeBuilder(
+                    platform=sim_platforms[0],
+                    fdwic_tensormap_mode="private",
+                    fdwic_scheduler_mode=FDWIC_SCHEDULER_MODE_SAME_CORE,
+                ).ensure_sim_context(build=True)
             except Exception as e:
                 logger.error(f"Failed to build cpu_sim_context: {e}")
                 raise
@@ -227,27 +272,45 @@ def build_all(
     # Collect all (platform, runtime_name, FDWIC mode) tasks to run in
     # parallel. Non-FDWIC tasks always receive an explicit private identity,
     # so a shell-wide shared setting cannot leak into an unrelated builder.
-    tasks = _collect_runtime_build_tasks(platforms, fdwic_tensormap_modes)
+    tasks = _collect_runtime_build_tasks(platforms, fdwic_tensormap_modes, fdwic_scheduler_modes)
 
-    def _build_runtime(platform: str, runtime_name: str, fdwic_tensormap_mode: str) -> None:
+    def _build_runtime(
+        platform: str,
+        runtime_name: str,
+        fdwic_tensormap_mode: str,
+        fdwic_scheduler_mode: str,
+    ) -> None:
         try:
-            builder = RuntimeBuilder(platform=platform, fdwic_tensormap_mode=fdwic_tensormap_mode)
+            builder = RuntimeBuilder(
+                platform=platform,
+                fdwic_tensormap_mode=fdwic_tensormap_mode,
+                fdwic_scheduler_mode=fdwic_scheduler_mode,
+            )
         except (ValueError, FileNotFoundError) as e:
             logger.warning(f"  {platform}: cannot initialize builder: {e}")
             return
 
-        mode_suffix = f"/{fdwic_tensormap_mode}" if _is_a5_fdwic(platform, runtime_name) else ""
+        mode_suffix = (
+            f"/{fdwic_tensormap_mode}/{fdwic_scheduler_mode}" if _is_a5_fdwic(platform, runtime_name) else ""
+        )
         logger.info(f"  Building {platform}/{runtime_name}{mode_suffix}...")
         builder.get_binaries(runtime_name, build=True)
 
     with ThreadPoolExecutor(max_workers=len(tasks) or 1) as executor:
-        futures = {executor.submit(_build_runtime, p, r, m): (p, r, m) for p, r, m in tasks}
+        futures = {
+            executor.submit(_build_runtime, p, r, tm, scheduler): (p, r, tm, scheduler)
+            for p, r, tm, scheduler in tasks
+        }
         for future in as_completed(futures):
-            platform, runtime_name, fdwic_tensormap_mode = futures[future]
+            platform, runtime_name, fdwic_tensormap_mode, fdwic_scheduler_mode = futures[future]
             try:
                 future.result()
             except Exception as e:
-                mode_suffix = f"/{fdwic_tensormap_mode}" if _is_a5_fdwic(platform, runtime_name) else ""
+                mode_suffix = (
+                    f"/{fdwic_tensormap_mode}/{fdwic_scheduler_mode}"
+                    if _is_a5_fdwic(platform, runtime_name)
+                    else ""
+                )
                 logger.error(f"  Failed to build {platform}/{runtime_name}{mode_suffix}: {e}")
                 executor.shutdown(wait=True, cancel_futures=True)
                 raise
@@ -326,6 +389,17 @@ def main():
             "The choice applies only to A5 fully_distributed_within_core."
         ),
     )
+    parser.add_argument(
+        "--fdwic-scheduler-mode",
+        dest="fdwic_scheduler_modes",
+        action="append",
+        choices=FDWIC_SCHEDULER_MODES,
+        default=None,
+        help=(
+            "FDWIC scheduler backend to pre-build. Repeat to build several. "
+            "If omitted, build same_core. Non-same-core modes require a shared TensorMap selection."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -353,6 +427,7 @@ def main():
         sanitizer=args.sanitizer,
         pto_isa_commit=args.pto_isa_commit,
         fdwic_tensormap_modes=args.fdwic_tensormap_modes,
+        fdwic_scheduler_modes=args.fdwic_scheduler_modes,
     )
 
 

@@ -52,6 +52,11 @@ if sys.platform == "darwin":
 import pytest  # noqa: E402
 
 from simpler_setup import parallel_scheduler as _ps  # noqa: E402
+from simpler_setup.fdwic_build_config import (  # noqa: E402
+    FDWIC_SCHEDULER_MODE_ENV,
+    FDWIC_SCHEDULER_MODE_SAME_CORE,
+    FDWIC_SCHEDULER_MODES,
+)
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, configure_logging  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
 from simpler_setup.scene_test import clear_compile_cache  # noqa: E402
@@ -156,6 +161,13 @@ def pytest_addoption(parser):
         default="private",
         help="Select the compile-time TensorMap artifact family for the a5/a5sim "
         "fully_distributed_within_core runtime. The default is private.",
+    )
+    parser.addoption(
+        "--fdwic-scheduler-mode",
+        action="store",
+        choices=FDWIC_SCHEDULER_MODES,
+        default=FDWIC_SCHEDULER_MODE_SAME_CORE,
+        help="Select the compile-time scheduler backend for A5 fully_distributed_within_core.",
     )
     parser.addoption(
         "--fdwic-profile",
@@ -561,6 +573,31 @@ def _configure_fdwic_tensormap(config):
     os.environ["PTO_FDWIC_TENSORMAP_MODE"] = mode
 
 
+def _configure_fdwic_scheduler(config):
+    """Validate and publish the explicit FDWIC scheduler artifact family."""
+
+    mode = config.getoption("--fdwic-scheduler-mode", default=FDWIC_SCHEDULER_MODE_SAME_CORE)
+    if mode == FDWIC_SCHEDULER_MODE_SAME_CORE:
+        os.environ.pop(FDWIC_SCHEDULER_MODE_ENV, None)
+        return
+    if mode not in FDWIC_SCHEDULER_MODES:
+        raise pytest.UsageError(f"unsupported --fdwic-scheduler-mode {mode!r}")
+    if config.getoption("--fdwic-tensormap", default="private") != "shared":
+        raise pytest.UsageError(f"--fdwic-scheduler-mode {mode} requires --fdwic-tensormap shared")
+    platform = config.getoption("--platform", default=None)
+    runtime = config.getoption("--runtime", default=None)
+    level = config.getoption("--level", default=None)
+    if platform not in {"a5", "a5sim"}:
+        raise pytest.UsageError(f"--fdwic-scheduler-mode {mode} requires --platform a5 or a5sim")
+    if runtime not in {None, "fully_distributed_within_core"}:
+        raise pytest.UsageError(
+            f"--fdwic-scheduler-mode {mode} only supports runtime fully_distributed_within_core"
+        )
+    if level not in {None, 2}:
+        raise pytest.UsageError(f"--fdwic-scheduler-mode {mode} only supports SceneTest level 2")
+    os.environ[FDWIC_SCHEDULER_MODE_ENV] = mode
+
+
 def pytest_configure(config):
     """Register custom markers and apply global config."""
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
@@ -574,6 +611,7 @@ def pytest_configure(config):
 
     _configure_sanitizer(config)
     _configure_fdwic_tensormap(config)
+    _configure_fdwic_scheduler(config)
     _configure_fdwic_profile(config)
 
     # Configure logging unconditionally (not only when --log-level is passed) so
@@ -1462,6 +1500,7 @@ def _fdwic_worker_build_config(cls, platform, runtime):
         return {}, ""
 
     from simpler_setup.scene_test import (  # noqa: PLC0415
+        _fdwic_scheduler_mode,
         _fdwic_tensormap_mode,
         get_aicore_path_override,
     )
@@ -1469,8 +1508,12 @@ def _fdwic_worker_build_config(cls, platform, runtime):
     cache_key = (cls.__qualname__, platform, runtime)
     cls.compile_chip_callable(platform)
     tensormap_mode = _fdwic_tensormap_mode()
-    kwargs = {"fdwic_tensormap_mode": tensormap_mode}
-    pool_token = f"{tensormap_mode}:"
+    scheduler_mode = _fdwic_scheduler_mode()
+    kwargs = {
+        "fdwic_tensormap_mode": tensormap_mode,
+        "fdwic_scheduler_mode": scheduler_mode,
+    }
+    pool_token = f"{tensormap_mode}:{scheduler_mode}:"
     aicore_override = get_aicore_path_override(cache_key)
     if aicore_override is not None:
         aicore_override = aicore_override.resolve()

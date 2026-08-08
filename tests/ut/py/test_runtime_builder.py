@@ -190,6 +190,75 @@ class TestFdwicTensorMapMode:
             builder.get_binaries("host_build_graph")
 
 
+class TestFdwicSchedulerMode:
+    """FDWIC scheduler backends are compile-time, artifact-isolated identities."""
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_defaults_to_same_core_and_reads_environment(self, MockCompiler, monkeypatch):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        monkeypatch.delenv("PTO_FDWIC_SCHEDULER_MODE", raising=False)
+        assert RuntimeBuilder(platform="a5").fdwic_scheduler_mode == "same_core"
+
+        monkeypatch.setenv("PTO_FDWIC_SCHEDULER_MODE", "cross_core_ordinary")
+        assert (
+            RuntimeBuilder(platform="a5sim", fdwic_tensormap_mode="shared").fdwic_scheduler_mode
+            == "cross_core_ordinary"
+        )
+        assert (
+            RuntimeBuilder(
+                platform="a5",
+                fdwic_tensormap_mode="shared",
+                fdwic_scheduler_mode="cross_core_dag",
+            ).fdwic_scheduler_mode
+            == "cross_core_dag"
+        )
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    @pytest.mark.parametrize("mode", ["", "cross-core", "unknown"])
+    def test_rejects_invalid_scheduler_mode(self, MockCompiler, mode):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        with pytest.raises(ValueError, match="Invalid FDWIC scheduler mode"):
+            RuntimeBuilder(platform="a5", fdwic_tensormap_mode="shared", fdwic_scheduler_mode=mode)
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "cross_core_ordinary",
+            "cross_core_dag",
+            "simt_cross_core_ordinary",
+            "simt_cross_core_dag",
+        ],
+    )
+    def test_non_same_core_requires_shared_tensormap(self, MockCompiler, mode):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        with pytest.raises(ValueError, match="requires FDWIC TensorMap mode 'shared'"):
+            RuntimeBuilder(platform="a5", fdwic_tensormap_mode="private", fdwic_scheduler_mode=mode)
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_scheduler_partitions_artifact_path_and_compile_identity(self, MockCompiler, tmp_path):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        builder = RuntimeBuilder(
+            platform="a5",
+            fdwic_tensormap_mode="shared",
+            fdwic_scheduler_mode="cross_core_ordinary",
+        )
+        runtime = "fully_distributed_within_core"
+
+        assert builder._runtime_artifact_dir(tmp_path, runtime) == (
+            tmp_path / "a5" / "onboard" / runtime / "shared" / "cross_core_ordinary"
+        )
+        assert builder.effective_compile_definitions(runtime) == [
+            "PTO_FDWIC_SHARED_MAP=1",
+            "PTO_FDWIC_TENSORMAP_RING_CAP=128",
+            "PTO_FDWIC_SCHEDULER_MODE=1",
+        ]
+
+
 class TestRuntimeBuilderPtoIsaValidation:
     """Test PTO-ISA compatibility validation is scoped to affected runtimes."""
 
@@ -373,7 +442,7 @@ class TestRuntimeBuilderGetBinaries:
         ]
         assert len(runtime_calls) == 3
         assert {tuple(call.kwargs["compile_definitions"]) for call in runtime_calls} == {
-            ("PTO_FDWIC_SHARED_MAP=1", "PTO_FDWIC_TENSORMAP_RING_CAP=128")
+            ("PTO_FDWIC_SHARED_MAP=1", "PTO_FDWIC_TENSORMAP_RING_CAP=128", "PTO_FDWIC_SCHEDULER_MODE=0")
         }
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
@@ -414,23 +483,27 @@ class TestRuntimeBuilderGetBinaries:
             RuntimeBuilder(platform="a5", fdwic_tensormap_mode=mode).get_binaries(runtime, build=True)
 
         private_calls = [
-            call for call in mock_instance.compile.call_args_list if Path(call.kwargs["output_dir"]).name == "private"
+            call
+            for call in mock_instance.compile.call_args_list
+            if Path(call.kwargs["output_dir"]).parent.name == "private"
         ]
         shared_calls = [
-            call for call in mock_instance.compile.call_args_list if Path(call.kwargs["output_dir"]).name == "shared"
+            call
+            for call in mock_instance.compile.call_args_list
+            if Path(call.kwargs["output_dir"]).parent.name == "shared"
         ]
         assert len(private_calls) == len(shared_calls) == 3
         assert {Path(call.kwargs["build_dir"]) for call in private_calls} == {
-            tmp_path / "build" / "cache" / "a5" / "onboard" / runtime / "private"
+            tmp_path / "build" / "cache" / "a5" / "onboard" / runtime / "private" / "same_core"
         }
         assert {Path(call.kwargs["build_dir"]) for call in shared_calls} == {
-            tmp_path / "build" / "cache" / "a5" / "onboard" / runtime / "shared"
+            tmp_path / "build" / "cache" / "a5" / "onboard" / runtime / "shared" / "same_core"
         }
         assert {tuple(call.kwargs["compile_definitions"]) for call in private_calls} == {
-            ("PTO_FDWIC_SHARED_MAP=0", "PTO_FDWIC_TENSORMAP_RING_CAP=128")
+            ("PTO_FDWIC_SHARED_MAP=0", "PTO_FDWIC_TENSORMAP_RING_CAP=128", "PTO_FDWIC_SCHEDULER_MODE=0")
         }
         assert {tuple(call.kwargs["compile_definitions"]) for call in shared_calls} == {
-            ("PTO_FDWIC_SHARED_MAP=1", "PTO_FDWIC_TENSORMAP_RING_CAP=128")
+            ("PTO_FDWIC_SHARED_MAP=1", "PTO_FDWIC_TENSORMAP_RING_CAP=128", "PTO_FDWIC_SCHEDULER_MODE=0")
         }
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
@@ -513,14 +586,24 @@ class TestFdwicAicoreExtraBuild:
         )
 
         call = mock_instance.compile.call_args
-        expected_root = tmp_path / "build" / "lib" / "a5" / "onboard" / runtime / "shared"
+        expected_root = tmp_path / "build" / "lib" / "a5" / "onboard" / runtime / "shared" / "same_core"
         assert result == expected_root / "aicore-extra" / "callable-key" / "aicore.o"
         assert Path(call.kwargs["build_dir"]) == (
-            tmp_path / "build" / "cache" / "a5" / "onboard" / runtime / "shared" / "aicore-extra" / "callable-key"
+            tmp_path
+            / "build"
+            / "cache"
+            / "a5"
+            / "onboard"
+            / runtime
+            / "shared"
+            / "same_core"
+            / "aicore-extra"
+            / "callable-key"
         )
         assert call.kwargs["compile_definitions"] == [
             "PTO_FDWIC_SHARED_MAP=1",
             "PTO_FDWIC_TENSORMAP_RING_CAP=128",
+            "PTO_FDWIC_SCHEDULER_MODE=0",
             "PTO_FDWIC_PERF_CLOCK=1",
             "PTO_FDWIC_TRACE_ENABLED=0",
         ]

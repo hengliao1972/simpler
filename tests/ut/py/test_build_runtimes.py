@@ -26,11 +26,11 @@ def test_shared_environment_does_not_change_install_default(monkeypatch):
     tasks = build_runtimes._collect_runtime_build_tasks(["a2a3sim", "a5sim"], None)
 
     assert tasks == [
-        ("a2a3sim", "fully_distributed_within_core", "private"),
-        ("a2a3sim", "host_build_graph", "private"),
-        ("a2a3sim", "tensormap_and_ringbuffer", "private"),
-        ("a5sim", "fully_distributed_within_core", "private"),
-        ("a5sim", "host_build_graph", "private"),
+        ("a2a3sim", "fully_distributed_within_core", "private", "same_core"),
+        ("a2a3sim", "host_build_graph", "private", "same_core"),
+        ("a2a3sim", "tensormap_and_ringbuffer", "private", "same_core"),
+        ("a5sim", "fully_distributed_within_core", "private", "same_core"),
+        ("a5sim", "host_build_graph", "private", "same_core"),
     ]
 
 
@@ -50,10 +50,32 @@ def test_explicit_modes_collect_both_fdwic_artifact_families_once(monkeypatch):
     )
 
     assert tasks == [
-        ("a5sim", "fully_distributed_within_core", "private"),
-        ("a5sim", "fully_distributed_within_core", "shared"),
-        ("a5sim", "host_build_graph", "private"),
+        ("a5sim", "fully_distributed_within_core", "private", "same_core"),
+        ("a5sim", "fully_distributed_within_core", "shared", "same_core"),
+        ("a5sim", "host_build_graph", "private", "same_core"),
     ]
+
+
+def test_non_same_core_build_tasks_only_emit_shared_identity(monkeypatch):
+    from simpler_setup import build_runtimes  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        build_runtimes,
+        "discover_runtimes",
+        lambda _arch: ["fully_distributed_within_core"],
+    )
+
+    assert build_runtimes._collect_runtime_build_tasks(
+        ["a5sim"],
+        ["private", "shared"],
+        ["cross_core_ordinary"],
+    ) == [("a5sim", "fully_distributed_within_core", "shared", "cross_core_ordinary")]
+    with pytest.raises(ValueError, match="require TensorMap mode 'shared'"):
+        build_runtimes._collect_runtime_build_tasks(
+            ["a5sim"],
+            ["private"],
+            ["cross_core_ordinary"],
+        )
 
 
 @pytest.mark.parametrize("modes", [[], ["typo"], "shared"])
@@ -73,18 +95,19 @@ def test_build_all_passes_mode_only_to_matching_runtime(tmp_path, monkeypatch):
         _LIB_DIR = None
         _CACHE_DIR = None
 
-        def __init__(self, platform, fdwic_tensormap_mode):
+        def __init__(self, platform, fdwic_tensormap_mode, fdwic_scheduler_mode):
             self.platform = platform
             self.mode = fdwic_tensormap_mode
+            self.scheduler = fdwic_scheduler_mode
 
         def ensure_simpler_log(self, build):
-            calls.append(("simpler_log", self.platform, self.mode, build))
+            calls.append(("simpler_log", self.platform, self.mode, self.scheduler, build))
 
         def ensure_sim_context(self, build):
-            calls.append(("sim_context", self.platform, self.mode, build))
+            calls.append(("sim_context", self.platform, self.mode, self.scheduler, build))
 
         def get_binaries(self, runtime_name, build):
-            calls.append((runtime_name, self.platform, self.mode, build))
+            calls.append((runtime_name, self.platform, self.mode, self.scheduler, build))
 
     monkeypatch.setattr(build_runtimes, "RuntimeBuilder", _FakeRuntimeBuilder)
     monkeypatch.setattr(
@@ -101,11 +124,11 @@ def test_build_all_passes_mode_only_to_matching_runtime(tmp_path, monkeypatch):
         fdwic_tensormap_modes=["private", "shared"],
     )
 
-    assert ("fully_distributed_within_core", "a5sim", "private", True) in calls
-    assert ("fully_distributed_within_core", "a5sim", "shared", True) in calls
-    assert calls.count(("host_build_graph", "a5sim", "private", True)) == 1
-    assert ("simpler_log", "a5sim", "private", True) in calls
-    assert ("sim_context", "a5sim", "private", True) in calls
+    assert ("fully_distributed_within_core", "a5sim", "private", "same_core", True) in calls
+    assert ("fully_distributed_within_core", "a5sim", "shared", "same_core", True) in calls
+    assert calls.count(("host_build_graph", "a5sim", "private", "same_core", True)) == 1
+    assert ("simpler_log", "a5sim", "private", "same_core", True) in calls
+    assert ("sim_context", "a5sim", "private", "same_core", True) in calls
 
 
 def test_cli_forwards_repeatable_fdwic_modes(tmp_path, monkeypatch):
@@ -128,6 +151,8 @@ def test_cli_forwards_repeatable_fdwic_modes(tmp_path, monkeypatch):
             "private",
             "--fdwic-tensormap",
             "shared",
+            "--fdwic-scheduler-mode",
+            "cross_core_dag",
         ],
     )
 
@@ -135,3 +160,4 @@ def test_cli_forwards_repeatable_fdwic_modes(tmp_path, monkeypatch):
 
     assert observed["platforms"] == ["a5sim"]
     assert observed["fdwic_tensormap_modes"] == ["private", "shared"]
+    assert observed["fdwic_scheduler_modes"] == ["cross_core_dag"]

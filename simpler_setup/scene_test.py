@@ -35,7 +35,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from .fdwic_build_config import fdwic_tensormap_ring_cap_definition
+from .fdwic_build_config import (
+    FDWIC_SCHEDULER_MODE_ENV,
+    FDWIC_SCHEDULER_MODE_SAME_CORE,
+    FDWIC_SCHEDULER_MODES,
+    fdwic_scheduler_mode_definition,
+    fdwic_tensormap_ring_cap_definition,
+    normalize_fdwic_scheduler_mode,
+)
 from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
 from .pto_isa import ensure_pto_isa_root
 
@@ -105,6 +112,31 @@ def _fdwic_tensormap_mode() -> str:
     return mode
 
 
+def _fdwic_scheduler_mode() -> str:
+    """Return the scheduler backend selected for this compile/run identity."""
+
+    raw_mode = os.environ.get(FDWIC_SCHEDULER_MODE_ENV, FDWIC_SCHEDULER_MODE_SAME_CORE)
+    try:
+        return normalize_fdwic_scheduler_mode(raw_mode or FDWIC_SCHEDULER_MODE_SAME_CORE)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported {FDWIC_SCHEDULER_MODE_ENV}={raw_mode!r}") from exc
+
+
+def _fdwic_scheduler_compile_definition(platform: str, runtime: str) -> str | None:
+    """Return the scheduler macro for a mode-aware translation unit."""
+
+    mode = _fdwic_scheduler_mode()
+    is_fdwic = platform in {"a5", "a5sim"} and runtime == "fully_distributed_within_core"
+    if mode != FDWIC_SCHEDULER_MODE_SAME_CORE and not is_fdwic:
+        raise ValueError(
+            f"{FDWIC_SCHEDULER_MODE_ENV}={mode} is only supported by "
+            "the a5/a5sim fully_distributed_within_core runtime"
+        )
+    if mode != FDWIC_SCHEDULER_MODE_SAME_CORE and _fdwic_tensormap_mode() != _FDWIC_TENSORMAP_SHARED:
+        raise ValueError(f"{FDWIC_SCHEDULER_MODE_ENV}={mode} requires {_FDWIC_TENSORMAP_MODE_ENV}=shared")
+    return fdwic_scheduler_mode_definition(mode) if is_fdwic else None
+
+
 def _validate_fdwic_tensormap_test_classes(mode: str, selected_by_cls) -> None:
     """Reject every shared selection outside the explicitly supported PA cases."""
     if mode != _FDWIC_TENSORMAP_SHARED:
@@ -143,10 +175,14 @@ def _fdwic_tensormap_compile_definitions(platform: str, runtime: str) -> list[st
         )
     if not is_fdwic:
         return None
-    return [
+    definitions = [
         f"PTO_FDWIC_SHARED_MAP={1 if mode == _FDWIC_TENSORMAP_SHARED else 0}",
         fdwic_tensormap_ring_cap_definition(),
     ]
+    scheduler_definition = _fdwic_scheduler_compile_definition(platform, runtime)
+    if scheduler_definition is not None:
+        definitions.append(scheduler_definition)
+    return definitions
 
 
 def _fdwic_profile() -> str:
@@ -245,7 +281,7 @@ def _fdwic_compile_definitions(profile: str) -> list[str] | None:
 
 def _profiled_cache_key(cache_key) -> tuple[Any, ...]:
     base = cache_key if isinstance(cache_key, tuple) else (cache_key,)
-    return (*base, _fdwic_tensormap_mode(), _fdwic_profile())
+    return (*base, _fdwic_tensormap_mode(), _fdwic_scheduler_mode(), _fdwic_profile())
 
 
 def clear_compile_cache() -> None:
@@ -587,7 +623,11 @@ def maybe_build_aicore_override(
         # bodies; the AIV orchestration translation unit is intentionally empty.
         # The runtime dispatches to two distinct role entry symbols after attach.
         compile_definitions.append("PTO_FDWIC_SHARED_PA_UNITY=1")
-    builder = RuntimeBuilder(platform, fdwic_tensormap_mode=tensormap_mode)
+    builder = RuntimeBuilder(
+        platform,
+        fdwic_tensormap_mode=tensormap_mode,
+        fdwic_scheduler_mode=_fdwic_scheduler_mode(),
+    )
     binary = builder.build_aicore_with_extra_sources(
         runtime,
         source_paths,
@@ -1957,7 +1997,10 @@ class SceneTestCase:
         cache_key = (cls.__qualname__, platform, cls._st_runtime)
         cls.compile_chip_callable(platform)
         aicore_override = get_aicore_path_override(cache_key)
-        kwargs = {"fdwic_tensormap_mode": _fdwic_tensormap_mode()}
+        kwargs = {
+            "fdwic_tensormap_mode": _fdwic_tensormap_mode(),
+            "fdwic_scheduler_mode": _fdwic_scheduler_mode(),
+        }
         if aicore_override is not None:
             kwargs["aicore_path_override"] = aicore_override
         w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime, **kwargs)
@@ -2431,6 +2474,12 @@ class SceneTestCase:
             "a5/a5sim fully_distributed_within_core runtime.",
         )
         parser.add_argument(
+            "--fdwic-scheduler-mode",
+            choices=FDWIC_SCHEDULER_MODES,
+            default=FDWIC_SCHEDULER_MODE_SAME_CORE,
+            help="Select the compile-time FDWIC scheduler backend.",
+        )
+        parser.add_argument(
             "-d",
             "--device",
             type=str,
@@ -2570,6 +2619,14 @@ class SceneTestCase:
             os.environ[_FDWIC_TENSORMAP_MODE_ENV] = _FDWIC_TENSORMAP_SHARED
         else:
             os.environ.pop(_FDWIC_TENSORMAP_MODE_ENV, None)
+        if args.fdwic_scheduler_mode != FDWIC_SCHEDULER_MODE_SAME_CORE:
+            if args.fdwic_tensormap != _FDWIC_TENSORMAP_SHARED:
+                parser.error("non-same-core --fdwic-scheduler-mode requires --fdwic-tensormap shared")
+            if args.platform not in {"a5", "a5sim"}:
+                parser.error("non-same-core --fdwic-scheduler-mode requires -p a5 or a5sim")
+            os.environ[FDWIC_SCHEDULER_MODE_ENV] = args.fdwic_scheduler_mode
+        else:
+            os.environ.pop(FDWIC_SCHEDULER_MODE_ENV, None)
 
         # Match the per-test kernel/orchestration compile to the runtime's
         # sanitizer, and require the runtime preloaded — same as conftest, since
@@ -2777,6 +2834,8 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
     common = ["-p", args.platform, "--manual", args.manual, "--log-level", args.log_level]
     if args.fdwic_tensormap != "private":
         common += ["--fdwic-tensormap", args.fdwic_tensormap]
+    if args.fdwic_scheduler_mode != FDWIC_SCHEDULER_MODE_SAME_CORE:
+        common += ["--fdwic-scheduler-mode", args.fdwic_scheduler_mode]
     if args.sanitizer != "none":
         common += ["--sanitizer", args.sanitizer]
     if args.rounds != 1:

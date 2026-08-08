@@ -19,7 +19,13 @@ from pathlib import Path
 from typing import Optional
 
 from .environment import PROJECT_ROOT
-from .fdwic_build_config import fdwic_tensormap_ring_cap_definition
+from .fdwic_build_config import (
+    FDWIC_SCHEDULER_MODE_ENV,
+    FDWIC_SCHEDULER_MODE_SAME_CORE,
+    fdwic_scheduler_mode_definition,
+    fdwic_tensormap_ring_cap_definition,
+    normalize_fdwic_scheduler_mode,
+)
 from .platform_info import TARGETS, load_build_config, parse_platform
 from .runtime_compiler import RuntimeCompiler
 
@@ -153,7 +159,12 @@ class RuntimeBuilder:
     _COMPDB_RUNTIME = "tensormap_and_ringbuffer"
     _COMPDB_VARIANT = "onboard"
 
-    def __init__(self, platform: str = "a2a3", fdwic_tensormap_mode: Optional[str] = None):
+    def __init__(
+        self,
+        platform: str = "a2a3",
+        fdwic_tensormap_mode: Optional[str] = None,
+        fdwic_scheduler_mode: Optional[str] = None,
+    ):
         """
         Initialize RuntimeBuilder with platform selection.
 
@@ -162,6 +173,9 @@ class RuntimeBuilder:
             fdwic_tensormap_mode: TensorMap implementation selected for the
                 A5 fully_distributed_within_core runtime. ``None`` reads
                 ``PTO_FDWIC_TENSORMAP_MODE`` and falls back to ``private``.
+            fdwic_scheduler_mode: Compile-time scheduler backend selected for
+                the same runtime. ``None`` reads ``PTO_FDWIC_SCHEDULER_MODE``
+                and falls back to ``same_core``.
         """
         self.platform = platform
         self._arch, self._variant = parse_platform(platform)
@@ -178,6 +192,23 @@ class RuntimeBuilder:
             raise ValueError(
                 "FDWIC TensorMap mode 'shared' is only valid for the a5/a5sim fully_distributed_within_core runtime"
             )
+        selected_scheduler = (
+            os.environ.get(FDWIC_SCHEDULER_MODE_ENV, FDWIC_SCHEDULER_MODE_SAME_CORE)
+            if fdwic_scheduler_mode is None
+            else fdwic_scheduler_mode
+        )
+        self.fdwic_scheduler_mode = normalize_fdwic_scheduler_mode(selected_scheduler)
+        if self.fdwic_scheduler_mode != FDWIC_SCHEDULER_MODE_SAME_CORE:
+            if self._arch != "a5":
+                raise ValueError(
+                    f"FDWIC scheduler mode {self.fdwic_scheduler_mode!r} is only valid for the "
+                    "a5/a5sim fully_distributed_within_core runtime"
+                )
+            if self.fdwic_tensormap_mode != "shared":
+                raise ValueError(
+                    f"FDWIC scheduler mode {self.fdwic_scheduler_mode!r} requires "
+                    "FDWIC TensorMap mode 'shared'"
+                )
 
         runtime_root = PROJECT_ROOT
         self.runtime_root = runtime_root
@@ -214,6 +245,11 @@ class RuntimeBuilder:
                 "fully_distributed_within_core runtime; "
                 f"got platform={self.platform!r}, runtime={name!r}"
             )
+        if self.fdwic_scheduler_mode != FDWIC_SCHEDULER_MODE_SAME_CORE and not self._is_fdwic_runtime(name):
+            raise ValueError(
+                f"FDWIC scheduler mode {self.fdwic_scheduler_mode!r} is only valid for the a5/a5sim "
+                f"fully_distributed_within_core runtime; got platform={self.platform!r}, runtime={name!r}"
+            )
 
     def _is_fdwic_runtime(self, name: str) -> bool:
         """Return whether ``name`` is the A5 runtime with selectable TensorMap."""
@@ -224,6 +260,7 @@ class RuntimeBuilder:
         path = root / self._arch / self._variant / name
         if self._is_fdwic_runtime(name):
             path /= self.fdwic_tensormap_mode
+            path /= self.fdwic_scheduler_mode
         return path
 
     @staticmethod
@@ -259,6 +296,7 @@ class RuntimeBuilder:
             shared_value = 1 if self.fdwic_tensormap_mode == "shared" else 0
             mode_definitions.append(f"{_FDWIC_SHARED_MAP_DEFINITION}={shared_value}")
             mode_definitions.append(fdwic_tensormap_ring_cap_definition())
+            mode_definitions.append(fdwic_scheduler_mode_definition(self.fdwic_scheduler_mode))
         return self._merge_compile_definitions(mode_definitions, compile_definitions)
 
     @staticmethod

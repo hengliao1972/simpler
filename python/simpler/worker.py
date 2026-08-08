@@ -1878,6 +1878,7 @@ class Worker:
         builder = RuntimeBuilder(
             platform,
             fdwic_tensormap_mode=self._config.get("fdwic_tensormap_mode"),
+            fdwic_scheduler_mode=self._config.get("fdwic_scheduler_mode"),
         )
         binaries = builder.get_binaries(runtime)
         aicore_path_override = self._config.get("aicore_path_override")
@@ -1917,6 +1918,7 @@ class Worker:
             builder = RuntimeBuilder(
                 platform,
                 fdwic_tensormap_mode=self._config.get("fdwic_tensormap_mode"),
+                fdwic_scheduler_mode=self._config.get("fdwic_scheduler_mode"),
             )
             binaries = builder.get_binaries(runtime)
 
