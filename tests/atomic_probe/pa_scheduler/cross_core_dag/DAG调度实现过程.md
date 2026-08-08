@@ -1547,3 +1547,36 @@ S16**：B256、`6,28,4,1`、96 workers、startup 起点到 FinalDrain 结束十�
 中位数 `781.623 us`，范围 `780.425..791.447 us`，对应提交 `fd2a8ca8`。
 23.1 的 `761.058 us` 只证明静态均衡的局部上限，因动态接管反例未闭合，不能
 作为可保留性能版本。
+
+## 24. 迁入 simpler：先建立真实动态 Submit 的 writer schema
+
+### 24.1 为什么不能直接复制 standalone 的 PA schema adapter
+
+standalone 在只读 dispatch plan 上可以按任意 task id 重建 PA 参数投影，因而
+能在 Build N 时直接查询历史 task 的 writer intent。真实 simpler 的通用 Submit
+没有这份 host DAG：任务和参数由 orchestration 动态产生，公共 runtime 也不能
+读取 PA `TaskKind` 或固定五任务间距来伪造历史 schema。
+
+生产迁移因此采用等价但更通用的证据源：每个唯一 Build owner 从已经
+materialize 的真实 `L0TaskArgs` 中提取最小 writer region，并发布到
+task-indexed 不可变 metadata cell。后续 task 仍按逻辑 task id 反向查找最近
+重叠 writer；物理上较晚 task 先发布，不能改变 DAG。
+
+### 24.2 D0：不可变 metadata 协议与 CPU 门槛
+
+新增公共 `cross_core_dag_protocol.h`，当前只冻结存储和可见性合同，尚未接入
+A5 Submit 热路：
+
+- control 独占 64B atomic-only cache line；
+- payload 最多保存 32 个真实 `CrossMapValue` writer region；
+- builder 只 clean-out 实际 `[0, writer_count)` 前缀，随后 CAS 发布
+  `(task_id, writer_count)`；
+- consumer 先 acquire control，再 invalidate 有效 payload，最后复读 control；
+- 反向扫描遇到未发布的更早 schema 返回 `Pending`，不得跳过去使用一个更早
+  writer；
+- 查询继续服从 runtime 的 `H` 历史窗口，不扩大依赖语义。
+
+CPU 新增 6 项定向测试，覆盖布局隔离、payload-before-control、零 writer 无
+DCCI、重复/非法发布、最近重叠 writer 和乱序发布缺口；mode 2 的跨镜像构建
+身份 4 项测试也通过。本阶段没有宣称 `cross_core_dag` 已经能运行真实算子，
+下一步才把该协议接入独立 state、AICPU reset 与动态 Submit。

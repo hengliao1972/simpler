@@ -653,6 +653,7 @@ endfunction()
 add_fdwic_build_identity_test(test_fdwic_build_identity_private 0 0)
 add_fdwic_build_identity_test(test_fdwic_build_identity_shared 1 0)
 add_fdwic_build_identity_test(test_fdwic_build_identity_cross_core_ordinary 1 1)
+add_fdwic_build_identity_test(test_fdwic_build_identity_cross_core_dag 1 2)
 
 # The first production cross-core contract is deliberately operator-agnostic:
 # one owner publishes an immutable execution payload and a compatible Scalar
@@ -701,6 +702,24 @@ target_include_directories(test_fdwic_cross_core_tensor_map_protocol BEFORE PRIV
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
 )
 set_tests_properties(test_fdwic_cross_core_tensor_map_protocol PROPERTIES LABELS "no_hardware")
+
+# DAG mode publishes one immutable writer-region schema per logical task.
+# Consumers walk logical task ids rather than trusting physical publication
+# order, so out-of-order builders cannot silently change the dependency graph.
+add_a5_test(test_fdwic_cross_core_dag_protocol a5/test_fdwic_cross_core_dag_protocol.cpp)
+target_compile_definitions(test_fdwic_cross_core_dag_protocol PRIVATE
+    __CPU_SIM=1
+    PTO_FDWIC_SHARED_MAP=1
+    PTO_FDWIC_SCHEDULER_MODE=2
+    PTO_FDWIC_TENSORMAP_RING_CAP=128
+)
+target_include_directories(test_fdwic_cross_core_dag_protocol BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/fully_distributed_within_core/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+)
+set_tests_properties(test_fdwic_cross_core_dag_protocol PROPERTIES LABELS "no_hardware")
 
 add_a5_test(test_fdwic_cross_core_state a5/test_fdwic_cross_core_state.cpp)
 target_compile_definitions(test_fdwic_cross_core_state PRIVATE
