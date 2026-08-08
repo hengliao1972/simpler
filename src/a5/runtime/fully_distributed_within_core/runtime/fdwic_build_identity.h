@@ -25,6 +25,21 @@
 #error "PTO_FDWIC_SHARED_MAP must be 0 (private) or 1 (shared)"
 #endif
 
+// Scheduler implementations are separate compile-time artifacts as well.  The
+// numeric values are part of the Host/AICPU/AICore ABI and must match
+// simpler_setup/fdwic_build_config.py.
+#ifndef PTO_FDWIC_SCHEDULER_MODE
+#define PTO_FDWIC_SCHEDULER_MODE 0
+#endif
+
+#if PTO_FDWIC_SCHEDULER_MODE < 0 || PTO_FDWIC_SCHEDULER_MODE > 4
+#error "PTO_FDWIC_SCHEDULER_MODE must be in [0, 4]"
+#endif
+
+#if PTO_FDWIC_SCHEDULER_MODE != 0 && !PTO_FDWIC_SHARED_MAP
+#error "cross-core and SIMT FDWIC schedulers require PTO_FDWIC_SHARED_MAP=1"
+#endif
+
 #ifndef PTO_FDWIC_TENSORMAP_RING_CAP
 #define PTO_FDWIC_TENSORMAP_RING_CAP 128
 #endif
@@ -46,10 +61,20 @@ enum class FdwicTensorMapMode : uint32_t {
     Shared = 1,
 };
 
+enum class FdwicSchedulerMode : uint32_t {
+    SameCore = 0,
+    CrossCoreOrdinary = 1,
+    CrossCoreDag = 2,
+    SimtCrossCoreOrdinary = 3,
+    SimtCrossCoreDag = 4,
+};
+
 inline constexpr uint64_t kFdwicBuildIdentityMagic = 0x46445749434d4150ULL;  // "FDWICMAP"
-inline constexpr uint32_t kFdwicBuildAbiVersion = PTO_FDWIC_SHARED_MAP ? 7U : 4U;
-inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = PTO_FDWIC_SHARED_MAP ? 7U : 4U;
+inline constexpr uint32_t kFdwicBuildAbiVersion = PTO_FDWIC_SHARED_MAP ? 7U + PTO_FDWIC_SCHEDULER_MODE : 4U;
+inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = PTO_FDWIC_SHARED_MAP ? 7U + PTO_FDWIC_SCHEDULER_MODE : 4U;
 inline constexpr FdwicTensorMapMode kFdwicCompiledTensorMapMode = static_cast<FdwicTensorMapMode>(PTO_FDWIC_SHARED_MAP);
+inline constexpr FdwicSchedulerMode kFdwicCompiledSchedulerMode =
+    static_cast<FdwicSchedulerMode>(PTO_FDWIC_SCHEDULER_MODE);
 // The replacement shared PA backend has no address-region ring. Keep the
 // identity field for the stable 64-byte cross-image prefix, but publish zero
 // rather than pretending the private CAP controls shared semantics.
@@ -84,7 +109,8 @@ struct alignas(64) FdwicBuildIdentity {
     uint32_t dist_global_layout_version;
     volatile uint32_t error_bits;
     uint32_t tensor_map_ring_cap;
-    uint32_t reserved[8];
+    uint32_t scheduler_mode;
+    uint32_t reserved[7];
 };
 
 static_assert(sizeof(FdwicBuildIdentity) == 64, "FDWIC build identity must occupy exactly one cache line");
@@ -98,6 +124,7 @@ static_assert(
 );
 static_assert(offsetof(FdwicBuildIdentity, error_bits) == 24, "FDWIC cross-image error-bit offset changed");
 static_assert(offsetof(FdwicBuildIdentity, tensor_map_ring_cap) == 28, "FDWIC ring-cap identity offset changed");
+static_assert(offsetof(FdwicBuildIdentity, scheduler_mode) == 32, "FDWIC scheduler identity offset changed");
 
 inline FdwicBuildIdentity fdwic_make_build_identity(uint32_t runtime_bytes) {
     return {
@@ -108,6 +135,7 @@ inline FdwicBuildIdentity fdwic_make_build_identity(uint32_t runtime_bytes) {
         kFdwicDistGlobalLayoutVersion,
         FdwicBuildErrorNone,
         kFdwicTensorMapRingCap,
+        static_cast<uint32_t>(kFdwicCompiledSchedulerMode),
         {},
     };
 }
@@ -120,6 +148,8 @@ inline bool fdwic_build_identity_matches(const volatile FdwicBuildIdentity &iden
 #endif
     return identity.magic == kFdwicBuildIdentityMagic && identity.abi_version == kFdwicBuildAbiVersion &&
            identity.tensor_map_mode == static_cast<uint32_t>(kFdwicCompiledTensorMapMode) &&
-           identity.tensor_map_ring_cap == kFdwicTensorMapRingCap && identity.runtime_bytes == expected_runtime_bytes &&
+           identity.tensor_map_ring_cap == kFdwicTensorMapRingCap &&
+           identity.scheduler_mode == static_cast<uint32_t>(kFdwicCompiledSchedulerMode) &&
+           identity.runtime_bytes == expected_runtime_bytes &&
            identity.dist_global_layout_version == kFdwicDistGlobalLayoutVersion;
 }

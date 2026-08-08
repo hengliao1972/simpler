@@ -625,10 +625,11 @@ set_tests_properties(test_fdwic_config_parse PROPERTIES LABELS "no_hardware")
 
 # Stable Host/AICPU/AICore identity is compiled in both executable artifact
 # modes, while their mode-specific ABI fields remain distinct.
-function(add_fdwic_build_identity_test name shared_map)
+function(add_fdwic_build_identity_test name shared_map scheduler_mode)
     add_executable(${name} a5/test_fdwic_build_identity.cpp)
     target_compile_definitions(${name} PRIVATE
         PTO_FDWIC_SHARED_MAP=${shared_map}
+        PTO_FDWIC_SCHEDULER_MODE=${scheduler_mode}
         PTO_FDWIC_TENSORMAP_RING_CAP=128
     )
     target_include_directories(${name} PRIVATE
@@ -649,8 +650,9 @@ function(add_fdwic_build_identity_test name shared_map)
     set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
 endfunction()
 
-add_fdwic_build_identity_test(test_fdwic_build_identity_private 0)
-add_fdwic_build_identity_test(test_fdwic_build_identity_shared 1)
+add_fdwic_build_identity_test(test_fdwic_build_identity_private 0 0)
+add_fdwic_build_identity_test(test_fdwic_build_identity_shared 1 0)
+add_fdwic_build_identity_test(test_fdwic_build_identity_cross_core_ordinary 1 1)
 
 # A5 trb runtime UTs — mirror of a2a3 trb runtime UTs, link against a5_rt_objs.
 # Target names carry the a5_ prefix because hierarchical/test_tensormap (and

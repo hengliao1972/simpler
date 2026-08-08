@@ -52,8 +52,10 @@ TEST(FdwicBuildIdentity, CompiledModeBuildsAMatchingStableLine) {
     EXPECT_EQ(offsetof(FdwicBuildIdentity, dist_global_layout_version), 20U);
     EXPECT_EQ(offsetof(FdwicBuildIdentity, error_bits), 24U);
     EXPECT_EQ(offsetof(FdwicBuildIdentity, tensor_map_ring_cap), 28U);
+    EXPECT_EQ(offsetof(FdwicBuildIdentity, scheduler_mode), 32U);
     EXPECT_EQ(identity.tensor_map_mode, static_cast<uint32_t>(kFdwicCompiledTensorMapMode));
     EXPECT_EQ(identity.tensor_map_ring_cap, kFdwicTensorMapRingCap);
+    EXPECT_EQ(identity.scheduler_mode, static_cast<uint32_t>(kFdwicCompiledSchedulerMode));
     EXPECT_TRUE(fdwic_build_identity_matches(identity, kRuntimeBytesForTest));
 #if PTO_FDWIC_SHARED_MAP
     EXPECT_EQ(kFdwicTensorMapRingCap, 0U);
@@ -80,6 +82,10 @@ TEST(FdwicBuildIdentity, RejectsEveryCrossImageContractField) {
 
     identity = fdwic_make_build_identity(kRuntimeBytesForTest);
     identity.tensor_map_ring_cap ^= 1;
+    EXPECT_FALSE(fdwic_build_identity_matches(identity, kRuntimeBytesForTest));
+
+    identity = fdwic_make_build_identity(kRuntimeBytesForTest);
+    identity.scheduler_mode = (identity.scheduler_mode + 1U) % 5U;
     EXPECT_FALSE(fdwic_build_identity_matches(identity, kRuntimeBytesForTest));
 
     identity = fdwic_make_build_identity(kRuntimeBytesForTest);
