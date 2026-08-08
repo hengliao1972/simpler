@@ -52,6 +52,7 @@ enum class ExecEngineClass : uint8_t {
     Aic = 1,
     Aiv = 2,
     Joint = 3,
+    Immediate = 4,
 };
 
 enum class ExecTokenPhase : uint8_t {
@@ -76,6 +77,13 @@ enum class ExecBuildResult : uint8_t {
     CellUnavailable = 2,
     PublishConflict = 3,
     FatalObserved = 4,
+};
+
+enum class ExecBuildReserveResult : uint8_t {
+    Reserved = 0,
+    InvalidInput = 1,
+    CellUnavailable = 2,
+    FatalObserved = 3,
 };
 
 enum class ExecAcquireResult : uint8_t {
@@ -214,6 +222,11 @@ PTO_DEVICE_FUNC inline bool ExecOwnerValid(uint32_t owner) { return owner <= kEx
 
 PTO_DEVICE_FUNC inline bool ExecEngineValid(ExecEngineClass engine_class) {
     return engine_class == ExecEngineClass::Aic || engine_class == ExecEngineClass::Aiv ||
+           engine_class == ExecEngineClass::Joint || engine_class == ExecEngineClass::Immediate;
+}
+
+PTO_DEVICE_FUNC inline bool ExecExecutorEngineValid(ExecEngineClass engine_class) {
+    return engine_class == ExecEngineClass::Aic || engine_class == ExecEngineClass::Aiv ||
            engine_class == ExecEngineClass::Joint;
 }
 
@@ -318,11 +331,16 @@ PTO_DEVICE_FUNC inline bool ComputeExecPayloadLayout(
 }
 
 PTO_DEVICE_FUNC inline bool ValidateExecPayloadSpec(const ExecPayloadSpec &spec, ExecPayloadLayout &layout) {
-    if (!ExecEngineValid(spec.engine_class) ||
-        (spec.function_id == kExecInvalidFunctionId && spec.function_address == 0) || (spec.flags & ~1U) != 0) {
+    if (!ExecEngineValid(spec.engine_class) || (spec.flags & ~1U) != 0) {
+        return false;
+    }
+    const bool immediate = spec.engine_class == ExecEngineClass::Immediate;
+    if ((immediate && (spec.function_id != kExecInvalidFunctionId || spec.function_address != 0)) ||
+        (!immediate && spec.function_id == kExecInvalidFunctionId && spec.function_address == 0)) {
         return false;
     }
     const bool multicore = (spec.flags & 1U) != 0;
+    if (immediate && multicore) return false;
     if ((!multicore && (spec.multicore_group_id != 0 || spec.multicore_rank != 0 || spec.multicore_size != 1)) ||
         (multicore && (spec.multicore_size < 2 || spec.multicore_rank >= spec.multicore_size))) {
         return false;
@@ -418,7 +436,8 @@ PTO_DEVICE_FUNC inline bool ValidateExecPayload(
     ExecPayloadLayout layout{};
     if ((payload.words[0] >> 32U) != 0 || (payload.words[6] >> 32U) != 0 || payload.words[7] != 0 ||
         header.task_id != task_id || header.engine_class != engine_class ||
-        (header.function_id == kExecInvalidFunctionId && header.function_address == 0) ||
+        ((header.engine_class == ExecEngineClass::Immediate) !=
+         (header.function_id == kExecInvalidFunctionId && header.function_address == 0)) ||
         !ComputeExecPayloadLayout(
             header.tensor_count, header.scalar_count, header.fanin_count, header.tensor_reference_mask, layout
         ) ||
@@ -462,8 +481,23 @@ PublishExecFatal(__gm__ SharedExecControl &fatal, ExecFatalReason reason, uint32
     return Ops::CompareExchange(&fatal.state, 0, desired) == 0;
 }
 
+template <typename Ops>
+PTO_DEVICE_FUNC ExecBuildReserveResult
+ReserveExecBuild(__gm__ SharedExecCell &cell, uint32_t task_id, uint32_t build_owner, __gm__ SharedExecControl &fatal) {
+    if (Ops::Load(&fatal.state) != 0) return ExecBuildReserveResult::FatalObserved;
+    if (!ExecOwnerValid(build_owner)) return ExecBuildReserveResult::InvalidInput;
+    const int64_t empty = 0;
+    const int64_t building = static_cast<int64_t>(
+        EncodeExecState(ExecPhase::Building, build_owner, kExecUnboundOwner, ExecEngineClass::None, 0, task_id)
+    );
+    if (Ops::CompareExchange(&cell.control.state, empty, building) != empty) {
+        return ExecBuildReserveResult::CellUnavailable;
+    }
+    return ExecBuildReserveResult::Reserved;
+}
+
 template <typename Ops, typename Source>
-PTO_DEVICE_FUNC ExecBuildResult BuildAndPublishExecPayload(
+PTO_DEVICE_FUNC ExecBuildResult PublishReservedExecPayload(
     __gm__ SharedExecCell &cell, uint32_t build_owner, const ExecPayloadSpec &spec, const Source &source,
     __gm__ SharedExecControl &fatal
 ) {
@@ -475,12 +509,12 @@ PTO_DEVICE_FUNC ExecBuildResult BuildAndPublishExecPayload(
         }
         return ExecBuildResult::InvalidInput;
     }
-    const int64_t empty = 0;
     const int64_t building = static_cast<int64_t>(
         EncodeExecState(ExecPhase::Building, build_owner, kExecUnboundOwner, ExecEngineClass::None, 0, spec.task_id)
     );
-    if (Ops::CompareExchange(&cell.control.state, empty, building) != empty) {
-        return ExecBuildResult::CellUnavailable;
+    if (Ops::Load(&cell.control.state) != building) {
+        (void)PublishExecFatal<Ops>(fatal, ExecFatalReason::ControlPublishConflict, spec.task_id, build_owner);
+        return ExecBuildResult::PublishConflict;
     }
     ExecPayloadLayout packed{};
     if (!PackExecPayload<Ops>(cell, spec, source, packed) || packed.payload_bytes != expected.payload_bytes) {
@@ -498,8 +532,48 @@ PTO_DEVICE_FUNC ExecBuildResult BuildAndPublishExecPayload(
     return ExecBuildResult::Published;
 }
 
+template <typename Ops, typename Source>
+PTO_DEVICE_FUNC ExecBuildResult BuildAndPublishExecPayload(
+    __gm__ SharedExecCell &cell, uint32_t build_owner, const ExecPayloadSpec &spec, const Source &source,
+    __gm__ SharedExecControl &fatal
+) {
+    switch (ReserveExecBuild<Ops>(cell, spec.task_id, build_owner, fatal)) {
+    case ExecBuildReserveResult::Reserved:
+        return PublishReservedExecPayload<Ops>(cell, build_owner, spec, source, fatal);
+    case ExecBuildReserveResult::InvalidInput:
+        return ExecBuildResult::InvalidInput;
+    case ExecBuildReserveResult::CellUnavailable:
+        return ExecBuildResult::CellUnavailable;
+    case ExecBuildReserveResult::FatalObserved:
+        return ExecBuildResult::FatalObserved;
+    }
+    return ExecBuildResult::InvalidInput;
+}
+
 PTO_DEVICE_FUNC inline bool ExecEngineCompatible(ExecEngineClass task, ExecEngineClass executor) {
     return task == executor;
+}
+
+template <typename Ops>
+PTO_DEVICE_FUNC ExecDoneResult PublishImmediateExecDone(
+    __gm__ SharedExecCell &cell, uint32_t task_id, uint32_t build_owner, __gm__ SharedExecControl &fatal
+) {
+    if (Ops::Load(&fatal.state) != 0) return ExecDoneResult::FatalObserved;
+    const int64_t observed_raw = Ops::Load(&cell.control.state);
+    const DecodedExecState observed = DecodeExecState(observed_raw);
+    if (!observed.valid || observed.phase != ExecPhase::Built || observed.task_id != task_id ||
+        observed.build_owner != build_owner || observed.engine_class != ExecEngineClass::Immediate) {
+        (void)PublishExecFatal<Ops>(fatal, ExecFatalReason::CompletionStateConflict, task_id, build_owner);
+        return ExecDoneResult::StateConflict;
+    }
+    const int64_t done = static_cast<int64_t>(EncodeExecState(
+        ExecPhase::Done, build_owner, build_owner, ExecEngineClass::Immediate, observed.payload_lines, task_id
+    ));
+    if (Ops::CompareExchange(&cell.control.state, observed_raw, done) != observed_raw) {
+        (void)PublishExecFatal<Ops>(fatal, ExecFatalReason::CompletionStateConflict, task_id, build_owner);
+        return ExecDoneResult::StateConflict;
+    }
+    return ExecDoneResult::Done;
 }
 
 template <typename Ops>
@@ -509,7 +583,7 @@ PTO_DEVICE_FUNC ExecAcquireResult AcquireExecPayload(
 ) {
     if (token.phase != ExecTokenPhase::Idle) return ExecAcquireResult::TokenBusy;
     if (Ops::Load(&fatal.state) != 0) return ExecAcquireResult::FatalObserved;
-    if (!ExecOwnerValid(execute_owner) || !ExecEngineValid(executor_engine)) {
+    if (!ExecOwnerValid(execute_owner) || !ExecExecutorEngineValid(executor_engine)) {
         return ExecAcquireResult::InvalidControl;
     }
     const int64_t observed_raw = Ops::Load(&cell.control.state);

@@ -102,6 +102,14 @@ ExecPayloadSpec MakeSpec() {
     };
 }
 
+ExecPayloadSpec MakeImmediateSpec() {
+    ExecPayloadSpec spec = MakeSpec();
+    spec.function_address = 0;
+    spec.function_id = kExecInvalidFunctionId;
+    spec.engine_class = ExecEngineClass::Immediate;
+    return spec;
+}
+
 TEST(FdwicCrossCoreExecProtocol, ControlAndImmutablePayloadNeverShareACacheLine) {
     EXPECT_EQ(sizeof(SharedExecControl), 64U);
     EXPECT_EQ(alignof(SharedExecControl), 64U);
@@ -166,6 +174,48 @@ TEST(FdwicCrossCoreExecProtocol, BuildFlushesBeforePublishAndACompatibleOwnerAcq
     EXPECT_EQ(done.phase, ExecPhase::Done);
     EXPECT_EQ(done.build_owner, 7U);
     EXPECT_EQ(done.execute_owner, 31U);
+}
+
+TEST(FdwicCrossCoreExecProtocol, BuildReservationCanPrecedePayloadConstruction) {
+    SharedExecCell cell{};
+    SharedExecControl fatal{};
+    PayloadSource source;
+    HostOps::Reset();
+
+    EXPECT_EQ(ReserveExecBuild<HostOps>(cell, 9, 7, fatal), ExecBuildReserveResult::Reserved);
+    const DecodedExecState reserved = DecodeExecState(cell.control.state);
+    ASSERT_TRUE(reserved.valid);
+    EXPECT_EQ(reserved.phase, ExecPhase::Building);
+    EXPECT_EQ(reserved.task_id, 9U);
+    EXPECT_EQ(reserved.build_owner, 7U);
+    EXPECT_EQ(HostOps::flush_count, 0U);
+
+    EXPECT_EQ(PublishReservedExecPayload<HostOps>(cell, 7, MakeSpec(), source, fatal), ExecBuildResult::Published);
+    EXPECT_EQ(HostOps::flush_count, 1U);
+    EXPECT_GT(HostOps::built_sequence, HostOps::flush_sequence);
+}
+
+TEST(FdwicCrossCoreExecProtocol, ImmediateTaskCompletesWithoutExecuteClaim) {
+    SharedExecCell cell{};
+    SharedExecControl fatal{};
+    PayloadSource source;
+    ExecToken token{};
+    ResetExecToken(token);
+    HostOps::Reset();
+
+    ASSERT_EQ(
+        BuildAndPublishExecPayload<HostOps>(cell, 12, MakeImmediateSpec(), source, fatal), ExecBuildResult::Published
+    );
+    EXPECT_EQ(
+        AcquireExecPayload<HostOps>(cell, 9, 31, ExecEngineClass::Aic, token, fatal), ExecAcquireResult::Incompatible
+    );
+    EXPECT_EQ(PublishImmediateExecDone<HostOps>(cell, 9, 12, fatal), ExecDoneResult::Done);
+    const DecodedExecState done = DecodeExecState(cell.control.state);
+    ASSERT_TRUE(done.valid);
+    EXPECT_EQ(done.phase, ExecPhase::Done);
+    EXPECT_EQ(done.engine_class, ExecEngineClass::Immediate);
+    EXPECT_EQ(done.build_owner, 12U);
+    EXPECT_EQ(done.execute_owner, 12U);
 }
 
 TEST(FdwicCrossCoreExecProtocol, EmptyOrBuildingCellIsNotMistakenForCorruption) {
