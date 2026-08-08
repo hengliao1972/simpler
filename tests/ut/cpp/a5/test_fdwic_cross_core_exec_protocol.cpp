@@ -195,6 +195,24 @@ TEST(FdwicCrossCoreExecProtocol, BuildReservationCanPrecedePayloadConstruction) 
     EXPECT_GT(HostOps::built_sequence, HostOps::flush_sequence);
 }
 
+TEST(FdwicCrossCoreExecProtocol, LinkedKernelIdCanIdentifyADeviceTargetWithoutAHostFunctionAddress) {
+    SharedExecCell cell{};
+    SharedExecControl fatal{};
+    PayloadSource source;
+    ExecPayloadSpec spec = MakeSpec();
+    spec.function_address = 0;
+    HostOps::Reset();
+
+    // CCEC invokes a linked kernel through function_id; only the host/sim
+    // function-pointer path requires a non-zero function_address.
+    EXPECT_EQ(BuildAndPublishExecPayload<HostOps>(cell, 7, spec, source, fatal), ExecBuildResult::Published);
+    const DecodedExecState built = DecodeExecState(cell.control.state);
+    ASSERT_TRUE(built.valid);
+    EXPECT_EQ(built.phase, ExecPhase::Built);
+    EXPECT_EQ(cell.payload.words[1], 0U);
+    EXPECT_EQ(static_cast<uint32_t>(cell.payload.words[3]), 3U);
+}
+
 TEST(FdwicCrossCoreExecProtocol, ImmediateTaskCompletesWithoutExecuteClaim) {
     SharedExecCell cell{};
     SharedExecControl fatal{};

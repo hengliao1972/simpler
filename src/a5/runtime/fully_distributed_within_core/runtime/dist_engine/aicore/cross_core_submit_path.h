@@ -344,9 +344,11 @@ PTO_DEVICE_FUNC bool dist_cross_core_publish_exec(
     DistCrossCorePayloadSource source{ctx.payload, &args, ctx.fanin};
     const uint64_t function_address =
         engine_class == ExecEngineClass::Immediate ? 0 : dist_aicore_slot_function_addr(g_dist.runtime, kernel_id);
+#if !defined(__CCE_AICORE__)
     if (engine_class != ExecEngineClass::Immediate && function_address == 0) {
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
+#endif
     const fdwic::cross_core::ExecPayloadSpec spec{
         static_cast<uint32_t>(ctx.task_id),
         function_address,

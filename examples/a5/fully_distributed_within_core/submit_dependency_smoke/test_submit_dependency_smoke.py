@@ -183,6 +183,20 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 4096, "mode": 1},
         },
         {
+            "name": "A5OnboardBd24OverlapSubView",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {"n": 4096, "mode": 1},
+        },
+        {
+            "name": "A5OnboardBd1OverlapSubView",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 4096, "mode": 1},
+        },
+        {
             "name": "A5SimBd36ExistingInoutChain",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -193,6 +207,20 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 2},
+        },
+        {
+            "name": "A5OnboardBd24ExistingInoutChain",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {"n": 4096, "mode": 2},
+        },
+        {
+            "name": "A5OnboardBd1ExistingInoutChain",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
             "params": {"n": 4096, "mode": 2},
         },
         {
