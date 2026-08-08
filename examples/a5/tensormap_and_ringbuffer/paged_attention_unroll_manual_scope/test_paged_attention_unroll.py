@@ -66,7 +66,7 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -74,6 +74,25 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
                 "head_dim": 128,
                 "block_size": 128,
                 "context_len": 8192,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+        {
+            # 保留 B256 的 1,280-task DAG，但把每个 batch 的上下文压到一个
+            # block：QK/SF/PV 均只处理一次 n_blocks=1，UP 本来就是一次。
+            # 这是纯 AICPU 调度路径的真实 PA 短负载门槛，不用 NOP 代替 kernel。
+            "name": "Case1Workload1111",
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "manual": True,
+            "params": {
+                "batch": 256,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 128,
+                "context_len": 128,
                 "max_model_len": 32768,
                 "dtype": "bfloat16",
             },
