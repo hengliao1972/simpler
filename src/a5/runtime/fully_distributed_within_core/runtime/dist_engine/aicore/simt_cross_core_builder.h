@@ -11,7 +11,7 @@
 
 #pragma once
 
-#if PTO_FDWIC_SCHEDULER_MODE == 3
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
 
 namespace {
 
@@ -24,6 +24,12 @@ constexpr int64_t kDistSimtBuilderRunning = 1;
 // protocol errors. One billion cycles covers the full request window while
 // allowing the builder to publish an explicit fatal first.
 constexpr uint64_t kDistSimtBuilderPollBudget = 1000000000ULL;
+
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+using DistSimtCrossCoreBuilderState = SimtCrossCoreOrdinaryState;
+#else
+using DistSimtCrossCoreBuilderState = SimtCrossCoreDagState;
+#endif
 
 PTO_DEVICE_FUNC bool dist_simt_cross_core_is_builder_worker(__gm__ const DistCore *self) {
 #if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
@@ -261,6 +267,8 @@ DIST_SIMT_CALLEE bool dist_simt_tensor_region(__gm__ uint64_t *tensor, uint64_t 
     return *lo < *hi;
 }
 
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+
 DIST_SIMT_CALLEE uint32_t dist_simt_map_hash(uint64_t address) {
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 16384
     (void)address;
@@ -408,6 +416,145 @@ DIST_SIMT_CALLEE bool dist_simt_prepare_map_and_fanin(
     return dist_simt_atomic_cas(completion, UINT64_MAX, request.task_id) == UINT64_MAX;
 }
 
+#else
+
+DIST_SIMT_CALLEE bool dist_simt_publish_dag_metadata(
+    __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata, const DistSimtRequestView &request
+) {
+    if (metadata == nullptr || request.task_id == UINT32_MAX) return false;
+    __gm__ fdwic::cross_core::DagTaskMetadataCell *cell = &metadata[request.task_id];
+    __gm__ uint64_t *control = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&cell->control.state));
+    if (dist_simt_atomic_load(control) != 0) return false;
+
+    uint32_t writer_count = 0;
+    for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
+        const uint32_t tag = dist_simt_request_tag(request, tensor);
+        if (tag != static_cast<uint32_t>(TensorArgType::INOUT) &&
+            tag != static_cast<uint32_t>(TensorArgType::OUTPUT_EXISTING)) {
+            continue;
+        }
+        __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
+        const bool manual_dependency = ((descriptor[5] >> 8U) & 0xFFU) != 0;
+        if (manual_dependency) continue;
+        if (writer_count >= fdwic::cross_core::kDagMaxWriterRegions) return false;
+        uint64_t address = 0;
+        uint64_t lo = 0;
+        uint64_t hi = 0;
+        if (!dist_simt_tensor_region(descriptor, &address, &lo, &hi)) return false;
+        __gm__ uint64_t *writer = reinterpret_cast<__gm__ uint64_t *>(&cell->payload.writers[writer_count]);
+        dist_simt_store(writer + 0, address);
+        dist_simt_store(writer + 1, lo);
+        dist_simt_store(writer + 2, hi);
+        dist_simt_store(writer + 3, request.task_id);
+        ++writer_count;
+    }
+
+    const uint64_t encoded =
+        (static_cast<uint64_t>(request.task_id + 1U) << fdwic::cross_core::kDagTaskPlusOneShift) | writer_count;
+    asc_threadfence();
+    return dist_simt_atomic_cas(control, 0, encoded) == 0;
+}
+
+DIST_SIMT_CALLEE int32_t dist_simt_lookup_dag(
+    __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata, uint64_t address, uint64_t lo, uint64_t hi,
+    uint32_t task_id, uint32_t history, __gm__ uint64_t *fatal, bool *valid
+) {
+    *valid = false;
+    if (metadata == nullptr || address == 0 || lo >= hi) return -1;
+    const uint32_t lower = task_id > history ? task_id - history : 0U;
+    for (uint32_t candidate = task_id; candidate > lower;) {
+        --candidate;
+        __gm__ fdwic::cross_core::DagTaskMetadataCell *cell = &metadata[candidate];
+        __gm__ uint64_t *control =
+            reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&cell->control.state));
+        const uint64_t wait_begin = clock();
+        uint32_t polls = 0;
+        uint64_t raw = 0;
+        while ((raw = dist_simt_atomic_load(control)) == 0) {
+            if (clock() - wait_begin > kDistSimtBuilderPollBudget) return -1;
+            if ((++polls & 1023U) == 0 && dist_simt_fatal_observed(fatal)) return -1;
+        }
+        const uint64_t task_plus_one =
+            (raw >> fdwic::cross_core::kDagTaskPlusOneShift) & fdwic::cross_core::kDagTaskPlusOneMask;
+        const uint32_t writer_count = static_cast<uint32_t>(raw & fdwic::cross_core::kDagWriterCountMask);
+        if ((raw & ~fdwic::cross_core::kDagControlKnownMask) != 0 || task_plus_one != candidate + 1U ||
+            writer_count > fdwic::cross_core::kDagMaxWriterRegions) {
+            return -1;
+        }
+
+        int32_t matched = -1;
+        for (uint32_t writer_index = 0; writer_index < writer_count; ++writer_index) {
+            __gm__ uint64_t *writer = reinterpret_cast<__gm__ uint64_t *>(&cell->payload.writers[writer_index]);
+            const uint64_t candidate_address = writer[0];
+            const uint64_t candidate_lo = writer[1];
+            const uint64_t candidate_hi = writer[2];
+            const uint64_t identity = writer[3];
+            if (candidate_address == 0 || candidate_lo >= candidate_hi ||
+                static_cast<uint32_t>(identity) != candidate || static_cast<uint32_t>(identity >> 32U) != 0) {
+                return -1;
+            }
+            if (candidate_address == address && lo < candidate_hi && candidate_lo < hi) {
+                matched = static_cast<int32_t>(candidate);
+                break;
+            }
+        }
+        if (dist_simt_atomic_load(control) != raw) return -1;
+        if (matched >= 0) {
+            *valid = true;
+            return matched;
+        }
+    }
+    *valid = true;
+    return -1;
+}
+
+DIST_SIMT_CALLEE bool dist_simt_prepare_dag_and_fanin(
+    __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata, const DistSimtRequestView &request, uint32_t history,
+    int32_t fanin[], uint32_t *fanin_count, __gm__ uint64_t *fatal
+) {
+    if (!dist_simt_publish_dag_metadata(metadata, request)) return false;
+    *fanin_count = 0;
+    for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
+        const uint32_t tag = dist_simt_request_tag(request, tensor);
+        if (tag == static_cast<uint32_t>(TensorArgType::OUTPUT)) continue;
+        __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
+        const uint64_t owner_raw = descriptor[2];
+        if (owner_raw != UINT64_MAX) {
+            const uint32_t producer = static_cast<uint32_t>(owner_raw);
+            if (static_cast<uint32_t>(owner_raw >> 32U) != 0 || producer >= request.task_id ||
+                !dist_simt_add_fanin(fanin, fanin_count, static_cast<int32_t>(producer))) {
+                return false;
+            }
+        }
+        const bool manual_dependency = ((descriptor[5] >> 8U) & 0xFFU) != 0;
+        uint64_t address = 0;
+        uint64_t lo = 0;
+        uint64_t hi = 0;
+        if (!dist_simt_tensor_region(descriptor, &address, &lo, &hi)) return false;
+        if (!manual_dependency && (tag == static_cast<uint32_t>(TensorArgType::INPUT) ||
+                                   tag == static_cast<uint32_t>(TensorArgType::INOUT))) {
+            bool lookup_valid = false;
+            const int32_t producer =
+                dist_simt_lookup_dag(metadata, address, lo, hi, request.task_id, history, fatal, &lookup_valid);
+            if (!lookup_valid || !dist_simt_add_fanin(fanin, fanin_count, producer)) return false;
+        }
+    }
+    const uint32_t dependency_offset = fdwic::cross_core::kSimtRequestHeaderWords +
+                                       request.tensor_count * fdwic::cross_core::kExecTensorDescWords +
+                                       request.scalar_count;
+    for (uint32_t dependency = 0; dependency < request.explicit_dep_count; ++dependency) {
+        const uint64_t raw = request.words[dependency_offset + dependency];
+        const uint32_t producer = static_cast<uint32_t>(raw);
+        if (static_cast<uint32_t>(raw >> 32U) != 0 || producer >= request.task_id ||
+            !dist_simt_add_fanin(fanin, fanin_count, static_cast<int32_t>(producer))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#endif
+
 DIST_SIMT_CALLEE bool dist_simt_materialize_outputs(
     __gm__ fdwic::cross_core::CrossCoreOutputCell<Tensor> *outputs, __gm__ uint64_t *heap_cursor,
     __gm__ uint8_t *heap_base, uint64_t heap_size, const DistSimtRequestView &request, uint32_t build_owner,
@@ -540,8 +687,9 @@ DIST_SIMT_CALLEE bool dist_simt_publish_exec(
 }
 
 DIST_SIMT_CALLEE bool dist_simt_build_request(
-    __gm__ SimtCrossCoreOrdinaryState *state, __gm__ DistTaskCell *task_cells, __gm__ uint8_t *heap_base,
-    uint64_t heap_size, uint32_t history, const DistSimtRequestView &request, uint32_t build_owner
+    __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells,
+    __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata, __gm__ uint8_t *heap_base, uint64_t heap_size,
+    uint32_t history, const DistSimtRequestView &request, uint32_t build_owner
 ) {
     __gm__ uint64_t *fatal =
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->runtime.fatal.state));
@@ -562,11 +710,16 @@ DIST_SIMT_CALLEE bool dist_simt_build_request(
 
     int32_t fanin[fdwic::cross_core::kExecMaxFanin] = {};
     uint32_t fanin_count = 0;
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+    (void)metadata;
     if (!dist_simt_prepare_map_and_fanin(
             &state->runtime.tensor_map, task_cells, request, history, fanin, &fanin_count, fatal
         )) {
         return false;
     }
+#else
+    if (!dist_simt_prepare_dag_and_fanin(metadata, request, history, fanin, &fanin_count, fatal)) return false;
+#endif
     return dist_simt_publish_exec(
         &state->runtime.tasks[request.task_id], task_cells, outputs, request, fanin, fanin_count, output_count,
         heap_end, build_owner
@@ -574,7 +727,7 @@ DIST_SIMT_CALLEE bool dist_simt_build_request(
 }
 
 static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSimtCrossCoreBuild(
-    __gm__ SimtCrossCoreOrdinaryState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
+    __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
     uint64_t heap_size, uint32_t history
 ) {
     const uint32_t thread = static_cast<uint32_t>(threadIdx.x);
@@ -598,6 +751,13 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
         reinterpret_cast<__gm__ fdwic::cross_core::SimtBuildRequestCell *>(
             reinterpret_cast<__gm__ uint8_t *>(started) + sizeof(SimtBuilderLifecycleState)
         );
+    __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata = nullptr;
+#if PTO_FDWIC_SCHEDULER_MODE == 4
+    metadata = reinterpret_cast<__gm__ fdwic::cross_core::DagTaskMetadataCell *>(
+        reinterpret_cast<__gm__ uint8_t *>(requests) +
+        kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::SimtBuildRequestCell)
+    );
+#endif
     if (thread == 0) {
         // Match standalone SimtWaitBuilderStart instruction-for-instruction:
         // thread zero of the sole VF invocation atomically advances Reset to
@@ -652,7 +812,7 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
                 if (!dist_simt_fatal_observed(fatal)) dist_simt_publish_fatal(fatal, task_id, warp);
                 break;
             }
-            if (!dist_simt_build_request(state, task_cells, heap_base, heap_size, history, request, warp)) {
+            if (!dist_simt_build_request(state, task_cells, metadata, heap_base, heap_size, history, request, warp)) {
                 dist_simt_publish_fatal(fatal, task_id, warp);
                 break;
             }
@@ -671,14 +831,18 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
 
 #if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
 extern "C" PTO_DEVICE_FUNC void fdwic_simt_cross_core_run_builder(
-    __gm__ SimtCrossCoreOrdinaryState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
+    __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
     uint64_t heap_size, uint32_t history
 );
 #endif
 
 PTO_DEVICE_FUNC bool dist_simt_cross_core_launch_builder(__gm__ DistCore *self) {
 #if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
-    __gm__ SimtCrossCoreOrdinaryState &state = g_dist.simt_cross_core_ordinary;
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+    __gm__ DistSimtCrossCoreBuilderState &state = g_dist.simt_cross_core_ordinary;
+#else
+    __gm__ DistSimtCrossCoreBuilderState &state = g_dist.simt_cross_core_dag;
+#endif
     if (!dist_simt_cross_core_is_builder_worker(self)) return true;
     if (DistCrossCoreAicoreOps::Load(&state.lifecycle.builder_started.state) != kDistSimtBuilderReset) {
         return dist_simt_cross_core_fail(self != nullptr ? self->local_index : -1, PTO2_ERROR_TENSORMAP_PROTOCOL);
@@ -704,7 +868,11 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_seal_requests(__gm__ DistCore *self) {
         static_cast<uint32_t>(self->local_index) > kFdwicCrossCoreTaskCapacity) {
         return dist_simt_cross_core_fail(self != nullptr ? self->local_index : -1, PTO2_ERROR_TENSORMAP_CAPACITY);
     }
+#if PTO_FDWIC_SCHEDULER_MODE == 3
     __gm__ volatile int64_t &sealed = g_dist.simt_cross_core_ordinary.lifecycle.sealed_task_count.state;
+#else
+    __gm__ volatile int64_t &sealed = g_dist.simt_cross_core_dag.lifecycle.sealed_task_count.state;
+#endif
     const int64_t count = self->local_index;
     const int64_t observed = DistCrossCoreAicoreOps::CompareExchange(&sealed, -1, count);
     if (observed != -1 && observed != count) {
@@ -722,7 +890,11 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_join_builder(__gm__ DistCore *self) {
     // The launch helper already consumed the completion event. Check only the
     // builder's GM completion contract here; a second wait_flag on the same
     // event is invalid.
-    __gm__ SimtCrossCoreOrdinaryState &state = g_dist.simt_cross_core_ordinary;
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+    __gm__ DistSimtCrossCoreBuilderState &state = g_dist.simt_cross_core_ordinary;
+#else
+    __gm__ DistSimtCrossCoreBuilderState &state = g_dist.simt_cross_core_dag;
+#endif
     if (DistCrossCoreAicoreOps::Load(&state.lifecycle.builder_started.state) != kDistSimtBuilderRunning ||
         DistCrossCoreAicoreOps::Load(&state.lifecycle.builder_finished.state) != kDistSimtBuilderWarps ||
         DistCrossCoreAicoreOps::Load(&state.runtime.fatal.state) != 0) {
@@ -738,4 +910,4 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_join_builder(__gm__ DistCore *self) {
 
 }  // namespace
 
-#endif  // PTO_FDWIC_SCHEDULER_MODE == 3
+#endif  // PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4

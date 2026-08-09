@@ -73,7 +73,7 @@
 //
 // Operator sources and wrappers keep the generic API names. Only a CCEC SIMT
 // mixed ELF rewrites the final symbols here; CPU and non-SIMT ABIs are intact.
-#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__CCE_AICORE__)
+#if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__CCE_AICORE__)
 #if PTO_FDWIC_SHARED_PA_BUILD_ROLE == 0
 #define aicpu_orchestration_entry aicpu_orchestration_entry_aic
 #define dist_submit_impl dist_submit_impl_aic

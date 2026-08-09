@@ -12,7 +12,7 @@
 // -----------------------------------------------------------------------------
 // Per-core entry point invoked by each AICore worker thread.
 // -----------------------------------------------------------------------------
-#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__CCE_AICORE__)
+#if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__CCE_AICORE__)
 #if PTO_FDWIC_SHARED_PA_BUILD_ROLE == 0
 #define DIST_CORE_MAIN_ENTRY dist_core_main_aic
 #else
@@ -66,7 +66,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void DIST_CORE_MAIN_ENTRY(__gm__ Runtime *runtime,
         fdwic_atomic_poll_region_end(startup_poll_region);
     }
 
-#if PTO_FDWIC_SCHEDULER_MODE == 3
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
     // Match the role contract proven by the standalone scheduler: the first
     // AIV0 Main Scalar only hosts the persistent SIMT builder and does not
     // replay orchestration. Other Scalars publish dynamic requests. Replaying
@@ -85,7 +85,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void DIST_CORE_MAIN_ENTRY(__gm__ Runtime *runtime,
     // parents. Reuse the orchestration end as the final-drain start so their
     // aggregate closes exactly in integer SYS_CNT cycles.
     TRACE_TIMESTAMP(orchestration_begin);
-#if PTO_FDWIC_SCHEDULER_MODE == 3
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
     if (!simt_builder_worker) {
         dist_submit_replay_orch(runtime);
     }
@@ -93,7 +93,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void DIST_CORE_MAIN_ENTRY(__gm__ Runtime *runtime,
     dist_submit_replay_orch(runtime);
 #endif
     TRACE_TIMESTAMP(orchestration_end);
-#if PTO_FDWIC_SCHEDULER_MODE == 3
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
     if (!simt_builder_worker && !fdwic_trace_is_fatal()) (void)dist_simt_cross_core_seal_requests(self);
     if (!fdwic_trace_is_fatal()) (void)dist_simt_cross_core_join_builder(self);
 #endif

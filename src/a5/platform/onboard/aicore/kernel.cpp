@@ -27,7 +27,7 @@
 #endif
 #include "common/platform_config.h"
 
-#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__DAV_VEC__)
+#if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__DAV_VEC__)
 // The dispatcher entry must advertise the stack requirements of the actual
 // persistent SIMT builder, not those of a trivial dummy VF. Compile the same
 // header once more in metadata-only mode so bisheng can derive the entry TLVs
@@ -45,13 +45,13 @@
 
 class Runtime;
 
-#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__DAV_VEC__)
+#if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__DAV_VEC__)
 // Keep the actual VF target and its async launch in the registered AIV entry
 // translation unit. The weak ordinary helper is callable from dist_engine but
 // is not a kernel entry, so rtRegisterAllKernel still sees only the AIC/AIV
 // dispatcher pair.
 extern "C" __attribute__((weak)) __aicore__ void fdwic_simt_cross_core_run_builder(
-    __gm__ SimtCrossCoreOrdinaryState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
+    __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
     uint64_t heap_size, uint32_t history
 ) {
     cce::async_invoke<DistSimtCrossCoreBuild>(
@@ -70,7 +70,7 @@ extern "C" __attribute__((weak)) __aicore__ void fdwic_simt_cross_core_run_build
                    // my_kernel_0_mix_aiv
 #define block_idx block_idx_aiv
 #define core_type core_type_aiv
-#if PTO_FDWIC_SCHEDULER_MODE == 3
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
 #define AICORE_EXECUTE_ENTRY aicore_execute_aiv
 #else
 #define AICORE_EXECUTE_ENTRY aicore_execute
@@ -79,7 +79,7 @@ extern "C" __attribute__((weak)) __aicore__ void fdwic_simt_cross_core_run_build
 #define KERNEL_ENTRY(x) x##_0_mix_aic
 #define block_idx block_idx_aic
 #define core_type core_type_aic
-#if PTO_FDWIC_SCHEDULER_MODE == 3
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
 #define AICORE_EXECUTE_ENTRY aicore_execute_aic
 #else
 #define AICORE_EXECUTE_ENTRY aicore_execute

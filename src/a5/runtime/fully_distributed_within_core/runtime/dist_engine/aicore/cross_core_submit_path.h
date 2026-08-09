@@ -535,7 +535,7 @@ PTO_DEVICE_FUNC ExecEngineClass dist_cross_core_executor_engine(__gm__ DistCore 
 PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngineClass task_engine) {
     const ExecEngineClass executor_engine = dist_cross_core_executor_engine(ctx.self);
     if (executor_engine != task_engine) return true;
-#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__CCE_AICORE__)
+#if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__CCE_AICORE__)
     // The first AIV0 hosts the persistent SIMT builder in mode 3. Its vector
     // unit cannot execute a linked AIV task until the deferred join, so keep
     // this one Scalar out of execute-owner election. Every other compatible

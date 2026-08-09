@@ -23,7 +23,7 @@
 #include "pto_types.h"
 #include "runtime.h"
 
-#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__CCE_AICORE__) && defined(__DAV_VEC__)
+#if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__CCE_AICORE__) && defined(__DAV_VEC__)
 #include "simt_api/asc_simt.h"
 #endif
 

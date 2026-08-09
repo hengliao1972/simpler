@@ -4012,3 +4012,48 @@ execution packet 协议；独立的 mode-4 状态决定 DAG metadata 存放位�
 
 此结果只证明生产动态语义已在模拟器上闭合。真实 A5 所需的持久
 SIMT DAG builder 仍未接入，因此 A5 继续标记为 NOT RUN，不报性能收益。
+
+### 24.3 真实 A5 持久 SIMT DAG builder
+
+在 24.2 的动态 request 和 A5sim 语义基线通过后，本阶段才打开真实
+A5 的持久 SIMT DAG builder。生产路径与 standalone 的静态 PA DAG 实现
+不同：它不识别 Alloc/QK/SF/PV/UP，也没有编译期 task plan，只消费
+Scalar 动态发布的 TensorDesc、tag 和显式依赖。
+
+第一版仍使用一个 AIV0 持久 builder，128 个 SIMT thread 中每个 warp
+只有 lane 0 负责构建，四个 leader 按 task id 模 4 消费动态 request。该
+阶段的目标是先闭合通用功能，不把 standalone 的多 builder 性能参数提前
+搬入生产路径。
+
+每个 SIMT leader 对 task N 执行：
+
+1. 校验并解码不可变 request；
+2. 申请 output heap，构造并发布 output TensorDesc；
+3. 将 N 的 INOUT/OUTPUT_EXISTING 非 manual-dependency 区域写入 task-indexed
+   DAG metadata，普通 store 完成后再用 atomic control 发布；
+4. 按 `N-1 ... max(0, N-H)` 的逻辑 task 序扫描 metadata。某个前序
+   schema 还未发布时原地等待，不跳过它去选物理上更早完成的 writer；
+5. 合并 descriptor owner、区域 writer 与显式依赖，发布不可变 execution
+   packet；
+6. Scalar execute owner 按原跨核协议消费 packet，SIMT builder 不执行 task
+   kernel。
+
+此处的“顺序”是 DAG 语义顺序，而不是将所有 Build 压成一条串行链：
+四个 warp 可以并发 Materialize 和发布自己的 schema；只有查询 task N 的最新
+writer 时，不允许跳过任何未发布的前序 schema。因此物理构建完成
+顺序不会改变逻辑 DAG。
+
+该路径已完成以下实测：
+
+- A5 基础 runtime 的 AIC/AIV CCEC 混合镜像编译：PASS；
+- A5 PA CaseB1：PASS；
+- A5 PA Case1/B256：PASS；
+- A5sim PA CaseB1 Scalar fallback 回归：PASS；
+- `simt_cross_core_ordinary` A5 PA CaseB1 回归：PASS；
+- DAG 协议、动态 request 与 mode 2/3/4 状态单测：19/19 PASS；
+- 两组用例均通过 Simpler 真实动态 Submit 产生 request，并由持久
+  SIMT DAG builder 消费。
+
+本阶段不报性能收益。它只建立“一个 builder / 四个 warp”的功能基线；
+后续需用独立性能口径与 standalone 对比，再决定 builder 数量、warp 数与
+待机方式，不在功能迁移阶段根据单次时间调参。

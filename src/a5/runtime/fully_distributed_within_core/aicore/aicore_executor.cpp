@@ -20,7 +20,7 @@
 #include "runtime.h"
 #include "dist_engine/aicore/primitive.h"
 
-#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__CCE_AICORE__)
+#if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__CCE_AICORE__)
 #if defined(__DAV_VEC__)
 #define AICORE_EXECUTE_ENTRY aicore_execute_aiv
 #define DIST_CORE_MAIN_ENTRY dist_core_main_aiv
@@ -82,7 +82,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * @param s_block_idx Block index (core ID)
  * @param core_type Core type (AIC or AIV)
  */
-// The mode-3 AIV call chain must remain AIV-compiled from the platform entry
+// A SIMT scheduler's AIV call chain must remain AIV-compiled from the platform entry
 // through the SIMT launch. A weak executor deduplicated to the AIC body cannot
 // be called across architectures. Other modes retain their historical single
 // weak entry and mixed-ELF contract.
@@ -136,7 +136,7 @@ AICORE_EXECUTE_ENTRY(__gm__ Runtime *runtime, int s_block_idx, CoreType core_typ
     }
     if (my_hank->aicpu_ready == AICPU_READY_DIST_RUN) {
         if (fdwic_build_identity_ok && kFdwicCompiledBackendReady) {
-#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__CCE_AICORE__)
+#if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__CCE_AICORE__)
             DIST_CORE_MAIN_ENTRY(runtime, s_block_idx, static_cast<int>(core_type));
 #else
             dist_core_main(runtime, s_block_idx, static_cast<int>(core_type));
@@ -175,6 +175,6 @@ AICORE_EXECUTE_ENTRY(__gm__ Runtime *runtime, int s_block_idx, CoreType core_typ
 }
 
 #undef AICORE_EXECUTE_ENTRY
-#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__CCE_AICORE__)
+#if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__CCE_AICORE__)
 #undef DIST_CORE_MAIN_ENTRY
 #endif
