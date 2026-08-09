@@ -682,3 +682,23 @@ SIMT/cross-core 路径。
 仍明显高于 same-core 的毫秒级目标，不宣称问题已完全解决。下一阶段
 应分别定位 Build/Execute owner 绑定等待、严格 TensorMap 插入链与
 Build dispatch 供给，不再把它们混成“DAG 太慢”。
+
+### 16.4 `cross_core_dag` 复用同一合同
+
+mode2 没有新增 DAG 专用输出状态，只把 PA 和非 PA smoke 的调用条件
+扩展到已有 deferred API。严格 TensorMap 插入、DAG metadata 发布与
+fanin lookup 均继续由 mode2 原协议处理。
+
+真实 A5 验证结果：
+
+- 非 PA `A5OnboardBd24CompeteFirstFreshOutput` PASS；
+- PA B1 数值 golden PASS；
+- PA B256 数值 golden PASS，96 核均精确完成 1280 次 Submit；
+- startup→FinalDrain 为 **24.459 ms**，相对旧 mode2 基线
+  **70.907 ms** 降低 **46.448 ms / 65.5%**。
+
+新数据位于
+`outputs/TestPagedAttentionUnroll_Case1_20260809_150934/fdwic_perf_clock_summary.json`。
+mode1/mode2 分别为 24.188 / 24.459 ms，只相差 0.271 ms；它们共同从
+约 71 ms 降到约 24 ms，进一步证明主要改善来自去除共有的全核输出
+等待，而不是削弱 DAG 语义。
