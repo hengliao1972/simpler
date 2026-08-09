@@ -84,6 +84,7 @@ that ...".
 
 Newest first.
 
+- [2026-08 — SIMT DAG region shortcuts regressed the CCEC hot path](2026-08-simt-dag-region-shortcut.md)
 - [2026-08 — SIMT DAG metadata prefix did not reduce end-to-end time](2026-08-simt-dag-metadata-prefix.md)
 - [2026-07 — Shared PA Case1: standalone 2.3 ms is not an equivalent baseline; five micro-optimizations dropped](2026-07-shared-pa-case1-performance-gap.md)
 - [2026-07 — fdwic: removing `RingSlot::scalars` from submit slot build](2026-07-fdwic-ring-slot-scalar-copy.md)

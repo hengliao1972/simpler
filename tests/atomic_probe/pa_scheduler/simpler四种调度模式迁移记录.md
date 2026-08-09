@@ -504,3 +504,63 @@ metadata 变成完整 task 顺序链。它也可能消除了 builder 到达后�
 后续若继续消减 metadata lookup，应优先考虑不引入全任务串行前缀的局部索引、
 按 symbol/region 缩小候选集合，或先补 builder 分阶段计数定位真实占比；不要
 为了替换候选 atomic 再引入同类全局 prefix chain。
+
+## 14. 第四阶段保留项：合并同一 task 的 DAG 查询窗口
+
+### 14.1 重复工作与等价改写
+
+mode4 原实现按 Tensor 分别调用 `dist_simt_lookup_dag()`。若一个 task 有
+`Q` 个自动依赖的 INPUT/INOUT，每个查询都从 `N-1` 逆向扫描至命中或
+`N-H`，因此同一批 immutable metadata control 最坏会被返回型 atomic
+读取 `Q × H` 次。
+
+保留版改为一次 task 级扫描：
+
+1. 先用 32 bit 本地 mask 标记最多 32 个自动依赖查询；
+2. 按 task id 从近到远，每个候选 control 只 acquire 一次；
+3. 将该候选的 writer regions 与所有尚未命中的查询比较；
+4. 每个查询的首次命中仍是逻辑上最近的 writer；
+5. 扫描完成后再按原 Tensor 顺序把 owner、lookup 与显式依赖加入 fanin。
+
+因此最坏 control 读取上界由 `Q × H` 降为 `H`。这项改动没有新增共享
+字段、DCCI、atomic 地址或全局顺序链，也没有改变 metadata 发布、K16/W4
+builder 拓扑和执行包协议。代价仅是每个活跃 warp leader 保存一个最多
+32 项的本地 producer 数组。
+
+### 14.2 正确性与构建验证
+
+以下验证均通过：
+
+- 四个 DAG build identity、protocol 与 state 定向 C++ 测试；
+- mode4 AIC/AIV CCEC 完整构建；
+- 真实 A5 非 PA `A5OnboardBd24ExistingInoutChain`；
+- PA B1 数值 golden，端到端 1.532 ms；
+- 四次 PA B256 数值 golden 与 worker/builder 角色闭合。
+
+该算法只依赖 Tensor tag、manual dependency、region overlap、task id 与
+history，不读取 PA task kind、batch 或固定 DAG。
+
+### 14.3 A5 性能与保留判断
+
+相同 PA B256、shared TensorMap、K16/W4、startup 到 FinalDrain 口径：
+
+| 实现 | 独立进程结果 | 中位数 |
+| ---- | ------------ | -----: |
+| 原逐 Tensor 扫描 | 173.206 / 172.669 / 173.976 ms | 173.206 ms |
+| task 级批量扫描，前三次 | 172.157 / 173.895 / 172.656 ms | 172.656 ms |
+| task 级批量扫描，补充一次 | 172.372 ms | 四样本中位 172.514 ms |
+
+按前三次同样本数比较，中位改善 0.550 ms，约 0.32%；加入补充样本后，
+四样本中位相对原基线改善 0.692 ms，约 0.40%。两组区间仍重叠，所以只
+认定为小幅收益；保留依据同时包括明确减少重复返回型 atomic、共享协议
+完全不变和非 PA 正确性闭合，不把该结果描述为数量级突破。
+
+### 14.4 否决同轮的 region 快捷分支
+
+在批量扫描上又尝试过两个源码级微调：先比较 descriptor address 再计算
+region，以及让 caller 跳过已经在 lookup 中完成的第二次 region 校验。
+它们保持数值正确，但两次 B256 分别回退到 197.612 / 187.161 ms。完整撤回
+后立即恢复到 172.372 ms，已排除单次设备波动解释。
+
+当前没有 VF 汇编与分阶段计数，不能把回退武断归因于某个寄存器或分支；只
+记录该 CCEC 代码形态不可保留。对应 investigation 保存重新评估条件。

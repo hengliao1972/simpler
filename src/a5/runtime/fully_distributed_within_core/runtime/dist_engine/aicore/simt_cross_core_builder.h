@@ -461,14 +461,35 @@ DIST_SIMT_CALLEE bool dist_simt_publish_dag_metadata(
     return dist_simt_atomic_cas(control, 0, encoded) == 0;
 }
 
-DIST_SIMT_CALLEE int32_t dist_simt_lookup_dag(
-    __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata, uint64_t address, uint64_t lo, uint64_t hi,
-    uint32_t task_id, uint32_t history, __gm__ uint64_t *fatal, bool *valid
+// All automatic INPUT/INOUT queries share the same logical history window.
+// Acquire each immutable metadata control once, then resolve every still
+// unmatched query against that candidate before moving to the older task.
+DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
+    __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata, const DistSimtRequestView &request, uint32_t history,
+    __gm__ uint64_t *fatal, int32_t producers[]
 ) {
-    *valid = false;
-    if (metadata == nullptr || address == 0 || lo >= hi) return -1;
-    const uint32_t lower = task_id > history ? task_id - history : 0U;
-    for (uint32_t candidate = task_id; candidate > lower;) {
+    uint32_t unresolved = 0;
+    for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
+        producers[tensor] = -1;
+        const uint32_t tag = dist_simt_request_tag(request, tensor);
+        if (tag != static_cast<uint32_t>(TensorArgType::INPUT) && tag != static_cast<uint32_t>(TensorArgType::INOUT)) {
+            continue;
+        }
+        __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
+        const bool manual_dependency = ((descriptor[5] >> 8U) & 0xFFU) != 0;
+        if (!manual_dependency) {
+            uint64_t address = 0;
+            uint64_t lo = 0;
+            uint64_t hi = 0;
+            if (!dist_simt_tensor_region(descriptor, &address, &lo, &hi)) return false;
+            unresolved |= uint32_t{1} << tensor;
+        }
+    }
+    if (unresolved == 0) return true;
+    if (metadata == nullptr) return false;
+
+    const uint32_t lower = request.task_id > history ? request.task_id - history : 0U;
+    for (uint32_t candidate = request.task_id; candidate > lower;) {
         --candidate;
         __gm__ fdwic::cross_core::DagTaskMetadataCell *cell = &metadata[candidate];
         __gm__ uint64_t *control =
@@ -477,18 +498,17 @@ DIST_SIMT_CALLEE int32_t dist_simt_lookup_dag(
         uint32_t polls = 0;
         uint64_t raw = 0;
         while ((raw = dist_simt_atomic_load(control)) == 0) {
-            if (clock() - wait_begin > kDistSimtBuilderPollBudget) return -1;
-            if ((++polls & 1023U) == 0 && dist_simt_fatal_observed(fatal)) return -1;
+            if (clock() - wait_begin > kDistSimtBuilderPollBudget) return false;
+            if ((++polls & 1023U) == 0 && dist_simt_fatal_observed(fatal)) return false;
         }
         const uint64_t task_plus_one =
             (raw >> fdwic::cross_core::kDagTaskPlusOneShift) & fdwic::cross_core::kDagTaskPlusOneMask;
         const uint32_t writer_count = static_cast<uint32_t>(raw & fdwic::cross_core::kDagWriterCountMask);
         if ((raw & ~fdwic::cross_core::kDagControlKnownMask) != 0 || task_plus_one != candidate + 1U ||
             writer_count > fdwic::cross_core::kDagMaxWriterRegions) {
-            return -1;
+            return false;
         }
 
-        int32_t matched = -1;
         for (uint32_t writer_index = 0; writer_index < writer_count; ++writer_index) {
             __gm__ uint64_t *writer = reinterpret_cast<__gm__ uint64_t *>(&cell->payload.writers[writer_index]);
             const uint64_t candidate_address = writer[0];
@@ -497,23 +517,26 @@ DIST_SIMT_CALLEE int32_t dist_simt_lookup_dag(
             const uint64_t identity = writer[3];
             if (candidate_address == 0 || candidate_lo >= candidate_hi ||
                 static_cast<uint32_t>(identity) != candidate || static_cast<uint32_t>(identity >> 32U) != 0) {
-                return -1;
+                return false;
             }
-            if (candidate_address == address && lo < candidate_hi && candidate_lo < hi) {
-                matched = static_cast<int32_t>(candidate);
-                break;
+
+            for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
+                const uint32_t bit = uint32_t{1} << tensor;
+                if ((unresolved & bit) == 0) continue;
+                __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
+                uint64_t address = 0;
+                uint64_t lo = 0;
+                uint64_t hi = 0;
+                if (!dist_simt_tensor_region(descriptor, &address, &lo, &hi)) return false;
+                if (candidate_address == address && lo < candidate_hi && candidate_lo < hi) {
+                    producers[tensor] = static_cast<int32_t>(candidate);
+                    unresolved &= ~bit;
+                }
             }
         }
-        // Metadata control and payload are publish-once and immutable during
-        // this run. The first nonzero acquire already fixes this snapshot;
-        // reloading the same control only adds a contended returned atomic.
-        if (matched >= 0) {
-            *valid = true;
-            return matched;
-        }
+        if (unresolved == 0) return true;
     }
-    *valid = true;
-    return -1;
+    return true;
 }
 
 DIST_SIMT_CALLEE bool dist_simt_prepare_dag_and_fanin(
@@ -522,6 +545,8 @@ DIST_SIMT_CALLEE bool dist_simt_prepare_dag_and_fanin(
 ) {
     if (!dist_simt_publish_dag_metadata(metadata, request)) return false;
     *fanin_count = 0;
+    int32_t lookup_producers[fdwic::cross_core::kExecMaxTensors] = {};
+    if (!dist_simt_lookup_dag_fanins(metadata, request, history, fatal, lookup_producers)) return false;
     for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
         const uint32_t tag = dist_simt_request_tag(request, tensor);
         if (tag == static_cast<uint32_t>(TensorArgType::OUTPUT)) continue;
@@ -541,10 +566,7 @@ DIST_SIMT_CALLEE bool dist_simt_prepare_dag_and_fanin(
         if (!dist_simt_tensor_region(descriptor, &address, &lo, &hi)) return false;
         if (!manual_dependency && (tag == static_cast<uint32_t>(TensorArgType::INPUT) ||
                                    tag == static_cast<uint32_t>(TensorArgType::INOUT))) {
-            bool lookup_valid = false;
-            const int32_t producer =
-                dist_simt_lookup_dag(metadata, address, lo, hi, request.task_id, history, fatal, &lookup_valid);
-            if (!lookup_valid || !dist_simt_add_fanin(fanin, fanin_count, producer)) return false;
+            if (!dist_simt_add_fanin(fanin, fanin_count, lookup_producers[tensor])) return false;
         }
     }
     const uint32_t dependency_offset = fdwic::cross_core::kSimtRequestHeaderWords +
