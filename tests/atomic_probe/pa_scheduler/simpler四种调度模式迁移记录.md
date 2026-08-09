@@ -886,3 +886,56 @@ SIMT ordinary/DAG state 和 request protocol 定向 C++ 测试也全部 PASS。
 扇入，没有消除 80～95 个 worker 对 1,280 个 Submit 的全量 replay。
 后续需要改造 replay/Build/Execute 的任务发放方式，不应继续把同一
 收益误解为 PA DAG 或某种 Tensor 特例。
+
+## 19. 只为 SIMT DAG 保留 Execute 两级仲裁
+
+### 19.1 全模式候选扫描
+
+Build/request owner 收敛后，每个可执行 task 仍会让所有同 engine
+worker 直接 CAS 同一个 `execute_owner`。实验版为 Execute 增加了与
+Build/request 独立的 task-private tournament，避免两类 owner 在同一份
+状态上相互覆盖。所有同 engine worker 仍是候选者，不改执行资格。
+
+首轮 PA B256 单样本扫描为：
+
+- `cross_core_ordinary`：11.123 ms，对照 11.058 ms，无收益；
+- `cross_core_dag`：5.120 ms，对照 5.151 ms，约 0.6%，在噪声内；
+- `simt_cross_core_ordinary`：55.201 ms，对照 55.534 ms，约 0.6%，
+  在噪声内；
+- `simt_cross_core_dag`：22.637 ms，对照 24.544 ms，需要复测。
+
+因此没有把“一个模式有效”扩大为“四种模式都增加状态”。
+mode1/mode2/mode3 已撤回 Execute tournament，不为无可证收益的路径
+每个 task 额外保留 4,608 B。
+
+### 19.2 mode4 的结构性适用边界
+
+`simt_cross_core_dag` 使用 16 个 AIV0 builder，与其他三种后端的
+replay/Build/Execute 重叠拓扑不同。该后端的 Execute 两级仲裁三次
+独立进程为：
+
+```text
+22.637 / 22.806 / 22.407 ms
+median = 22.637 ms
+```
+
+相对第 18 章 24.544 ms 中位数改善约 7.8%，三次都低于对照
+最快样本 24.512 ms。将状态和热路缩回为 mode4 编译期独有后，
+最终确认样本为 **22.356 ms**。
+
+保留条件是 scheduler backend 的 builder/replay 拓扑，不是 PA task kind、
+batch、Tensor 形状或 DAG 内容。同 engine 的全部非 builder worker 仍参与
+仲裁，Build owner 与 Execute owner 仍完全解耦。
+
+### 19.3 正确性和观察闭合
+
+- mode4 的六类非 PA 边界全部数值 golden PASS；
+- 四种 mode 的 AIC/AIV、AICPU 和 Host 均完整 CCEC 构建通过；
+- ordinary/DAG/SIMT state 与 execution protocol 五组 C++ 测试通过；
+- 泳道 atomic site 增加 Execute local/root 名称，两者均按
+  `return_ready` CAS 观察；
+- 本阶段不使用 A5Sim。
+
+该优化仍只是降低 owner CAS 的并发扇入，没有改变 80 个 replay
+worker 全量运行 1,280 次 Submit 的基本架构，因而不会单独把 mode4
+推到 2 ms 目标。

@@ -169,6 +169,8 @@ const char *atomic_site_name(uint32_t site) {
         "SharedClaimTournamentRoot",
         "CrossCoreBuildTournamentLocal",
         "CrossCoreBuildTournamentRoot",
+        "CrossCoreExecuteTournamentLocal",
+        "CrossCoreExecuteTournamentRoot",
 #else
         "WonSlotClaimMax",
         "WonRemainingExchange",
@@ -525,7 +527,7 @@ bool validate_header_and_counts(
 #if PTO_FDWIC_SHARED_MAP
              || core_state.dcci_calls != 0 || core_state.dcci_lines != 0 || core_state.dcci_records != 0
 #endif
-             )) {
+            )) {
             LOG_ERROR(
                 "fdwic swimlane level-%u core %u unexpectedly reports atomic counters: calls=%u poll_calls=%u "
                 "poll_batches=%u",

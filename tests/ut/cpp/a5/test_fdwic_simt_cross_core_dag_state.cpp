@@ -70,6 +70,14 @@ TEST(FdwicSimtCrossCoreDagState, ResetTouchesEveryControlButPreservesImmutablePa
         EXPECT_EQ(state->runtime.tasks[task].control.state, 0) << "task=" << task;
         EXPECT_EQ(state->requests[task].control.state, 0) << "task=" << task;
         EXPECT_EQ(state->metadata[task].control.state, 0) << "task=" << task;
+        EXPECT_EQ(state->runtime.build_tournament[task].root.owner.v, -1) << "task=" << task;
+        EXPECT_EQ(state->runtime.execute_tournament[task].root.owner.v, -1) << "task=" << task;
+        for (uint32_t group = 0; group < kFdwicSharedClaimTournamentMaxGroups; ++group) {
+            EXPECT_EQ(state->runtime.build_tournament[task].local[group].owner.v, -1)
+                << "task=" << task << " group=" << group;
+            EXPECT_EQ(state->runtime.execute_tournament[task].local[group].owner.v, -1)
+                << "task=" << task << " group=" << group;
+        }
     }
     EXPECT_TRUE(BytesEqual(
         &state->requests[0], offsetof(fdwic::cross_core::SimtBuildRequestCell, payload),

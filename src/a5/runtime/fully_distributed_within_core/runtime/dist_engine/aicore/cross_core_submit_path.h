@@ -574,6 +574,11 @@ PTO_DEVICE_FUNC ExecEngineClass dist_cross_core_executor_engine(__gm__ DistCore 
     return ExecEngineClass::None;
 }
 
+PTO_DEVICE_FUNC bool dist_cross_core_win_task_tournament(
+    DistSubmitCtx &ctx, __gm__ SharedClaimTournamentTask &tournament, FdwicAtomicSite local_site,
+    FdwicAtomicSite root_site, bool &won
+);
+
 PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngineClass task_engine) {
     const ExecEngineClass executor_engine = dist_cross_core_executor_engine(ctx.self);
     if (executor_engine != task_engine) return true;
@@ -583,6 +588,17 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
     // keep the complete builder pool out of execute-owner election. Every
     // remaining engine-compatible worker stays a dynamic candidate.
     if (dist_cross_core_is_simt_builder_worker(ctx.self)) return true;
+#endif
+#if PTO_FDWIC_SCHEDULER_MODE == 4
+    bool tournament_winner = false;
+    if (!dist_cross_core_win_task_tournament(
+            ctx, dist_cross_core_runtime_state().execute_tournament[static_cast<uint32_t>(ctx.task_id)],
+            FdwicAtomicSite::CrossCoreExecuteTournamentLocal, FdwicAtomicSite::CrossCoreExecuteTournamentRoot,
+            tournament_winner
+        )) {
+        return false;
+    }
+    if (!tournament_winner) return true;
 #endif
     // Each compatible worker attempts the dynamic owner CAS once; only the
     // first arrival waits for BUILT. The task-private CAS line does not contend
@@ -642,7 +658,10 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
     }
 }
 
-PTO_DEVICE_FUNC bool dist_cross_core_win_build_tournament(DistSubmitCtx &ctx, bool &won) {
+PTO_DEVICE_FUNC bool dist_cross_core_win_task_tournament(
+    DistSubmitCtx &ctx, __gm__ SharedClaimTournamentTask &tournament, FdwicAtomicSite local_site,
+    FdwicAtomicSite root_site, bool &won
+) {
     won = false;
     if (ctx.self == nullptr || ctx.self->core_idx < 0 || g_dist.num_workers <= 0 ||
         ctx.self->core_idx >= g_dist.num_workers) {
@@ -652,27 +671,30 @@ PTO_DEVICE_FUNC bool dist_cross_core_win_build_tournament(DistSubmitCtx &ctx, bo
     const uint32_t groups =
         worker_count < kFdwicSharedClaimTournamentMaxGroups ? worker_count : kFdwicSharedClaimTournamentMaxGroups;
     const uint32_t group = static_cast<uint32_t>(ctx.self->core_idx) % groups;
-    __gm__ SharedClaimTournamentTask &tournament =
-        dist_cross_core_runtime_state().build_tournament[static_cast<uint32_t>(ctx.task_id)];
     const int64_t expected = -1;
     const int64_t desired = static_cast<int64_t>(ctx.task_id);
     const int64_t local_observed = fdwic_trace_atomic_compare_exchange<int64_t>(
-        ctx.task_id, FdwicAtomicSite::CrossCoreBuildTournamentLocal, tournament.local[group].owner.v, expected, desired,
-        /*result_used=*/true
+        ctx.task_id, local_site, tournament.local[group].owner.v, expected, desired, /*result_used=*/true
     );
     if (local_observed != expected) {
         if (local_observed != desired) return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
         return true;
     }
     const int64_t root_observed = fdwic_trace_atomic_compare_exchange<int64_t>(
-        ctx.task_id, FdwicAtomicSite::CrossCoreBuildTournamentRoot, tournament.root.owner.v, expected, desired,
-        /*result_used=*/true
+        ctx.task_id, root_site, tournament.root.owner.v, expected, desired, /*result_used=*/true
     );
     if (root_observed != expected && root_observed != desired) {
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
     won = root_observed == expected;
     return true;
+}
+
+PTO_DEVICE_FUNC bool dist_cross_core_win_build_tournament(DistSubmitCtx &ctx, bool &won) {
+    return dist_cross_core_win_task_tournament(
+        ctx, dist_cross_core_runtime_state().build_tournament[static_cast<uint32_t>(ctx.task_id)],
+        FdwicAtomicSite::CrossCoreBuildTournamentLocal, FdwicAtomicSite::CrossCoreBuildTournamentRoot, won
+    );
 }
 
 PTO_DEVICE_FUNC bool dist_cross_core_reserve_build(DistSubmitCtx &ctx, bool &build_owner) {

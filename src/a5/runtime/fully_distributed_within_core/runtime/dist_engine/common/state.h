@@ -481,6 +481,12 @@ struct alignas(kCacheLine) CrossCoreRuntimeState {
     // 选 Build owner，SIMT 模式用它选唯一 request publisher。复用
     // same-core 已验证的 512B 节点间距，不按算子类型裁剪候选核。
     SharedClaimTournamentTask build_tournament[kFdwicCrossCoreTaskCapacity];
+#if PTO_FDWIC_SCHEDULER_MODE == 4
+    // Execute 与 Build/request 可以并行且 owner 必须解耦，因此使用
+    // 独立的 task-private 仲裁树。SIMT DAG 的 16 个 builder 会使剩余
+    // replay/Execute 核形成独有拥塞；同 engine 的所有核仍是候选者。
+    SharedClaimTournamentTask execute_tournament[kFdwicCrossCoreTaskCapacity];
+#endif
 };
 using CrossCoreOrdinaryState = CrossCoreRuntimeState;
 static_assert(offsetof(CrossCoreOrdinaryState, fatal) == 0);
@@ -508,7 +514,11 @@ static_assert(
                 (sizeof(fdwic::cross_core::SharedExecControl) + sizeof(fdwic::cross_core::SharedExecCell) +
                  sizeof(fdwic::cross_core::CrossCoreOutputCell<Tensor>)) +
             sizeof(fdwic::cross_core::CrossCoreTensorMapState) +
-            kFdwicCrossCoreTaskCapacity * sizeof(SharedClaimTournamentTask),
+            kFdwicCrossCoreTaskCapacity * sizeof(SharedClaimTournamentTask)
+#if PTO_FDWIC_SCHEDULER_MODE == 4
+            + kFdwicCrossCoreTaskCapacity * sizeof(SharedClaimTournamentTask)
+#endif
+        ,
     "cross-core ordinary state size changed"
 );
 

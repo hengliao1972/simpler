@@ -160,7 +160,9 @@ enum class FdwicAtomicSite : uint32_t {
     SharedClaimTournamentRoot = 41,
     CrossCoreBuildTournamentLocal = 42,
     CrossCoreBuildTournamentRoot = 43,
-    Count = 44,
+    CrossCoreExecuteTournamentLocal = 44,
+    CrossCoreExecuteTournamentRoot = 45,
+    Count = 46,
     // Stale private BlockWon helpers still have to parse while the shared
     // submit path is compiled from the same translation unit. Values outside
     // Count are intentionally unencodable: executing one makes the trace
@@ -319,6 +321,8 @@ PTO_DEVICE_FUNC constexpr FdwicAtomicOp fdwic_atomic_site_op(FdwicAtomicSite sit
     case FdwicAtomicSite::SharedClaimTournamentRoot:
     case FdwicAtomicSite::CrossCoreBuildTournamentLocal:
     case FdwicAtomicSite::CrossCoreBuildTournamentRoot:
+    case FdwicAtomicSite::CrossCoreExecuteTournamentLocal:
+    case FdwicAtomicSite::CrossCoreExecuteTournamentRoot:
         return FdwicAtomicOp::CompareExchange;
 #else
     case FdwicAtomicSite::WonRemainingFetchSub:
@@ -382,7 +386,7 @@ PTO_DEVICE_FUNC constexpr bool fdwic_atomic_site_result_used(FdwicAtomicSite sit
 }
 
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kFdwicAtomicReturnReadySiteCount = 38;
+constexpr uint32_t kFdwicAtomicReturnReadySiteCount = 40;
 constexpr uint32_t kFdwicAtomicSourceIssueSiteCount = 6;
 #else
 constexpr uint32_t kFdwicAtomicReturnReadySiteCount = 16;
