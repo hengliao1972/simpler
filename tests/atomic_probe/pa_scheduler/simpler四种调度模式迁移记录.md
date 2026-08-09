@@ -952,3 +952,43 @@ batch、Tensor 形状或 DAG 内容。同 engine 的全部非 builder worker 仍
 该优化仍只是降低 owner CAS 的并发扇入，没有改变 80 个 replay
 worker 全量运行 1,280 次 Submit 的基本架构，因而不会单独把 mode4
 推到 2 ms 目标。
+
+## 20. 已否决的“缩减 replay 后统一 Execute”结构
+
+### 20.1 单 replay worker
+
+首个候选只让一个 Scalar 回放动态 orchestration，其余 95 个 Scalar 等待
+回放完成后再执行。该 Scalar 同时承担 Materialize、DAG history 查询、
+TensorMap metadata 发布和 Build payload 发布，PA B256 虽然数值正确，
+startup→FinalDrain 却达到 **163.880 ms**。这证明减少 replay 人口本身不等于
+减少 Build 工作；只要“计划生成”和“完整 Build”仍绑在同一 Scalar，方案就把
+原有并行 Build 退化成串行。
+
+### 20.2 16-worker 通用 replay cohort
+
+第二个候选按 96 个 worker 的物理编号均匀选择 16 个 replay worker，不读取
+PA task kind、batch 或固定五任务形状。16 个 worker 仍通过逐 task Build
+tournament 并行构建；全部 replay 完成后，由一个 sealer 扫描不可变 exec cell，
+生成 AIC/AIV task-id 队列，最后由 96 个 Scalar 统一 Execute。
+
+该候选通过本轮六类通用边界和 PA 数值 golden，但 PA B256
+startup→FinalDrain 为 **13.1668 ms**，仍比保留流水的约 **5.15 ms** 基线
+回退约 **155.7%**。根因不是 16 这个 PA 特例参数，而是全局 replay 闭合屏障
+把可重叠的 Build/Execute 强制串成前后两段。
+
+### 20.3 结论
+
+两版代码均已完整撤回，不作为性能候选保留。后续若要缩减全核重复 replay，
+必须同时满足：
+
+1. orchestration 计划生产与完整 Build 解耦，计划生产者不得承担全部 Build；
+2. Build 发布后立即允许同 engine executor 取得工作，不能等待全量计划封口；
+3. 动态输出用稳定 `(producer_task_id, output_slot)` 引用跨过计划阶段，不能迫使
+   计划生产者等待真实 TensorDesc；
+4. TensorMap metadata 仍严格按 task-id writer 前驱发布，而 Fanin/Build/Execute
+   继续允许并行；
+5. 新协议必须通过第 17 章十类、四模式共 40 个非 PA 边界组合。
+
+因此下一条可行主线是复用已有通用 build-request/payload 协议，形成“轻量计划
+发布 → 多 Scalar 动态 Build → Build 后即时 Execute”的流水，而不是继续微调
+replay worker 数量。
