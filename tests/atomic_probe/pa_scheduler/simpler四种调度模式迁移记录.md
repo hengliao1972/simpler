@@ -297,3 +297,37 @@ SIMT builder 并行摊分。
 2. 保留通用 region/alias/manual dependency 语义，不以 PA 固定图替代查询；
 3. 优先让索引构建或查询留在多 builder 可并行的位置；
 4. 每个候选先通过非 PA INOUT 链正确性，再以 188.308 ms 为端到端保留门槛。
+
+## 9. 第二阶段保留项：不可变控制字只做一次返回型读取
+
+### 9.1 冗余来源与改动边界
+
+mode4 的 request 与 DAG metadata 都遵循 publish-once 合同：发布者先写完整
+payload，再用 control atomic 发布；本轮运行中不再修改，只有下一轮启动前由
+AICPU 复位。原 SIMT 热路径仍存在三类重复返回型 atomic：
+
+- builder 轮询到 request `Published` 后，decode 再读一次 control；
+- decode 读取 immutable payload 后，第三次读取相同 control；
+- DAG lookup 首次读到非零 metadata control 并检查 payload 后，再次读取同一
+  control；metadata 发布前还先 load，再用 CAS 检查一次冲突。
+
+收敛后，轮询取得的首个 published control 直接传给 decode；metadata lookup
+也只保留首次非零 acquire。发布冲突仍由最终 CAS 的返回值检查。改动没有减少
+任何 Tensor region、writer、fanin 或 payload 校验，也没有改变 builder/execute
+拓扑和 TensorMap 顺序。
+
+### 9.2 同时段 A/B 实测
+
+相同 PA B256、真实 A5、shared TensorMap、startup 到 FinalDrain 口径，每次为
+独立 pytest 进程：
+
+| 实现 | 三次端到端时间 | 中位数 |
+| ---- | -------------- | -----: |
+| 单次读取候选 | 183.221 / 185.231 / 189.940 ms | 185.231 ms |
+| 恢复旧重复读取 | 185.215 / 186.827 / 187.642 ms | 186.827 ms |
+
+候选中位数降低 1.596 ms，约 0.85%；两组范围仍有重叠，因此只认定为小幅收益，
+不把最快样本当作稳定提升。通用正确性方面，相关协议单测全部通过，AIC/AIV
+CCEC clean build 通过，真实 A5 非 PA 的
+`A5OnboardBd24ExistingInoutChain` 也通过。该项建立在明确的不可变发布合同上，
+不含 PA 特例，予以保留。

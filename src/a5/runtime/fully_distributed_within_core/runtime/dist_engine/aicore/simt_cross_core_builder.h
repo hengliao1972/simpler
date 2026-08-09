@@ -116,10 +116,9 @@ DIST_SIMT_CALLEE __gm__ uint64_t *dist_simt_request_tensor(const DistSimtRequest
 }
 
 DIST_SIMT_CALLEE bool dist_simt_decode_request(
-    __gm__ fdwic::cross_core::SimtBuildRequestCell *cell, uint32_t task_id, DistSimtRequestView *request
+    __gm__ fdwic::cross_core::SimtBuildRequestCell *cell, uint32_t task_id, uint64_t raw,
+    DistSimtRequestView *request
 ) {
-    __gm__ uint64_t *control = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&cell->control.state));
-    const uint64_t raw = dist_simt_atomic_load(control);
     const uint32_t phase = static_cast<uint32_t>(raw & fdwic::cross_core::kSimtRequestPhaseMask);
     if (phase != static_cast<uint32_t>(fdwic::cross_core::SimtRequestPhase::Published)) return false;
     const uint32_t payload_lines = static_cast<uint32_t>(
@@ -165,7 +164,10 @@ DIST_SIMT_CALLEE bool dist_simt_decode_request(
                                    request->scalar_count + request->explicit_dep_count;
     const uint32_t expected_lines = (written_words * sizeof(uint64_t) + fdwic::cross_core::kExecCacheLineBytes - 1U) /
                                     fdwic::cross_core::kExecCacheLineBytes;
-    if (expected_lines != payload_lines || dist_simt_atomic_load(control) != raw) return false;
+    // Published request controls and payloads are immutable until the next
+    // AICPU reset. The caller's acquire load is therefore sufficient; a
+    // second returned atomic cannot detect a legal in-run state transition.
+    if (expected_lines != payload_lines) return false;
     for (uint32_t tensor = 0; tensor < request->tensor_count; ++tensor) {
         const uint32_t tag = dist_simt_request_tag(*request, tensor);
         if (tag > static_cast<uint32_t>(TensorArgType::NO_DEP)) return false;
@@ -431,7 +433,6 @@ DIST_SIMT_CALLEE bool dist_simt_publish_dag_metadata(
     if (metadata == nullptr || request.task_id == UINT32_MAX) return false;
     __gm__ fdwic::cross_core::DagTaskMetadataCell *cell = &metadata[request.task_id];
     __gm__ uint64_t *control = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&cell->control.state));
-    if (dist_simt_atomic_load(control) != 0) return false;
 
     uint32_t writer_count = 0;
     for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
@@ -505,7 +506,9 @@ DIST_SIMT_CALLEE int32_t dist_simt_lookup_dag(
                 break;
             }
         }
-        if (dist_simt_atomic_load(control) != raw) return -1;
+        // Metadata control and payload are publish-once and immutable during
+        // this run. The first nonzero acquire already fixes this snapshot;
+        // reloading the same control only adds a contended returned atomic.
         if (matched >= 0) {
             *valid = true;
             return matched;
@@ -808,7 +811,7 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
                 const uint64_t raw = dist_simt_atomic_load(control);
                 const uint32_t phase = static_cast<uint32_t>(raw & fdwic::cross_core::kSimtRequestPhaseMask);
                 if (phase == static_cast<uint32_t>(fdwic::cross_core::SimtRequestPhase::Published)) {
-                    acquired = dist_simt_decode_request(cell, task_id, &request);
+                    acquired = dist_simt_decode_request(cell, task_id, raw, &request);
                     if (!acquired) dist_simt_publish_fatal(fatal, task_id, builder_owner);
                     break;
                 }
