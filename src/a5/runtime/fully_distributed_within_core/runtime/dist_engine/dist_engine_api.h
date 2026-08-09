@@ -138,9 +138,7 @@ public:
         role_(CoreType::AIC),
         block_id_(-1) {}
 
-    PTO_DEVICE_FUNC bool ready() const {
-        return (role_ == CoreType::AIC || role_ == CoreType::AIV) && block_id_ >= 0;
-    }
+    PTO_DEVICE_FUNC bool ready() const { return (role_ == CoreType::AIC || role_ == CoreType::AIV) && block_id_ >= 0; }
     PTO_DEVICE_FUNC CoreType role() const { return role_; }
     PTO_DEVICE_FUNC int32_t block_id() const { return block_id_; }
 
@@ -181,15 +179,28 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *rt, const L0Ta
 // progress and Claim; Finish consumes the synchronously built args. The same
 // MixedKernels object must remain unchanged until Finish returns. The old
 // one-shot APIs above remain available unchanged for all existing examples.
-PTO_DEVICE_FUNC DistCompeteFirstTicket
-dist_submit_compete_first_begin(PTO2Runtime *rt, const MixedKernels &mixed);
+PTO_DEVICE_FUNC DistCompeteFirstTicket dist_submit_compete_first_begin(PTO2Runtime *rt, const MixedKernels &mixed);
 PTO_DEVICE_FUNC TaskOutputTensors dist_submit_compete_first_finish(
     PTO2Runtime *rt, const MixedKernels &mixed, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args
 );
 PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_begin(PTO2Runtime *rt);
-PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_compete_first_finish(
-    PTO2Runtime *rt, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args
+PTO_DEVICE_FUNC TaskOutputTensors
+dist_alloc_compete_first_finish(PTO2Runtime *rt, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args);
+
+#if PTO_FDWIC_SHARED_MAP
+// Non-blocking output-reference variant for cross-core schedulers.  All replay
+// actors still enter Finish so engine-compatible workers may compete for
+// Execute ownership, but only the unique Build owner touches args or waits for
+// predecessor output descriptors.  expected_output_count is checked before
+// the builder publishes its output cell.
+PTO_DEVICE_FUNC bool dist_submit_deferred_compete_first_finish(
+    PTO2Runtime *rt, const MixedKernels &mixed, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args,
+    uint32_t expected_output_count
 );
+PTO_DEVICE_FUNC bool dist_alloc_deferred_compete_first_finish(
+    PTO2Runtime *rt, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args, uint32_t expected_output_count
+);
+#endif
 
 #if PTO_FDWIC_SHARED_MAP
 // Shared PA split submit. Begin performs Claim, closes a nonwinner, and
@@ -198,25 +209,22 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_compete_first_finish(
 // orchestration wrapper skips that redundant cross-TU call.
 PTO_DEVICE_FUNC DistSharedPaReplayContext dist_shared_pa_replay_context();
 PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_submit_begin(
-    PTO2Runtime *rt, DistSharedPaReplayContext replay,
-    const MixedKernels &mixed, DistSharedPaTaskKind kind
+    PTO2Runtime *rt, DistSharedPaReplayContext replay, const MixedKernels &mixed, DistSharedPaTaskKind kind
 );
 PTO_DEVICE_FUNC bool dist_shared_pa_submit_finish(
-    PTO2Runtime *rt, DistSharedPaReplayContext replay,
-    const MixedKernels &mixed, DistSharedPaTaskKind kind,
+    PTO2Runtime *rt, DistSharedPaReplayContext replay, const MixedKernels &mixed, DistSharedPaTaskKind kind,
     const DistCompeteFirstTicket &ticket, const L0TaskArgs *winner_args
 );
-PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_alloc_begin(
-    PTO2Runtime *rt, DistSharedPaReplayContext replay
-);
+PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_alloc_begin(PTO2Runtime *rt, DistSharedPaReplayContext replay);
 PTO_DEVICE_FUNC bool dist_shared_pa_alloc_finish(
-    PTO2Runtime *rt, DistSharedPaReplayContext replay,
-    const DistCompeteFirstTicket &ticket, const L0TaskArgs *winner_args
+    PTO2Runtime *rt, DistSharedPaReplayContext replay, const DistCompeteFirstTicket &ticket,
+    const L0TaskArgs *winner_args
 );
 #endif
 
-// perf-clock 专用构建由具体 orchestration 显式声明本核应重放的 Submit
-// 总数。普通构建中该接口编译为空操作，不改变公开 submit ABI。
+// A perf-clock orchestration explicitly declares the expected number of
+// Submit calls replayed by this core. The API compiles to a no-op in regular
+// builds and does not change the public Submit ABI.
 PTO_DEVICE_FUNC void dist_perf_clock_expect_submits(uint32_t expected_submits);
 PTO_DEVICE_FUNC void dist_submit_pmu_expect_submits(uint32_t expected_submits);
 

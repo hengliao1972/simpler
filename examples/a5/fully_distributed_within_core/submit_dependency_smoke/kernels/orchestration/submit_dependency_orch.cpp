@@ -377,6 +377,17 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     if (mode == 32) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs left_args;
+#if PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE == 1
+        SharedTaskOutputs left_out = rt_submit_aic_task_deferred_compete_first(
+            FUNC_MAKE_LEFT_AIC, 1, left_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                submit_args.add_input(input);
+                submit_args.add_output(scratch_ci);
+                submit_args.add_scalar(n);
+            }
+        );
+        if (left_out.size() != 1) return;
+        FdwicOutputRef left = left_out.output_ref(0);
+#else
         TaskOutputTensors left_out = rt_submit_aic_task_compete_first(
             FUNC_MAKE_LEFT_AIC, left_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                 submit_args.add_input(input);
@@ -385,6 +396,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
             }
         );
         __gm__ const Tensor &left = left_out.get_ref(0);
+#endif
 
         L0TaskArgs fanin_args;
         fanin_args.add_input(left);

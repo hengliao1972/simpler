@@ -28,10 +28,11 @@
 
 #include "dist_engine/common/target.h"
 
-// `shared TensorMap` 是后端存储合同，不能等同于 legacy same-core PA
-// 的专用回放协议。只有 same_core + shared 才使用固定 Case1、
-// SharedOutputRef 和角色特化的快路径；跨核调度器必须走通用 Submit
-// 接口，才能让构建 owner、执行 owner 和输出描述符协议保持算子无关。
+// A shared TensorMap is a storage contract, not the legacy same-core PA
+// replay protocol. Only same_core + shared uses the fixed Case1,
+// SharedOutputRef, and role-specialized fast path. Cross-core schedulers must
+// use generic Submit APIs so Build ownership, Execute ownership, and output
+// descriptor publication remain operator-independent.
 #if PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE == 0
 #define PTO_FDWIC_SAME_CORE_SHARED_PA_PATH 1
 #else
@@ -81,9 +82,8 @@ constexpr uint64_t kPaOrchestrationProfSysCntFreq = 50000000;  // 50 MHz
 PTO_DEVICE_FUNC inline uint64_t min_u64(uint64_t a, uint64_t b) { return a < b ? a : b; }
 
 #if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
-PTO_DEVICE_FUNC inline void init_shared_pa_create_info(
-    TensorCreateInfo &info, const uint32_t shapes[], uint32_t ndims, DataType dtype
-) {
+PTO_DEVICE_FUNC inline void
+init_shared_pa_create_info(TensorCreateInfo &info, const uint32_t shapes[], uint32_t ndims, DataType dtype) {
     always_assert(ndims > 0 && ndims <= MAX_TENSOR_DIMS);
     info.initial_value = 0;
     info.has_initial_value = false;
@@ -95,7 +95,8 @@ PTO_DEVICE_FUNC inline void init_shared_pa_create_info(
     info.manual_dep = false;
     info.is_contiguous = true;
     info.__pad_flags__ = 0;
-    for (uint32_t index = 0; index < ndims; ++index) info.shapes[index] = shapes[index];
+    for (uint32_t index = 0; index < ndims; ++index)
+        info.shapes[index] = shapes[index];
 }
 
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
@@ -137,8 +138,7 @@ static_assert(
 
 PTO_DEVICE_FUNC inline void shared_pa_report_unexpected_winner_role() {
     rt_report_fatal(
-        PTO2_ERROR_TENSORMAP_PROTOCOL,
-        "shared PA Claim selected a winner whose compiled role cannot execute the task"
+        PTO2_ERROR_TENSORMAP_PROTOCOL, "shared PA Claim selected a winner whose compiled role cannot execute the task"
     );
 }
 #endif
@@ -207,9 +207,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // scalar fields instead of loading DistCore identity from GM.
     const DistSharedPaReplayContext replay = dist_shared_pa_replay_context();
     if (!replay.ready()) {
-        rt_report_fatal(
-            PTO2_ERROR_DIST_CONFIG_INVALID, "shared PA replay has no valid attached AICore identity"
-        );
+        rt_report_fatal(PTO2_ERROR_DIST_CONFIG_INVALID, "shared PA replay has no valid attached AICore identity");
         return;
     }
 #endif
@@ -218,10 +216,11 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // query: shape=[batch, num_heads, head_dim]
     uint64_t batch = orch_args.tensor(0).ref().shapes[0];
 #if PTO_FDWIC_PERF_CLOCK || PTO_FDWIC_SUBMIT_PMU
-    // perf-clock 与 submit-pmu-none 当前只服务与 Case1 同构的 PA：每个 batch 恰好一次
-    // Alloc 和一组 QK/SF/PV/UP，共 5 次 Submit。Case2/3 的 block 分组数
-    // 不同；若误用该诊断构建，最终实际 count 会超过 expected，host 必须
-    // fail closed，不能把中途第 5*batch 次 Submit 冒充为末次。
+    // perf-clock and submit-pmu-none currently cover only the Case1-shaped PA:
+    // one Alloc plus one QK/SF/PV/UP group per batch, or five Submit calls.
+    // Case2/3 use different block grouping. If this diagnostic build is used
+    // there, the actual count exceeds the expected count and the host must fail
+    // closed instead of treating the intermediate 5*batch Submit as the last.
     rt_perf_clock_expect_submits(static_cast<uint32_t>(5 * batch));
 #endif
     uint64_t num_heads = orch_args.tensor(0).ref().shapes[1];
@@ -234,12 +233,11 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // The build/scene gate rejects every non-Case1 selection before compile.
     // Repeat the exact data contract here so a custom caller cannot bypass
     // that gate and run this specialized image with an unsupported shape.
-    if (batch != kFdwicSharedPaBatches || num_heads != 16 || head_dim != 128 ||
-        block_size != 128 || data_type != DataType::BFLOAT16) {
+    if (batch != kFdwicSharedPaBatches || num_heads != 16 || head_dim != 128 || block_size != 128 ||
+        data_type != DataType::BFLOAT16) {
         rt_report_fatal(
-            PTO2_ERROR_DIST_CONFIG_INVALID,
-            "shared PA phase 1 requires Case1: batch=256, num_heads=16, "
-            "head_dim=128, block_size=128, bfloat16"
+            PTO2_ERROR_DIST_CONFIG_INVALID, "shared PA phase 1 requires Case1: batch=256, num_heads=16, "
+                                            "head_dim=128, block_size=128, bfloat16"
         );
         return;
     }
@@ -258,9 +256,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // Alloc -> QK -> SF -> PV -> UP.  Reject shapes that would submit a
     // second q-head group or exceed the fixed shared task table.
     if (q_loop != 1) {
-        rt_report_fatal(
-            PTO2_ERROR_DIST_CONFIG_INVALID, "shared PA phase 1 requires exactly one q-head group"
-        );
+        rt_report_fatal(PTO2_ERROR_DIST_CONFIG_INVALID, "shared PA phase 1 requires exactly one q-head group");
         return;
     }
 #endif
@@ -363,8 +359,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                 // its exact task-id prefix into each typed Submit so all 96
                 // replay actors do an equality check instead of rebuilding
                 // task kind from task_id%5 on the Claim hot path.
-                const int32_t shared_batch_task_start =
-                    static_cast<int32_t>(b_idx * kFdwicSharedPaTasksPerBatch);
+                const int32_t shared_batch_task_start = static_cast<int32_t>(b_idx * kFdwicSharedPaTasksPerBatch);
                 // Deliberately uninitialized: each retained symbol is
                 // assigned by an earlier successful Submit in this task
                 // group before its role-matched winner callback consumes it.
@@ -394,22 +389,21 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
                 CYCLE_COUNT_LAP(prof_param_setup);
 #if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
-                SharedTaskOutputs alloc_outs =
-                    PTO_FDWIC_SHARED_PA_ALLOC_CALL(shared_pa_alloc_tensors_compete_first)(
-                        replay, PTO_FDWIC_SHARED_PA_ALLOC_IDENTITY(shared_batch_task_start)
-                        params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
-                            // Alloc has no executable lane.  Its two-level
-                            // tournament deliberately admits all 96 workers,
-                            // so either compiled role must be able to build
-                            // the same three output descriptors when it wins.
-                            CYCLE_COUNT_LAP(prof_submit_task);
-                            submit_args.reset();
-                            submit_args.add_output(tile2d_ci);
-                            submit_args.add_output(scalar_ci);
-                            submit_args.add_output(scalar_ci);
-                            CYCLE_COUNT_LAP(prof_param_setup);
-                        }
-                    );
+                SharedTaskOutputs alloc_outs = PTO_FDWIC_SHARED_PA_ALLOC_CALL(shared_pa_alloc_tensors_compete_first)(
+                    replay, PTO_FDWIC_SHARED_PA_ALLOC_IDENTITY(shared_batch_task_start) params,
+                    [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                        // Alloc has no executable lane.  Its two-level
+                        // tournament deliberately admits all 96 workers,
+                        // so either compiled role must be able to build
+                        // the same three output descriptors when it wins.
+                        CYCLE_COUNT_LAP(prof_submit_task);
+                        submit_args.reset();
+                        submit_args.add_output(tile2d_ci);
+                        submit_args.add_output(scalar_ci);
+                        submit_args.add_output(scalar_ci);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                    }
+                );
                 if (alloc_outs.size() != 3) return;
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
                 if constexpr (ReplayRole == CoreType::AIV) {
@@ -422,20 +416,31 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                 FdwicOutputRef li_update = alloc_outs.output_ref(1);
                 FdwicOutputRef mi_update = alloc_outs.output_ref(2);
 #endif
-#else
-                TaskOutputTensors alloc_outs = alloc_tensors_compete_first(
-                    params,
-                    [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+#elif PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE == 1
+                SharedTaskOutputs alloc_outs =
+                    alloc_tensors_deferred_compete_first(3, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                         CYCLE_COUNT_LAP(prof_submit_task);
                         submit_args.add_output(tile2d_ci);
                         submit_args.add_output(scalar_ci);
                         submit_args.add_output(scalar_ci);
                         CYCLE_COUNT_LAP(prof_param_setup);
-                    }
-                );
-                __gm__ const Tensor &oi = alloc_outs.get_ref(0);
-                __gm__ const Tensor &li_update = alloc_outs.get_ref(1);
-                __gm__ const Tensor &mi_update = alloc_outs.get_ref(2);
+                    });
+                if (alloc_outs.size() != 3) return;
+                FdwicOutputRef oi = alloc_outs.output_ref(0);
+                FdwicOutputRef li_update = alloc_outs.output_ref(1);
+                FdwicOutputRef mi_update = alloc_outs.output_ref(2);
+#else
+        TaskOutputTensors alloc_outs =
+            alloc_tensors_compete_first(params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                CYCLE_COUNT_LAP(prof_submit_task);
+                submit_args.add_output(tile2d_ci);
+                submit_args.add_output(scalar_ci);
+                submit_args.add_output(scalar_ci);
+                CYCLE_COUNT_LAP(prof_param_setup);
+            });
+        __gm__ const Tensor &oi = alloc_outs.get_ref(0);
+        __gm__ const Tensor &li_update = alloc_outs.get_ref(1);
+        __gm__ const Tensor &mi_update = alloc_outs.get_ref(2);
 #endif
 #ifdef ENABLE_PROFILING
                 prof_submit_count++;
@@ -467,49 +472,45 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 
 #if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
-                    SharedTaskOutputs qk_outs = PTO_FDWIC_SHARED_PA_TASK_CALL(
-                        shared_pa_submit_aic_compete_first, DistSharedPaTaskKind::Qk
-                    )(
-                        replay, PTO_FDWIC_SHARED_PA_TASK_IDENTITY(
-                            DistSharedPaTaskKind::Qk, shared_batch_task_start + 1
-                        ) FUNC_QK_MATMUL, params,
-                        [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    SharedTaskOutputs qk_outs =
+                        PTO_FDWIC_SHARED_PA_TASK_CALL(shared_pa_submit_aic_compete_first, DistSharedPaTaskKind::Qk)(
+                            replay,
+                            PTO_FDWIC_SHARED_PA_TASK_IDENTITY(DistSharedPaTaskKind::Qk, shared_batch_task_start + 1)
+                                FUNC_QK_MATMUL,
+                            params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            if constexpr (ReplayRole == CoreType::AIC) {
+                                if constexpr (ReplayRole == CoreType::AIC) {
 #endif
-                            CYCLE_COUNT_LAP(prof_submit_task);
-                            submit_args.reset();
-                            const uint64_t n_blocks =
-                                min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
-                            const uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
-                            uint32_t sij_buf_shapes[2] = {
-                                static_cast<uint32_t>(q_tile),
-                                static_cast<uint32_t>(n_blocks * block_size)
-                            };
-                            CYCLE_COUNT_LAP(prof_param_extract);
-                            uint32_t qi_shapes[2] = {
-                                static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)
-                            };
-                            uint32_t qi_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                            qi = Tensor::view(query, qi_shapes, qi_offsets);
-                            init_shared_pa_create_info(
-                                sij_buf_ci, sij_buf_shapes, 2, DataType::FLOAT32
-                            );
-                            submit_args.add_input(qi, key_cache, block_table);
-                            submit_args.add_output(sij_buf_ci);
-                            submit_args.add_scalar(n_blocks, b_idx * block_num + bn);
+                                    CYCLE_COUNT_LAP(prof_submit_task);
+                                    submit_args.reset();
+                                    const uint64_t n_blocks =
+                                        min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
+                                    const uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
+                                    uint32_t sij_buf_shapes[2] = {
+                                        static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
+                                    };
+                                    CYCLE_COUNT_LAP(prof_param_extract);
+                                    uint32_t qi_shapes[2] = {
+                                        static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)
+                                    };
+                                    uint32_t qi_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
+                                    qi = Tensor::view(query, qi_shapes, qi_offsets);
+                                    init_shared_pa_create_info(sij_buf_ci, sij_buf_shapes, 2, DataType::FLOAT32);
+                                    submit_args.add_input(qi, key_cache, block_table);
+                                    submit_args.add_output(sij_buf_ci);
+                                    submit_args.add_scalar(n_blocks, b_idx * block_num + bn);
 #ifdef ENABLE_PROFILING
-                            ++prof_view_count;
-                            ++prof_make_count;
+                                    ++prof_view_count;
+                                    ++prof_make_count;
 #endif
-                            CYCLE_COUNT_LAP(prof_param_setup);
+                                    CYCLE_COUNT_LAP(prof_param_setup);
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            } else {
-                                shared_pa_report_unexpected_winner_role();
-                            }
+                                } else {
+                                    shared_pa_report_unexpected_winner_role();
+                                }
 #endif
-                        }
-                    );
+                            }
+                        );
                     if (qk_outs.size() != 1) return;
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
                     if constexpr (ReplayRole == CoreType::AIV) {
@@ -518,10 +519,9 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #else
                     FdwicOutputRef sij_buf = qk_outs.output_ref(0);
 #endif
-#else
-                    TaskOutputTensors qk_outs = rt_submit_aic_task_compete_first(
-                        FUNC_QK_MATMUL, params,
-                        [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+#elif PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE == 1
+                    SharedTaskOutputs qk_outs = rt_submit_aic_task_deferred_compete_first(
+                        FUNC_QK_MATMUL, 1, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                             CYCLE_COUNT_LAP(prof_submit_task);
                             submit_args.reset();
                             submit_args.add_input(qi, key_cache, block_table);
@@ -530,7 +530,19 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                             CYCLE_COUNT_LAP(prof_param_setup);
                         }
                     );
-                    __gm__ const Tensor &sij_buf = qk_outs.get_ref(0);
+                    if (qk_outs.size() != 1) return;
+                    FdwicOutputRef sij_buf = qk_outs.output_ref(0);
+#else
+            TaskOutputTensors qk_outs =
+                rt_submit_aic_task_compete_first(FUNC_QK_MATMUL, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    CYCLE_COUNT_LAP(prof_submit_task);
+                    submit_args.reset();
+                    submit_args.add_input(qi, key_cache, block_table);
+                    submit_args.add_output(sij_buf_ci);
+                    submit_args.add_scalar(n_blocks, b_idx * block_num + bn);
+                    CYCLE_COUNT_LAP(prof_param_setup);
+                });
+            __gm__ const Tensor &sij_buf = qk_outs.get_ref(0);
 #endif
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
@@ -552,50 +564,44 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 
 #if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
-                    SharedTaskOutputs sf_outs = PTO_FDWIC_SHARED_PA_TASK_CALL(
-                        shared_pa_submit_aiv_compete_first, DistSharedPaTaskKind::Sf
-                    )(
-                        replay, PTO_FDWIC_SHARED_PA_TASK_IDENTITY(
-                            DistSharedPaTaskKind::Sf, shared_batch_task_start + 2
-                        ) FUNC_SOFTMAX_PREPARE, params,
-                        [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    SharedTaskOutputs sf_outs =
+                        PTO_FDWIC_SHARED_PA_TASK_CALL(shared_pa_submit_aiv_compete_first, DistSharedPaTaskKind::Sf)(
+                            replay,
+                            PTO_FDWIC_SHARED_PA_TASK_IDENTITY(DistSharedPaTaskKind::Sf, shared_batch_task_start + 2)
+                                FUNC_SOFTMAX_PREPARE,
+                            params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            if constexpr (ReplayRole == CoreType::AIV) {
+                                if constexpr (ReplayRole == CoreType::AIV) {
 #endif
-                            CYCLE_COUNT_LAP(prof_submit_task);
-                            submit_args.reset();
-                            const uint64_t n_blocks =
-                                min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
-                            const uint64_t last_block_seq_start =
-                                (bn + n_blocks - 1) * block_size;
-                            const uint64_t valid_len_last =
-                                min_u64(block_size, cur_seq - last_block_seq_start);
-                            uint32_t pij_buf_shapes[2] = {
-                                static_cast<uint32_t>(q_tile),
-                                static_cast<uint32_t>(n_blocks * block_size)
-                            };
-                            CYCLE_COUNT_LAP(prof_param_extract);
-                            init_shared_pa_create_info(
-                                pij_buf_ci, pij_buf_shapes, 2, data_type
-                            );
+                                    CYCLE_COUNT_LAP(prof_submit_task);
+                                    submit_args.reset();
+                                    const uint64_t n_blocks =
+                                        min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
+                                    const uint64_t last_block_seq_start = (bn + n_blocks - 1) * block_size;
+                                    const uint64_t valid_len_last = min_u64(block_size, cur_seq - last_block_seq_start);
+                                    uint32_t pij_buf_shapes[2] = {
+                                        static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
+                                    };
+                                    CYCLE_COUNT_LAP(prof_param_extract);
+                                    init_shared_pa_create_info(pij_buf_ci, pij_buf_shapes, 2, data_type);
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            submit_args.add_input(role_outputs.qk_scores);
+                                    submit_args.add_input(role_outputs.qk_scores);
 #else
-                            submit_args.add_input(sij_buf);
+                                submit_args.add_input(sij_buf);
 #endif
-                            submit_args.add_output(pij_buf_ci, scalar_ci, scalar_ci);
-                            submit_args.add_scalar(scale_value, n_blocks, valid_len_last);
+                                    submit_args.add_output(pij_buf_ci, scalar_ci, scalar_ci);
+                                    submit_args.add_scalar(scale_value, n_blocks, valid_len_last);
 #ifdef ENABLE_PROFILING
-                            ++prof_make_count;
+                                    ++prof_make_count;
 #endif
-                            CYCLE_COUNT_LAP(prof_param_setup);
+                                    CYCLE_COUNT_LAP(prof_param_setup);
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            } else {
-                                shared_pa_report_unexpected_winner_role();
-                            }
+                                } else {
+                                    shared_pa_report_unexpected_winner_role();
+                                }
 #endif
-                        }
-                    );
+                            }
+                        );
                     if (sf_outs.size() != 3) return;
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
                     if constexpr (ReplayRole == CoreType::AIC) {
@@ -609,10 +615,9 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                     FdwicOutputRef mi = sf_outs.output_ref(1);
                     FdwicOutputRef li = sf_outs.output_ref(2);
 #endif
-#else
-                    TaskOutputTensors sf_outs = rt_submit_aiv_task_compete_first(
-                        FUNC_SOFTMAX_PREPARE, params,
-                        [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+#elif PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE == 1
+                    SharedTaskOutputs sf_outs = rt_submit_aiv_task_deferred_compete_first(
+                        FUNC_SOFTMAX_PREPARE, 3, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                             CYCLE_COUNT_LAP(prof_submit_task);
                             submit_args.reset();
                             submit_args.add_input(sij_buf);
@@ -621,9 +626,24 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                             CYCLE_COUNT_LAP(prof_param_setup);
                         }
                     );
-                    __gm__ const Tensor &pij_buf = sf_outs.get_ref(0);
-                    __gm__ const Tensor &mi = sf_outs.get_ref(1);
-                    __gm__ const Tensor &li = sf_outs.get_ref(2);
+                    if (sf_outs.size() != 3) return;
+                    FdwicOutputRef pij_buf = sf_outs.output_ref(0);
+                    FdwicOutputRef mi = sf_outs.output_ref(1);
+                    FdwicOutputRef li = sf_outs.output_ref(2);
+#else
+            TaskOutputTensors sf_outs = rt_submit_aiv_task_compete_first(
+                FUNC_SOFTMAX_PREPARE, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    CYCLE_COUNT_LAP(prof_submit_task);
+                    submit_args.reset();
+                    submit_args.add_input(sij_buf);
+                    submit_args.add_output(pij_buf_ci, scalar_ci, scalar_ci);
+                    submit_args.add_scalar(scale_value, n_blocks, valid_len_last);
+                    CYCLE_COUNT_LAP(prof_param_setup);
+                }
+            );
+            __gm__ const Tensor &pij_buf = sf_outs.get_ref(0);
+            __gm__ const Tensor &mi = sf_outs.get_ref(1);
+            __gm__ const Tensor &li = sf_outs.get_ref(2);
 #endif
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
@@ -632,38 +652,35 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 
                     // === Task 3: SplitK PV matmul (accumulated P @ V) ===
 #if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
-                    SharedTaskOutputs pv_outs = PTO_FDWIC_SHARED_PA_TASK_CALL(
-                        shared_pa_submit_aic_compete_first, DistSharedPaTaskKind::Pv
-                    )(
-                        replay, PTO_FDWIC_SHARED_PA_TASK_IDENTITY(
-                            DistSharedPaTaskKind::Pv, shared_batch_task_start + 3
-                        ) FUNC_PV_MATMUL, params,
-                        [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    SharedTaskOutputs pv_outs =
+                        PTO_FDWIC_SHARED_PA_TASK_CALL(shared_pa_submit_aic_compete_first, DistSharedPaTaskKind::Pv)(
+                            replay,
+                            PTO_FDWIC_SHARED_PA_TASK_IDENTITY(DistSharedPaTaskKind::Pv, shared_batch_task_start + 3)
+                                FUNC_PV_MATMUL,
+                            params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            if constexpr (ReplayRole == CoreType::AIC) {
+                                if constexpr (ReplayRole == CoreType::AIC) {
 #endif
-                            CYCLE_COUNT_LAP(prof_submit_task);
-                            submit_args.reset();
-                            const uint64_t n_blocks =
-                                min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
-                            CYCLE_COUNT_LAP(prof_param_extract);
+                                    CYCLE_COUNT_LAP(prof_submit_task);
+                                    submit_args.reset();
+                                    const uint64_t n_blocks =
+                                        min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
+                                    CYCLE_COUNT_LAP(prof_param_extract);
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            submit_args.add_input(
-                                role_outputs.sf_probs, value_cache, block_table
-                            );
+                                    submit_args.add_input(role_outputs.sf_probs, value_cache, block_table);
 #else
-                            submit_args.add_input(pij_buf, value_cache, block_table);
+                                submit_args.add_input(pij_buf, value_cache, block_table);
 #endif
-                            submit_args.add_output(tile2d_ci);
-                            submit_args.add_scalar(n_blocks, b_idx * block_num + bn);
-                            CYCLE_COUNT_LAP(prof_param_setup);
+                                    submit_args.add_output(tile2d_ci);
+                                    submit_args.add_scalar(n_blocks, b_idx * block_num + bn);
+                                    CYCLE_COUNT_LAP(prof_param_setup);
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            } else {
-                                shared_pa_report_unexpected_winner_role();
-                            }
+                                } else {
+                                    shared_pa_report_unexpected_winner_role();
+                                }
 #endif
-                        }
-                    );
+                            }
+                        );
                     if (pv_outs.size() != 1) return;
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
                     if constexpr (ReplayRole == CoreType::AIV) {
@@ -672,10 +689,9 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #else
                     FdwicOutputRef oi_new = pv_outs.output_ref(0);
 #endif
-#else
-                    TaskOutputTensors pv_outs = rt_submit_aic_task_compete_first(
-                        FUNC_PV_MATMUL, params,
-                        [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+#elif PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE == 1
+                    SharedTaskOutputs pv_outs = rt_submit_aic_task_deferred_compete_first(
+                        FUNC_PV_MATMUL, 1, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                             CYCLE_COUNT_LAP(prof_submit_task);
                             submit_args.reset();
                             submit_args.add_input(pij_buf, value_cache, block_table);
@@ -684,7 +700,19 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                             CYCLE_COUNT_LAP(prof_param_setup);
                         }
                     );
-                    __gm__ const Tensor &oi_new = pv_outs.get_ref(0);
+                    if (pv_outs.size() != 1) return;
+                    FdwicOutputRef oi_new = pv_outs.output_ref(0);
+#else
+            TaskOutputTensors pv_outs =
+                rt_submit_aic_task_compete_first(FUNC_PV_MATMUL, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    CYCLE_COUNT_LAP(prof_submit_task);
+                    submit_args.reset();
+                    submit_args.add_input(pij_buf, value_cache, block_table);
+                    submit_args.add_output(tile2d_ci);
+                    submit_args.add_scalar(n_blocks, b_idx * block_num + bn);
+                    CYCLE_COUNT_LAP(prof_param_setup);
+                });
+            __gm__ const Tensor &oi_new = pv_outs.get_ref(0);
 #endif
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
@@ -699,69 +727,74 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #endif
 
 #if PTO_FDWIC_SAME_CORE_SHARED_PA_PATH
-                    SharedTaskOutputs up_outs = PTO_FDWIC_SHARED_PA_TASK_CALL(
-                        shared_pa_submit_aiv_compete_first, DistSharedPaTaskKind::Up
-                    )(
-                        replay, PTO_FDWIC_SHARED_PA_TASK_IDENTITY(
-                            DistSharedPaTaskKind::Up, shared_batch_task_start + 4
-                        ) FUNC_ONLINE_UPDATE, params,
-                        [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    SharedTaskOutputs up_outs =
+                        PTO_FDWIC_SHARED_PA_TASK_CALL(shared_pa_submit_aiv_compete_first, DistSharedPaTaskKind::Up)(
+                            replay,
+                            PTO_FDWIC_SHARED_PA_TASK_IDENTITY(DistSharedPaTaskKind::Up, shared_batch_task_start + 4)
+                                FUNC_ONLINE_UPDATE,
+                            params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            if constexpr (ReplayRole == CoreType::AIV) {
+                                if constexpr (ReplayRole == CoreType::AIV) {
 #endif
+                                    CYCLE_COUNT_LAP(prof_submit_task);
+                                    submit_args.reset();
+                                    const uint64_t n_blocks =
+                                        min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
+                                    const uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
+                                    const uint64_t is_first = (bn == 0) ? 1 : 0;
+                                    const uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
+                                    CYCLE_COUNT_LAP(prof_param_extract);
+                                    uint32_t out_view_shapes[2] = {
+                                        static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)
+                                    };
+                                    uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
+                                    out_view = Tensor::view(out, out_view_shapes, out_view_offsets, true);
+#if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
+                                    submit_args.add_input(
+                                        role_outputs.sf_max, role_outputs.sf_sum, role_outputs.pv_output
+                                    );
+                                    submit_args.add_inout(
+                                        role_outputs.accumulated_max, role_outputs.accumulated_sum,
+                                        role_outputs.accumulated_output, out_view
+                                    );
+#else
+                                submit_args.add_input(mi, li, oi_new);
+                                submit_args.add_inout(mi_update, li_update, oi, out_view);
+#endif
+                                    submit_args.add_scalar(is_first, is_last);
+#ifdef ENABLE_PROFILING
+                                    ++prof_view_count;
+#endif
+                                    CYCLE_COUNT_LAP(prof_param_setup);
+#if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
+                                } else {
+                                    shared_pa_report_unexpected_winner_role();
+                                }
+#endif
+                            }
+                        );
+                    if (up_outs.producer_task_id < 0 || !up_outs.empty()) return;
+#elif PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE == 1
+                    SharedTaskOutputs up_outs = rt_submit_aiv_task_deferred_compete_first(
+                        FUNC_ONLINE_UPDATE, 0, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                             CYCLE_COUNT_LAP(prof_submit_task);
                             submit_args.reset();
-                            const uint64_t n_blocks =
-                                min_u64(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
-                            const uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
-                            const uint64_t is_first = (bn == 0) ? 1 : 0;
-                            const uint64_t is_last =
-                                (bn + n_blocks >= bn_this_batch) ? 1 : 0;
-                            CYCLE_COUNT_LAP(prof_param_extract);
-                            uint32_t out_view_shapes[2] = {
-                                static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)
-                            };
-                            uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                            out_view = Tensor::view(out, out_view_shapes, out_view_offsets, true);
-#if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            submit_args.add_input(
-                                role_outputs.sf_max, role_outputs.sf_sum,
-                                role_outputs.pv_output
-                            );
-                            submit_args.add_inout(
-                                role_outputs.accumulated_max,
-                                role_outputs.accumulated_sum,
-                                role_outputs.accumulated_output, out_view
-                            );
-#else
                             submit_args.add_input(mi, li, oi_new);
                             submit_args.add_inout(mi_update, li_update, oi, out_view);
-#endif
                             submit_args.add_scalar(is_first, is_last);
-#ifdef ENABLE_PROFILING
-                            ++prof_view_count;
-#endif
                             CYCLE_COUNT_LAP(prof_param_setup);
-#if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-                            } else {
-                                shared_pa_report_unexpected_winner_role();
-                            }
-#endif
                         }
                     );
                     if (up_outs.producer_task_id < 0 || !up_outs.empty()) return;
 #else
-                    rt_submit_aiv_task_compete_first(
-                        FUNC_ONLINE_UPDATE, params,
-                        [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
-                            CYCLE_COUNT_LAP(prof_submit_task);
-                            submit_args.reset();
-                            submit_args.add_input(mi, li, oi_new);
-                            submit_args.add_inout(mi_update, li_update, oi, out_view);
-                            submit_args.add_scalar(is_first, is_last);
-                            CYCLE_COUNT_LAP(prof_param_setup);
-                        }
-                    );
+            rt_submit_aiv_task_compete_first(FUNC_ONLINE_UPDATE, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                CYCLE_COUNT_LAP(prof_submit_task);
+                submit_args.reset();
+                submit_args.add_input(mi, li, oi_new);
+                submit_args.add_inout(mi_update, li_update, oi, out_view);
+                submit_args.add_scalar(is_first, is_last);
+                CYCLE_COUNT_LAP(prof_param_setup);
+            });
 #endif
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
@@ -792,14 +825,12 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         );
         LOG_INFO_V9(
             "  create_info(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", prof_make_count,
-            pa_orchestration_cycles_to_us(prof_make_tensor),
-            prof_make_tensor * 100.0 / total,
+            pa_orchestration_cycles_to_us(prof_make_tensor), prof_make_tensor * 100.0 / total,
             prof_make_count > 0 ? pa_orchestration_cycles_to_us(prof_make_tensor) / prof_make_count : 0.0
         );
         LOG_INFO_V9(
             "  tensor_view(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", prof_view_count,
-            pa_orchestration_cycles_to_us(prof_tensor_view),
-            prof_tensor_view * 100.0 / total,
+            pa_orchestration_cycles_to_us(prof_tensor_view), prof_tensor_view * 100.0 / total,
             prof_view_count > 0 ? pa_orchestration_cycles_to_us(prof_tensor_view) / prof_view_count : 0.0
         );
         LOG_INFO_V9(
@@ -808,8 +839,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         );
         LOG_INFO_V9(
             "  submit_task(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", prof_submit_count,
-            pa_orchestration_cycles_to_us(prof_submit_task),
-            prof_submit_task * 100.0 / total,
+            pa_orchestration_cycles_to_us(prof_submit_task), prof_submit_task * 100.0 / total,
             prof_submit_count > 0 ? pa_orchestration_cycles_to_us(prof_submit_task) / prof_submit_count : 0.0
         );
         LOG_INFO_V9(

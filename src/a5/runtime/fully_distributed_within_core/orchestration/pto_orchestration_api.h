@@ -73,9 +73,8 @@ PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors_compete_first(L0TaskArgs 
 }
 
 template <typename BuildArgs>
-PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_task_compete_first(
-    const MixedKernels &mixed_kernels, L0TaskArgs &args, BuildArgs &&build_args
-) {
+PTO_DEVICE_FUNC inline TaskOutputTensors
+rt_submit_task_compete_first(const MixedKernels &mixed_kernels, L0TaskArgs &args, BuildArgs &&build_args) {
     if (dist_is_fatal_query()) return TaskOutputTensors{};
     const DistCompeteFirstTicket ticket = dist_submit_compete_first_begin(nullptr, mixed_kernels);
     if (ticket.ready != 0) build_args(args);
@@ -83,26 +82,86 @@ PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_task_compete_first(
 }
 
 template <typename BuildArgs>
-PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aic_task_compete_first(
-    int32_t kernel_id, L0TaskArgs &args, BuildArgs &&build_args
-) {
+PTO_DEVICE_FUNC inline TaskOutputTensors
+rt_submit_aic_task_compete_first(int32_t kernel_id, L0TaskArgs &args, BuildArgs &&build_args) {
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
     return rt_submit_task_compete_first(mk, args, static_cast<BuildArgs &&>(build_args));
 }
 
 template <typename BuildArgs>
-PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aiv_task_compete_first(
-    int32_t kernel_id, L0TaskArgs &args, BuildArgs &&build_args
-) {
+PTO_DEVICE_FUNC inline TaskOutputTensors
+rt_submit_aiv_task_compete_first(int32_t kernel_id, L0TaskArgs &args, BuildArgs &&build_args) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt_submit_task_compete_first(mk, args, static_cast<BuildArgs &&>(build_args));
 }
 
 #if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC inline SharedTaskOutputs rt_deferred_task_outputs(int32_t task_id, uint32_t output_count) {
+    SharedTaskOutputs outputs;
+    if (!outputs.reset_deferred(task_id, output_count)) return fdwic_invalid_shared_outputs();
+    return outputs;
+}
+
+/**
+ * Generic cross-core compete-first helpers with deferred output references.
+ *
+ * The caller supplies the task's output arity as part of its schema.  Every
+ * replay actor receives stable FdwicOutputRef values immediately; only the
+ * unique builder constructs Args, validates that arity, materializes outputs,
+ * and resolves predecessor references.  These helpers deliberately coexist
+ * with the original TaskOutputTensors API, whose get_ref() contract remains
+ * synchronous and materialized.
+ */
+template <typename BuildArgs>
 PTO_DEVICE_FUNC inline SharedTaskOutputs
-rt_shared_pa_outputs(int32_t task_id, DistSharedPaTaskKind kind) {
+alloc_tensors_deferred_compete_first(uint32_t expected_output_count, L0TaskArgs &args, BuildArgs &&build_args) {
+    if (dist_is_fatal_query()) return fdwic_invalid_shared_outputs();
+    const DistCompeteFirstTicket ticket = dist_alloc_compete_first_begin(nullptr);
+    if (ticket.ready != 0) build_args(args);
+    if (!dist_alloc_deferred_compete_first_finish(nullptr, ticket, args, expected_output_count)) {
+        return fdwic_invalid_shared_outputs();
+    }
+    return rt_deferred_task_outputs(ticket.task_id, expected_output_count);
+}
+
+template <typename BuildArgs>
+PTO_DEVICE_FUNC inline SharedTaskOutputs rt_submit_task_deferred_compete_first(
+    const MixedKernels &mixed_kernels, uint32_t expected_output_count, L0TaskArgs &args, BuildArgs &&build_args
+) {
+    if (dist_is_fatal_query()) return fdwic_invalid_shared_outputs();
+    const DistCompeteFirstTicket ticket = dist_submit_compete_first_begin(nullptr, mixed_kernels);
+    if (ticket.ready != 0) build_args(args);
+    if (!dist_submit_deferred_compete_first_finish(nullptr, mixed_kernels, ticket, args, expected_output_count)) {
+        return fdwic_invalid_shared_outputs();
+    }
+    return rt_deferred_task_outputs(ticket.task_id, expected_output_count);
+}
+
+template <typename BuildArgs>
+PTO_DEVICE_FUNC inline SharedTaskOutputs rt_submit_aic_task_deferred_compete_first(
+    int32_t kernel_id, uint32_t expected_output_count, L0TaskArgs &args, BuildArgs &&build_args
+) {
+    MixedKernels mixed;
+    mixed.aic_kernel_id = kernel_id;
+    return rt_submit_task_deferred_compete_first(
+        mixed, expected_output_count, args, static_cast<BuildArgs &&>(build_args)
+    );
+}
+
+template <typename BuildArgs>
+PTO_DEVICE_FUNC inline SharedTaskOutputs rt_submit_aiv_task_deferred_compete_first(
+    int32_t kernel_id, uint32_t expected_output_count, L0TaskArgs &args, BuildArgs &&build_args
+) {
+    MixedKernels mixed;
+    mixed.aiv0_kernel_id = kernel_id;
+    return rt_submit_task_deferred_compete_first(
+        mixed, expected_output_count, args, static_cast<BuildArgs &&>(build_args)
+    );
+}
+
+PTO_DEVICE_FUNC inline SharedTaskOutputs rt_shared_pa_outputs(int32_t task_id, DistSharedPaTaskKind kind) {
     if (task_id < 0) return fdwic_invalid_shared_outputs();
     SharedTaskOutputs outputs;
     outputs.reset(task_id);
@@ -117,13 +176,12 @@ rt_shared_pa_outputs(int32_t task_id, DistSharedPaTaskKind kind) {
 
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
 template <DistSharedPaTaskKind Kind>
-PTO_DEVICE_FUNC inline __attribute__((always_inline)) SharedTaskOutputs
-rt_shared_pa_outputs_fixed(int32_t task_id) {
+PTO_DEVICE_FUNC inline __attribute__((always_inline)) SharedTaskOutputs rt_shared_pa_outputs_fixed(int32_t task_id) {
     static_assert(Kind != DistSharedPaTaskKind::Count, "shared PA output kind must be concrete");
     if (task_id < 0) return fdwic_invalid_shared_outputs();
-    constexpr uint32_t output_count =
-        Kind == DistSharedPaTaskKind::Alloc || Kind == DistSharedPaTaskKind::Sf ? 3U :
-        Kind == DistSharedPaTaskKind::Qk || Kind == DistSharedPaTaskKind::Pv ? 1U : 0U;
+    constexpr uint32_t output_count = Kind == DistSharedPaTaskKind::Alloc || Kind == DistSharedPaTaskKind::Sf ? 3U :
+                                      Kind == DistSharedPaTaskKind::Qk || Kind == DistSharedPaTaskKind::Pv    ? 1U :
+                                                                                                                0U;
     // Stable shared symbols are a replay-local task/count pair. Their full
     // descriptor publication remains winner-only in Finish, so constructing
     // this POD directly does not make any shared state visible early.
@@ -147,8 +205,7 @@ template <CoreType ReplayRole, typename BuildArgs>
 #else
 template <typename BuildArgs>
 #endif
-PTO_DEVICE_FUNC inline SharedTaskOutputs
-shared_pa_alloc_tensors_compete_first(
+PTO_DEVICE_FUNC inline SharedTaskOutputs shared_pa_alloc_tensors_compete_first(
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
     DistSharedPaReplayContext replay, int32_t expected_task_id, L0TaskArgs &args, BuildArgs &&build_args
 #else
@@ -159,13 +216,11 @@ shared_pa_alloc_tensors_compete_first(
     // dist_is_fatal_query() implementation is deliberately always false, so
     // calling it here only adds an external no-op to every replay actor.
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-    const DistCompeteFirstTicket ticket =
-        dist_shared_pa_begin_ticket<ReplayRole, DistSharedPaTaskKind::Alloc>(
-            replay, expected_task_id, INVALID_KERNEL_ID
-        );
+    const DistCompeteFirstTicket ticket = dist_shared_pa_begin_ticket<ReplayRole, DistSharedPaTaskKind::Alloc>(
+        replay, expected_task_id, INVALID_KERNEL_ID
+    );
 #elif PTO_FDWIC_SHARED_PA_UNITY
-    const DistCompeteFirstTicket ticket =
-        dist_shared_pa_begin_ticket(replay, DistSharedPaTaskKind::Alloc, nullptr);
+    const DistCompeteFirstTicket ticket = dist_shared_pa_begin_ticket(replay, DistSharedPaTaskKind::Alloc, nullptr);
 #else
     const DistCompeteFirstTicket ticket = dist_shared_pa_alloc_begin(nullptr, replay);
 #endif
@@ -173,8 +228,7 @@ shared_pa_alloc_tensors_compete_first(
     if (ticket.won != 0) {
         build_args(args);
     }
-    if (ticket.won != 0 &&
-        !dist_shared_pa_alloc_finish(nullptr, replay, ticket, &args)) {
+    if (ticket.won != 0 && !dist_shared_pa_alloc_finish(nullptr, replay, ticket, &args)) {
         return fdwic_invalid_shared_outputs();
     }
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
@@ -191,24 +245,24 @@ template <typename BuildArgs>
 #endif
 PTO_DEVICE_FUNC inline SharedTaskOutputs shared_pa_submit_task_compete_first(
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-    DistSharedPaReplayContext replay, int32_t expected_task_id, int32_t kernel_id,
-    L0TaskArgs &args, BuildArgs &&build_args
+    DistSharedPaReplayContext replay, int32_t expected_task_id, int32_t kernel_id, L0TaskArgs &args,
+    BuildArgs &&build_args
 #else
-    DistSharedPaReplayContext replay, const MixedKernels &mixed,
-    DistSharedPaTaskKind kind, L0TaskArgs &args, BuildArgs &&build_args
+    DistSharedPaReplayContext replay, const MixedKernels &mixed, DistSharedPaTaskKind kind, L0TaskArgs &args,
+    BuildArgs &&build_args
 #endif
 ) {
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-    static_assert(Kind != DistSharedPaTaskKind::Alloc && Kind != DistSharedPaTaskKind::Count,
-                  "shared PA kernel submit requires QK/SF/PV/UP");
+    static_assert(
+        Kind != DistSharedPaTaskKind::Alloc && Kind != DistSharedPaTaskKind::Count,
+        "shared PA kernel submit requires QK/SF/PV/UP"
+    );
     const DistCompeteFirstTicket ticket =
         dist_shared_pa_begin_ticket<ReplayRole, Kind>(replay, expected_task_id, kernel_id);
 #elif PTO_FDWIC_SHARED_PA_UNITY
-    const DistCompeteFirstTicket ticket =
-        dist_shared_pa_begin_ticket(replay, kind, &mixed);
+    const DistCompeteFirstTicket ticket = dist_shared_pa_begin_ticket(replay, kind, &mixed);
 #else
-    const DistCompeteFirstTicket ticket =
-        dist_shared_pa_submit_begin(nullptr, replay, mixed, kind);
+    const DistCompeteFirstTicket ticket = dist_shared_pa_submit_begin(nullptr, replay, mixed, kind);
 #endif
     if (ticket.ready == 0) return fdwic_invalid_shared_outputs();
     if (ticket.won != 0) {
@@ -228,8 +282,7 @@ PTO_DEVICE_FUNC inline SharedTaskOutputs shared_pa_submit_task_compete_first(
     }
     return rt_shared_pa_outputs_fixed<Kind>(ticket.task_id);
 #else
-    if (ticket.won != 0 &&
-        !dist_shared_pa_submit_finish(nullptr, replay, mixed, kind, ticket, &args)) {
+    if (ticket.won != 0 && !dist_shared_pa_submit_finish(nullptr, replay, mixed, kind, ticket, &args)) {
         return fdwic_invalid_shared_outputs();
     }
     return rt_shared_pa_outputs(ticket.task_id, kind);
@@ -243,25 +296,24 @@ template <typename BuildArgs>
 #endif
 PTO_DEVICE_FUNC inline SharedTaskOutputs shared_pa_submit_aic_compete_first(
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-    DistSharedPaReplayContext replay, int32_t expected_task_id,
-    int32_t kernel_id, L0TaskArgs &args, BuildArgs &&build_args
+    DistSharedPaReplayContext replay, int32_t expected_task_id, int32_t kernel_id, L0TaskArgs &args,
+    BuildArgs &&build_args
 #else
-    DistSharedPaReplayContext replay, DistSharedPaTaskKind kind,
-    int32_t kernel_id, L0TaskArgs &args, BuildArgs &&build_args
+    DistSharedPaReplayContext replay, DistSharedPaTaskKind kind, int32_t kernel_id, L0TaskArgs &args,
+    BuildArgs &&build_args
 #endif
 ) {
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-    static_assert(Kind == DistSharedPaTaskKind::Qk || Kind == DistSharedPaTaskKind::Pv,
-                  "shared PA AIC wrapper requires QK or PV");
+    static_assert(
+        Kind == DistSharedPaTaskKind::Qk || Kind == DistSharedPaTaskKind::Pv, "shared PA AIC wrapper requires QK or PV"
+    );
     return shared_pa_submit_task_compete_first<ReplayRole, Kind>(
         replay, expected_task_id, kernel_id, args, static_cast<BuildArgs &&>(build_args)
     );
 #else
     MixedKernels mixed;
     mixed.aic_kernel_id = kernel_id;
-    return shared_pa_submit_task_compete_first(
-        replay, mixed, kind, args, static_cast<BuildArgs &&>(build_args)
-    );
+    return shared_pa_submit_task_compete_first(replay, mixed, kind, args, static_cast<BuildArgs &&>(build_args));
 #endif
 }
 
@@ -272,25 +324,24 @@ template <typename BuildArgs>
 #endif
 PTO_DEVICE_FUNC inline SharedTaskOutputs shared_pa_submit_aiv_compete_first(
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-    DistSharedPaReplayContext replay, int32_t expected_task_id,
-    int32_t kernel_id, L0TaskArgs &args, BuildArgs &&build_args
+    DistSharedPaReplayContext replay, int32_t expected_task_id, int32_t kernel_id, L0TaskArgs &args,
+    BuildArgs &&build_args
 #else
-    DistSharedPaReplayContext replay, DistSharedPaTaskKind kind,
-    int32_t kernel_id, L0TaskArgs &args, BuildArgs &&build_args
+    DistSharedPaReplayContext replay, DistSharedPaTaskKind kind, int32_t kernel_id, L0TaskArgs &args,
+    BuildArgs &&build_args
 #endif
 ) {
 #if PTO_FDWIC_SHARED_PA_UNITY && defined(__CCE_AICORE__)
-    static_assert(Kind == DistSharedPaTaskKind::Sf || Kind == DistSharedPaTaskKind::Up,
-                  "shared PA AIV wrapper requires SF or UP");
+    static_assert(
+        Kind == DistSharedPaTaskKind::Sf || Kind == DistSharedPaTaskKind::Up, "shared PA AIV wrapper requires SF or UP"
+    );
     return shared_pa_submit_task_compete_first<ReplayRole, Kind>(
         replay, expected_task_id, kernel_id, args, static_cast<BuildArgs &&>(build_args)
     );
 #else
     MixedKernels mixed;
     mixed.aiv0_kernel_id = kernel_id;
-    return shared_pa_submit_task_compete_first(
-        replay, mixed, kind, args, static_cast<BuildArgs &&>(build_args)
-    );
+    return shared_pa_submit_task_compete_first(replay, mixed, kind, args, static_cast<BuildArgs &&>(build_args));
 #endif
 }
 #endif

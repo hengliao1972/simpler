@@ -914,6 +914,36 @@ dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &tic
 #endif
 }
 
+DIST_API_ATTR PTO_DEVICE_FUNC bool dist_submit_deferred_compete_first_finish(
+    PTO2Runtime *, const MixedKernels &mixed, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args,
+    uint32_t expected_output_count
+) {
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
+    return dist_cross_core_submit_deferred_compete_first_finish(mixed, ticket, args, expected_output_count);
+#else
+    (void)mixed;
+    (void)ticket;
+    (void)args;
+    (void)expected_output_count;
+    (void)dist_shared_pa_reject_generic_submit();
+    return false;
+#endif
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC bool dist_alloc_deferred_compete_first_finish(
+    PTO2Runtime *, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args, uint32_t expected_output_count
+) {
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
+    return dist_cross_core_alloc_deferred_compete_first_finish(ticket, args, expected_output_count);
+#else
+    (void)ticket;
+    (void)args;
+    (void)expected_output_count;
+    (void)dist_shared_pa_reject_generic_submit();
+    return false;
+#endif
+}
+
 #if !PTO_FDWIC_SHARED_PA_UNITY
 DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_shared_pa_submit_begin(
     PTO2Runtime *, DistSharedPaReplayContext replay, const MixedKernels &mixed, DistSharedPaTaskKind kind

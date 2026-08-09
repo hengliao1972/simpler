@@ -104,9 +104,19 @@ PTO_DEVICE_FUNC bool dist_cross_core_plan_outputs(
         }
         const TensorArgType tag = args.tag(index);
         if (tag != TensorArgType::OUTPUT) {
-            if (args.tensor(index).tensor_from_shared_output() || !args.tensor(index).has_existing_tensor()) {
-                return false;
+            if (args.tensor(index).tensor_from_shared_output()) {
+                const FdwicOutputRef ref = args.tensor(index).shared_output_ref();
+                if (!fdwic_plain_output_ref(ref) || ref.producer_task_id < 0 || ref.output_slot < 0 ||
+                    static_cast<uint32_t>(ref.producer_task_id) >= kFdwicCrossCoreTaskCapacity ||
+                    static_cast<uint32_t>(ref.output_slot) >= MAX_TENSOR_ARGS) {
+                    return false;
+                }
+                if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
+                    register_mask |= uint32_t{1} << static_cast<uint32_t>(index);
+                }
+                continue;
             }
+            if (!args.tensor(index).has_existing_tensor()) return false;
             if ((tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) &&
                 !dist_submit_tensor_uses_manual_dependency(args, index)) {
                 register_mask |= uint32_t{1} << static_cast<uint32_t>(index);
@@ -129,8 +139,40 @@ PTO_DEVICE_FUNC bool dist_cross_core_plan_outputs(
     return output_count <= fdwic::cross_core::kOutputMaxDescriptors;
 }
 
-PTO_DEVICE_FUNC bool
-dist_cross_core_copy_existing_tensor(__gm__ Tensor &destination, const L0TaskArgs &args, int32_t index) {
+PTO_DEVICE_FUNC bool dist_cross_core_copy_existing_tensor(
+    __gm__ Tensor &destination, const L0TaskArgs &args, int32_t index, DistSubmitCtx &ctx
+) {
+    if (args.tensor(index).tensor_from_shared_output()) {
+        const FdwicOutputRef ref = args.tensor(index).shared_output_ref();
+        if (!fdwic_plain_output_ref(ref) || ref.producer_task_id < 0 || ref.producer_task_id >= ctx.task_id ||
+            ref.output_slot < 0 || static_cast<uint32_t>(ref.output_slot) >= MAX_TENSOR_ARGS) {
+            return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+        }
+        __gm__ CrossCoreOutputCell<Tensor> &producer_outputs =
+            dist_cross_core_runtime_state().outputs[static_cast<uint32_t>(ref.producer_task_id)];
+        uint32_t polls = 0;
+        uint32_t producer_output_count = 0;
+        while (true) {
+            const OutputAcquireResult result = fdwic::cross_core::AcquirePublishedTaskOutputs<DistCrossCoreAicoreOps>(
+                producer_outputs, static_cast<uint32_t>(ref.producer_task_id), producer_output_count,
+                dist_cross_core_runtime_state().fatal
+            );
+            if (result == OutputAcquireResult::Acquired) break;
+            if (result != OutputAcquireResult::NotPublished) {
+                return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+            }
+            SPIN_WAIT_HINT();
+            if ((++polls & 1023U) == 0 && fdwic_trace_is_fatal(ctx.task_id)) return false;
+        }
+        if (static_cast<uint32_t>(ref.output_slot) >= producer_output_count) {
+            return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+        }
+        Tensor::copy(destination, producer_outputs.descriptors[static_cast<uint32_t>(ref.output_slot)]);
+        if (destination.owner_task_id.raw != PTO2TaskId::make(0, static_cast<uint32_t>(ref.producer_task_id)).raw) {
+            return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+        }
+        return true;
+    }
 #if defined(__CCE_AICORE__)
     if (args.tensor(index).tensor_from_gm()) {
         Tensor::copy(destination, args.tensor(index).gm_ref());
@@ -165,7 +207,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_materialize_builder(
     uint32_t output_slot = 0;
     for (int32_t index = 0; index < ctx.tensor_count; ++index) {
         if ((output_mask & (uint32_t{1} << static_cast<uint32_t>(index))) == 0) {
-            if (!dist_cross_core_copy_existing_tensor(ctx.payload->tensors[index], args, index)) return false;
+            if (!dist_cross_core_copy_existing_tensor(ctx.payload->tensors[index], args, index, ctx)) return false;
             continue;
         }
         __gm__ Tensor &output = outputs.descriptors[output_slot++];
@@ -618,7 +660,8 @@ PTO_DEVICE_FUNC bool dist_cross_core_reserve_build(DistSubmitCtx &ctx, bool &bui
 }
 
 PTO_DEVICE_FUNC bool dist_cross_core_finish_builder(
-    DistSubmitCtx &ctx, const L0TaskArgs &args, ExecEngineClass engine_class, int32_t kernel_id
+    DistSubmitCtx &ctx, const L0TaskArgs &args, ExecEngineClass engine_class, int32_t kernel_id,
+    uint32_t expected_output_count = UINT32_MAX
 ) {
     ctx.tensor_count = args.tensor_count();
     ctx.scalar_count = args.scalar_count();
@@ -626,6 +669,9 @@ PTO_DEVICE_FUNC bool dist_cross_core_finish_builder(
     uint32_t output_mask = 0;
     uint32_t output_count = 0;
     if (!dist_cross_core_plan_outputs(args, layout, ctx.register_mask, output_mask, output_count)) {
+        return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+    }
+    if (expected_output_count != UINT32_MAX && output_count != expected_output_count) {
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
     HeapReservation heap{};
@@ -779,6 +825,28 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_cross_core_compete_first_finish(
     );
 }
 
+PTO_DEVICE_FUNC bool dist_cross_core_compete_first_finish_deferred(
+    const MixedKernels *mixed, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args, DistSubmitKind kind,
+    uint32_t expected_output_count
+) {
+    DistSubmitCtx ctx;
+    ExecEngineClass engine_class = ExecEngineClass::None;
+    int32_t kernel_id = INVALID_KERNEL_ID;
+    if (!dist_cross_core_restore_ticket(ticket, mixed, kind, ctx, engine_class, kernel_id)) return false;
+    if (expected_output_count > MAX_TENSOR_ARGS) {
+        return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+    }
+    const bool build_owner = ticket.won != 0;
+    if (build_owner && !dist_cross_core_finish_builder(ctx, args, engine_class, kernel_id, expected_output_count)) {
+        return false;
+    }
+    // Observers deliberately skip output acquisition.  They retain only the
+    // stable (task_id, output_slot) references supplied by orchestration.  All
+    // engine-compatible actors still reach this point so one of them can own
+    // Execute independently from the Build owner.
+    return kind != DistSubmitKind::Kernel || dist_cross_core_bind_execution(ctx, engine_class);
+}
+
 PTO_DEVICE_FUNC TaskOutputTensors dist_cross_core_submit_kernel(const MixedKernels &mixed, const L0TaskArgs &args) {
     return dist_cross_core_submit(&mixed, args, DistSubmitKind::Kernel);
 }
@@ -804,6 +872,23 @@ PTO_DEVICE_FUNC DistCompeteFirstTicket dist_cross_core_alloc_compete_first_begin
 PTO_DEVICE_FUNC TaskOutputTensors
 dist_cross_core_alloc_compete_first_finish(const DistCompeteFirstTicket &ticket, const L0TaskArgs &args) {
     return dist_cross_core_compete_first_finish(nullptr, ticket, args, DistSubmitKind::Alloc);
+}
+
+PTO_DEVICE_FUNC bool dist_cross_core_submit_deferred_compete_first_finish(
+    const MixedKernels &mixed, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args,
+    uint32_t expected_output_count
+) {
+    return dist_cross_core_compete_first_finish_deferred(
+        &mixed, ticket, args, DistSubmitKind::Kernel, expected_output_count
+    );
+}
+
+PTO_DEVICE_FUNC bool dist_cross_core_alloc_deferred_compete_first_finish(
+    const DistCompeteFirstTicket &ticket, const L0TaskArgs &args, uint32_t expected_output_count
+) {
+    return dist_cross_core_compete_first_finish_deferred(
+        nullptr, ticket, args, DistSubmitKind::Alloc, expected_output_count
+    );
 }
 
 }  // namespace

@@ -115,8 +115,7 @@ TEST(FdwicSharedPaTensorMapState, AicpuResetOnlyReinitializesPublishedControlAnd
         const SharedClaimTournamentTask &tournament = state->claim_tournament[task];
         EXPECT_EQ(tournament.root.owner.v, -1) << "task=" << task;
         for (uint32_t group = 0; group < kFdwicSharedClaimTournamentMaxGroups; ++group) {
-            EXPECT_EQ(tournament.local[group].owner.v, -1)
-                << "task=" << task << ", group=" << group;
+            EXPECT_EQ(tournament.local[group].owner.v, -1) << "task=" << task << ", group=" << group;
         }
         EXPECT_EQ(state->insert_completion.cells[task].v, -1) << "task=" << task;
 
@@ -205,6 +204,14 @@ TEST(FdwicSharedPaOutputRef, PlainAndInvalidFormsAreUnambiguous) {
     EXPECT_FALSE(outputs.add_output_ref(17, 3));
     EXPECT_EQ(outputs.producer_task_id, 17);
     EXPECT_EQ(outputs.size(), 2U);
+
+    SharedTaskOutputs deferred;
+    EXPECT_TRUE(deferred.reset_deferred(23, MAX_TENSOR_ARGS));
+    EXPECT_EQ(deferred.producer_task_id, 23);
+    EXPECT_EQ(deferred.size(), MAX_TENSOR_ARGS);
+    EXPECT_FALSE(deferred.reset_deferred(24, MAX_TENSOR_ARGS + 1));
+    EXPECT_EQ(deferred.producer_task_id, -1);
+    EXPECT_TRUE(deferred.empty());
 }
 
 #else

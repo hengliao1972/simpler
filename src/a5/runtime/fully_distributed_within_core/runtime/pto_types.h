@@ -100,9 +100,7 @@ static_assert(
     "FdwicOutputRef must remain trivial for AICore replay-local state"
 );
 
-PTO_DEVICE_FUNC inline FdwicOutputRef fdwic_invalid_output_ref() {
-    return FdwicOutputRef{-1, -1, 0, 0, 0, 0};
-}
+PTO_DEVICE_FUNC inline FdwicOutputRef fdwic_invalid_output_ref() { return FdwicOutputRef{-1, -1, 0, 0, 0, 0}; }
 
 PTO_DEVICE_FUNC inline bool fdwic_plain_output_ref(const FdwicOutputRef &ref) {
     return ref.producer_task_id >= 0 && ref.output_slot >= 0 && ref.flags == 0 && ref.view_ndims == 0 &&
@@ -110,12 +108,12 @@ PTO_DEVICE_FUNC inline bool fdwic_plain_output_ref(const FdwicOutputRef &ref) {
 }
 
 /**
- * Replay-visible output set for the shared backend.
+ * Replay-visible output reference set for a shared backend.
  *
- * Every actor receives the same stable symbols, while only the Claim winner
- * materializes and publishes their Tensor descriptors. No constructor or
- * default member initializer is allowed: orchestration reuses this POD in its
- * hot loop and the runtime initializes both fields explicitly.
+ * Every actor may retain the same stable (task, slot) symbols while a unique
+ * builder materializes and publishes the corresponding Tensor descriptors.
+ * No constructor or default member initializer is allowed: orchestration
+ * reuses this POD in its hot loop and initializes both fields explicitly.
  */
 struct SharedTaskOutputs {
     int32_t producer_task_id;
@@ -135,6 +133,20 @@ struct SharedTaskOutputs {
         return true;
     }
 
+    /// Cross-core generic submit already knows its output arity from the task
+    /// schema.  Record that arity without constructing one descriptor pointer
+    /// per output.  The unique builder independently validates the actual Arg
+    /// before it publishes anything.
+    PTO_DEVICE_FUNC bool reset_deferred(int32_t task_id, uint32_t count) {
+        if (task_id < 0 || count > MAX_TENSOR_ARGS) {
+            reset(-1);
+            return false;
+        }
+        producer_task_id = task_id;
+        output_count = count;
+        return true;
+    }
+
     PTO_DEVICE_FUNC bool empty() const { return output_count == 0; }
     PTO_DEVICE_FUNC uint32_t size() const { return output_count; }
 
@@ -146,12 +158,7 @@ struct SharedTaskOutputs {
     PTO_DEVICE_FUNC FdwicOutputRef output_ref(uint32_t index) const {
         always_assert(producer_task_id >= 0 && index < output_count);
         return FdwicOutputRef{
-            producer_task_id,
-            static_cast<int16_t>(index),
-            0,
-            0,
-            0,
-            0,
+            producer_task_id, static_cast<int16_t>(index), 0, 0, 0, 0,
         };
     }
 };
@@ -349,8 +356,7 @@ public:
 };
 
 static_assert(
-    std::is_trivially_default_constructible_v<TensorRef>,
-    "unused TensorRef slots must remain lazily initialized"
+    std::is_trivially_default_constructible_v<TensorRef>, "unused TensorRef slots must remain lazily initialized"
 );
 
 /**
@@ -780,13 +786,11 @@ private:
         } else {
             static_assert(
 #if PTO_FDWIC_SHARED_MAP
-                ((std::is_same_v<std::decay_t<Args>, Tensor> ||
-                  std::is_same_v<std::decay_t<Args>, FdwicOutputRef>) &&
+                ((std::is_same_v<std::decay_t<Args>, Tensor> || std::is_same_v<std::decay_t<Args>, FdwicOutputRef>) &&
                  ...),
                 "all arguments must be Tensor or FdwicOutputRef"
 #else
-                (std::is_same_v<std::decay_t<Args>, Tensor> && ...),
-                "all arguments must be Tensor"
+                (std::is_same_v<std::decay_t<Args>, Tensor> && ...), "all arguments must be Tensor"
 #endif
             );
         }

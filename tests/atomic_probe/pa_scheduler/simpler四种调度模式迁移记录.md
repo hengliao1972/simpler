@@ -394,7 +394,7 @@ DAG lookup、TensorMap、exec ticket 和 startup→FinalDrain 端点不变，依
 首轮取数如下：
 
 | builder K | replay 核 | B256 startup→FinalDrain | 判断 |
-| --------: | ----------: | ------------------------: | ---- |
+| --------: | --------: | ----------------------: | ---- |
 | 8 | 88 | 208.016 ms | Build 供给不足，明显回退 |
 | 16 | 80 | 172.833 ms | 首轮最优，进入重复验证 |
 | 24 | 72 | 182.619 ms | 优于 K=32，但不及 K=16 |
@@ -615,3 +615,70 @@ K1 在同一轮内出现 93.608～138.501 ms 的巨大波动。若把扫描前�
 后续若重启该方向，应先让 builder limit 成为明确的构建身份并采集至少两个
 非 PA 工作负载，再用交错 A/B 和 Build/Execute 分段数据选择默认值。不得把
 PA task kind、batch 或固定 task 图写进 builder 选择逻辑。
+
+## 16. 通用延迟输出引用：去除 replay 全核逐 task 等待
+
+### 16.1 根因与修正边界
+
+前述约 71 ms 的 Scalar cross-core 结果不是 DAG 查询本身造成的：
+`cross_core_ordinary` 和 `cross_core_dag` 分别为 71.442 / 70.907 ms，
+已经证明两者共有的 Submit 语义才是首要问题。源码核对后确认：
+
+1. 旧 `TaskOutputTensors` 合同要求 Finish 返回时 TensorDesc 已完整可读；
+2. 迁移版让 96 个 replay actor 都在每个 task 的 Finish 中取得
+   `SharedTaskOutputCell`；
+3. 因而 loser/非 builder 也会轮询 builder 发布，把原本的延迟输出
+   引用错做成了逐 task 的全核屏障。
+
+修正不改动旧 API，而是增加一组通用 deferred compete-first API：
+
+- 调用方显式给出 task schema 中的预期输出数；
+- 所有 replay actor 立即获得稳定 `(task_id, output_slot)` 引用；
+- 只有唯一 builder 构造 Args、校验实际输出数、Materialize 并发布
+  TensorDesc；
+- 后续 task 的 builder 在真正解析 fanin 时，才等待它实际依赖的
+  producer output cell；
+- 非 builder 仍进入 Finish，保留与 engine 类型匹配的 Execute owner
+  竞争，不把 Build 与 Execute 重新绑回同一个核。
+
+旧 `TaskOutputTensors/get_ref()` 的“返回时已物化”语义完全保留，
+same-core 路径不变。新合同只在调用方显式选择 deferred API 时生效，
+避免用性能修正暗中改写全仓接口语义。
+
+### 16.2 内存与顺序合同
+
+该修正只把“谁需要等待 TensorDesc”从全体 replay actor 收窄到真正的
+fanin consumer，不改以下不变量：
+
+- TensorMap writer metadata 仍严格按 task id 插入；
+- output descriptor 仍是“写 payload → clean-out DCCI → atomic publication”；
+- consumer 仍是“atomic acquire → invalidate descriptor lines → copy”；
+- Build N 仍拒绝 `producer_task_id >= N` 的未来引用；
+- builder 在发布任何共享状态前校验实际 output arity，不让调用方
+  schema 与 Args 不一致时带着半发布状态继续运行。
+
+`SharedTaskOutputs` 仍为 8 byte trivial POD，只保存 task id 与 output count；
+新增 `reset_deferred()` 支持通用 `MAX_TENSOR_ARGS` 上限，旧 PA helper 的
+8-output 限制与 ABI 均未改动。
+
+### 16.3 真实 A5 证据
+
+本阶段只以 CCEC 和真实 A5 为有效证据，不使用 A5Sim 裁决
+SIMT/cross-core 路径。
+
+- 四组 shared/cross-core C++ 布局与协议测试全部 PASS；
+- 非 PA `A5OnboardBd24CompeteFirstFreshOutput` 在 24 worker 下数值验证 PASS，
+  证明通用 fresh output 能被后续 task 作为 fanin 消费；
+- PA B1 数值 golden PASS；
+- PA B256 数值 golden PASS，96 个 replay core 均精确完成 1280 次
+  Submit；
+- B256 `perf-clock` 的 startup→FinalDrain 为 **24.188 ms**，原
+  `cross_core_ordinary` 基线为 **71.442 ms**，单阶段降低
+  **47.254 ms / 66.1%**。
+
+新数据位于
+`outputs/TestPagedAttentionUnroll_Case1_20260809_145059/fdwic_perf_clock_summary.json`。
+这个对比证明 replay 全核逐 task 输出等待是主要回退源，但 24.188 ms
+仍明显高于 same-core 的毫秒级目标，不宣称问题已完全解决。下一阶段
+应分别定位 Build/Execute owner 绑定等待、严格 TensorMap 插入链与
+Build dispatch 供给，不再把它们混成“DAG 太慢”。
