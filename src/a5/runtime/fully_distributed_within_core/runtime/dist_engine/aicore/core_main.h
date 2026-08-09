@@ -34,6 +34,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC void DIST_CORE_MAIN_ENTRY(__gm__ Runtime *runtime,
     fdwic_submit_pmu_attach(runtime, self);
     fdwic_swimlane_attach(runtime);
     trace_reset_core(self);
+    // The authoritative cross-core perf-clock window starts before the
+    // startup increment. This hook is empty for same-core, whose first Submit
+    // still establishes the start boundary.
+    fdwic_perf_clock_worker_begin();
 #if DIST_TRACE_ENABLED && PTO_FDWIC_SHARED_MAP
     if (fdwic_atomic_swimlane_enabled()) {
         const uint32_t startup_config_lines = fdwic_dcci_region_cache_line_count(&runtime->dist.shared_addr, 64);
@@ -102,6 +106,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC void DIST_CORE_MAIN_ENTRY(__gm__ Runtime *runtime,
     // error at the same logical Submit, so workers finish and AICPU reports the
     // aggregated error_code to the host.
     if (!fdwic_trace_is_fatal()) dist_submit_drain_to_completion(self);
+    // End immediately after FinalDrain. Later trace/PMU publication and
+    // worker-completion bookkeeping are outside the cross-core scheduler
+    // window. This hook is empty for same-core.
+    fdwic_perf_clock_worker_end();
     TRACE_TIMESTAMP(final_drain_end);
     // Publish both parent records after the measured work. Their own GM writes
     // therefore belong to neither business interval.

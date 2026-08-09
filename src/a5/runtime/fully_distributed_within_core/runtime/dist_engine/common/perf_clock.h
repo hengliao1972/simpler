@@ -41,24 +41,49 @@ PTO_DEVICE_FUNC inline void fdwic_perf_clock_attach(__gm__ Runtime *runtime, __g
 }
 
 PTO_DEVICE_FUNC inline void fdwic_perf_clock_expect_submits(uint32_t expected_submits) {
-    // 该接口在首个 Submit 之前由 PA orchestration 调用一次。最终 host 会用
-    // DistCore::local_index 与 expected/final_seen 做闭合校验，不静默修正。
+    // Orchestration calls this once before its first Submit. The host closes
+    // DistCore::local_index against expected/final_seen without repairing it.
     g_fdwic_perf_clock_expected_submits = expected_submits;
 }
 
+PTO_DEVICE_FUNC inline void fdwic_perf_clock_worker_begin() {
+#if PTO_FDWIC_SCHEDULER_MODE != 0
+    // Cross-core work includes the startup barrier, dynamic Build/Execute,
+    // and FinalDrain. Starting before the startup increment gives the
+    // dedicated SIMT builder the same boundary even though it replays no Submit.
+    g_fdwic_perf_clock_first_submit = get_sys_cnt_aicore();
+#endif
+}
+
+PTO_DEVICE_FUNC inline void fdwic_perf_clock_worker_end() {
+#if PTO_FDWIC_SCHEDULER_MODE != 0
+    // core_main calls this immediately after dist_submit_drain_to_completion().
+    // Later trace/observer publication does not belong to the business window.
+    g_fdwic_perf_clock_last_submit = get_sys_cnt_aicore();
+#endif
+}
+
 PTO_DEVICE_FUNC inline void fdwic_perf_clock_submit_begin(int32_t task_id) {
-    // task_id 本来就是本核严格递增的 Submit 序号；直接复用，避免另做一份
-    // 1280 次 block-local increment/store。
+#if PTO_FDWIC_SCHEDULER_MODE == 0
+    // task_id is already the strictly increasing per-core Submit ordinal, so
+    // reuse it instead of adding one block-local increment/store per Submit.
     if (task_id == 0) {
         g_fdwic_perf_clock_first_submit = get_sys_cnt_aicore();
     }
+#else
+    (void)task_id;
+#endif
 }
 
 PTO_DEVICE_FUNC inline void fdwic_perf_clock_submit_end(int32_t task_id) {
+#if PTO_FDWIC_SCHEDULER_MODE == 0
     if (task_id >= 0 && static_cast<uint32_t>(task_id + 1) == g_fdwic_perf_clock_expected_submits &&
         g_fdwic_perf_clock_expected_submits != 0) {
         g_fdwic_perf_clock_last_submit = get_sys_cnt_aicore();
     }
+#else
+    (void)task_id;
+#endif
 }
 
 #if PTO_FDWIC_PERF_CLOCK_KERNEL
@@ -67,13 +92,16 @@ constexpr uint32_t kFdwicPerfClockKernelTickOrderError = 1U << 0;
 constexpr uint32_t kFdwicPerfClockKernelTickOverflow = 1U << 1;
 constexpr uint32_t kFdwicPerfClockKernelCallOverflow = 1U << 2;
 
-// 只在本核首个 Submit 已进入、末个 Submit 尚未返回时打开 Kernel 子窗。
-// 因此最后一个 Submit 之后的 FinalDrain Kernel 不会混入逐核整数闭合。
+// Same-core opens the Kernel subwindow from its first through last Submit.
+// Cross-core covers startup through FinalDrain, including tail Kernels.
 PTO_DEVICE_FUNC inline uint64_t fdwic_perf_clock_kernel_begin() {
     if (g_fdwic_perf_clock_first_submit == 0 || g_fdwic_perf_clock_last_submit != 0 ||
-        g_fdwic_perf_clock_expected_submits == 0 || g_fdwic_perf_clock_kernel_status != 0) {
+        g_fdwic_perf_clock_kernel_status != 0) {
         return 0;
     }
+#if PTO_FDWIC_SCHEDULER_MODE == 0
+    if (g_fdwic_perf_clock_expected_submits == 0) return 0;
+#endif
     return get_sys_cnt_aicore();
 }
 
@@ -110,7 +138,8 @@ PTO_DEVICE_FUNC inline void fdwic_perf_clock_flush(__gm__ DistCore *self) {
     core->dropped = g_fdwic_perf_clock_kernel_status;
     core->atomic_calls = 0;
     core->poll_calls = 0;
-    core->poll_batch_records = kFdwicPerfClockKernelMode;
+    core->poll_batch_records =
+        PTO_FDWIC_SCHEDULER_MODE == 0 ? kFdwicPerfClockKernelMode : kFdwicPerfClockKernelCrossCoreE2eMode;
     core->perf_clock_kernel.first_submit_start = g_fdwic_perf_clock_first_submit;
     core->perf_clock_kernel.last_submit_end = g_fdwic_perf_clock_last_submit;
     core->perf_clock_kernel.submit_count = static_cast<uint32_t>(self->local_index);
@@ -126,7 +155,7 @@ PTO_DEVICE_FUNC inline void fdwic_perf_clock_flush(__gm__ DistCore *self) {
     core->perf_clock.last_submit_end = g_fdwic_perf_clock_last_submit;
     core->perf_clock.submit_count = static_cast<uint32_t>(self->local_index);
     core->perf_clock.expected_submit_count = g_fdwic_perf_clock_expected_submits;
-    core->perf_clock.mode = kFdwicPerfClockMode;
+    core->perf_clock.mode = PTO_FDWIC_SCHEDULER_MODE == 0 ? kFdwicPerfClockMode : kFdwicPerfClockCrossCoreE2eMode;
     core->perf_clock.final_seen = g_fdwic_perf_clock_last_submit != 0 ? 1U : 0U;
 #endif
     dist_aicore_flush_region(core, sizeof(FdwicSwimlaneCoreState));
@@ -136,6 +165,8 @@ PTO_DEVICE_FUNC inline void fdwic_perf_clock_flush(__gm__ DistCore *self) {
 
 PTO_DEVICE_FUNC inline void fdwic_perf_clock_attach(__gm__ Runtime *, __gm__ DistCore *) {}
 PTO_DEVICE_FUNC inline void fdwic_perf_clock_expect_submits(uint32_t) {}
+PTO_DEVICE_FUNC inline void fdwic_perf_clock_worker_begin() {}
+PTO_DEVICE_FUNC inline void fdwic_perf_clock_worker_end() {}
 PTO_DEVICE_FUNC inline void fdwic_perf_clock_submit_begin(int32_t) {}
 PTO_DEVICE_FUNC inline void fdwic_perf_clock_submit_end(int32_t) {}
 PTO_DEVICE_FUNC inline void fdwic_perf_clock_flush(__gm__ DistCore *) {}

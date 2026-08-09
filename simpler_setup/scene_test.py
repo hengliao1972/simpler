@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from .fdwic_build_config import (
     FDWIC_SCHEDULER_MODE_ENV,
+    FDWIC_SCHEDULER_MODE_IDS,
     FDWIC_SCHEDULER_MODE_SAME_CORE,
     FDWIC_SCHEDULER_MODES,
     fdwic_scheduler_mode_definition,
@@ -1617,14 +1618,23 @@ def _render_case_fdwic_submit_pmu(case_label: str, output_prefix: Path, build_id
     return report
 
 
-def _validate_case_fdwic_perf_clock(  # noqa: PLR0912 -- fail-closed artifact contract is intentionally explicit
+def _validate_case_fdwic_perf_clock(  # noqa: PLR0912, PLR0915 -- fail-closed artifact contract is explicit
     case_label: str, output_prefix: Path, profile: str
 ) -> Path:
     """Validate the exact artifact contract of one successful perf-clock case."""
     try:
-        output_name, schema = _FDWIC_PERF_CLOCK_ARTIFACTS[profile]
+        output_name, same_core_schema = _FDWIC_PERF_CLOCK_ARTIFACTS[profile]
     except KeyError as exc:
         raise ValueError(f"Unsupported perf-clock artifact profile {profile!r}") from exc
+    scheduler_mode = _fdwic_scheduler_mode()
+    cross_core_e2e = scheduler_mode != FDWIC_SCHEDULER_MODE_SAME_CORE
+    schema = (
+        "fdwic-cross-core-e2e-clock-kernel-v1"
+        if cross_core_e2e and profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL
+        else "fdwic-cross-core-e2e-clock-v1"
+        if cross_core_e2e
+        else same_core_schema
+    )
 
     artifact = output_prefix / output_name
     if not artifact.is_file() or artifact.stat().st_size == 0:
@@ -1643,6 +1653,15 @@ def _validate_case_fdwic_perf_clock(  # noqa: PLR0912 -- fail-closed artifact co
         "aic_cores": 32,
         "aiv_cores": 64,
     }
+    if cross_core_e2e:
+        expected_builder_cores = 1 if scheduler_mode.startswith("simt_") else 0
+        expected_scalars.update(
+            scheduler_mode=scheduler_mode,
+            scheduler_mode_id=FDWIC_SCHEDULER_MODE_IDS[scheduler_mode],
+            boundary="startup_sync_begin_to_final_drain_end",
+            replay_cores=96 - expected_builder_cores,
+            builder_cores=expected_builder_cores,
+        )
     mismatches = [
         f"{name}={payload.get(name)!r}, expected {expected!r}"
         for name, expected in expected_scalars.items()
@@ -1651,10 +1670,11 @@ def _validate_case_fdwic_perf_clock(  # noqa: PLR0912 -- fail-closed artifact co
     if mismatches:
         raise RuntimeError(f"[{case_label}] invalid {profile} artifact contract: {'; '.join(mismatches)}")
 
-    expected_submits = payload.get("expected_submits_per_core")
+    expected_submits_key = "expected_submits_per_replay_core" if cross_core_e2e else "expected_submits_per_core"
+    expected_submits = payload.get(expected_submits_key)
     cores = payload.get("cores")
     if type(expected_submits) is not int or expected_submits <= 0:
-        raise RuntimeError(f"[{case_label}] {profile} expected_submits_per_core must be a positive integer")
+        raise RuntimeError(f"[{case_label}] {profile} {expected_submits_key} must be a positive integer")
     if not isinstance(cores, list) or len(cores) != 96 or not all(isinstance(core, dict) for core in cores):
         raise RuntimeError(f"[{case_label}] {profile} cores must contain exactly 96 objects")
 
@@ -1665,14 +1685,25 @@ def _validate_case_fdwic_perf_clock(  # noqa: PLR0912 -- fail-closed artifact co
     if core_types.count("aic") != 32 or core_types.count("aiv") != 64:
         raise RuntimeError(f"[{case_label}] {profile} core_type topology is not 32 AIC + 64 AIV")
 
+    builder_rows = []
     for core in cores:
-        if core.get("submit_count") != expected_submits:
-            raise RuntimeError(
-                f"[{case_label}] {profile} core {core.get('core_id')} submit_count does not match "
-                "expected_submits_per_core"
+        role = core.get("worker_role") if cross_core_e2e else "replay"
+        if role not in {"replay", "builder"}:
+            raise RuntimeError(f"[{case_label}] {profile} core {core.get('core_id')} has invalid worker_role")
+        if role == "builder":
+            builder_rows.append(core)
+            submit_closure = core.get("submit_count") == 0 and core.get("expected_submit_count") == 0
+        else:
+            submit_closure = core.get("submit_count") == expected_submits and (
+                not cross_core_e2e or core.get("expected_submit_count") == expected_submits
             )
-        start = core.get("first_submit_start")
-        end = core.get("last_submit_end")
+        if not submit_closure:
+            raise RuntimeError(
+                f"[{case_label}] {profile} core {core.get('core_id')} Submit/role closure does not match "
+                f"{expected_submits_key}"
+            )
+        start = core.get("startup_begin" if cross_core_e2e else "first_submit_start")
+        end = core.get("final_drain_end" if cross_core_e2e else "last_submit_end")
         elapsed = core.get("elapsed_ticks")
         ordered_window = (
             type(start) is int
@@ -1680,19 +1711,39 @@ def _validate_case_fdwic_perf_clock(  # noqa: PLR0912 -- fail-closed artifact co
             and type(elapsed) is int
             and start > 0
             and end - start == elapsed
-            and (end > start if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL else end >= start)
+            and (end > start if cross_core_e2e or profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL else end >= start)
         )
         if not ordered_window:
             raise RuntimeError(f"[{case_label}] {profile} core {core.get('core_id')} elapsed tick closure failed")
 
-    global_start = min(core["first_submit_start"] for core in cores)
-    global_end = max(core["last_submit_end"] for core in cores)
-    if (
-        payload.get("global_first_submit_start") != global_start
-        or payload.get("global_last_submit_end") != global_end
-        or payload.get("global_submit_span_ticks") != global_end - global_start
-    ):
-        raise RuntimeError(f"[{case_label}] {profile} global Submit tick closure failed")
+    if cross_core_e2e:
+        expected_builder_cores = 1 if scheduler_mode.startswith("simt_") else 0
+        if len(builder_rows) != expected_builder_cores or (
+            builder_rows
+            and not (
+                builder_rows[0].get("core_type") == "aiv"
+                and builder_rows[0].get("block_id") == 0
+                and builder_rows[0].get("lane") == 1
+            )
+        ):
+            raise RuntimeError(f"[{case_label}] {profile} SIMT builder topology closure failed")
+        global_start = min(core["startup_begin"] for core in cores)
+        global_end = max(core["final_drain_end"] for core in cores)
+        if (
+            payload.get("global_startup_begin") != global_start
+            or payload.get("global_final_drain_end") != global_end
+            or payload.get("global_e2e_span_ticks") != global_end - global_start
+        ):
+            raise RuntimeError(f"[{case_label}] {profile} global startup-to-FinalDrain tick closure failed")
+    else:
+        global_start = min(core["first_submit_start"] for core in cores)
+        global_end = max(core["last_submit_end"] for core in cores)
+        if (
+            payload.get("global_first_submit_start") != global_start
+            or payload.get("global_last_submit_end") != global_end
+            or payload.get("global_submit_span_ticks") != global_end - global_start
+        ):
+            raise RuntimeError(f"[{case_label}] {profile} global Submit tick closure failed")
 
     kernel_ticks: list[int] = []
     kernel_calls: list[int] = []
@@ -1767,22 +1818,33 @@ def _validate_case_fdwic_perf_clock(  # noqa: PLR0912 -- fail-closed artifact co
             raise RuntimeError(
                 f"[{case_label}] invalid {profile} integer aggregates: {'; '.join(aggregate_mismatches)}"
             )
-        min_calls = payload.get("min_kernel_calls_in_window")
-        max_calls = payload.get("max_kernel_calls_in_window")
-        batches, remainder = divmod(expected_submits, 5)
-        aic_calls = sum(core["kernel_calls"] for core in cores if core["core_type"] == "aic")
-        aiv_calls = sum(core["kernel_calls"] for core in cores if core["core_type"] == "aiv")
-        if (
-            remainder != 0
-            or type(min_calls) is not int
-            or type(max_calls) is not int
-            or min_calls != batches
-            or max_calls != 4 * batches
-            or not batches <= aic_calls <= 2 * batches
-            or not 0 <= aiv_calls <= 2 * batches
-            or not batches <= exact_aggregates["kernel_calls"] <= 4 * batches
-        ):
-            raise RuntimeError(f"[{case_label}] {profile} global Kernel call range closure failed")
+        expected_kernel_boundary = (
+            "linked_kernel_call_within_per_core_startup_to_final_drain_window"
+            if cross_core_e2e
+            else "linked_kernel_call_within_per_core_submit_window"
+        )
+        if payload.get("kernel_boundary") != expected_kernel_boundary:
+            raise RuntimeError(f"[{case_label}] {profile} Kernel boundary contract failed")
+        if cross_core_e2e:
+            if "min_kernel_calls_in_window" in payload or "max_kernel_calls_in_window" in payload:
+                raise RuntimeError(f"[{case_label}] {profile} must not publish PA-shaped Kernel call bounds")
+        else:
+            min_calls = payload.get("min_kernel_calls_in_window")
+            max_calls = payload.get("max_kernel_calls_in_window")
+            batches, remainder = divmod(expected_submits, 5)
+            aic_calls = sum(core["kernel_calls"] for core in cores if core["core_type"] == "aic")
+            aiv_calls = sum(core["kernel_calls"] for core in cores if core["core_type"] == "aiv")
+            if (
+                remainder != 0
+                or type(min_calls) is not int
+                or type(max_calls) is not int
+                or min_calls != batches
+                or max_calls != 4 * batches
+                or not batches <= aic_calls <= 2 * batches
+                or not 0 <= aiv_calls <= 2 * batches
+                or not batches <= exact_aggregates["kernel_calls"] <= 4 * batches
+            ):
+                raise RuntimeError(f"[{case_label}] {profile} global Kernel call range closure failed")
     return artifact
 
 

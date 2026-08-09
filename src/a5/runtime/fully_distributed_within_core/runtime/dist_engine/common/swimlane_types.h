@@ -55,6 +55,11 @@ constexpr uint32_t kFdwicAtomicSwimlaneRecordsPerCore = kFdwicSwimlaneDefaultRec
 constexpr uint32_t kFdwicAtomicSwimlaneLevel = 4;
 constexpr uint32_t kFdwicPerfClockMode = 1;
 constexpr uint32_t kFdwicPerfClockKernelMode = 2;
+// The authoritative cross-core performance window runs from before startup
+// synchronization through FinalDrain. Distinct mode values prevent the host
+// from silently interpreting the same 32B storage as the old Submit window.
+constexpr uint32_t kFdwicPerfClockCrossCoreE2eMode = 3;
+constexpr uint32_t kFdwicPerfClockKernelCrossCoreE2eMode = 4;
 static_assert(
     (static_cast<uint64_t>(kFdwicAtomicSwimlaneRecordsPerCore) * kFdwicSwimlaneRecordSizeBytes) % 64 == 0,
     "generic record partitions must keep every worker base on a 64B boundary"
@@ -494,9 +499,12 @@ struct FdwicAtomicPollBurst {
     uint32_t enabled_mask;
 };
 
-// perf-clock 只复用每核固定 64B 状态中的既有 32B pad，不分配逐事件
-// record。expected_submit_count 由 PA orchestration 明确声明；设备与 host
-// 都用它校验最后一个 Submit 的边界，而不是把任意一次 Submit 当作末次。
+// perf-clock reuses the existing 32B pad in each fixed 64B core state and
+// allocates no event records. Same-core interprets the clocks as first/last
+// Submit; cross-core interprets them as startup and FinalDrain. mode proves
+// which interpretation applies. Orchestration still declares
+// expected_submit_count for replay workers; the dedicated SIMT builder
+// legitimately keeps 0/0.
 struct FdwicPerfClockCoreData {
     uint64_t first_submit_start;
     uint64_t last_submit_end;
@@ -512,9 +520,10 @@ static_assert(offsetof(FdwicPerfClockCoreData, last_submit_end) == 8, "perf-cloc
 static_assert(offsetof(FdwicPerfClockCoreData, submit_count) == 16, "perf-clock count offset changed");
 static_assert(offsetof(FdwicPerfClockCoreData, expected_submit_count) == 20, "perf-clock expected offset changed");
 
-// perf-clock-kernel 与普通 perf-clock 共用同一个 32B tail，但把末尾 8B
-// 用于逐核 Kernel 累计时间。构建 profile 和外层 mode 字段负责区分两种
-// 解释，避免扩大每核 64B cacheline 或增加多核共享 sidecar。
+// perf-clock-kernel shares the same 32B tail with plain perf-clock but uses
+// its last 8B for per-core accumulated Kernel time. The build profile and
+// outer mode distinguish interpretations without enlarging the 64B per-core
+// cacheline or adding a multicore sidecar.
 struct FdwicPerfClockKernelCoreData {
     uint64_t first_submit_start;
     uint64_t last_submit_end;
@@ -531,10 +540,11 @@ static_assert(
 );
 
 struct FdwicSwimlaneCoreState {
-    // perf-clock-kernel 关闭 trace 后复用前 20B：count=Kernel 调用数，
-    // dropped=聚合错误状态，atomic_calls/poll_calls=0，
-    // poll_batch_records=kFdwicPerfClockKernelMode。普通 perf-clock 仍要求
-    // 五个字段全零；两种解释不会静默混用。
+    // With trace disabled, perf-clock-kernel reuses the first 20B:
+    // count=Kernel calls, dropped=aggregate error state,
+    // atomic_calls/poll_calls=0, and poll_batch_records=the profile mode.
+    // Plain perf-clock requires all five fields to be zero, so interpretations
+    // cannot be mixed silently.
     volatile uint32_t count;
     volatile uint32_t dropped;
     // Exact number of source-level atomic wrapper calls made by this worker

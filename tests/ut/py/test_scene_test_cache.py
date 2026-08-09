@@ -32,6 +32,7 @@ import pytest
 from _task_interface import ArgDirection, ChipCallable  # pyright: ignore[reportMissingImports]
 
 from conftest import _configure_fdwic_profile, _configure_fdwic_scheduler, _configure_fdwic_tensormap
+from simpler_setup.fdwic_build_config import FDWIC_SCHEDULER_MODE_IDS
 
 # ``simpler_setup/__init__.py`` re-exports the ``scene_test`` *decorator*,
 # which shadows the submodule attribute when accessed via ``simpler_setup``.
@@ -692,6 +693,7 @@ def _write_perf_clock_artifact(tmp_path: Path, profile: str) -> Path:
     }
     if is_kernel:
         payload.update(
+            kernel_boundary="linked_kernel_call_within_per_core_submit_window",
             kernel_calls=1,
             min_kernel_calls_in_window=1,
             max_kernel_calls_in_window=4,
@@ -740,11 +742,147 @@ def _write_perf_clock_artifact(tmp_path: Path, profile: str) -> Path:
     return artifact
 
 
+def _write_cross_core_e2e_clock_artifact(tmp_path: Path, profile: str, scheduler_mode: str) -> Path:
+    """Build a self-closing cross-core artifact, including the SIMT builder role."""
+    is_kernel = profile == "perf-clock-kernel"
+    is_simt = scheduler_mode.startswith("simt_")
+    output_name = "fdwic_perf_clock_kernel_summary.json" if is_kernel else "fdwic_perf_clock_summary.json"
+    cores = []
+    for core_id in range(96):
+        is_aic = core_id < 32
+        aiv_ordinal = core_id - 32
+        block_id = core_id if is_aic else aiv_ordinal // 2
+        lane = 0 if is_aic else 1 + aiv_ordinal % 2
+        is_builder = is_simt and not is_aic and block_id == 0 and lane == 1
+        core = {
+            "core_id": core_id,
+            "core_type": "aic" if is_aic else "aiv",
+            "block_id": block_id,
+            "lane": lane,
+            "worker_role": "builder" if is_builder else "replay",
+            "submit_count": 0 if is_builder else 5,
+            "expected_submit_count": 0 if is_builder else 5,
+            "startup_begin": 100 + core_id,
+            "final_drain_end": 300 + core_id,
+            "elapsed_ticks": 200,
+        }
+        if is_kernel:
+            has_kernel = core_id == 0
+            core.update(
+                kernel_elapsed_ticks=10 if has_kernel else 0,
+                kernel_calls=1 if has_kernel else 0,
+                non_kernel_residual_ticks=190 if has_kernel else 200,
+            )
+        cores.append(core)
+
+    payload = {
+        "schema": "fdwic-cross-core-e2e-clock-kernel-v1" if is_kernel else "fdwic-cross-core-e2e-clock-v1",
+        "mode": profile,
+        "scheduler_mode": scheduler_mode,
+        "scheduler_mode_id": FDWIC_SCHEDULER_MODE_IDS[scheduler_mode],
+        "boundary": "startup_sync_begin_to_final_drain_end",
+        "num_cores": 96,
+        "aic_cores": 32,
+        "aiv_cores": 64,
+        "replay_cores": 95 if is_simt else 96,
+        "builder_cores": 1 if is_simt else 0,
+        "expected_submits_per_replay_core": 5,
+        "global_startup_begin": 100,
+        "global_final_drain_end": 395,
+        "global_e2e_span_ticks": 295,
+        "cores": cores,
+    }
+    if is_kernel:
+        payload.update(
+            kernel_boundary="linked_kernel_call_within_per_core_startup_to_final_drain_window",
+            kernel_calls=1,
+            kernel_elapsed_ticks_sum=10,
+            non_kernel_residual_ticks_sum=19190,
+            groups={
+                "aic": {
+                    "cores": 32,
+                    "elapsed_min_ticks": 200,
+                    "elapsed_max_ticks": 200,
+                    "elapsed_sum_ticks": 6400,
+                    "kernel_min_ticks": 0,
+                    "kernel_max_ticks": 10,
+                    "kernel_sum_ticks": 10,
+                    "kernel_calls_min": 0,
+                    "kernel_calls_max": 1,
+                    "kernel_calls_sum": 1,
+                    "residual_min_ticks": 190,
+                    "residual_max_ticks": 200,
+                    "residual_sum_ticks": 6390,
+                },
+                "aiv": {
+                    "cores": 64,
+                    "elapsed_min_ticks": 200,
+                    "elapsed_max_ticks": 200,
+                    "elapsed_sum_ticks": 12800,
+                    "kernel_min_ticks": 0,
+                    "kernel_max_ticks": 0,
+                    "kernel_sum_ticks": 0,
+                    "kernel_calls_min": 0,
+                    "kernel_calls_max": 0,
+                    "kernel_calls_sum": 0,
+                    "residual_min_ticks": 200,
+                    "residual_max_ticks": 200,
+                    "residual_sum_ticks": 12800,
+                },
+            },
+        )
+    else:
+        payload["groups"] = {
+            "aic": {"min_ticks": 200, "max_ticks": 200},
+            "aiv": {"min_ticks": 200, "max_ticks": 200},
+        }
+    artifact = tmp_path / output_name
+    artifact.write_text(json.dumps(payload))
+    return artifact
+
+
 @pytest.mark.parametrize("profile", ["perf-clock", "perf-clock-kernel"])
 def test_perf_clock_case_artifact_contract_accepts_exact_closure(tmp_path, profile):
     artifact = _write_perf_clock_artifact(tmp_path, profile)
 
     assert _validate_case_fdwic_perf_clock("Case", tmp_path, profile) == artifact
+
+
+@pytest.mark.parametrize(
+    "scheduler_mode",
+    ["cross_core_ordinary", "cross_core_dag", "simt_cross_core_ordinary", "simt_cross_core_dag"],
+)
+@pytest.mark.parametrize("profile", ["perf-clock", "perf-clock-kernel"])
+def test_cross_core_e2e_clock_accepts_exact_replay_and_builder_closure(monkeypatch, tmp_path, scheduler_mode, profile):
+    monkeypatch.setenv("PTO_FDWIC_SCHEDULER_MODE", scheduler_mode)
+    artifact = _write_cross_core_e2e_clock_artifact(tmp_path, profile, scheduler_mode)
+
+    assert _validate_case_fdwic_perf_clock("Case", tmp_path, profile) == artifact
+
+
+def test_simt_cross_core_e2e_clock_rejects_builder_as_replay_worker(monkeypatch, tmp_path):
+    scheduler_mode = "simt_cross_core_ordinary"
+    monkeypatch.setenv("PTO_FDWIC_SCHEDULER_MODE", scheduler_mode)
+    artifact = _write_cross_core_e2e_clock_artifact(tmp_path, "perf-clock", scheduler_mode)
+    payload = json.loads(artifact.read_text())
+    builder = next(core for core in payload["cores"] if core["worker_role"] == "builder")
+    builder.update(worker_role="replay", submit_count=5, expected_submit_count=5)
+    artifact.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="SIMT builder topology closure failed"):
+        _validate_case_fdwic_perf_clock("Case", tmp_path, "perf-clock")
+
+
+def test_cross_core_e2e_clock_rejects_submit_only_boundary(monkeypatch, tmp_path):
+    scheduler_mode = "cross_core_dag"
+    monkeypatch.setenv("PTO_FDWIC_SCHEDULER_MODE", scheduler_mode)
+    artifact = _write_cross_core_e2e_clock_artifact(tmp_path, "perf-clock", scheduler_mode)
+    payload = json.loads(artifact.read_text())
+    payload["boundary"] = "first_submit_to_last_submit"
+    artifact.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="invalid perf-clock artifact contract"):
+        _validate_case_fdwic_perf_clock("Case", tmp_path, "perf-clock")
 
 
 def test_perf_clock_kernel_case_artifact_contract_rejects_wrong_integer_aggregate(tmp_path):
