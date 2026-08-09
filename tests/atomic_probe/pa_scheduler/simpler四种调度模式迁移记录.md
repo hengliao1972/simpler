@@ -702,3 +702,42 @@ fanin lookup 均继续由 mode2 原协议处理。
 mode1/mode2 分别为 24.188 / 24.459 ms，只相差 0.271 ms；它们共同从
 约 71 ms 降到约 24 ms，进一步证明主要改善来自去除共有的全核输出
 等待，而不是削弱 DAG 语义。
+
+### 16.5 SIMT ordinary 中将描述符解析收窄到唯一 publisher
+
+SIMT 路径不能直接复用 Scalar builder 的 Finish：Scalar replay actor 先竞争
+request publisher，再由持久 SIMT VF 消费不可变 request 并构建 execution
+payload。本轮保留该分工，没有把 Build 退回 Scalar，也没有扩大 request ABI：
+
+1. `ValidateSimtL0TaskArgs()` 接受 plain `FdwicOutputRef`，但拒绝未来
+   task、非 plain 引用、越界 slot 和预期 output arity 不一致；
+2. 唯一 request publisher 只等待当前 task 实际使用的 producer output cell，
+   acquire 后把完整 TensorDesc 复制到本核 task payload 暂存；
+3. request source 将该完整描述符按旧格式打包，SIMT builder 继续只看
+   TensorDesc，因此 ordinary TensorMap、fanin 和 execution payload 协议不变；
+4. 其余 replay actor 不再取得本 task 的 output cell，但与 engine 匹配的
+   actor 仍参与独立 Execute owner 竞争。
+
+这个版本仍会让唯一 Scalar publisher 支付真实 producer 描述符的等待与
+copy，但已把代价从“95 个 replay actor 每 task 都等”收窄为“1 个 publisher
+只等实际 fanin”。将符号引用编入 request、再由 SIMT builder 直接解析可能
+进一步减少 Scalar 工作，但会扩大 request 协议和控制面，不在本次功能
+收敛中冒进引入。
+
+验证结果：
+
+- SIMT request 协议 C++ 单测 8 项全部 PASS，包括 shared ref 解析、
+  output arity 和未来引用拒绝；
+- 真实 A5 非 PA `A5OnboardBd24CompeteFirstFreshOutput` PASS；
+- PA B1 数值 golden PASS；
+- PA B256 三个独立进程均 PASS，`95 replay + 1 builder` 角色与每核
+  1280 次 Submit 均闭合；
+- startup→FinalDrain 为 **63.613 / 64.551 / 64.742 ms**，中位数
+  **64.551 ms**。相对第 15 章保留的旧 K1 四样本中位数
+  **99.419 ms** 下降 **34.868 ms / 35.1%**。
+
+三份新数据分别位于：
+
+- `outputs/TestPagedAttentionUnroll_Case1_20260809_151947/`；
+- `outputs/TestPagedAttentionUnroll_Case1_20260809_152101/`；
+- `outputs/TestPagedAttentionUnroll_Case1_20260809_152206/`。

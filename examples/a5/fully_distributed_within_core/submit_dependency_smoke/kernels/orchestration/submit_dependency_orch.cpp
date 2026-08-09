@@ -377,7 +377,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     if (mode == 32) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs left_args;
-#if PTO_FDWIC_SHARED_MAP && (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2)
+#if PTO_FDWIC_SHARED_MAP && \
+    (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3)
         SharedTaskOutputs left_out = rt_submit_aic_task_deferred_compete_first(
             FUNC_MAKE_LEFT_AIC, 1, left_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                 submit_args.add_input(input);

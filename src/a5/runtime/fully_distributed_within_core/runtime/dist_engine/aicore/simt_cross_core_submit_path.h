@@ -75,10 +75,15 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_reserve_request(DistSubmitCtx &ctx, bo
 }
 
 PTO_DEVICE_FUNC bool dist_simt_cross_core_publish_request(
-    DistSubmitCtx &ctx, const L0TaskArgs &args, ExecEngineClass engine_class, int32_t kernel_id
+    DistSubmitCtx &ctx, const L0TaskArgs &args, ExecEngineClass engine_class, int32_t kernel_id,
+    uint32_t expected_output_count = UINT32_MAX
 ) {
-    if (!fdwic::cross_core::ValidateSimtL0TaskArgs(args, static_cast<uint32_t>(ctx.task_id))) {
+    if (!fdwic::cross_core::ValidateSimtL0TaskArgs(args, static_cast<uint32_t>(ctx.task_id), expected_output_count)) {
         return dist_simt_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+    }
+    for (int32_t tensor = 0; tensor < args.tensor_count(); ++tensor) {
+        if (args.tag(tensor) == TensorArgType::OUTPUT || !args.tensor(tensor).tensor_from_shared_output()) continue;
+        if (!dist_cross_core_copy_existing_tensor(ctx.payload->tensors[tensor], args, tensor, ctx)) return false;
     }
     const bool immediate = engine_class == ExecEngineClass::Immediate;
     const uint64_t function_address = immediate ? 0 : dist_aicore_slot_function_addr(g_dist.runtime, kernel_id);
@@ -92,7 +97,7 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_publish_request(
         engine_class,
         0,
     };
-    const SimtL0TaskArgsRequestSource source{args};
+    const SimtL0TaskArgsRequestSource source{args, ctx.payload->tensors};
     __gm__ fdwic::cross_core::SimtBuildRequestCell &request =
         dist_simt_cross_core_state().requests[static_cast<uint32_t>(ctx.task_id)];
     if (fdwic::cross_core::PublishReservedSimtBuildRequest<DistCrossCoreAicoreOps>(
@@ -117,11 +122,12 @@ PTO_DEVICE_FUNC DistCompeteFirstTicket dist_simt_cross_core_invalid_ticket() {
 
 PTO_DEVICE_FUNC bool dist_simt_cross_core_finish_request(
     DistSubmitCtx &ctx, const L0TaskArgs *publisher_args, DistSubmitKind kind, ExecEngineClass engine_class,
-    int32_t kernel_id, bool publisher
+    int32_t kernel_id, bool publisher, bool acquire_outputs = true, uint32_t expected_output_count = UINT32_MAX
 ) {
     if (publisher) {
-        if (publisher_args == nullptr ||
-            !dist_simt_cross_core_publish_request(ctx, *publisher_args, engine_class, kernel_id)) {
+        if (publisher_args == nullptr || !dist_simt_cross_core_publish_request(
+                                             ctx, *publisher_args, engine_class, kernel_id, expected_output_count
+                                         )) {
             return false;
         }
 #if !defined(__CCE_AICORE__)
@@ -131,12 +137,12 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_finish_request(
         // Real A5 never enters this fallback.
         bool scalar_builder = false;
         if (!dist_cross_core_reserve_build(ctx, scalar_builder) || !scalar_builder ||
-            !dist_cross_core_finish_builder(ctx, *publisher_args, engine_class, kernel_id)) {
+            !dist_cross_core_finish_builder(ctx, *publisher_args, engine_class, kernel_id, expected_output_count)) {
             return dist_simt_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
         }
 #endif
     }
-    if (!dist_cross_core_acquire_outputs(ctx)) return false;
+    if (acquire_outputs && !dist_cross_core_acquire_outputs(ctx)) return false;
     return kind != DistSubmitKind::Kernel || dist_cross_core_bind_execution(ctx, engine_class);
 }
 
@@ -245,6 +251,20 @@ PTO_DEVICE_FUNC TaskOutputTensors dist_simt_cross_core_compete_first_finish(
     return ctx.result;
 }
 
+PTO_DEVICE_FUNC bool dist_simt_cross_core_compete_first_finish_deferred(
+    const MixedKernels *mixed, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args, DistSubmitKind kind,
+    uint32_t expected_output_count
+) {
+    DistSubmitCtx ctx;
+    ExecEngineClass engine_class = ExecEngineClass::None;
+    int32_t kernel_id = INVALID_KERNEL_ID;
+    if (!dist_simt_cross_core_restore_ticket(ticket, mixed, kind, ctx, engine_class, kernel_id)) return false;
+    const bool publisher = ticket.won != 0;
+    return dist_simt_cross_core_finish_request(
+        ctx, publisher ? &args : nullptr, kind, engine_class, kernel_id, publisher, false, expected_output_count
+    );
+}
+
 PTO_DEVICE_FUNC TaskOutputTensors
 dist_simt_cross_core_submit_kernel(const MixedKernels &mixed, const L0TaskArgs &args) {
     return dist_simt_cross_core_submit(&mixed, args, DistSubmitKind::Kernel);
@@ -271,6 +291,23 @@ PTO_DEVICE_FUNC DistCompeteFirstTicket dist_simt_cross_core_alloc_compete_first_
 PTO_DEVICE_FUNC TaskOutputTensors
 dist_simt_cross_core_alloc_compete_first_finish(const DistCompeteFirstTicket &ticket, const L0TaskArgs &args) {
     return dist_simt_cross_core_compete_first_finish(nullptr, ticket, args, DistSubmitKind::Alloc);
+}
+
+PTO_DEVICE_FUNC bool dist_simt_cross_core_submit_deferred_compete_first_finish(
+    const MixedKernels &mixed, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args,
+    uint32_t expected_output_count
+) {
+    return dist_simt_cross_core_compete_first_finish_deferred(
+        &mixed, ticket, args, DistSubmitKind::Kernel, expected_output_count
+    );
+}
+
+PTO_DEVICE_FUNC bool dist_simt_cross_core_alloc_deferred_compete_first_finish(
+    const DistCompeteFirstTicket &ticket, const L0TaskArgs &args, uint32_t expected_output_count
+) {
+    return dist_simt_cross_core_compete_first_finish_deferred(
+        nullptr, ticket, args, DistSubmitKind::Alloc, expected_output_count
+    );
 }
 
 }  // namespace

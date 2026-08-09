@@ -18,22 +18,33 @@
 
 namespace fdwic::cross_core {
 
-PTO_DEVICE_FUNC inline bool ValidateSimtL0TaskArgs(const L0TaskArgs &args, uint32_t task_id) {
+PTO_DEVICE_FUNC inline bool
+ValidateSimtL0TaskArgs(const L0TaskArgs &args, uint32_t task_id, uint32_t expected_output_count = UINT32_MAX) {
     if (task_id == UINT32_MAX || args.has_error || args.tensor_count() < 0 ||
         args.tensor_count() > static_cast<int32_t>(kExecMaxTensors) || args.scalar_count() < 0 ||
         args.scalar_count() > static_cast<int32_t>(kExecMaxScalars) ||
         args.explicit_dep_count() > kSimtRequestMaxExplicitDependencies) {
         return false;
     }
+    uint32_t output_count = 0;
     for (int32_t tensor = 0; tensor < args.tensor_count(); ++tensor) {
         const TensorArgType tag = args.tag(tensor);
         if (!SimtRequestTensorTagValid(tag)) return false;
         if (tag == TensorArgType::OUTPUT) {
             if (!args.tensor(tensor).has_create_info()) return false;
+            ++output_count;
             continue;
         }
 #if PTO_FDWIC_SHARED_MAP
-        if (args.tensor(tensor).tensor_from_shared_output()) return false;
+        if (args.tensor(tensor).tensor_from_shared_output()) {
+            const FdwicOutputRef ref = args.tensor(tensor).shared_output_ref();
+            if (!fdwic_plain_output_ref(ref) || ref.producer_task_id < 0 ||
+                static_cast<uint32_t>(ref.producer_task_id) >= task_id || ref.output_slot < 0 ||
+                static_cast<uint32_t>(ref.output_slot) >= MAX_TENSOR_ARGS) {
+                return false;
+            }
+            continue;
+        }
 #endif
         if (!args.tensor(tensor).has_existing_tensor()) return false;
     }
@@ -41,11 +52,12 @@ PTO_DEVICE_FUNC inline bool ValidateSimtL0TaskArgs(const L0TaskArgs &args, uint3
         const PTO2TaskId id = args.explicit_dep(dependency);
         if (!id.is_valid() || id.ring() != 0 || id.local() >= task_id) return false;
     }
-    return true;
+    return expected_output_count == UINT32_MAX || output_count == expected_output_count;
 }
 
 struct SimtL0TaskArgsRequestSource {
     const L0TaskArgs &args;
+    __gm__ const Tensor *resolved_tensors;
 
     PTO_DEVICE_FUNC uint64_t TensorWord(uint32_t tensor, uint32_t word) const {
         const int32_t index = static_cast<int32_t>(tensor);
@@ -53,6 +65,12 @@ struct SimtL0TaskArgsRequestSource {
             const auto *words = reinterpret_cast<const uint64_t *>(&args.tensor(index).create_info());
             return words[word];
         }
+#if PTO_FDWIC_SHARED_MAP
+        if (args.tensor(index).tensor_from_shared_output()) {
+            __gm__ const auto *words = reinterpret_cast<__gm__ const uint64_t *>(&resolved_tensors[index]);
+            return words[word];
+        }
+#endif
 #if defined(__CCE_AICORE__)
         if (args.tensor(index).tensor_from_gm()) {
             __gm__ const auto *words = reinterpret_cast<__gm__ const uint64_t *>(&args.tensor(index).gm_ref());

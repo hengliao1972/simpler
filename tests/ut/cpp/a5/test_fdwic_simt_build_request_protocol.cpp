@@ -211,7 +211,7 @@ TEST(FdwicSimtBuildRequestProtocol, RealL0TaskArgsAreCopiedByValueWithoutLocalRe
     const SimtBuildRequestSpec spec{
         5, 0x123456780ULL, 17, 2, 1, 2, ExecEngineClass::Aiv, 0,
     };
-    const SimtL0TaskArgsRequestSource source{args};
+    const SimtL0TaskArgsRequestSource source{args, nullptr};
     ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 5, 2, fatal), SimtRequestReserveResult::Reserved);
     ASSERT_EQ(
         PublishReservedSimtBuildRequest<HostOps>(cell, 2, spec, source, fatal), SimtRequestPublishResult::Published
@@ -245,6 +245,40 @@ TEST(FdwicSimtBuildRequestProtocol, RealL0TaskArgsRejectFutureOrCrossRingDepende
     PTO2TaskId dependency = PTO2TaskId::make(1, 2);
     cross_ring.set_dependencies(&dependency, 1);
     EXPECT_FALSE(ValidateSimtL0TaskArgs(cross_ring, 7));
+}
+
+TEST(FdwicSimtBuildRequestProtocol, SharedOutputReferenceUsesResolvedPublisherDescriptor) {
+    uint32_t shape[1] = {16};
+    Tensor resolved = make_tensor_external(reinterpret_cast<void *>(0x4000), shape, 1, DataType::FLOAT32);
+    resolved.owner_task_id = PTO2TaskId::make(0, 3);
+    FdwicOutputRef input_ref{3, 0, 0, 0, 0, 0};
+    L0TaskArgs args;
+    args.add_input(input_ref);
+    ASSERT_TRUE(ValidateSimtL0TaskArgs(args, 5, 0));
+    EXPECT_FALSE(ValidateSimtL0TaskArgs(args, 5, 1));
+
+    Tensor resolved_tensors[MAX_TENSOR_ARGS]{};
+    Tensor::copy(resolved_tensors[0], resolved);
+    const SimtL0TaskArgsRequestSource source{args, resolved_tensors};
+    SimtBuildRequestCell cell{};
+    SharedExecControl fatal{};
+    const SimtBuildRequestSpec spec{
+        5, 0x123456780ULL, 17, 1, 0, 0, ExecEngineClass::Aiv, 0,
+    };
+    ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 5, 2, fatal), SimtRequestReserveResult::Reserved);
+    ASSERT_EQ(
+        PublishReservedSimtBuildRequest<HostOps>(cell, 2, spec, source, fatal), SimtRequestPublishResult::Published
+    );
+
+    const auto *resolved_words = reinterpret_cast<const uint64_t *>(&resolved);
+    for (uint32_t word = 0; word < kExecTensorDescWords; ++word) {
+        EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(0) + word], resolved_words[word]);
+    }
+
+    FdwicOutputRef future_ref{5, 0, 0, 0, 0, 0};
+    L0TaskArgs future_args;
+    future_args.add_input(future_ref);
+    EXPECT_FALSE(ValidateSimtL0TaskArgs(future_args, 5, 0));
 }
 
 }  // namespace

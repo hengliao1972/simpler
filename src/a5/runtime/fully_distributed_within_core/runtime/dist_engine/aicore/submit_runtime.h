@@ -920,6 +920,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC bool dist_submit_deferred_compete_first_finish(
 ) {
 #if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
     return dist_cross_core_submit_deferred_compete_first_finish(mixed, ticket, args, expected_output_count);
+#elif PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
+    return dist_simt_cross_core_submit_deferred_compete_first_finish(mixed, ticket, args, expected_output_count);
 #else
     (void)mixed;
     (void)ticket;
@@ -935,6 +937,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC bool dist_alloc_deferred_compete_first_finish(
 ) {
 #if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
     return dist_cross_core_alloc_deferred_compete_first_finish(ticket, args, expected_output_count);
+#elif PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
+    return dist_simt_cross_core_alloc_deferred_compete_first_finish(ticket, args, expected_output_count);
 #else
     (void)ticket;
     (void)args;
