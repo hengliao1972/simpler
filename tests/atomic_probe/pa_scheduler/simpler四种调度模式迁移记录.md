@@ -564,3 +564,54 @@ region，以及让 caller 跳过已经在 lookup 中完成的第二次 region �
 
 当前没有 VF 汇编与分阶段计数，不能把回退武断归因于某个寄存器或分支；只
 记录该 CCEC 代码形态不可保留。对应 investigation 保存重新评估条件。
+
+## 15. mode3 中间 builder 拓扑扫描：继续保留 K1
+
+### 15.1 扫描动机与协议修正
+
+早期 `simt_cross_core_ordinary` 只比较过 K1 与 K32，没有覆盖 K2/K4/K8
+这类中间供给。由于 mode3 的端到端仍明显慢于 Scalar 两种模式，本轮保持
+ordinary TensorMap、request、execute ticket、W4 和 startup 到 FinalDrain
+端点不变，只扫描 builder block 数量。
+
+把 K1 临时扩为 K2 时首先触发 fail-closed。根因不是 TensorMap：K1 收敛后
+mode3 的 `builder_rank` 固定为 0，多 VF 会重复消费同一 task 流。实验版将
+rank 恢复为物理 block id 后，K2/K4/K8/K16 都完成 PA B256 数值 golden，
+builder/replay 数量也与拓扑一致。该 rank 改动在恢复 K1 后没有独立功能价值，
+最终一并撤回。
+
+### 15.2 同窗口扫描结果
+
+| ordinary builder K | replay 核 | B256 startup→FinalDrain |
+| -----------------: | --------: | ----------------------: |
+| 1 | 95 | 94.732 ms |
+| 2 | 94 | 136.467 ms |
+| 4 | 92 | 118.651 ms |
+| 8 | 88 | 106.304 ms |
+| 16 | 80 | 93.843 ms |
+
+K16 首样本只比 K1 快约 0.94%，因此又分别重复：
+
+```text
+K16: 93.843 / 100.282 / 97.869 ms, median = 97.869 ms
+K1 : 104.105 / 93.608 / 138.501 ms, median = 104.105 ms
+```
+
+K1 在同一轮内出现 93.608～138.501 ms 的巨大波动。若把扫描前的 94.732 ms
+也计入，K1 四样本中位约 99.419 ms，K16 的中位优势只剩约 1.56%，且两组
+范围明显重叠。
+
+### 15.3 裁决
+
+本轮不把 K16 固化为公共默认值，继续保留 K1，原因是：
+
+1. 端到端收益没有超过当前 mode3 波动；
+2. K16 固定减少 15 个 AIV replay/Execute worker，这一取舍可能随算子 Build
+   重量变化，不能只凭 PA 单负载设为通用合同；
+3. K2/K4/K8 都未超过 K1，说明“增加 builder 必然更快”不成立；
+4. 当前没有 Build 与 Execute 分阶段计数，无法解释 K1 长尾究竟来自 builder
+   供给、设备状态还是后段执行竞争。
+
+后续若重启该方向，应先让 builder limit 成为明确的构建身份并采集至少两个
+非 PA 工作负载，再用交错 A/B 和 Build/Execute 分段数据选择默认值。不得把
+PA task kind、batch 或固定 task 图写进 builder 选择逻辑。

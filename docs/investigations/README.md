@@ -84,6 +84,7 @@ that ...".
 
 Newest first.
 
+- [2026-08 — Intermediate SIMT ordinary builder counts were not retained](2026-08-simt-ordinary-builder-topology.md)
 - [2026-08 — SIMT DAG region shortcuts regressed the CCEC hot path](2026-08-simt-dag-region-shortcut.md)
 - [2026-08 — SIMT DAG metadata prefix did not reduce end-to-end time](2026-08-simt-dag-metadata-prefix.md)
 - [2026-07 — Shared PA Case1: standalone 2.3 ms is not an equivalent baseline; five micro-optimizations dropped](2026-07-shared-pa-case1-performance-gap.md)
