@@ -586,6 +586,12 @@ DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
     __gm__ uint64_t *fatal, int32_t producers[]
 ) {
     uint32_t unresolved = 0;
+    // Tensor 区域只由当前 immutable request 决定。先解析一次并保存在
+    // leader 本地，避免在 history × writer 的内层循环中反复读取同一份
+    // GM descriptor、重算 shape/stride。该消减与算子 task 形状无关。
+    uint64_t query_address[fdwic::cross_core::kExecMaxTensors] = {};
+    uint64_t query_lo[fdwic::cross_core::kExecMaxTensors] = {};
+    uint64_t query_hi[fdwic::cross_core::kExecMaxTensors] = {};
     for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
         producers[tensor] = -1;
         const uint32_t tag = dist_simt_request_tag(request, tensor);
@@ -596,10 +602,11 @@ DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
         if (descriptor == nullptr) return false;
         const bool manual_dependency = ((descriptor[5] >> 8U) & 0xFFU) != 0;
         if (!manual_dependency) {
-            uint64_t address = 0;
-            uint64_t lo = 0;
-            uint64_t hi = 0;
-            if (!dist_simt_tensor_region(descriptor, &address, &lo, &hi)) return false;
+            if (!dist_simt_tensor_region(
+                    descriptor, &query_address[tensor], &query_lo[tensor], &query_hi[tensor]
+                )) {
+                return false;
+            }
             unresolved |= uint32_t{1} << tensor;
         }
     }
@@ -641,13 +648,8 @@ DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
             for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
                 const uint32_t bit = uint32_t{1} << tensor;
                 if ((unresolved & bit) == 0) continue;
-                __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
-                if (descriptor == nullptr) return false;
-                uint64_t address = 0;
-                uint64_t lo = 0;
-                uint64_t hi = 0;
-                if (!dist_simt_tensor_region(descriptor, &address, &lo, &hi)) return false;
-                if (candidate_address == address && lo < candidate_hi && candidate_lo < hi) {
+                if (candidate_address == query_address[tensor] && query_lo[tensor] < candidate_hi &&
+                    candidate_lo < query_hi[tensor]) {
                     producers[tensor] = static_cast<int32_t>(candidate);
                     unresolved &= ~bit;
                 }

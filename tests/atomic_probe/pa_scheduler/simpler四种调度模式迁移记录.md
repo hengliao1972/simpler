@@ -1211,3 +1211,36 @@ PA B256 五次为 8.013 / 8.051 / 8.095 / 8.068 / 8.173 ms，中位数
 这组数据说明，mode4 的 Build tournament 已不是当前端到端主要矛盾。后续应
 先分别测清 request 发布完成前沿、Builder 完成前沿和 Execute 完成前沿，再
 选择优化对象，不能继续凭 atomic 调用数量猜测收益。
+
+## 23. SIMT DAG 查询 Tensor 区域只解析一次
+
+### 23.1 重复工作的来源
+
+`dist_simt_lookup_dag_fanins()` 原先在扫描每个历史 writer 时，都会为每个尚未
+解析的 Tensor 重新读取 request 中的 `TensorDesc`，并重复计算 buffer 地址和
+`[lo, hi)` 区域。对 32 个 Tensor、64 个历史 task 的最坏组合，这部分工作处在
+`history × writer × tensor` 内层；同一个 immutable request 的查询区域实际上
+从未改变。
+
+保留实现先在 leader 本地为每个 Tensor 计算一次 `address/lo/hi`，历史扫描只
+读取这三组紧凑数组进行重叠比较。manual dependency、writer 发布验证、producer
+选择顺序、fanin 去重和错误收敛均保持原协议。实现不读取 PA task kind、batch、
+固定五 task 次序或 Tensor 形状，因此是动态 DAG 查询的通用消减。
+
+### 23.2 真实 A5 结果
+
+相同 shared TensorMap、SIMT DAG、PA B256、startup 到 FinalDrain 的
+`perf-clock` 口径，五个独立进程结果为：
+
+- 3.27452 ms；
+- 3.23714 ms；
+- 3.26356 ms；
+- 3.30605 ms；
+- 3.40025 ms。
+
+中位数为 **3.27452 ms**，相对第 22.4 节 8.078 ms 中位数改善约 **59.5%**。
+这仍未达到 2 ms 目标，但已证明重复解析 immutable Tensor 区域是 mode4 的主要
+通用热点之一。
+
+改动后重新运行第 22.3 节十二类边界，四种 scheduler 合计 **48/48** 个真实
+A5 模式/场景组合数值 golden PASS；本阶段未运行 A5Sim。
