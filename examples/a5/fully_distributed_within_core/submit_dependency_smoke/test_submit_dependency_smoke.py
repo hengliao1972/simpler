@@ -97,6 +97,20 @@ class TestSubmitDependencySmoke(SceneTestCase):
                 "core_type": "aiv",
                 "signature": [D.INOUT],
             },
+            {
+                "func_id": 10,
+                "name": "NOOP_AIC",
+                "source": "kernels/noop.cpp",
+                "core_type": "aic",
+                "signature": [],
+            },
+            {
+                "func_id": 11,
+                "name": "NOOP_AIV",
+                "source": "kernels/noop.cpp",
+                "core_type": "aiv",
+                "signature": [],
+            },
         ],
     }
 
@@ -409,6 +423,22 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 32},
             "params": {"n": 4096, "mode": 34},
+        },
+        {
+            "name": "A5OnboardBd32TaskCapacityMinusOne",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 2047, "mode": 42},
+        },
+        {
+            "name": "A5OnboardBd32ExactTaskCapacity",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            # 零参数 task 不产生 TensorMap 写入，使这一用例只验证
+            # 跨核 task 状态的 2048 容量上界和并发尾票退出。
+            "params": {"n": 2048, "mode": 42},
         },
         {
             "name": "A5OnboardBd32DeferredCrossRoleChain",
@@ -893,6 +923,9 @@ class TestSubmitDependencySmoke(SceneTestCase):
             return
         if mode == 41:
             args.output[:] = args.input + 8.0
+            return
+        if mode == 42:
+            args.output[:] = -1.0
             return
         if mode == 10:
             args.output[:] = (args.input * 3.0 + 5.0) * 3.0 + 8.0

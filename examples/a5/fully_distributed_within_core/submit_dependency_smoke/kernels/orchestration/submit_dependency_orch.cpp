@@ -23,6 +23,8 @@
 #define FUNC_INSPECT_ALLOC_AIC 7
 #define FUNC_DCCI_ATOMIC_CLOBBER_AIC 8
 #define FUNC_DCCI_ATOMIC_CLOBBER_AIV 9
+#define FUNC_NOOP_AIC 10
+#define FUNC_NOOP_AIV 11
 
 #if !defined(__CCE_AICORE__) && !defined(dcci)
 #define dcci(...) \
@@ -633,6 +635,20 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
             bump_args.add_inout(output);
             bump_args.add_scalar(n);
             rt_submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_args);
+        }
+        return;
+    }
+
+    if (mode == 42) {
+        // 交替发布零参数 AIC/AIV task，专门验证调度状态的数量
+        // 边界。不读写 TensorMap 或 heap，避免其他容量合同先于 task 上限失败。
+        for (uint64_t task = 0; task < n; ++task) {
+            L0TaskArgs task_args;
+            if ((task & 1U) == 0) {
+                rt_submit_aic_task(FUNC_NOOP_AIC, task_args);
+            } else {
+                rt_submit_aiv_task(FUNC_NOOP_AIV, task_args);
+            }
         }
         return;
     }

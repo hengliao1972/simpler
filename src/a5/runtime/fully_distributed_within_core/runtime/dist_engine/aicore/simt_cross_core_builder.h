@@ -932,8 +932,17 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
         uint32_t task_id = builder_rank * kDistSimtBuilderWarps + warp;
         while (!dist_simt_fatal_observed(fatal)) {
             if (task_id >= kFdwicCrossCoreTaskCapacity) {
-                const uint64_t count = dist_simt_atomic_load(sealed);
-                if (count != UINT64_MAX && task_id >= count) break;
+                // 恰好填满 2048 个 request 时，leader 完成 task 2047 后会
+                // 先于 replay seal 步进到数组尾部。此时不能访问越界 cell，
+                // 也不能把“尚未封口”误判成超容量；等待 seal/fatal 后再裁决。
+                const uint64_t seal_wait_begin = clock();
+                uint64_t count = dist_simt_atomic_load(sealed);
+                while (count == UINT64_MAX && !dist_simt_fatal_observed(fatal) &&
+                       clock() - seal_wait_begin <= kDistSimtBuilderPollBudget) {
+                    count = dist_simt_atomic_load(sealed);
+                }
+                if (dist_simt_fatal_observed(fatal)) break;
+                if (count != UINT64_MAX && count <= kFdwicCrossCoreTaskCapacity && task_id >= count) break;
                 dist_simt_publish_fatal(fatal, task_id, builder_owner);
                 break;
             }

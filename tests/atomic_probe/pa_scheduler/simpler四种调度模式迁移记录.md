@@ -818,25 +818,39 @@ Build 尚未发布，不是控制字损坏；Execute 侧继续等待并定期检
   完全无任务时的闭合；
 - `Bd7AlternatingCrossEngineInout`：17 组 AIC→AIV writer 交接，验证同一
   region 的跨引擎严格前驱顺序，不依赖 PA 的固定五任务 DAG。
+- `Bd32TaskCapacityMinusOne`：96 worker、2047 个零参数 task，
+  验证 task 状态容量上限前一项；
+- `Bd32ExactTaskCapacity`：96 worker、2048 个零参数 task，验证
+  末个合法 request、SIMT Builder 封口和并发 Execute 尾票退出。
 
 `Bd32BuildExecuteSkewNoFreshOutput` 交替提交 AIC/AIV，并让每个 task 写独立
 subview；它不会因为业务依赖把 Build 人为串行化，能放大 Execute 先看到
 `Empty` 的时序。多输出用例通过通用 deferred alloc 一次发布两个 output，
 后续 AIC/AIV 分别写入并合并，不依赖 PA 的三输出 Alloc 图形。
 
+两个 task 容量用例交替提交 AIC/AIV 零参数 kernel，不生成
+TensorMap writer，也不申请 heap。这使 2047/2048 验证只针对跨核
+task 状态容量，不会像输出 view 链那样先命中 TensorMap bucket 的
+独立容量合同。
+
 ### 17.3 四模式真实 A5 结果
 
-以下四种 scheduler 均运行上述十个 case，合计 40 个模式/场景组合：
+以下四种 scheduler 均运行上述十二个 case，合计 48 个模式/场景组合：
 
 - `cross_core_ordinary`：全部数值 golden PASS；
 - `cross_core_dag`：全部数值 golden PASS；
 - `simt_cross_core_ordinary`：全部数值 golden PASS；
 - `simt_cross_core_dag`：全部数值 golden PASS。
 
-后补的四类边界于 2026-08-09 再次在四种 scheduler 上逐一构建三镜像并
-真机运行，16 个模式/场景组合全部数值 golden PASS。零 Submit、单引擎
-空闲和 17-task 非均匀数量均由同一公开 orchestration API 产生，没有增加
-调度器测试专用分支。
+2026-08-09 在同一最终源码状态上逐一重跑三镜像和真机数值
+golden，48 个组合全部 PASS。零 Submit、单引擎空闲、17-task 非均匀
+数量和 2047/2048 容量边界均由同一公开 orchestration API 产生，
+没有增加调度器测试专用分支。
+
+2048-task 首次真机运行暴露了 SIMT Builder 的通用封口时序：
+leader 完成 task 2047 后可能先于 replay sealer 走到 request 数组尾部。
+修正后 Builder 不访问越界 cell，而是等待 seal/fatal 后再区分正常穷尽和
+真实容量错误。该分支只使用通用 task 容量和 lifecycle 状态。
 
 同时，cross-core execution/output/TensorMap 协议与 ordinary/DAG state 五组
 C++ 单测全部 PASS。没有运行 A5Sim；SIMT/cross-core 的裁决继续只使用 CCEC
@@ -987,7 +1001,7 @@ startup→FinalDrain 为 **13.1668 ms**，仍比保留流水的约 **5.15 ms** �
    计划生产者等待真实 TensorDesc；
 4. TensorMap metadata 仍严格按 task-id writer 前驱发布，而 Fanin/Build/Execute
    继续允许并行；
-5. 新协议必须通过第 17 章十类、四模式共 40 个非 PA 边界组合。
+5. 新协议必须通过第 17 章十二类、四模式共 48 个非 PA 边界组合。
 
 因此下一条可行主线是复用已有通用 build-request/payload 协议，形成“轻量计划
 发布 → 多 Scalar 动态 Build → Build 后即时 Execute”的流水，而不是继续微调
