@@ -19,6 +19,20 @@ list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../c
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common")
+
+# SIMT intrinsics are shipped below the architecture-specific ASC include
+# directory rather than the toolkit's compiler builtin include path. Derive
+# the active toolkit root from the configured CCEC binary so the production
+# runtime uses the same header that the standalone SIMT probes compile against.
+get_filename_component(BISHENG_BIN_DIR "${BISHENG_CC}" DIRECTORY)
+get_filename_component(ASCEND_TOOLKIT_ROOT "${BISHENG_BIN_DIR}" DIRECTORY)
+set(ASC_SIMT_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/asc/include")
+if(EXISTS "${ASC_SIMT_INCLUDE_DIR}/simt_api/asc_simt.h")
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${ASCEND_TOOLKIT_ROOT}/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/include")
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${ASCEND_TOOLKIT_ROOT}/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/asc")
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${ASC_SIMT_INCLUDE_DIR}")
+endif()
+
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
         list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${INC_DIR}")

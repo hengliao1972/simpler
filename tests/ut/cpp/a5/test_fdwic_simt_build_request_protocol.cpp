@@ -26,11 +26,17 @@ struct HostOps {
     static inline uint32_t flush_count = 0;
     static inline uint32_t invalidate_count = 0;
     static inline uint64_t last_bytes = 0;
+    static inline uintptr_t flush_addresses[2]{};
+    static inline uint64_t flush_bytes[2]{};
 
     static void Reset() {
         flush_count = 0;
         invalidate_count = 0;
         last_bytes = 0;
+        flush_addresses[0] = 0;
+        flush_addresses[1] = 0;
+        flush_bytes[0] = 0;
+        flush_bytes[1] = 0;
     }
 
     static int64_t Load(volatile int64_t *address) { return __atomic_load_n(address, __ATOMIC_ACQUIRE); }
@@ -43,7 +49,11 @@ struct HostOps {
 
     static void StorePayloadWord(volatile uint64_t *address, uint64_t value) { *address = value; }
 
-    static void FlushRegion(const volatile void *, uint64_t bytes) {
+    static void FlushRegion(const volatile void *address, uint64_t bytes) {
+        if (flush_count < 2) {
+            flush_addresses[flush_count] = reinterpret_cast<uintptr_t>(address);
+            flush_bytes[flush_count] = bytes;
+        }
         ++flush_count;
         last_bytes = bytes;
         std::atomic_thread_fence(std::memory_order_release);
@@ -114,13 +124,17 @@ TEST(FdwicSimtBuildRequestProtocol, PublisherFlushesPackedPayloadBeforePublished
     EXPECT_EQ(
         PublishReservedSimtBuildRequest<HostOps>(cell, 5, spec, source, fatal), SimtRequestPublishResult::Published
     );
-    EXPECT_EQ(HostOps::flush_count, 1U);
+    ASSERT_EQ(HostOps::flush_count, 2U);
+    EXPECT_EQ(HostOps::flush_addresses[0], reinterpret_cast<uintptr_t>(&cell.payload));
+    EXPECT_EQ(HostOps::flush_bytes[0], 6U * kExecCacheLineBytes);
+    EXPECT_EQ(HostOps::flush_addresses[1], reinterpret_cast<uintptr_t>(&cell.control));
+    EXPECT_EQ(HostOps::flush_bytes[1], kExecCacheLineBytes);
 
     const DecodedSimtRequestControl control = DecodeSimtRequestControl(cell.control.state);
     ASSERT_TRUE(control.valid);
     EXPECT_EQ(control.phase, SimtRequestPhase::Published);
     EXPECT_EQ(control.payload_lines, 6U);
-    EXPECT_EQ(HostOps::last_bytes, 6U * kExecCacheLineBytes);
+    EXPECT_EQ(HostOps::last_bytes, kExecCacheLineBytes);
 
     SimtBuildRequestHeader header{};
     SimtBuildRequestLayout layout{};

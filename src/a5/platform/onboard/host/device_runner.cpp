@@ -25,12 +25,16 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 #include "aicpu_topology_probe.h"
 #include "callable.h"
@@ -84,6 +88,64 @@ static void *prof_alloc_cb(size_t size) {
 }
 
 static int prof_free_cb(void *dev_ptr) { return rtFree(dev_ptr); }
+
+namespace {
+
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
+// The full SIMT builder call chain exceeds A5's default 1024-byte SIMT stack.
+// This capacity is configured by JSON only on the process's first aclInit;
+// rtDeviceSetLimit after initialization is not the same interface. The
+// short-lived file is only aclInit input and is removed once parsed, so it does
+// not become a deployed runtime resource.
+aclError init_fdwic_simt_acl() {
+    constexpr char kConfig[] = "{\n"
+                               "  \"StackSize\": {\n"
+                               "    \"simt_stack_size\": 1536,\n"
+                               "    \"simt_divergence_stack_size\": 4608\n"
+                               "  }\n"
+                               "}\n";
+    char path[] = "/tmp/simpler_fdwic_simt_acl_XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd < 0) {
+        LOG_ERROR("mkstemp for FDWIC SIMT ACL config failed: errno=%d", errno);
+        return ACL_ERROR_FAILURE;
+    }
+    size_t written = 0;
+    while (written < sizeof(kConfig) - 1) {
+        const ssize_t rc = write(fd, kConfig + written, sizeof(kConfig) - 1 - written);
+        if (rc > 0) {
+            written += static_cast<size_t>(rc);
+            continue;
+        }
+        if (rc < 0 && errno == EINTR) continue;
+        LOG_ERROR("write FDWIC SIMT ACL config failed: errno=%d", errno);
+        (void)close(fd);
+        (void)unlink(path);
+        return ACL_ERROR_FAILURE;
+    }
+    if (close(fd) != 0) {
+        LOG_ERROR("close FDWIC SIMT ACL config failed: errno=%d", errno);
+        (void)unlink(path);
+        return ACL_ERROR_FAILURE;
+    }
+    const aclError rc = aclInit(path);
+    (void)unlink(path);
+    return rc;
+}
+#endif
+
+}  // namespace
+
+DeviceRunner::DeviceRunner() {
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
+    constexpr int kAclRepeatInit = 100002;
+    const aclError rc = init_fdwic_simt_acl();
+    if (rc != ACL_SUCCESS && static_cast<int>(rc) != kAclRepeatInit) {
+        throw std::runtime_error("failed to initialize ACL with FDWIC SIMT stack configuration");
+    }
+    acl_ready_ = true;
+#endif
+}
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
@@ -167,9 +229,11 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // failure cascade into a single fast, self-explanatory error; the runner is
     // then recovered at finalize.
     if (device_unusable_) {
-        LOG_ERROR("DeviceRunner marked unusable by a prior AICore failure; refusing to run. "
-                  "A soft reset does not clear the poison on a5; finalize() will force-reset "
-                  "the card so the next Worker on it inits clean.");
+        LOG_ERROR(
+            "DeviceRunner marked unusable by a prior AICore failure; refusing to run. "
+            "A soft reset does not clear the poison on a5; finalize() will force-reset "
+            "the card so the next Worker on it inits clean."
+        );
         return -1;
     }
     if (validate_launch_aicpu_num(launch_aicpu_num) != 0) return -1;
@@ -334,7 +398,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
         if (fdwic_submit_pmu_host_init == nullptr || fdwic_submit_pmu_host_export == nullptr ||
             fdwic_submit_pmu_host_finalize == nullptr) {
-            LOG_ERROR("fdwic submit-PMU profile was requested but the selected runtime does not provide its host hooks"
+            LOG_ERROR(
+                "fdwic submit-PMU profile was requested but the selected runtime does not provide its host hooks"
             );
             return -1;
         }
@@ -344,8 +409,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
             return rc < 0 ? rc : -1;
         }
         fdwic_submit_pmu_active = true;
-        // 该 profile 只复用 KernelArgs::regs 解析本核 MMIO 地址。所有通用
-        // collector 位与地址必须为空，避免把逐 task ring 混入整窗证据。
+        // This profile reuses KernelArgs::regs only to resolve this core's MMIO
+        // address. All generic collector flags and addresses must remain empty
+        // so a per-task ring cannot contaminate whole-window evidence.
         kernel_args_.args.enable_profiling_flag = PROFILING_FLAG_NONE;
         kernel_args_.args.l2_swimlane_data_base = 0;
         kernel_args_.args.l2_swimlane_aicore_rotation_table = 0;
@@ -439,10 +505,11 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         dep_gen_collector_.start(thread_factory);
     }
 
-    // prepare_runtime_for_launch 已按本轮 block_dim 写入 host launch-plan：
-    // 前 block_dim 个 worker 为 AIC，其余为 AIV。设备握手随后会在 device
-    // Runtime 中确认实际角色，但不会回写这里的 host Runtime。将当前计划表
-    // 交给 L2 collector，用于 AICORE_TIMING (level=1) host 输出的 lane 标签。
+    // prepare_runtime_for_launch populated the host launch plan for this
+    // block_dim: the first block_dim workers are AIC and the remainder are AIV.
+    // The device handshake later confirms actual roles in the device Runtime
+    // without updating this host Runtime. Pass the current plan to the L2
+    // collector for AICORE_TIMING (level=1) host lane labels.
     if (enable_l2_swimlane_ && l2_swimlane_collector_.is_initialized()) {
         std::vector<CoreType> core_types(num_aicore);
         for (int i = 0; i < num_aicore; i++) {
@@ -633,7 +700,11 @@ class AclInitGuard {
 public:
     AclInitGuard() {
         constexpr int kAclRepeatInit = 100002;
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
+        aclError rc = init_fdwic_simt_acl();
+#else
         aclError rc = aclInit(nullptr);
+#endif
         if (rc == ACL_SUCCESS) {
             owns_ = true;
             ok_ = true;

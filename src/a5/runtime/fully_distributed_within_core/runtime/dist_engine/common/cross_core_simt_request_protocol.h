@@ -348,7 +348,16 @@ PTO_DEVICE_FUNC SimtRequestPublishResult PublishReservedSimtBuildRequest(
     const int64_t published = static_cast<int64_t>(
         EncodeSimtRequestControl(SimtRequestPhase::Published, publisher_owner, packed.payload_lines, spec.task_id)
     );
-    if (Ops::CompareExchange(&cell.control.state, reserved, published) != reserved) {
+    // The reserve CAS already elected one publisher. The A5 cross-execution-unit
+    // publication contract is a local plain store plus DCCI on an isolated
+    // control line, followed by a remote atomic load. A second Scalar CAS can
+    // leave the VF's returned atomic load observing the old value indefinitely.
+    // Exact reads before and after publication retain fail-closed validation.
+    Ops::StorePayloadWord(
+        reinterpret_cast<__gm__ volatile uint64_t *>(&cell.control.state), static_cast<uint64_t>(published)
+    );
+    Ops::FlushRegion(&cell.control, kExecCacheLineBytes);
+    if (Ops::Load(&cell.control.state) != published) {
         return SimtRequestPublishResult::PublishConflict;
     }
     return SimtRequestPublishResult::Published;

@@ -26,9 +26,43 @@
 #endif
 #endif
 #include "common/platform_config.h"
+
+#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__DAV_VEC__)
+// The dispatcher entry must advertise the stack requirements of the actual
+// persistent SIMT builder, not those of a trivial dummy VF. Compile the same
+// header once more in metadata-only mode so bisheng can derive the entry TLVs
+// from the real VF body; scalar launch/join helpers remain owned by dist_engine.
+#include "simt_api/asc_simt.h"
+#include "dist_engine/common/state.h"
+#define PTO_FDWIC_SIMT_METADATA_ONLY 1
+#define PTO_FDWIC_SIMT_DEFINE_BUILDER_VF 1
+#include "dist_engine/aicore/simt_cross_core_builder.h"
+#undef PTO_FDWIC_SIMT_DEFINE_BUILDER_VF
+#undef PTO_FDWIC_SIMT_METADATA_ONLY
+#endif
+
 #include "simt_anchor.h"
 
 class Runtime;
+
+#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__DAV_VEC__)
+// Keep the actual VF target and its async launch in the registered AIV entry
+// translation unit. The weak ordinary helper is callable from dist_engine but
+// is not a kernel entry, so rtRegisterAllKernel still sees only the AIC/AIV
+// dispatcher pair.
+extern "C" __attribute__((weak)) __aicore__ void fdwic_simt_cross_core_run_builder(
+    __gm__ SimtCrossCoreOrdinaryState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
+    uint64_t heap_size, uint32_t history
+) {
+    cce::async_invoke<DistSimtCrossCoreBuild>(
+        cce::dim3{kDistSimtBuilderThreads, 1U, 1U}, state, task_cells, heap_base_address, heap_size, history
+    );
+    set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+    // Dedicated builder Scalar waits for the persistent VF; the other 95
+    // Scalars remain independent and continue publishing dynamic requests.
+    wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+}
+#endif
 
 #ifdef __DAV_VEC__
 #define KERNEL_ENTRY(x) \
@@ -36,10 +70,20 @@ class Runtime;
                    // my_kernel_0_mix_aiv
 #define block_idx block_idx_aiv
 #define core_type core_type_aiv
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+#define AICORE_EXECUTE_ENTRY aicore_execute_aiv
+#else
+#define AICORE_EXECUTE_ENTRY aicore_execute
+#endif
 #else
 #define KERNEL_ENTRY(x) x##_0_mix_aic
 #define block_idx block_idx_aic
 #define core_type core_type_aic
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+#define AICORE_EXECUTE_ENTRY aicore_execute_aic
+#else
+#define AICORE_EXECUTE_ENTRY aicore_execute
+#endif
 #endif
 
 [[block_local]] int block_idx;
@@ -51,9 +95,7 @@ class Runtime;
 __attribute__((weak)) __aicore__ void set_fdwic_submit_pmu_reg_base(uint64_t reg_base) {
     s_fdwic_submit_pmu_reg_base = reg_base;
 }
-__attribute__((weak)) __aicore__ uint64_t get_fdwic_submit_pmu_reg_base() {
-    return s_fdwic_submit_pmu_reg_base;
-}
+__attribute__((weak)) __aicore__ uint64_t get_fdwic_submit_pmu_reg_base() { return s_fdwic_submit_pmu_reg_base; }
 #elif !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
 // Per-core profiling state. Populated once by KERNEL_ENTRY from KernelArgs;
 // read by aicore_execute and profiling helpers via the getters below. This
@@ -98,7 +140,7 @@ __attribute__((weak)) __aicore__ void set_aicore_pmu_reg_base(uint64_t reg_base)
 __attribute__((weak)) __aicore__ uint64_t get_aicore_pmu_reg_base() { return s_aicore_pmu_reg_base; }
 #endif
 
-extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
+extern __aicore__ void AICORE_EXECUTE_ENTRY(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 
 /**
  * Kernel entry point with control loop
@@ -131,12 +173,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
 #endif
 
 #if defined(PTO_FDWIC_SUBMIT_PMU) && PTO_FDWIC_SUBMIT_PMU
-    // 独立整窗 PMU 构建不打开 generic PROFILING_FLAG_PMU，也不创建逐 task
-    // ring。这里仅从 host 已发布的物理寄存器表解析本核 MMIO 基址。
+    // The whole-window PMU build neither enables generic PROFILING_FLAG_PMU nor
+    // allocates a per-task ring. Resolve only this core's MMIO base from the
+    // physical register table published by the host.
     __gm__ uint64_t *regs_array = reinterpret_cast<__gm__ uint64_t *>(k_args->regs);
-    set_fdwic_submit_pmu_reg_base(
-        regs_array == nullptr ? 0 : regs_array[get_physical_core_id()]
-    );
+    set_fdwic_submit_pmu_reg_base(regs_array == nullptr ? 0 : regs_array[get_physical_core_id()]);
 #elif !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
     // Publish per-core profiling state into platform-owned slots before the
     // executor runs. AICore reads via get_aicore_*() — never touches Handshake
@@ -194,5 +235,7 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     }
 #endif
 
-    aicore_execute(k_args->runtime_args, block_idx, core_type);
+    AICORE_EXECUTE_ENTRY(k_args->runtime_args, block_idx, core_type);
 }
+
+#undef AICORE_EXECUTE_ENTRY

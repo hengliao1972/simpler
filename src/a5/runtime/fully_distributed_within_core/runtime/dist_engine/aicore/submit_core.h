@@ -188,15 +188,19 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
             complete_executed_task(self, s.task_id);
         }
     } else {
-#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3
 #if PTO_FDWIC_SCHEDULER_MODE == 1
         __gm__ fdwic::cross_core::SharedExecCell &exec_cell =
             g_dist.cross_core_ordinary.tasks[static_cast<uint32_t>(s.task_id)];
         __gm__ fdwic::cross_core::SharedExecControl &exec_fatal = g_dist.cross_core_ordinary.fatal;
-#else
+#elif PTO_FDWIC_SCHEDULER_MODE == 2
         __gm__ fdwic::cross_core::SharedExecCell &exec_cell =
             g_dist.cross_core_dag.runtime.tasks[static_cast<uint32_t>(s.task_id)];
         __gm__ fdwic::cross_core::SharedExecControl &exec_fatal = g_dist.cross_core_dag.runtime.fatal;
+#else
+        __gm__ fdwic::cross_core::SharedExecCell &exec_cell =
+            g_dist.simt_cross_core_ordinary.runtime.tasks[static_cast<uint32_t>(s.task_id)];
+        __gm__ fdwic::cross_core::SharedExecControl &exec_fatal = g_dist.simt_cross_core_ordinary.runtime.fatal;
 #endif
         const uint64_t completion_vend = exec_cell.payload.words[2];
         store_task_vend(s.task_id, completion_vend);

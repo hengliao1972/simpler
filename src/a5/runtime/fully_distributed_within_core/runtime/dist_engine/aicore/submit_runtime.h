@@ -464,6 +464,7 @@ dist_submit_finish_alloc_tail(DistSubmitCtx &ctx, uint64_t completion_begin, uin
 #include "dist_engine/aicore/shared_submit_path.h"
 #include "dist_engine/aicore/cross_core_submit_path.h"
 #include "dist_engine/aicore/simt_cross_core_submit_path.h"
+#include "dist_engine/aicore/simt_cross_core_builder.h"
 
 #include "dist_engine/aicore/run_state.h"
 
@@ -850,6 +851,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
 dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
 #if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
     return dist_cross_core_submit_kernel(mixed, args);
+#elif PTO_FDWIC_SCHEDULER_MODE == 3
+    return dist_simt_cross_core_submit_kernel(mixed, args);
 #else
     return dist_shared_pa_reject_generic_submit();
 #endif
@@ -858,6 +861,8 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
 #if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
     return dist_cross_core_alloc(args);
+#elif PTO_FDWIC_SCHEDULER_MODE == 3
+    return dist_simt_cross_core_alloc(args);
 #else
     return dist_shared_pa_reject_generic_submit();
 #endif
@@ -867,6 +872,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket
 dist_submit_compete_first_begin(PTO2Runtime *, const MixedKernels &mixed) {
 #if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
     return dist_cross_core_submit_compete_first_begin(mixed);
+#elif PTO_FDWIC_SCHEDULER_MODE == 3
+    return dist_simt_cross_core_submit_compete_first_begin(mixed);
 #else
     (void)dist_shared_pa_reject_generic_submit();
     return dist_shared_pa_invalid_ticket(DistCompeteFirstKind::Kernel);
@@ -878,6 +885,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_compete_first_finish
 ) {
 #if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
     return dist_cross_core_submit_compete_first_finish(mixed, ticket, args);
+#elif PTO_FDWIC_SCHEDULER_MODE == 3
+    return dist_simt_cross_core_submit_compete_first_finish(mixed, ticket, args);
 #else
     return dist_shared_pa_reject_generic_submit();
 #endif
@@ -886,6 +895,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_compete_first_finish
 DIST_API_ATTR PTO_DEVICE_FUNC DistCompeteFirstTicket dist_alloc_compete_first_begin(PTO2Runtime *) {
 #if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
     return dist_cross_core_alloc_compete_first_begin();
+#elif PTO_FDWIC_SCHEDULER_MODE == 3
+    return dist_simt_cross_core_alloc_compete_first_begin();
 #else
     (void)dist_shared_pa_reject_generic_submit();
     return dist_shared_pa_invalid_ticket(DistCompeteFirstKind::Alloc);
@@ -896,6 +907,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
 dist_alloc_compete_first_finish(PTO2Runtime *, const DistCompeteFirstTicket &ticket, const L0TaskArgs &args) {
 #if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
     return dist_cross_core_alloc_compete_first_finish(ticket, args);
+#elif PTO_FDWIC_SCHEDULER_MODE == 3
+    return dist_simt_cross_core_alloc_compete_first_finish(ticket, args);
 #else
     return dist_shared_pa_reject_generic_submit();
 #endif

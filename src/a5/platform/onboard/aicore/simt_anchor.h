@@ -60,9 +60,11 @@
 // anchor branch never executes (force_simt_anchor is always 0), so the kernel
 // only needs to exist at compile time for classification; internal linkage
 // drops the global symbol while keeping the SIMT meta tag.
+#if PTO_FDWIC_SCHEDULER_MODE != 3
 static __simt_vf__ LAUNCH_BOUND(1024) __aicore__ void simt_meta_anchor_kernel(__gm__ uint32_t *sink) {
     sink[threadIdx.x] = threadIdx.x;
 }
+#endif
 
 // SIMD VF companion: marks the entry as also using the SIMD vector unit so
 // bisheng classifies it SIMD_SIMT_MIX_VF(4) rather than SIMT_VF_ONLY(3). The
@@ -76,7 +78,18 @@ __simd_vf__ __aicore__ void simd_meta_anchor_kernel(__ubuf__ uint32_t *ub) { ub[
 // SIMT tag to the *entry* function's `.ascend.meta` section, which is the one
 // runtime reads at register time.
 __attribute__((always_inline)) inline __aicore__ void simt_meta_anchor(__gm__ uint32_t *sink) {
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+    // Reuse the exact persistent builder body in the dispatcher translation
+    // unit. The branch guarding this helper is never taken at runtime, so the
+    // pointer values are irrelevant; their only purpose is to make bisheng
+    // attach the real builder's SIMT/DVG stack metadata to KERNEL_ENTRY.
+    cce::async_invoke<DistSimtCrossCoreBuild>(
+        cce::dim3{kDistSimtBuilderThreads, 1U, 1U}, reinterpret_cast<__gm__ SimtCrossCoreOrdinaryState *>(sink),
+        static_cast<__gm__ DistTaskCell *>(nullptr), 0U, 0U, 0U
+    );
+#else
     cce::async_invoke<simt_meta_anchor_kernel>(cce::dim3{1, 1, 1}, sink);
+#endif
     simd_meta_anchor_kernel((__ubuf__ uint32_t *)0);
 }
 

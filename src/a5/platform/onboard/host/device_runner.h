@@ -73,7 +73,7 @@
  */
 class DeviceRunner : public DeviceRunnerBase {
 public:
-    DeviceRunner() = default;
+    DeviceRunner();
     ~DeviceRunner();
 
     // `setup_static_arena`, `allocate_tensor`, `free_tensor`,

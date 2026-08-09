@@ -590,6 +590,66 @@ def _assert_fdwic_shared_pa_role_entries(binary: Path) -> None:
         raise RuntimeError(f"Invalid shared-PA AICore image {binary}: {'; '.join(details)}")
 
 
+def _assert_fdwic_simt_role_abi(binary: Path) -> None:
+    """Prove a SIMT mixed ELF keeps each role on its attached worker state.
+
+    SIMT launch requires a real AIV-compiled call chain, so unlike the ordinary
+    schedulers the AIC and AIV engine objects cannot be weak-deduplicated into
+    one body.  Their orchestration entry and every orchestration-facing runtime
+    operation must therefore remain role-specific as well.
+    """
+    symbol_rows = _fdwic_elf_symbol_rows(binary)
+    required_pairs = (
+        "aicpu_orchestration_entry",
+        "aicore_execute",
+        "dist_core_main",
+        "dist_submit_impl",
+        "dist_alloc_tensors",
+        "dist_submit_compete_first_begin",
+        "dist_submit_compete_first_finish",
+        "dist_alloc_compete_first_begin",
+        "dist_alloc_compete_first_finish",
+    )
+    missing = []
+    for stem in required_pairs:
+        for role in ("aic", "aiv"):
+            symbol = f"{stem}_{role}"
+            count = sum(kind == "FUNC" and ndx != "UND" and symbol in name for kind, ndx, name in symbol_rows)
+            if count != 1:
+                missing.append(f"{symbol}={count}")
+
+    state_counts: dict[str, int] = {}
+    for kind, ndx, name in symbol_rows:
+        if kind != "OBJECT" or ndx == "UND":
+            continue
+        match = re.fullmatch(r"_ZL\d+(g_(?:self|dist_ptr))", name)
+        if match is not None:
+            logical_name = match.group(1)
+            state_counts[logical_name] = state_counts.get(logical_name, 0) + 1
+    invalid_state = [
+        f"{symbol}={state_counts.get(symbol, 0)}"
+        for symbol in ("g_self", "g_dist_ptr")
+        if state_counts.get(symbol, 0) != 2
+    ]
+
+    generic_entry = any(name == "aicpu_orchestration_entry" for _kind, _ndx, name in symbol_rows)
+    generic_submit = any(
+        kind == "FUNC" and ndx != "UND" and re.search(r"dist_submit_impl(?!_(?:aic|aiv))", name)
+        for kind, ndx, name in symbol_rows
+    )
+    if missing or invalid_state or generic_entry or generic_submit:
+        details = []
+        if missing:
+            details.append(f"expected exactly one defined role API ({', '.join(missing)})")
+        if invalid_state:
+            details.append(f"expected two role-local worker states ({', '.join(invalid_state)})")
+        if generic_entry:
+            details.append("generic aicpu_orchestration_entry is still present")
+        if generic_submit:
+            details.append("generic dist_submit_impl is still present")
+        raise RuntimeError(f"Invalid SIMT FDWIC AICore image {binary}: {'; '.join(details)}")
+
+
 def _fdwic_use_shared_pa_unity(tensormap_mode: str, scheduler_mode: str) -> bool:
     """Keep the legacy PA-only unity image out of generic cross-core modes."""
     return tensormap_mode == _FDWIC_TENSORMAP_SHARED and scheduler_mode == FDWIC_SCHEDULER_MODE_SAME_CORE
@@ -628,9 +688,9 @@ def maybe_build_aicore_override(
     compile_definitions = list(_fdwic_compile_definitions(profile) or ())
     if shared_pa_unity:
         # The legacy same-core shared PA path still needs its role-specialized
-        # unity image.  Generic cross-core schedulers compile dist_engine as an
-        # ordinary independent TU and must retain the generic orchestration
-        # entry and runtime symbols.
+        # unity image. Generic Scalar cross-core schedulers retain one runtime
+        # body; SIMT schedulers are validated separately because their AIV
+        # launch chain and orchestration-facing runtime API are role-specific.
         compile_definitions.append("PTO_FDWIC_SHARED_PA_UNITY=1")
     builder = RuntimeBuilder(
         platform,
@@ -646,6 +706,8 @@ def maybe_build_aicore_override(
     )
     if platform == "a5" and shared_pa_unity:
         _assert_fdwic_shared_pa_role_entries(binary)
+    if platform == "a5" and scheduler_mode in {"simt_cross_core_ordinary", "simt_cross_core_dag"}:
+        _assert_fdwic_simt_role_abi(binary)
     if profile in _FDWIC_PERF_CLOCK_PROFILES:
         _assert_fdwic_perf_clock_elf(binary, profile)
     elif profile in _FDWIC_SUBMIT_PMU_PROFILES:

@@ -11,7 +11,7 @@
 
 #pragma once
 
-#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3
 
 #include "dist_engine/aicore/cross_core_kernel_classification.h"
 #include "dist_engine/aicore/tensor_map_common.h"
@@ -37,8 +37,10 @@ using fdwic::cross_core::SharedExecCell;
 PTO_DEVICE_FUNC __gm__ CrossCoreRuntimeState &dist_cross_core_runtime_state() {
 #if PTO_FDWIC_SCHEDULER_MODE == 1
     return g_dist.cross_core_ordinary;
-#else
+#elif PTO_FDWIC_SCHEDULER_MODE == 2
     return g_dist.cross_core_dag.runtime;
+#else
+    return g_dist.simt_cross_core_ordinary.runtime;
 #endif
 }
 
@@ -522,6 +524,13 @@ PTO_DEVICE_FUNC ExecEngineClass dist_cross_core_executor_engine(__gm__ DistCore 
 PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngineClass task_engine) {
     const ExecEngineClass executor_engine = dist_cross_core_executor_engine(ctx.self);
     if (executor_engine != task_engine) return true;
+#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__CCE_AICORE__)
+    // The first AIV0 hosts the persistent SIMT builder in mode 3. Its vector
+    // unit cannot execute a linked AIV task until the deferred join, so keep
+    // this one Scalar out of execute-owner election. Every other compatible
+    // worker remains a dynamic candidate.
+    if (ctx.self->role == CoreType::AIV && ctx.self->block_id == 0 && ctx.self->lane == LANE_AIV0) return true;
+#endif
     // Each compatible worker attempts the dynamic owner CAS once; only the
     // first arrival waits for BUILT. The task-private CAS line does not contend
     // with the builder's SharedExecCell::control. Unlike fixed task-id routing,
@@ -534,8 +543,20 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
     __gm__ SharedExecCell &cell = dist_cross_core_runtime_state().tasks[static_cast<uint32_t>(ctx.task_id)];
     uint32_t polls = 0;
     while (true) {
-        const fdwic::cross_core::DecodedExecState state =
-            fdwic::cross_core::DecodeExecState(DistCrossCoreAicoreOps::Load(&cell.control.state));
+        const int64_t raw_state = DistCrossCoreAicoreOps::Load(&cell.control.state);
+        const fdwic::cross_core::DecodedExecState state = fdwic::cross_core::DecodeExecState(raw_state);
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+        // The SIMT builder is fully asynchronous with the Scalar publisher and
+        // execute owner: output descriptors may be visible before the exec cell
+        // advances from Empty to Building. Empty is therefore pending producer
+        // progress here, not corrupt control. Ordinary cross-core modes retain
+        // their strict contract because one Scalar reserves Build first.
+        if (raw_state == 0) {
+            SPIN_WAIT_HINT();
+            if ((++polls & 1023U) == 0 && fdwic_trace_is_fatal(ctx.task_id)) return false;
+            continue;
+        }
+#endif
         if (!state.valid || state.task_id != static_cast<uint32_t>(ctx.task_id)) {
             return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
         }
@@ -600,7 +621,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_finish_builder(
     if (!dist_cross_core_materialize_builder(args, ctx, layout, output_mask, output_count, heap)) {
         return false;
     }
-#if PTO_FDWIC_SCHEDULER_MODE == 1
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 3
     if (!dist_cross_core_wait_map_turn(ctx)) return false;
     CrossMapValue writer_entries[fdwic::cross_core::kExecMaxTensors];
     uint32_t writer_count = 0;
@@ -776,4 +797,4 @@ dist_cross_core_alloc_compete_first_finish(const DistCompeteFirstTicket &ticket,
 
 }  // namespace
 
-#endif  // PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
+#endif  // PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3

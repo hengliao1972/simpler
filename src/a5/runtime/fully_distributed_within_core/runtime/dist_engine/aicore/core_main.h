@@ -12,12 +12,21 @@
 // -----------------------------------------------------------------------------
 // Per-core entry point invoked by each AICore worker thread.
 // -----------------------------------------------------------------------------
-DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
+#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__CCE_AICORE__)
+#if PTO_FDWIC_SHARED_PA_BUILD_ROLE == 0
+#define DIST_CORE_MAIN_ENTRY dist_core_main_aic
+#else
+#define DIST_CORE_MAIN_ENTRY dist_core_main_aiv
+#endif
+#else
+#define DIST_CORE_MAIN_ENTRY dist_core_main
+#endif
+
+DIST_API_ATTR PTO_DEVICE_FUNC void DIST_CORE_MAIN_ENTRY(__gm__ Runtime *runtime, int core_idx, int core_type_int) {
     uint64_t startup_config_invalidate_begin = 0;
     uint64_t startup_config_invalidate_end = 0;
     __gm__ DistCore *self = dist_aicore_attach_worker(
-        runtime, core_idx, core_type_int,
-        startup_config_invalidate_begin, startup_config_invalidate_end
+        runtime, core_idx, core_type_int, startup_config_invalidate_begin, startup_config_invalidate_end
     );
     if (self == nullptr) return;
     g_fdwic_joint_submit_seen = false;
@@ -27,15 +36,11 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     trace_reset_core(self);
 #if DIST_TRACE_ENABLED && PTO_FDWIC_SHARED_MAP
     if (fdwic_atomic_swimlane_enabled()) {
-        const uint32_t startup_config_lines =
-            fdwic_dcci_region_cache_line_count(&runtime->dist.shared_addr, 64);
+        const uint32_t startup_config_lines = fdwic_dcci_region_cache_line_count(&runtime->dist.shared_addr, 64);
         if (startup_config_lines != 1 ||
             !fdwic_swimlane_record_dcci(
-                self, -1, -1, FdwicDcciSite::StartupConfigInvalidate,
-                FdwicDcciOp::Invalidate, /*trailing_dsb=*/true,
-                /*call_count=*/1, startup_config_lines,
-                startup_config_invalidate_begin,
-                startup_config_invalidate_end
+                self, -1, -1, FdwicDcciSite::StartupConfigInvalidate, FdwicDcciOp::Invalidate, /*trailing_dsb=*/true,
+                /*call_count=*/1, startup_config_lines, startup_config_invalidate_begin, startup_config_invalidate_end
             )) {
             g_fdwic_dcci_counter_overflow = true;
         }
@@ -61,15 +66,41 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
         fdwic_atomic_poll_region_end(startup_poll_region);
     }
 
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+    // Match the role contract proven by the standalone scheduler: the first
+    // AIV0 Main Scalar only hosts the persistent SIMT builder and does not
+    // replay orchestration. Other Scalars publish dynamic requests. Replaying
+    // on the host Scalar would contend with its resident VF, and the dedicated
+    // host's local_index cannot participate in sealing.
+    const bool simt_builder_worker = dist_simt_cross_core_is_builder_worker(self);
+    if (!fdwic_trace_is_fatal()) (void)dist_simt_cross_core_launch_builder(self);
+    // Request slots are reset before the run and each task is published once.
+    // The publisher therefore has no requirement to start the consumer first.
+    // Non-builder Scalars replay Submit immediately; a request may precede its
+    // VF consumer, avoiding pointless returned-atomic contention on one
+    // builder_started address.
+#endif
+
     // Schema-v4 observes the complete worker business window as two adjacent
     // parents. Reuse the orchestration end as the final-drain start so their
     // aggregate closes exactly in integer SYS_CNT cycles.
     TRACE_TIMESTAMP(orchestration_begin);
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+    if (!simt_builder_worker) {
+        dist_submit_replay_orch(runtime);
+    }
+#else
     dist_submit_replay_orch(runtime);
+#endif
     TRACE_TIMESTAMP(orchestration_end);
-    // 失败运行不再等待已经失去依赖闭包的 task ring。容量错误由每个
-    // private replica 在相同逻辑 Submit 上确定性发现，worker 直接完成，
-    // AICPU 汇总全局 error_code 后向 Host 返回非零。
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+    if (!simt_builder_worker && !fdwic_trace_is_fatal()) (void)dist_simt_cross_core_seal_requests(self);
+    if (!fdwic_trace_is_fatal()) (void)dist_simt_cross_core_join_builder(self);
+#endif
+    // A failed run must not wait on a task ring whose dependency closure is no
+    // longer valid. Every private replica deterministically finds a capacity
+    // error at the same logical Submit, so workers finish and AICPU reports the
+    // aggregated error_code to the host.
     if (!fdwic_trace_is_fatal()) dist_submit_drain_to_completion(self);
     TRACE_TIMESTAMP(final_drain_end);
     // Publish both parent records after the measured work. Their own GM writes
@@ -82,3 +113,5 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     fdwic_submit_pmu_flush(self);
     dist_aicore_finish_worker(runtime);
 }
+
+#undef DIST_CORE_MAIN_ENTRY

@@ -40,6 +40,7 @@ from simpler_setup.scene_test import (
     _aicore_override_cache,
     _assert_fdwic_perf_clock_elf,
     _assert_fdwic_shared_pa_role_entries,
+    _assert_fdwic_simt_role_abi,
     _assert_fdwic_submit_pmu_elf,
     _assert_fdwic_submit_pmu_host_elf,
     _assert_fdwic_swimlane_elf,
@@ -1158,6 +1159,72 @@ def test_shared_pa_role_entry_gate_rejects_incomplete_or_deduplicated_image(
 
     with pytest.raises(RuntimeError, match=message):
         _assert_fdwic_shared_pa_role_entries(tmp_path / "aicore_kernel.o")
+
+
+def _simt_role_symbol_table() -> str:
+    stems = (
+        "aicpu_orchestration_entry",
+        "aicore_execute",
+        "dist_core_main",
+        "dist_submit_impl",
+        "dist_alloc_tensors",
+        "dist_submit_compete_first_begin",
+        "dist_submit_compete_first_finish",
+        "dist_alloc_compete_first_begin",
+        "dist_alloc_compete_first_finish",
+    )
+    rows = []
+    index = 1
+    for stem in stems:
+        for role in ("aic", "aiv"):
+            rows.append(f"{index}: 0 64 FUNC WEAK DEFAULT 1 {stem}_{role}")
+            index += 1
+    rows.extend(
+        (
+            f"{index}: 8 8 OBJECT LOCAL DEFAULT 17 _ZL6g_self",
+            f"{index + 1}: 16 8 OBJECT LOCAL DEFAULT 17 _ZL6g_self",
+            f"{index + 2}: 24 8 OBJECT LOCAL DEFAULT 17 _ZL10g_dist_ptr",
+            f"{index + 3}: 32 8 OBJECT LOCAL DEFAULT 17 _ZL10g_dist_ptr",
+        )
+    )
+    return "\n".join(rows) + "\n"
+
+
+def test_simt_role_abi_gate_accepts_two_complete_role_call_chains(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=_simt_role_symbol_table(), stderr=""),
+    )
+
+    _assert_fdwic_simt_role_abi(tmp_path / "aicore_kernel.o")
+
+
+@pytest.mark.parametrize(
+    ("remove", "append", "message"),
+    [
+        ("dist_submit_impl_aiv", "", "dist_submit_impl_aiv=0"),
+        ("_ZL6g_self", "", "expected two role-local worker states.*g_self=1"),
+        ("", "99: 0 64 FUNC WEAK DEFAULT 1 aicpu_orchestration_entry\n", "generic aicpu_orchestration_entry"),
+        ("", "99: 0 64 FUNC WEAK DEFAULT 1 dist_submit_impl\n", "generic dist_submit_impl"),
+    ],
+)
+def test_simt_role_abi_gate_rejects_deduplicated_or_generic_chain(monkeypatch, tmp_path, remove, append, message):
+    rows = _simt_role_symbol_table().splitlines()
+    if remove:
+        for index, row in enumerate(rows):
+            if remove in row:
+                del rows[index]
+                break
+    symbol_table = "\n".join(rows) + "\n" + append
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _assert_fdwic_simt_role_abi(tmp_path / "aicore_kernel.o")
 
 
 @pytest.mark.parametrize(

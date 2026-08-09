@@ -525,3 +525,94 @@ mode 3 同时具备请求保留和发布 helper，但本阶段没有打开 `subm
 | 未来依赖与跨 ring 依赖拒绝 | PASS |
 | mode 1/2 状态及 Python 构建选择回归 | PASS |
 | mode 3 A5 动态 Submit | NOT RUN（consumer 尚未接通） |
+
+### 14.4 生产 persistent builder 与动态 Submit 闭环
+
+本阶段把请求 ABI 接入真实 Simpler 执行链，而不是把 standalone 的静态 PA plan
+搬进 runtime：
+
+```text
+95 个普通 Scalar
+  -> 回放算子 orchestration
+  -> 每 task 竞争唯一 request publisher
+  -> 发布不可变 L0TaskArgs 快照
+  -> 获取统一 output descriptor
+  -> 兼容角色动态竞争 Execute owner
+
+首个 AIV0 Main Scalar
+  -> async_invoke 一个 128-thread / 4-warp persistent builder
+  -> warp leader 按 task_id % 4 消费请求
+  -> Materialize
+  -> ordinary TensorMap 严格 writer 顺序插入
+  -> Fanin + immutable execution payload 发布
+  -> 等四个 warp 完成后返回
+```
+
+builder 宿主不再回放 orchestration，也不参与 AIV Execute owner 竞争；其余 63 个
+AIV Scalar 和全部 32 个 AIC Scalar 仍动态参与对应 engine 的执行仲裁。请求槽在
+运行前已经复位且单次发布，因此 publisher 不等待 `builder_started`：请求允许先于
+consumer 发布，避免 95 个 Scalar 对同一启动控制字做无业务意义的返回型 atomic
+轮询。所有非 builder worker 回放结束后用相同 task count 幂等封口；builder 只在
+尚未发布的请求槽上结合 sealed count 判断是否结束。
+
+SIMT builder 与 Scalar publisher 完全异步，output descriptor 可能已经发布，而
+execution cell 仍处于 Empty。mode 3 的 Execute owner 因此把 Empty 解释为合法的
+builder 进度并继续等待；mode 1/2 仍保持“进入 bind 前已经 reserve build”的严格
+合同，不接受 Empty。
+
+### 14.5 真机暴露的两个编译与链接合同
+
+#### 14.5.1 SIMT stack 必须在首次 ACL 初始化时配置
+
+完整 builder 的 ELF metadata 显示 SIMT 调用链栈约 1240 B，超过 A5 默认 1024 B。
+只注册简单 VF 可以成功，但完整 VF 在进入函数体前就无法运行。查证本机 CANN 接口
+后确认：SIMT stack 与 divergence stack 只能通过进程首次 `aclInit(config_path)` 的
+`StackSize` 配置生效，初始化后的 `rtDeviceSetLimit` 不是等价接口。
+
+mode 3/4 Host runtime 现在首次初始化时使用：
+
+```json
+{"StackSize":{"simt_stack_size":1536,"simt_divergence_stack_size":4608}}
+```
+
+配置文件由 Host 临时生成，`aclInit` 解析完成后立即删除，不增加部署资源依赖；设备
+强制复位后的重新初始化也复用同一配置。此前 VF 完全未进入的问题由此闭环。
+
+#### 14.5.2 AIC/AIV orchestration-facing API 不能 weak 合并
+
+SIMT launch 要求 AIV 编译调用链，因此 mode 3 最终 mixed ELF 必须保留 AIC/AIV 两套
+`aicore_execute`、`dist_core_main` 和 `[[block_local]]` worker state。最初只把
+`aicpu_orchestration_entry` 分成 AIC/AIV 两个名字，却让 Submit 等 weak runtime API
+继续同名。链接器只保留 AIC `dist_submit_impl`，导致 63 个 AIV worker 全部进入 AIV
+orchestration 后，读取的是从未由 AIV attach 的另一套 `g_self/g_dist_ptr`，在首个
+Submit 之前停住。
+
+最终修正对所有算子统一实施，不放在 PA adapter：CCEC mode 3 将完整
+orchestration-facing API 改写为 `_aic/_aiv` 成对符号，使各角色只调用自己的已
+attach worker state。构建阶段新增最终 ELF 门禁，要求：
+
+- AIC/AIV orchestration、executor、core-main 和六个 Submit/Alloc API 各恰有一份；
+- `g_self/g_dist_ptr` 各有两套角色局部状态；
+- generic `aicpu_orchestration_entry` 和 generic `dist_submit_impl` 不得残留。
+
+这条约束来自 mixed ELF 的实际符号与真机行为，不依赖 PA task 类型，也适用于后续
+`simt_cross_core_dag`。
+
+### 14.6 当前功能验证
+
+| 验证 | 配置 | 结果 |
+| ---- | ---- | ---- |
+| ELF role ABI 单测 | 完整、缺 AIV API、错误 state 数、generic 泄漏 | 5/5 PASS |
+| 请求与生命周期协议单测 | request 7 项、state/reset 2 项 | 9/9 PASS |
+| Python 构建与 ABI 回归 | scene 130 项、builder 44 项 | 174/174 PASS |
+| A5sim 最小闭环 | CaseB1，Scalar fallback，含 golden | PASS |
+| 真实 A5 最小闭环 | CaseB1，5 task，128 threads / 4 warps，含 golden | PASS |
+| 真实 A5 完整 PA | Case1，B256，1280 task，含 golden | PASS |
+
+完整 Python `runtime_builder + scene_test_cache` 回归另有 5 个既有 A2/A3
+Tensor 布局集成失败（测试仍要求 offset 576，当前 A2/A3 结构为 568），与本阶段
+A5 模式选择及运行时代码无关；为避免把存量问题写成当前通过项，表中只列实际通过
+的 A5 相关集合。
+
+本阶段结论仅为 `simt_cross_core_ordinary` 生产功能闭合，尚未给出性能接近
+standalone 的结论。性能优化放在四种模式功能都接通之后。

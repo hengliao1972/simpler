@@ -23,6 +23,10 @@
 #include "pto_types.h"
 #include "runtime.h"
 
+#if PTO_FDWIC_SCHEDULER_MODE == 3 && defined(__CCE_AICORE__) && defined(__DAV_VEC__)
+#include "simt_api/asc_simt.h"
+#endif
+
 #include "dist_engine/common/state.h"          // NOLINT(build/include_subdir)
 #include "dist_engine/common/atomic.h"         // NOLINT(build/include_subdir)
 #include "dist_engine/common/trace.h"          // NOLINT(build/include_subdir)
@@ -60,19 +64,20 @@ extern "C" PTO_DEVICE_FUNC void aicpu_orchestration_entry(const L2TaskArgs &orch
 #define SPIN_WAIT_HINT() ((void)0)
 #endif
 
-#include "dist_engine/aicore/primitive.h"              // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/cross_core_aicore_ops.h"  // NOLINT(build/include_subdir)
-#include "dist_engine/common/perf_clock.h"             // NOLINT(build/include_subdir)
-#include "dist_engine/common/submit_pmu.h"             // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/api_glue.h"               // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/log.h"                    // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/tensor_map.h"             // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/core_state.h"             // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/submit_core.h"            // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/submit_helpers.h"         // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/tensor_data_access.h"     // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/backend.h"                // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/submit_runtime.h"         // NOLINT(build/include_subdir)
-#include "dist_engine/aicore/core_main.h"              // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/primitive.h"                       // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/cross_core_aicore_ops.h"           // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/cross_core_simt_request_source.h"  // NOLINT(build/include_subdir)
+#include "dist_engine/common/perf_clock.h"                      // NOLINT(build/include_subdir)
+#include "dist_engine/common/submit_pmu.h"                      // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/api_glue.h"                        // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/log.h"                             // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/tensor_map.h"                      // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/core_state.h"                      // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/submit_core.h"                     // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/submit_helpers.h"                  // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/tensor_data_access.h"              // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/backend.h"                         // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/submit_runtime.h"                  // NOLINT(build/include_subdir)
+#include "dist_engine/aicore/core_main.h"                       // NOLINT(build/include_subdir)
 
 #endif  // !PTO_FDWIC_SHARED_PA_UNITY || PTO_FDWIC_SHARED_PA_UNITY_IMPLEMENTATION
