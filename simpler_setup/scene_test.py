@@ -41,6 +41,7 @@ from .fdwic_build_config import (
     FDWIC_SCHEDULER_MODE_SAME_CORE,
     FDWIC_SCHEDULER_MODES,
     fdwic_scheduler_mode_definition,
+    fdwic_simt_builder_count,
     fdwic_tensormap_ring_cap_definition,
     normalize_fdwic_scheduler_mode,
 )
@@ -125,9 +126,7 @@ def _fdwic_scheduler_mode() -> str:
 
 def _fdwic_perf_clock_builder_cores(scheduler_mode: str) -> int:
     """Return the exact 32-block artifact builder population for one scheduler."""
-    if scheduler_mode == "simt_cross_core_dag":
-        return 32
-    return 1 if scheduler_mode.startswith("simt_") else 0
+    return fdwic_simt_builder_count(scheduler_mode, 32)
 
 
 def _fdwic_scheduler_compile_definition(platform: str, runtime: str) -> str | None:
@@ -1726,13 +1725,9 @@ def _validate_case_fdwic_perf_clock(  # noqa: PLR0912, PLR0915 -- fail-closed ar
     if cross_core_e2e:
         expected_builder_cores = _fdwic_perf_clock_builder_cores(scheduler_mode)
         builder_topology = {(core.get("core_type"), core.get("block_id"), core.get("lane")) for core in builder_rows}
-        expected_builder_topology = (
-            {("aiv", block_id, 1) for block_id in range(32)}
-            if scheduler_mode == "simt_cross_core_dag"
-            else {("aiv", 0, 1)}
-            if scheduler_mode.startswith("simt_")
-            else set()
-        )
+        expected_builder_topology = {
+            ("aiv", block_id, 1) for block_id in range(expected_builder_cores)
+        }
         if len(builder_rows) != expected_builder_cores or builder_topology != expected_builder_topology:
             raise RuntimeError(f"[{case_label}] {profile} SIMT builder topology closure failed")
         global_start = min(core["startup_begin"] for core in cores)

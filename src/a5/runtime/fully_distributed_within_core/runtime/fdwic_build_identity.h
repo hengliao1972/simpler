@@ -69,12 +69,35 @@ enum class FdwicSchedulerMode : uint32_t {
     SimtCrossCoreDag = 4,
 };
 
+// Builder Scalars are selected by physical block id so Host and AICore can
+// independently close the same topology.  DAG Build is heavier than ordinary
+// lookup, but consuming every AIV0 also removes half of the AIV replay/execute
+// workers.  Keep the retained supply limit in this cross-image identity.
+inline constexpr uint32_t kFdwicSimtOrdinaryBuilderLimit = 1U;
+inline constexpr uint32_t kFdwicSimtDagBuilderLimit = 16U;
+
+inline constexpr uint32_t FdwicSimtBuilderLimit(FdwicSchedulerMode mode) {
+    return mode == FdwicSchedulerMode::SimtCrossCoreDag ? kFdwicSimtDagBuilderLimit :
+           mode == FdwicSchedulerMode::SimtCrossCoreOrdinary ? kFdwicSimtOrdinaryBuilderLimit :
+                                                               0U;
+}
+
+inline constexpr uint32_t FdwicSimtBuilderCount(FdwicSchedulerMode mode, uint32_t block_count) {
+    const uint32_t limit = FdwicSimtBuilderLimit(mode);
+    return block_count < limit ? block_count : limit;
+}
+
+inline constexpr bool FdwicSimtBuilderBlockSelected(FdwicSchedulerMode mode, uint32_t block_id) {
+    return block_id < FdwicSimtBuilderLimit(mode);
+}
+
 inline constexpr uint64_t kFdwicBuildIdentityMagic = 0x46445749434d4150ULL;  // "FDWICMAP"
 inline constexpr uint32_t kFdwicBuildAbiVersion = PTO_FDWIC_SHARED_MAP ? 7U + PTO_FDWIC_SCHEDULER_MODE : 4U;
 inline constexpr uint32_t kFdwicDistGlobalLayoutVersion = PTO_FDWIC_SHARED_MAP ? 7U + PTO_FDWIC_SCHEDULER_MODE : 4U;
 inline constexpr FdwicTensorMapMode kFdwicCompiledTensorMapMode = static_cast<FdwicTensorMapMode>(PTO_FDWIC_SHARED_MAP);
 inline constexpr FdwicSchedulerMode kFdwicCompiledSchedulerMode =
     static_cast<FdwicSchedulerMode>(PTO_FDWIC_SCHEDULER_MODE);
+inline constexpr uint32_t kFdwicCompiledSimtBuilderLimit = FdwicSimtBuilderLimit(kFdwicCompiledSchedulerMode);
 // The replacement shared PA backend has no address-region ring. Keep the
 // identity field for the stable 64-byte cross-image prefix, but publish zero
 // rather than pretending the private CAP controls shared semantics.
@@ -125,6 +148,7 @@ static_assert(
 static_assert(offsetof(FdwicBuildIdentity, error_bits) == 24, "FDWIC cross-image error-bit offset changed");
 static_assert(offsetof(FdwicBuildIdentity, tensor_map_ring_cap) == 28, "FDWIC ring-cap identity offset changed");
 static_assert(offsetof(FdwicBuildIdentity, scheduler_mode) == 32, "FDWIC scheduler identity offset changed");
+static_assert(offsetof(FdwicBuildIdentity, reserved) == 36, "FDWIC builder-limit identity offset changed");
 
 inline FdwicBuildIdentity fdwic_make_build_identity(uint32_t runtime_bytes) {
     return {
@@ -136,7 +160,7 @@ inline FdwicBuildIdentity fdwic_make_build_identity(uint32_t runtime_bytes) {
         FdwicBuildErrorNone,
         kFdwicTensorMapRingCap,
         static_cast<uint32_t>(kFdwicCompiledSchedulerMode),
-        {},
+        {kFdwicCompiledSimtBuilderLimit, 0, 0, 0, 0, 0, 0},
     };
 }
 
@@ -150,6 +174,7 @@ inline bool fdwic_build_identity_matches(const volatile FdwicBuildIdentity &iden
            identity.tensor_map_mode == static_cast<uint32_t>(kFdwicCompiledTensorMapMode) &&
            identity.tensor_map_ring_cap == kFdwicTensorMapRingCap &&
            identity.scheduler_mode == static_cast<uint32_t>(kFdwicCompiledSchedulerMode) &&
+           identity.reserved[0] == kFdwicCompiledSimtBuilderLimit &&
            identity.runtime_bytes == expected_runtime_bytes &&
            identity.dist_global_layout_version == kFdwicDistGlobalLayoutVersion;
 }

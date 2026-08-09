@@ -53,9 +53,11 @@ TEST(FdwicBuildIdentity, CompiledModeBuildsAMatchingStableLine) {
     EXPECT_EQ(offsetof(FdwicBuildIdentity, error_bits), 24U);
     EXPECT_EQ(offsetof(FdwicBuildIdentity, tensor_map_ring_cap), 28U);
     EXPECT_EQ(offsetof(FdwicBuildIdentity, scheduler_mode), 32U);
+    EXPECT_EQ(offsetof(FdwicBuildIdentity, reserved), 36U);
     EXPECT_EQ(identity.tensor_map_mode, static_cast<uint32_t>(kFdwicCompiledTensorMapMode));
     EXPECT_EQ(identity.tensor_map_ring_cap, kFdwicTensorMapRingCap);
     EXPECT_EQ(identity.scheduler_mode, static_cast<uint32_t>(kFdwicCompiledSchedulerMode));
+    EXPECT_EQ(identity.reserved[0], kFdwicCompiledSimtBuilderLimit);
     EXPECT_TRUE(fdwic_build_identity_matches(identity, kRuntimeBytesForTest));
 #if PTO_FDWIC_SHARED_MAP
     EXPECT_EQ(kFdwicTensorMapRingCap, 0U);
@@ -64,6 +66,18 @@ TEST(FdwicBuildIdentity, CompiledModeBuildsAMatchingStableLine) {
     EXPECT_EQ(kFdwicTensorMapRingBuckets * kFdwicTensorMapRingCap, 16384U);
 #endif
     EXPECT_TRUE(kFdwicCompiledBackendReady);
+}
+
+TEST(FdwicBuildIdentity, SimtBuilderTopologyIsBoundedByPhysicalBlocks) {
+    EXPECT_EQ(FdwicSimtBuilderCount(FdwicSchedulerMode::SameCore, 32), 0U);
+    EXPECT_EQ(FdwicSimtBuilderCount(FdwicSchedulerMode::CrossCoreDag, 32), 0U);
+    EXPECT_EQ(FdwicSimtBuilderCount(FdwicSchedulerMode::SimtCrossCoreOrdinary, 32), 1U);
+    EXPECT_EQ(FdwicSimtBuilderCount(FdwicSchedulerMode::SimtCrossCoreDag, 4), 4U);
+    EXPECT_EQ(FdwicSimtBuilderCount(FdwicSchedulerMode::SimtCrossCoreDag, 32), kFdwicSimtDagBuilderLimit);
+    EXPECT_TRUE(FdwicSimtBuilderBlockSelected(FdwicSchedulerMode::SimtCrossCoreDag, 0));
+    EXPECT_FALSE(
+        FdwicSimtBuilderBlockSelected(FdwicSchedulerMode::SimtCrossCoreDag, kFdwicSimtDagBuilderLimit)
+    );
 }
 
 TEST(FdwicBuildIdentity, RejectsEveryCrossImageContractField) {
@@ -86,6 +100,10 @@ TEST(FdwicBuildIdentity, RejectsEveryCrossImageContractField) {
 
     identity = fdwic_make_build_identity(kRuntimeBytesForTest);
     identity.scheduler_mode = (identity.scheduler_mode + 1U) % 5U;
+    EXPECT_FALSE(fdwic_build_identity_matches(identity, kRuntimeBytesForTest));
+
+    identity = fdwic_make_build_identity(kRuntimeBytesForTest);
+    identity.reserved[0] += 1U;
     EXPECT_FALSE(fdwic_build_identity_matches(identity, kRuntimeBytesForTest));
 
     identity = fdwic_make_build_identity(kRuntimeBytesForTest);

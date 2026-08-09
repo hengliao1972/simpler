@@ -655,6 +655,7 @@ add_fdwic_build_identity_test(test_fdwic_build_identity_shared 1 0)
 add_fdwic_build_identity_test(test_fdwic_build_identity_cross_core_ordinary 1 1)
 add_fdwic_build_identity_test(test_fdwic_build_identity_cross_core_dag 1 2)
 add_fdwic_build_identity_test(test_fdwic_build_identity_simt_cross_core_ordinary 1 3)
+add_fdwic_build_identity_test(test_fdwic_build_identity_simt_cross_core_dag 1 4)
 
 # The first production cross-core contract is deliberately operator-agnostic:
 # one owner publishes an immutable execution payload and a compatible Scalar

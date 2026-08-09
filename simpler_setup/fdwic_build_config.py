@@ -22,6 +22,8 @@ FDWIC_SCHEDULER_MODES = (
     "simt_cross_core_dag",
 )
 FDWIC_SCHEDULER_MODE_IDS = {mode: index for index, mode in enumerate(FDWIC_SCHEDULER_MODES)}
+FDWIC_SIMT_ORDINARY_BUILDER_LIMIT = 1
+FDWIC_SIMT_DAG_BUILDER_LIMIT = 16
 
 
 def fdwic_tensormap_ring_cap_definition() -> str:
@@ -44,3 +46,22 @@ def fdwic_scheduler_mode_definition(mode: str) -> str:
 
     normalized = normalize_fdwic_scheduler_mode(mode)
     return f"{FDWIC_SCHEDULER_MODE_DEFINITION}={FDWIC_SCHEDULER_MODE_IDS[normalized]}"
+
+
+def fdwic_simt_builder_limit(mode: str) -> int:
+    """Return the compiled builder-block limit for one scheduler backend."""
+
+    normalized = normalize_fdwic_scheduler_mode(mode)
+    if normalized == "simt_cross_core_dag":
+        return FDWIC_SIMT_DAG_BUILDER_LIMIT
+    if normalized == "simt_cross_core_ordinary":
+        return FDWIC_SIMT_ORDINARY_BUILDER_LIMIT
+    return 0
+
+
+def fdwic_simt_builder_count(mode: str, block_count: int) -> int:
+    """Bound one scheduler's builder population by the physical block count."""
+
+    if not isinstance(block_count, int) or isinstance(block_count, bool) or block_count < 0:
+        raise ValueError(f"Invalid FDWIC block count {block_count!r}; expected a non-negative integer")
+    return min(block_count, fdwic_simt_builder_limit(mode))

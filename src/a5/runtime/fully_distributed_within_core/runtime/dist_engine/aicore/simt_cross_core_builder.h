@@ -43,11 +43,9 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_is_builder_worker(__gm__ const DistCor
 
 #if !defined(PTO_FDWIC_SIMT_METADATA_ONLY)
 PTO_DEVICE_FUNC uint32_t dist_simt_cross_core_builder_count() {
-#if PTO_FDWIC_SCHEDULER_MODE == 3
-    return 1U;
-#else
-    return g_dist.num_blocks > 0 ? static_cast<uint32_t>(g_dist.num_blocks) : 0U;
-#endif
+    if (g_dist.num_blocks <= 0) return 0U;
+    const uint32_t block_count = static_cast<uint32_t>(g_dist.num_blocks);
+    return block_count < kFdwicCompiledSimtBuilderLimit ? block_count : kFdwicCompiledSimtBuilderLimit;
 }
 #endif
 

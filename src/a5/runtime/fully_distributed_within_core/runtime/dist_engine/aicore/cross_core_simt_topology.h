@@ -16,14 +16,7 @@ namespace {
 PTO_DEVICE_FUNC bool dist_cross_core_is_simt_builder_worker(__gm__ const DistCore *self) {
 #if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
     if (self == nullptr || self->role != CoreType::AIV || self->block_id < 0 || self->lane != LANE_AIV0) return false;
-#if PTO_FDWIC_SCHEDULER_MODE == 3
-    // Ordinary lookup is already cheap; keep all but block0/AIV0 available for
-    // replay and execution. DAG lookup is scan-heavy and uses every AIV0 to
-    // spread the independent dynamic metadata work.
-    return self->block_id == 0;
-#else
-    return true;
-#endif
+    return static_cast<uint32_t>(self->block_id) < kFdwicCompiledSimtBuilderLimit;
 #else
     (void)self;
     return false;

@@ -259,12 +259,11 @@ bool is_simt_scheduler(FdwicSchedulerMode mode) {
 bool is_simt_builder_worker(FdwicSchedulerMode mode, CoreType core_type, int32_t block_id, int32_t lane) {
     constexpr int32_t kAiv0Lane = 1;
     if (!is_simt_scheduler(mode) || core_type != CoreType::AIV || block_id < 0 || lane != kAiv0Lane) return false;
-    return mode == FdwicSchedulerMode::SimtCrossCoreDag || block_id == 0;
+    return FdwicSimtBuilderBlockSelected(mode, static_cast<uint32_t>(block_id));
 }
 
 uint32_t expected_simt_builder_workers(FdwicSchedulerMode mode, uint32_t block_count) {
-    if (mode == FdwicSchedulerMode::SimtCrossCoreDag) return block_count;
-    return mode == FdwicSchedulerMode::SimtCrossCoreOrdinary ? 1U : 0U;
+    return FdwicSimtBuilderCount(mode, block_count);
 }
 
 bool build_expected_core_layout(

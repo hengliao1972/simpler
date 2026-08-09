@@ -27,8 +27,9 @@ SIMT 两种模式都使 Build owner 与 Execute owner 保持独立，但 builder
 
 - `simt_cross_core_ordinary` 由唯一 `block0/AIV0` Main Scalar 承载持久
   builder VF，其他 95 个 Scalar 继续 replay 和竞争执行；
-- `simt_cross_core_dag` 按运行时 block 拓扑让每个 AIV0 承载一个 builder
-  VF，32 block 时即 32 builder + 64 replay。
+- `simt_cross_core_dag` 按物理 block id 选择最多 16 个 AIV0 承载 builder
+  VF；32 block 时为 16 builder + 80 replay，小于 16 block 时按实际
+  block 数收缩。
 
 这一区分只依赖 scheduler mode 与物理 block/lane，不读 PA `TaskKind`、
 batch 或固定 task 图形。
@@ -71,7 +72,8 @@ global min(每核 startup increment 前起点)
 
 - 模式 1/2：96 个 replay worker，0 builder；
 - 模式 3：95 个 replay worker，唯一 `block0/AIV0` builder；
-- 模式 4：每 block 的 AIV0 是 builder；32 block 时为 64 replay + 32 builder；
+- 模式 4：按 block id 选择最多 16 个 AIV0 builder；32 block 时为
+  80 replay + 16 builder；
 - replay worker 必须满足 `submit_count == expected_submit_count > 0`；
 - builder 必须满足 `submit_count == expected_submit_count == 0`；
 - 设备 raw 使用独立 mode 值，host 使用独立 schema
@@ -378,3 +380,63 @@ builder 到达，CAS 返回值仍会令其 fail-closed。Immediate task 继续�
 183.457 / 184.400 / 188.445 ms，中位 184.400 ms。相对上一保留版 185.231 ms
 中位降低 0.831 ms，约 0.45%。两组范围重叠，仍只认定为符合协议的一次明确
 atomic 消减，不将其描述为主要瓶颈突破。
+
+## 12. 第三阶段保留项：在 Build 供给与 Execute 供给之间收缩 builder 拓扑
+
+### 12.1 问题与扫描方法
+
+全 32 个 AIV0 承载 builder 能消除单 builder 的数量级瓶颈，但也会把
+AIV replay/Execute 候选核从 64 个减少到 32 个。因此不能把“builder
+越多越好”当作协议结论。本轮仅改变 builder 数量，保持 request、
+DAG lookup、TensorMap、exec ticket 和 startup→FinalDrain 端点不变，依次
+测量 K=8/16/24，并与已保留的 K=32 对照。
+
+首轮取数如下：
+
+| builder K | replay 核 | B256 startup→FinalDrain | 判断 |
+| --------: | ----------: | ------------------------: | ---- |
+| 8 | 88 | 208.016 ms | Build 供给不足，明显回退 |
+| 16 | 80 | 172.833 ms | 首轮最优，进入重复验证 |
+| 24 | 72 | 182.619 ms | 优于 K=32，但不及 K=16 |
+| 32 | 64 | 184.400 ms | 上一保留版三次中位数 |
+
+K=8/16/24 扫描初期，设备 raw 已闭合对应 builder/replay 数量，但
+Python 产物校验器仍固定期望 32 builder，因此 pytest 在设备完成后按
+角色数不匹配拒绝产物。选出 K=16 后，校验器与测试已同步到新拓扑，
+后续三次结果都是完整 PASS，不使用被旧校验器拒绝的扫描产物充当
+最终正确性证据。
+
+### 12.2 保留协议
+
+保留版的拓扑不读取 PA task kind、batch 或固定 DAG：
+
+1. `simt_cross_core_ordinary` 仍保留 1 个 builder；
+2. `simt_cross_core_dag` 选择 `block_id < min(block_count, 16)` 的 AIV0；
+3. builder rank 仍与连续 block id 一致，task stride 仍由实际
+   `builder_count * 4 warps` 计算；
+4. Host 泳道角色、AICore 启动/完成闭合和 Python `perf-clock`
+   校验使用同一拓扑规则；
+5. `FdwicBuildIdentity` 的稳定 64 B 前缀消耗一个既有 reserved word
+   记录编译期 builder limit，Host/AICPU/AICore 任一镜像不一致都
+   fail-closed。
+
+这个数量是调度器拓扑配置，不是 PA 语义特例。但当前性能取舍只在
+PA B256 上完成了稳定多轮取数；其他 DAG 工作负载可能有不同的最优
+供给比。因此后续接入其他算子时必须复核端到端性能；若需要可调，
+应将 builder limit 提升为明确的构建身份，不得根据 PA 内部 task
+类型在热路径中动态分支。
+
+### 12.3 最终实测与验证
+
+K=16 重建 Host/AICPU/AICore 后，PA B256 三个独立进程完整 PASS：
+
+```text
+173.206 ms / 172.669 ms / 173.976 ms
+median = 173.206 ms
+```
+
+相对 K=32 保留版 184.400 ms 中位数降低 11.194 ms，约 6.1%。
+此外，真实 A5 非 PA `A5OnboardBd24ExistingInoutChain` 数值 golden PASS；
+16 个定向 FDWIC C++ 身份/协议测试全部 PASS；`test_scene_test_cache.py`
+140 项 PASS。全仓 C++/Python 构建仍被 A2/A3 `PTO2TaskPayload` 既有布局
+断言（期望 576，当前 568）阻断，本轮没有改动该架构。
