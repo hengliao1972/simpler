@@ -452,3 +452,55 @@ startup→FinalDrain 为 254.568 ms，相对 W4 的 173.206 ms 中位数回退
 协议下，增加 leader 数量会大幅恶化端到端性能。没有分阶段计数时，
 不把回退唯一归因为某条 atomic 或 VF 资源。W5 已完整撤回，保留
 W4；既然 W5 已是数量级回退，不继续盲测 W8。
+
+## 13. 第四阶段候选：否决 metadata 全任务前缀发布
+
+### 13.1 候选协议
+
+mode4 的 DAG lookup 会对每个 INPUT/INOUT 在最近 `H=64` 个 task 中逆向
+扫描；每个候选 metadata control 都通过需要返回值的 `atomicAdd(0)` 读取。
+本轮尝试把“候选 control 已发布”收敛为一个连续 task 前缀：
+
+1. task N 的 builder 先写完整 writer metadata；
+2. N 等待 task N-1 的 prefix-ready 位，再原子发布自己的 control；
+3. lookup 依靠该前缀证明 `[0, N)` 的 control 已经发布；
+4. 候选 control 改用 CANN 正式 `asc_ldcg` 读取。该接口绕过 L1，保留
+   正常 L2 缓存，不要求返回型 atomic。
+
+实现复用了既有 64 bit control 的保留位，没有增加额外 GM 字段。曾先验证
+`__builtin_cce_ld_dev`，但它在当前 SIMT VF 的 dav-c310-vec 编译前端触发
+退出码 139，因此未进入上板版本；上板候选只使用已查证实现的 `asc_ldcg`。
+
+### 13.2 正确性证据
+
+开发顺序是先补 CPU 协议测试，证明 prefix 不允许跨过尚未发布的前序 task，
+再修改 CCEC 热路径。以下检查均通过：
+
+- 四个 DAG build identity、protocol 和 state 定向测试；
+- mode4 AIC/AIV CCEC 完整构建；
+- 真实 A5 非 PA `A5OnboardBd24ExistingInoutChain`；
+- PA B1 与 PA B256 完整数值 golden。
+
+因此否决原因是性能，不是功能没有闭合。
+
+### 13.3 A5 性能与裁决
+
+相同 PA B256、shared TensorMap、K16/W4、startup 到 FinalDrain 的
+`perf-clock` 口径，三个独立进程结果为：
+
+```text
+178.674 ms / 175.802 ms / 172.999 ms
+median = 175.802 ms
+```
+
+当前保留版中位数为 173.206 ms，候选回退 2.596 ms，约 1.50%；候选前两次
+也都慢于保留版三次结果中的最大值 173.976 ms，不能认定有稳定收益。实现代码
+与临时协议测试已完整撤回，只保留本节与 investigation 记录。
+
+该候选减少了 lookup 的返回型 atomic，但同时把原本由 K16 builder 并行发布的
+metadata 变成完整 task 顺序链。它也可能消除了 builder 到达后续共享阶段的
+自然错峰；当前没有分阶段计数，后一点只作为待验证解释，不写成既定根因。
+
+后续若继续消减 metadata lookup，应优先考虑不引入全任务串行前缀的局部索引、
+按 symbol/region 缩小候选集合，或先补 builder 分阶段计数定位真实占比；不要
+为了替换候选 atomic 再引入同类全局 prefix chain。
