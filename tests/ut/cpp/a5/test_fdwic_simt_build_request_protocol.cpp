@@ -71,11 +71,13 @@ struct RequestSource {
     uint64_t scalars[2]{};
     uint64_t dependencies[2]{};
     TensorArgType tags[2]{TensorArgType::INPUT, TensorArgType::OUTPUT};
+    bool references[2]{};
 
     uint64_t TensorWord(uint32_t tensor, uint32_t word) const { return tensors[tensor][word]; }
     uint64_t Scalar(uint32_t scalar) const { return scalars[scalar]; }
     uint64_t ExplicitDependency(uint32_t dependency) const { return dependencies[dependency]; }
     TensorArgType TensorTag(uint32_t tensor) const { return tags[tensor]; }
+    bool TensorIsReference(uint32_t tensor) const { return references[tensor]; }
 };
 
 SimtBuildRequestSpec KernelSpec(uint32_t task_id = 9) {
@@ -211,7 +213,7 @@ TEST(FdwicSimtBuildRequestProtocol, RealL0TaskArgsAreCopiedByValueWithoutLocalRe
     const SimtBuildRequestSpec spec{
         5, 0x123456780ULL, 17, 2, 1, 2, ExecEngineClass::Aiv, 0,
     };
-    const SimtL0TaskArgsRequestSource source{args, nullptr};
+    const SimtL0TaskArgsRequestSource source{args};
     ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 5, 2, fatal), SimtRequestReserveResult::Reserved);
     ASSERT_EQ(
         PublishReservedSimtBuildRequest<HostOps>(cell, 2, spec, source, fatal), SimtRequestPublishResult::Published
@@ -247,38 +249,112 @@ TEST(FdwicSimtBuildRequestProtocol, RealL0TaskArgsRejectFutureOrCrossRingDepende
     EXPECT_FALSE(ValidateSimtL0TaskArgs(cross_ring, 7));
 }
 
-TEST(FdwicSimtBuildRequestProtocol, SharedOutputReferenceUsesResolvedPublisherDescriptor) {
-    uint32_t shape[1] = {16};
-    Tensor resolved = make_tensor_external(reinterpret_cast<void *>(0x4000), shape, 1, DataType::FLOAT32);
-    resolved.owner_task_id = PTO2TaskId::make(0, 3);
+TEST(FdwicSimtBuildRequestProtocol, SharedOutputReferenceRemainsCompactUntilBuilderResolution) {
     FdwicOutputRef input_ref{3, 0, 0, 0, 0, 0};
     L0TaskArgs args;
     args.add_input(input_ref);
     ASSERT_TRUE(ValidateSimtL0TaskArgs(args, 5, 0));
     EXPECT_FALSE(ValidateSimtL0TaskArgs(args, 5, 1));
 
-    Tensor resolved_tensors[MAX_TENSOR_ARGS]{};
-    Tensor::copy(resolved_tensors[0], resolved);
-    const SimtL0TaskArgsRequestSource source{args, resolved_tensors};
+    EXPECT_EQ(SimtL0TaskArgsReferenceMask(args), 0x1U);
+    const SimtL0TaskArgsRequestSource source{args};
     SimtBuildRequestCell cell{};
     SharedExecControl fatal{};
     const SimtBuildRequestSpec spec{
-        5, 0x123456780ULL, 17, 1, 0, 0, ExecEngineClass::Aiv, 0,
+        5, 0x123456780ULL, 17, 1, 0, 0, ExecEngineClass::Aiv, 0, 0x1,
     };
     ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 5, 2, fatal), SimtRequestReserveResult::Reserved);
     ASSERT_EQ(
         PublishReservedSimtBuildRequest<HostOps>(cell, 2, spec, source, fatal), SimtRequestPublishResult::Published
     );
 
-    const auto *resolved_words = reinterpret_cast<const uint64_t *>(&resolved);
-    for (uint32_t word = 0; word < kExecTensorDescWords; ++word) {
-        EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(0) + word], resolved_words[word]);
-    }
+    EXPECT_EQ(cell.payload.words[7], 0x1U);
+    EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(0, 0x1)], source.TensorWord(0, 0));
+    SimtBuildRequestHeader header{};
+    SimtBuildRequestLayout layout{};
+    ASSERT_EQ(AcquireSimtBuildRequest<HostOps>(cell, 5, header, layout, fatal), SimtRequestAcquireResult::Acquired);
+    EXPECT_EQ(header.tensor_reference_mask, 0x1U);
+    EXPECT_EQ(layout.inline_tensor_count, 0U);
+    EXPECT_EQ(layout.scalar_word_offset, kSimtRequestHeaderWords + 1U);
+    EXPECT_EQ(layout.payload_lines, 2U);
 
     FdwicOutputRef future_ref{5, 0, 0, 0, 0, 0};
     L0TaskArgs future_args;
     future_args.add_input(future_ref);
     EXPECT_FALSE(ValidateSimtL0TaskArgs(future_args, 5, 0));
+}
+
+TEST(FdwicSimtBuildRequestProtocol, ReferenceMaskRejectsOutputAndOutOfRangeBits) {
+    RequestSource source{};
+    source.tags[0] = TensorArgType::OUTPUT;
+    source.references[0] = true;
+    SimtBuildRequestCell output_cell{};
+    SharedExecControl fatal{};
+    SimtBuildRequestSpec output_spec{
+        5, 0x123456780ULL, 17, 1, 0, 0, ExecEngineClass::Aiv, 0, 0x1,
+    };
+    ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(output_cell, 5, 2, fatal), SimtRequestReserveResult::Reserved);
+    EXPECT_EQ(
+        PublishReservedSimtBuildRequest<HostOps>(output_cell, 2, output_spec, source, fatal),
+        SimtRequestPublishResult::InvalidInput
+    );
+
+    SimtBuildRequestLayout layout{};
+    EXPECT_FALSE(ComputeSimtBuildRequestLayout(1, 0, 0, 0x2, layout));
+}
+
+TEST(FdwicSimtBuildRequestProtocol, MixedInlineOutputAndReferenceKeepAllOffsetsStable) {
+    uint32_t shape[1] = {8};
+    Tensor input = make_tensor_external(reinterpret_cast<void *>(0x8000), shape, 1, DataType::FLOAT32);
+    TensorCreateInfo output(shape, 1, DataType::FLOAT32);
+    FdwicOutputRef prior{2, 1, 0, 0, 0, 0};
+    PTO2TaskId dependency = PTO2TaskId::make(0, 1);
+    L0TaskArgs args;
+    args.add_input(input);
+    args.add_output(output);
+    args.add_inout(prior);
+    args.add_scalar(uint64_t{0x5678});
+    args.set_dependencies(&dependency, 1);
+    ASSERT_TRUE(ValidateSimtL0TaskArgs(args, 5, 1));
+    ASSERT_EQ(SimtL0TaskArgsReferenceMask(args), 0x4U);
+
+    SimtBuildRequestCell cell{};
+    SharedExecControl fatal{};
+    const SimtBuildRequestSpec spec{
+        5, 0x123456780ULL, 17, 3, 1, 1, ExecEngineClass::Aiv, 0, 0x4,
+    };
+    const SimtL0TaskArgsRequestSource source{args};
+    ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 5, 2, fatal), SimtRequestReserveResult::Reserved);
+    ASSERT_EQ(
+        PublishReservedSimtBuildRequest<HostOps>(cell, 2, spec, source, fatal), SimtRequestPublishResult::Published
+    );
+
+    SimtBuildRequestHeader header{};
+    SimtBuildRequestLayout layout{};
+    ASSERT_EQ(AcquireSimtBuildRequest<HostOps>(cell, 5, header, layout, fatal), SimtRequestAcquireResult::Acquired);
+    EXPECT_EQ(header.tensor_reference_mask, 0x4U);
+    EXPECT_EQ(layout.inline_tensor_count, 2U);
+    EXPECT_EQ(layout.scalar_word_offset, kSimtRequestHeaderWords + 2U * kExecTensorDescWords + 1U);
+    EXPECT_EQ(layout.explicit_dep_word_offset, layout.scalar_word_offset + 1U);
+    EXPECT_EQ(cell.payload.words[SimtRequestTensorWordOffset(2, 0x4)], source.TensorWord(2, 0));
+    EXPECT_EQ(cell.payload.words[layout.scalar_word_offset], 0x5678U);
+    EXPECT_EQ(cell.payload.words[layout.explicit_dep_word_offset], dependency.raw);
+}
+
+TEST(FdwicSimtBuildRequestProtocol, ReferenceMaskMustMatchTheSourceReferenceKind) {
+    RequestSource source{};
+    source.references[0] = true;
+    source.tensors[0][0] = 1;
+    SimtBuildRequestCell cell{};
+    SharedExecControl fatal{};
+    const SimtBuildRequestSpec missing_mask{
+        5, 0x123456780ULL, 17, 1, 0, 0, ExecEngineClass::Aiv, 0, 0,
+    };
+    ASSERT_EQ(ReserveSimtBuildRequest<HostOps>(cell, 5, 2, fatal), SimtRequestReserveResult::Reserved);
+    EXPECT_EQ(
+        PublishReservedSimtBuildRequest<HostOps>(cell, 2, missing_mask, source, fatal),
+        SimtRequestPublishResult::InvalidInput
+    );
 }
 
 }  // namespace

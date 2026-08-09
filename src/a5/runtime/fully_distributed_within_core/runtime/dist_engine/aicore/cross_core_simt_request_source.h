@@ -55,9 +55,29 @@ ValidateSimtL0TaskArgs(const L0TaskArgs &args, uint32_t task_id, uint32_t expect
     return expected_output_count == UINT32_MAX || output_count == expected_output_count;
 }
 
+PTO_DEVICE_FUNC inline uint32_t SimtL0TaskArgsReferenceMask(const L0TaskArgs &args) {
+    uint32_t mask = 0;
+#if PTO_FDWIC_SHARED_MAP
+    for (int32_t tensor = 0; tensor < args.tensor_count(); ++tensor) {
+        if (args.tensor(tensor).tensor_from_shared_output()) mask |= uint32_t{1} << static_cast<uint32_t>(tensor);
+    }
+#else
+    (void)args;
+#endif
+    return mask;
+}
+
 struct SimtL0TaskArgsRequestSource {
     const L0TaskArgs &args;
-    __gm__ const Tensor *resolved_tensors;
+
+    PTO_DEVICE_FUNC bool TensorIsReference(uint32_t tensor) const {
+#if PTO_FDWIC_SHARED_MAP
+        return args.tensor(static_cast<int32_t>(tensor)).tensor_from_shared_output();
+#else
+        (void)tensor;
+        return false;
+#endif
+    }
 
     PTO_DEVICE_FUNC uint64_t TensorWord(uint32_t tensor, uint32_t word) const {
         const int32_t index = static_cast<int32_t>(tensor);
@@ -67,8 +87,9 @@ struct SimtL0TaskArgsRequestSource {
         }
 #if PTO_FDWIC_SHARED_MAP
         if (args.tensor(index).tensor_from_shared_output()) {
-            __gm__ const auto *words = reinterpret_cast<__gm__ const uint64_t *>(&resolved_tensors[index]);
-            return words[word];
+            const FdwicOutputRef ref = args.tensor(index).shared_output_ref();
+            const auto *words = reinterpret_cast<const uint64_t *>(&ref);
+            return word < sizeof(FdwicOutputRef) / sizeof(uint64_t) ? words[word] : 0;
         }
 #endif
 #if defined(__CCE_AICORE__)

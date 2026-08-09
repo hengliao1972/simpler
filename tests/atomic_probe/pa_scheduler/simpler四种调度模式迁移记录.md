@@ -992,3 +992,85 @@ startup→FinalDrain 为 **13.1668 ms**，仍比保留流水的约 **5.15 ms** �
 因此下一条可行主线是复用已有通用 build-request/payload 协议，形成“轻量计划
 发布 → 多 Scalar 动态 Build → Build 后即时 Execute”的流水，而不是继续微调
 replay worker 数量。
+
+## 21. SIMT request 延迟携带 shared output 引用
+
+### 21.1 旧 publisher 等待不是计划发布的必要工作
+
+mode3/mode4 虽然已经把完整 Build 交给 SIMT builder，但 request publisher 在
+写 request 前仍逐个调用 `dist_cross_core_copy_existing_tensor()`。只要参数中有
+`FdwicOutputRef`，publisher 就必须等待 producer 发布真实 `TensorDesc`，再把
+整份 descriptor 复制进 request。结果是 replay 端仍沿动态依赖链等待，轻量
+计划发布和完整 Build 没有真正解耦。
+
+本阶段只改变通用 request wire contract，不读取 PA `TaskKind`、batch、固定五
+task 次序、C/V 比例或 Tensor 形状：
+
+1. request header 第 7 个 word 的低 32 位保存 `tensor_reference_mask`，高
+   32 位继续固定为零；header 仍为 64 B；
+2. 普通 existing Tensor 继续内联完整 descriptor，OUTPUT 继续内联
+   `TensorCreateInfo`，shared output 只携带一个 64-bit
+   `(producer_task_id, output_slot, flags, view_ndims)`；
+3. source 声明的引用种类必须与 mask 逐 tensor 完全一致，引用不能标成
+   OUTPUT，producer 必须严格小于 consumer task id，slot 和保留字段均校验；
+4. SIMT builder 取得 request 后等待对应 output control 到 Published，校验
+   task id、output count、build owner 和 descriptor owner，再从 producer 的
+   task-indexed output cell 读取不可变 descriptor；
+5. TensorMap writer 顺序、ordinary/DAG fanin 推导、execution payload、Execute
+   owner 和 FinalDrain 合同均不变。
+
+引用只占一个 word，因此混合 inline descriptor、OUTPUT create-info、shared
+reference、scalar 和 explicit dependency 时，所有后续 offset 都由同一个
+layout 函数计算，不再假设每个 tensor 固定占一份完整 descriptor。
+
+### 21.2 首版局部状态过重及修正
+
+首版为了避免重复解析，在每个 SIMT leader 的局部 request view 中保存了
+32 个 descriptor GM 指针。代码能够编译，但真实 A5 上连 B1 都触发 AICPU
+异常；零 Submit 也复现，说明问题发生在 builder VF 的局部状态形状，而不是
+PA output 依赖本身。
+
+该实现未保留。修正版只在 request view 中保存一个 shared output 数组基址和
+一个“引用已验证”标志：先逐引用完成 Published/identity 校验，之后按紧凑 ref
+现场计算 descriptor 地址。修正后零 Submit 不再出现设备异常，PA B1 在
+ordinary/DAG 两模式均数值 PASS。这个过程也说明，SIMT 路径不能为了少几次
+地址计算而无界增加每 lane 的局部数组。
+
+### 21.3 通用正确性门槛
+
+request protocol C++ 测试扩展到 11 项，新增覆盖：
+
+- shared reference 的紧凑布局与 payload line 数；
+- inline INPUT、OUTPUT、INOUT reference、scalar、explicit dependency 混合
+  时的全部 offset；
+- source/reference mask 不一致、OUTPUT reference、越界 mask、future/self
+  producer 和非 plain ref 的 fail-closed 行为。
+
+真实 A5 上，`simt_cross_core_ordinary` 与 `simt_cross_core_dag` 分别完整重跑
+第 17.2 节十类边界，合计 20 个模式/场景组合全部数值 golden PASS。门槛包括
+零 Submit、纯 AIC、纯 AIV、3/12/21/96 worker、17 个非 2 次幂 task、无 fresh
+output、多 output、AIC→AIV→AIC deferred 链、重复 INOUT 和交替跨引擎 INOUT。
+因此本阶段不是只对 PA 固定图成立。
+
+### 21.4 PA B256 端到端结果
+
+相同 shared TensorMap、PA B256、startup→FinalDrain `perf-clock` 口径，三个
+独立 pytest 进程结果如下：
+
+| 模式 | 本阶段三次结果 | 中位数 | 第 18/19 章中位数 | 改善 |
+| ---- | -------------- | -----: | ----------------: | ---: |
+| `simt_cross_core_ordinary` | 26.006 / 26.063 / 26.081 ms | 26.063 ms | 55.534 ms | 53.1% |
+| `simt_cross_core_dag` | 8.722 / 8.739 / 8.745 ms | 8.739 ms | 22.637 ms | 61.4% |
+
+对应 raw 目录：
+
+- ordinary：`TestPagedAttentionUnroll_Case1_20260809_185304`、
+  `TestPagedAttentionUnroll_Case1_20260809_190211`、
+  `TestPagedAttentionUnroll_Case1_20260809_190314`；
+- DAG：`TestPagedAttentionUnroll_Case1_20260809_185420`、
+  `TestPagedAttentionUnroll_Case1_20260809_190014`、
+  `TestPagedAttentionUnroll_Case1_20260809_190112`。
+
+收益证明 publisher 的逐 output descriptor 等待是两种 SIMT simpler 路径的
+通用串行链路。26.1/8.7 ms 仍未达到 2 ms 目标，下一阶段应继续减少全量 replay
+和 Build 任务发放成本，而不是加入 PA task 特例。

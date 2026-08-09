@@ -55,6 +55,7 @@ PTO_DEVICE_FUNC uint32_t dist_simt_cross_core_builder_count() {
 
 struct DistSimtRequestView {
     __gm__ uint64_t *words;
+    __gm__ fdwic::cross_core::CrossCoreOutputCell<Tensor> *all_outputs;
     uint32_t task_id;
     uint32_t function_id;
     uint64_t function_address;
@@ -63,6 +64,10 @@ struct DistSimtRequestView {
     uint32_t explicit_dep_count;
     uint32_t engine_class;
     uint32_t payload_lines;
+    uint32_t tensor_reference_mask;
+    uint32_t scalar_word_offset;
+    uint32_t explicit_dep_word_offset;
+    uint32_t references_ready;
 };
 
 DIST_SIMT_CALLEE uint64_t dist_simt_atomic_load(__gm__ uint64_t *address) {
@@ -108,14 +113,54 @@ DIST_SIMT_CALLEE uint32_t dist_simt_request_tag(const DistSimtRequestView &reque
     return static_cast<uint32_t>(packed >> ((tensor % 8U) * 8U)) & 0xFFU;
 }
 
+DIST_SIMT_CALLEE uint32_t dist_simt_request_mask_for_count(uint32_t tensor_count) {
+    return tensor_count >= 32U ? UINT32_MAX : ((uint32_t{1} << tensor_count) - 1U);
+}
+
+DIST_SIMT_CALLEE uint32_t dist_simt_request_reference_count(uint32_t reference_mask) {
+    uint32_t count = 0;
+    while (reference_mask != 0) {
+        count += reference_mask & 1U;
+        reference_mask >>= 1U;
+    }
+    return count;
+}
+
+DIST_SIMT_CALLEE uint32_t dist_simt_request_tensor_word_offset(uint32_t tensor, uint32_t reference_mask) {
+    const uint32_t preceding_mask = tensor == 0U ? 0U : reference_mask & dist_simt_request_mask_for_count(tensor);
+    return fdwic::cross_core::kSimtRequestHeaderWords + tensor * fdwic::cross_core::kExecTensorDescWords -
+           dist_simt_request_reference_count(preceding_mask) * (fdwic::cross_core::kExecTensorDescWords - 1U);
+}
+
+DIST_SIMT_CALLEE bool dist_simt_decode_output_reference(
+    uint64_t encoded, uint32_t consumer_task, uint32_t *producer_task, uint32_t *output_slot
+) {
+    const int32_t producer = static_cast<int32_t>(static_cast<uint32_t>(encoded));
+    const int16_t slot = static_cast<int16_t>(static_cast<uint16_t>(encoded >> 32U));
+    if (producer < 0 || static_cast<uint32_t>(producer) >= consumer_task || slot < 0 ||
+        static_cast<uint32_t>(slot) >= fdwic::cross_core::kOutputMaxDescriptors ||
+        static_cast<uint16_t>(encoded >> 48U) != 0) {
+        return false;
+    }
+    *producer_task = static_cast<uint32_t>(producer);
+    *output_slot = static_cast<uint32_t>(slot);
+    return true;
+}
+
 DIST_SIMT_CALLEE __gm__ uint64_t *dist_simt_request_tensor(const DistSimtRequestView &request, uint32_t tensor) {
-    return request.words + fdwic::cross_core::kSimtRequestHeaderWords +
-           tensor * fdwic::cross_core::kExecTensorDescWords;
+    const uint32_t word_offset = dist_simt_request_tensor_word_offset(tensor, request.tensor_reference_mask);
+    if ((request.tensor_reference_mask & (uint32_t{1} << tensor)) == 0) return request.words + word_offset;
+    if (request.references_ready == 0 || request.all_outputs == nullptr) return nullptr;
+    uint32_t producer = 0;
+    uint32_t output_slot = 0;
+    if (!dist_simt_decode_output_reference(request.words[word_offset], request.task_id, &producer, &output_slot)) {
+        return nullptr;
+    }
+    return reinterpret_cast<__gm__ uint64_t *>(&request.all_outputs[producer].descriptors[output_slot]);
 }
 
 DIST_SIMT_CALLEE bool dist_simt_decode_request(
-    __gm__ fdwic::cross_core::SimtBuildRequestCell *cell, uint32_t task_id, uint64_t raw,
-    DistSimtRequestView *request
+    __gm__ fdwic::cross_core::SimtBuildRequestCell *cell, uint32_t task_id, uint64_t raw, DistSimtRequestView *request
 ) {
     const uint32_t phase = static_cast<uint32_t>(raw & fdwic::cross_core::kSimtRequestPhaseMask);
     if (phase != static_cast<uint32_t>(fdwic::cross_core::SimtRequestPhase::Published)) return false;
@@ -134,6 +179,7 @@ DIST_SIMT_CALLEE bool dist_simt_decode_request(
     const uint64_t identity = words[0];
     const uint64_t counts = words[2];
     request->words = words;
+    request->all_outputs = nullptr;
     request->task_id = static_cast<uint32_t>(identity);
     request->function_id = static_cast<uint32_t>(identity >> 32U);
     request->function_address = words[1];
@@ -142,10 +188,12 @@ DIST_SIMT_CALLEE bool dist_simt_decode_request(
     request->explicit_dep_count = static_cast<uint16_t>(counts >> 32U);
     request->engine_class = static_cast<uint8_t>(counts >> 48U);
     request->payload_lines = payload_lines;
-    if (request->task_id != task_id || static_cast<uint8_t>(counts >> 56U) != 0 || words[7] != 0 ||
-        request->tensor_count > fdwic::cross_core::kExecMaxTensors ||
+    request->tensor_reference_mask = static_cast<uint32_t>(words[7]);
+    if (request->task_id != task_id || static_cast<uint8_t>(counts >> 56U) != 0 ||
+        static_cast<uint32_t>(words[7] >> 32U) != 0 || request->tensor_count > fdwic::cross_core::kExecMaxTensors ||
         request->scalar_count > fdwic::cross_core::kExecMaxScalars ||
         request->explicit_dep_count > fdwic::cross_core::kSimtRequestMaxExplicitDependencies ||
+        (request->tensor_reference_mask & ~dist_simt_request_mask_for_count(request->tensor_count)) != 0 ||
         (request->engine_class != static_cast<uint32_t>(fdwic::cross_core::ExecEngineClass::Aic) &&
          request->engine_class != static_cast<uint32_t>(fdwic::cross_core::ExecEngineClass::Aiv) &&
          request->engine_class != static_cast<uint32_t>(fdwic::cross_core::ExecEngineClass::Immediate))) {
@@ -157,9 +205,10 @@ DIST_SIMT_CALLEE bool dist_simt_decode_request(
         (!immediate && request->function_id == UINT32_MAX && request->function_address == 0)) {
         return false;
     }
+    const uint32_t reference_count = dist_simt_request_reference_count(request->tensor_reference_mask);
     const uint32_t written_words = fdwic::cross_core::kSimtRequestHeaderWords +
-                                   request->tensor_count * fdwic::cross_core::kExecTensorDescWords +
-                                   request->scalar_count + request->explicit_dep_count;
+                                   (request->tensor_count - reference_count) * fdwic::cross_core::kExecTensorDescWords +
+                                   reference_count + request->scalar_count + request->explicit_dep_count;
     const uint32_t expected_lines = (written_words * sizeof(uint64_t) + fdwic::cross_core::kExecCacheLineBytes - 1U) /
                                     fdwic::cross_core::kExecCacheLineBytes;
     // Published request controls and payloads are immutable until the next
@@ -169,7 +218,76 @@ DIST_SIMT_CALLEE bool dist_simt_decode_request(
     for (uint32_t tensor = 0; tensor < request->tensor_count; ++tensor) {
         const uint32_t tag = dist_simt_request_tag(*request, tensor);
         if (tag > static_cast<uint32_t>(TensorArgType::NO_DEP)) return false;
+        const uint32_t word_offset = dist_simt_request_tensor_word_offset(tensor, request->tensor_reference_mask);
+        if ((request->tensor_reference_mask & (uint32_t{1} << tensor)) != 0) {
+            uint32_t producer = 0;
+            uint32_t output_slot = 0;
+            if (tag == static_cast<uint32_t>(TensorArgType::OUTPUT) ||
+                !dist_simt_decode_output_reference(words[word_offset], task_id, &producer, &output_slot)) {
+                return false;
+            }
+        }
     }
+    request->scalar_word_offset = fdwic::cross_core::kSimtRequestHeaderWords +
+                                  (request->tensor_count - reference_count) * fdwic::cross_core::kExecTensorDescWords +
+                                  reference_count;
+    request->explicit_dep_word_offset = request->scalar_word_offset + request->scalar_count;
+    request->references_ready = 0;
+    return true;
+}
+
+DIST_SIMT_CALLEE bool dist_simt_resolve_request_references(
+    __gm__ fdwic::cross_core::CrossCoreOutputCell<Tensor> *all_outputs, DistSimtRequestView *request,
+    __gm__ uint64_t *fatal
+) {
+    request->all_outputs = all_outputs;
+    uint32_t unresolved = request->tensor_reference_mask;
+    while (unresolved != 0) {
+        uint32_t tensor = 0;
+        while ((unresolved & (uint32_t{1} << tensor)) == 0)
+            ++tensor;
+        unresolved &= ~(uint32_t{1} << tensor);
+
+        const uint32_t word_offset = dist_simt_request_tensor_word_offset(tensor, request->tensor_reference_mask);
+        uint32_t producer = 0;
+        uint32_t output_slot = 0;
+        if (!dist_simt_decode_output_reference(
+                request->words[word_offset], request->task_id, &producer, &output_slot
+            )) {
+            return false;
+        }
+        __gm__ fdwic::cross_core::CrossCoreOutputCell<Tensor> *producer_outputs = &all_outputs[producer];
+        __gm__ uint64_t *control =
+            reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&producer_outputs->control.state));
+        const uint64_t begin = clock();
+        uint32_t polls = 0;
+        uint64_t raw = 0;
+        while (clock() - begin <= kDistSimtBuilderPollBudget) {
+            raw = dist_simt_atomic_load(control);
+            const uint32_t phase = static_cast<uint32_t>(raw & fdwic::cross_core::kOutputStatePhaseMask);
+            if (phase == static_cast<uint32_t>(fdwic::cross_core::OutputPhase::Published)) break;
+            if (raw != 0 || ((++polls & 1023U) == 0 && dist_simt_fatal_observed(fatal))) return false;
+        }
+        const uint32_t phase = static_cast<uint32_t>(raw & fdwic::cross_core::kOutputStatePhaseMask);
+        const uint32_t output_count = static_cast<uint32_t>(
+            (raw >> fdwic::cross_core::kOutputStateCountShift) & fdwic::cross_core::kOutputStateCountMask
+        );
+        const uint32_t build_owner = static_cast<uint32_t>(
+            (raw >> fdwic::cross_core::kOutputStateOwnerShift) & fdwic::cross_core::kOutputStateOwnerMask
+        );
+        const uint32_t encoded_task = static_cast<uint32_t>(
+            (raw >> fdwic::cross_core::kOutputStateTaskIdShift) & fdwic::cross_core::kOutputStateTaskIdMask
+        );
+        if (phase != static_cast<uint32_t>(fdwic::cross_core::OutputPhase::Published) ||
+            (raw & ~fdwic::cross_core::kOutputStateKnownMask) != 0 ||
+            output_count > fdwic::cross_core::kOutputMaxDescriptors || build_owner > fdwic::cross_core::kExecMaxOwner ||
+            encoded_task != producer || output_slot >= output_count) {
+            return false;
+        }
+        __gm__ uint64_t *descriptor = reinterpret_cast<__gm__ uint64_t *>(&producer_outputs->descriptors[output_slot]);
+        if (descriptor[2] != producer) return false;
+    }
+    request->references_ready = 1;
     return true;
 }
 
@@ -376,6 +494,7 @@ DIST_SIMT_CALLEE bool dist_simt_prepare_map_and_fanin(
         const uint32_t tag = dist_simt_request_tag(request, tensor);
         if (tag == static_cast<uint32_t>(TensorArgType::OUTPUT)) continue;
         __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
+        if (descriptor == nullptr) return false;
         const uint64_t owner_raw = descriptor[2];
         if (owner_raw != UINT64_MAX) {
             const uint32_t producer = static_cast<uint32_t>(owner_raw);
@@ -405,11 +524,8 @@ DIST_SIMT_CALLEE bool dist_simt_prepare_map_and_fanin(
             ++writer_count;
         }
     }
-    const uint32_t dependency_offset = fdwic::cross_core::kSimtRequestHeaderWords +
-                                       request.tensor_count * fdwic::cross_core::kExecTensorDescWords +
-                                       request.scalar_count;
     for (uint32_t dependency = 0; dependency < request.explicit_dep_count; ++dependency) {
-        const uint64_t raw = request.words[dependency_offset + dependency];
+        const uint64_t raw = request.words[request.explicit_dep_word_offset + dependency];
         const uint32_t producer = static_cast<uint32_t>(raw);
         if (static_cast<uint32_t>(raw >> 32U) != 0 || producer >= request.task_id ||
             !dist_simt_add_fanin(fanin, fanin_count, static_cast<int32_t>(producer))) {
@@ -440,6 +556,7 @@ DIST_SIMT_CALLEE bool dist_simt_publish_dag_metadata(
             continue;
         }
         __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
+        if (descriptor == nullptr) return false;
         const bool manual_dependency = ((descriptor[5] >> 8U) & 0xFFU) != 0;
         if (manual_dependency) continue;
         if (writer_count >= fdwic::cross_core::kDagMaxWriterRegions) return false;
@@ -476,6 +593,7 @@ DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
             continue;
         }
         __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
+        if (descriptor == nullptr) return false;
         const bool manual_dependency = ((descriptor[5] >> 8U) & 0xFFU) != 0;
         if (!manual_dependency) {
             uint64_t address = 0;
@@ -524,6 +642,7 @@ DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
                 const uint32_t bit = uint32_t{1} << tensor;
                 if ((unresolved & bit) == 0) continue;
                 __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
+                if (descriptor == nullptr) return false;
                 uint64_t address = 0;
                 uint64_t lo = 0;
                 uint64_t hi = 0;
@@ -551,6 +670,7 @@ DIST_SIMT_CALLEE bool dist_simt_prepare_dag_and_fanin(
         const uint32_t tag = dist_simt_request_tag(request, tensor);
         if (tag == static_cast<uint32_t>(TensorArgType::OUTPUT)) continue;
         __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
+        if (descriptor == nullptr) return false;
         const uint64_t owner_raw = descriptor[2];
         if (owner_raw != UINT64_MAX) {
             const uint32_t producer = static_cast<uint32_t>(owner_raw);
@@ -569,11 +689,8 @@ DIST_SIMT_CALLEE bool dist_simt_prepare_dag_and_fanin(
             if (!dist_simt_add_fanin(fanin, fanin_count, lookup_producers[tensor])) return false;
         }
     }
-    const uint32_t dependency_offset = fdwic::cross_core::kSimtRequestHeaderWords +
-                                       request.tensor_count * fdwic::cross_core::kExecTensorDescWords +
-                                       request.scalar_count;
     for (uint32_t dependency = 0; dependency < request.explicit_dep_count; ++dependency) {
-        const uint64_t raw = request.words[dependency_offset + dependency];
+        const uint64_t raw = request.words[request.explicit_dep_word_offset + dependency];
         const uint32_t producer = static_cast<uint32_t>(raw);
         if (static_cast<uint32_t>(raw >> 32U) != 0 || producer >= request.task_id ||
             !dist_simt_add_fanin(fanin, fanin_count, static_cast<int32_t>(producer))) {
@@ -595,7 +712,8 @@ DIST_SIMT_CALLEE bool dist_simt_materialize_outputs(
     for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
         if (dist_simt_request_tag(request, tensor) != static_cast<uint32_t>(TensorArgType::OUTPUT)) continue;
         uint64_t bytes = 0;
-        if (!dist_simt_output_size(dist_simt_request_tensor(request, tensor), &bytes) ||
+        __gm__ uint64_t *create_info = dist_simt_request_tensor(request, tensor);
+        if (create_info == nullptr || !dist_simt_output_size(create_info, &bytes) ||
             bytes > UINT64_MAX - (PTO2_PACKED_OUTPUT_ALIGN - 1U)) {
             return false;
         }
@@ -616,9 +734,11 @@ DIST_SIMT_CALLEE bool dist_simt_materialize_outputs(
     for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
         if (dist_simt_request_tag(request, tensor) != static_cast<uint32_t>(TensorArgType::OUTPUT)) continue;
         __gm__ uint64_t *destination = reinterpret_cast<__gm__ uint64_t *>(&outputs->descriptors[output]);
+        __gm__ uint64_t *create_info = dist_simt_request_tensor(request, tensor);
+        if (create_info == nullptr) return false;
         dist_simt_write_output_descriptor(
-            destination, dist_simt_request_tensor(request, tensor),
-            reinterpret_cast<uint64_t>(heap_base + begin + offset), output_bytes[output], request.task_id
+            destination, create_info, reinterpret_cast<uint64_t>(heap_base + begin + offset), output_bytes[output],
+            request.task_id
         );
         offset += (output_bytes[output] + PTO2_PACKED_OUTPUT_ALIGN - 1U) & ~(PTO2_PACKED_OUTPUT_ALIGN - 1U);
         ++output;
@@ -673,14 +793,13 @@ DIST_SIMT_CALLEE bool dist_simt_publish_exec(
         } else {
             source = dist_simt_request_tensor(request, tensor);
         }
+        if (source == nullptr) return false;
         dist_simt_copy_words(payload + destination, source, fdwic::cross_core::kExecTensorDescWords);
         destination += fdwic::cross_core::kExecTensorDescWords;
     }
     if (output != output_count) return false;
-    const uint32_t scalar_offset =
-        fdwic::cross_core::kSimtRequestHeaderWords + request.tensor_count * fdwic::cross_core::kExecTensorDescWords;
     for (uint32_t scalar = 0; scalar < request.scalar_count; ++scalar) {
-        dist_simt_store(payload + destination++, request.words[scalar_offset + scalar]);
+        dist_simt_store(payload + destination++, request.words[request.scalar_word_offset + scalar]);
     }
     for (uint32_t edge = 0; edge < fanin_count; edge += 2U) {
         uint64_t packed = static_cast<uint32_t>(fanin[edge]);
@@ -719,7 +838,7 @@ DIST_SIMT_CALLEE bool dist_simt_publish_exec(
 DIST_SIMT_CALLEE bool dist_simt_build_request(
     __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells,
     __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata, __gm__ uint8_t *heap_base, uint64_t heap_size,
-    uint32_t history, const DistSimtRequestView &request, uint32_t build_owner
+    uint32_t history, DistSimtRequestView request, uint32_t build_owner
 ) {
     __gm__ uint64_t *fatal =
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->runtime.fatal.state));
@@ -730,6 +849,7 @@ DIST_SIMT_CALLEE bool dist_simt_build_request(
     __gm__ uint64_t *heap_cursor =
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->runtime.heap_cursor.state));
     __gm__ fdwic::cross_core::CrossCoreOutputCell<Tensor> *outputs = &state->runtime.outputs[request.task_id];
+    if (!dist_simt_resolve_request_references(state->runtime.outputs, &request, fatal)) return false;
     if (!dist_simt_materialize_outputs(
             outputs, heap_cursor, heap_base, heap_size, request, build_owner, output_bytes, &output_count, &heap_begin,
             &heap_end
@@ -803,11 +923,8 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
     }
     if (active) {
         const uint64_t start_begin = clock();
-        while (
-            topology_valid && dist_simt_atomic_load(started) < builder_count &&
-            clock() - start_begin <= kDistSimtBuilderPollBudget && !dist_simt_fatal_observed(fatal)
-        ) {
-        }
+        while (topology_valid && dist_simt_atomic_load(started) < builder_count &&
+               clock() - start_begin <= kDistSimtBuilderPollBudget && !dist_simt_fatal_observed(fatal)) {}
         if (!topology_valid || dist_simt_atomic_load(started) != builder_count) {
             dist_simt_publish_fatal(fatal, UINT32_MAX, builder_owner);
         }

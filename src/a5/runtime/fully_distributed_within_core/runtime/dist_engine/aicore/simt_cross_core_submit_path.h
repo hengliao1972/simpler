@@ -20,6 +20,7 @@ namespace {
 
 using fdwic::cross_core::ExecEngineClass;
 using fdwic::cross_core::SimtBuildRequestSpec;
+using fdwic::cross_core::SimtL0TaskArgsReferenceMask;
 using fdwic::cross_core::SimtL0TaskArgsRequestSource;
 using fdwic::cross_core::SimtRequestPublishResult;
 using fdwic::cross_core::SimtRequestReserveResult;
@@ -84,10 +85,6 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_publish_request(
     if (!fdwic::cross_core::ValidateSimtL0TaskArgs(args, static_cast<uint32_t>(ctx.task_id), expected_output_count)) {
         return dist_simt_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
-    for (int32_t tensor = 0; tensor < args.tensor_count(); ++tensor) {
-        if (args.tag(tensor) == TensorArgType::OUTPUT || !args.tensor(tensor).tensor_from_shared_output()) continue;
-        if (!dist_cross_core_copy_existing_tensor(ctx.payload->tensors[tensor], args, tensor, ctx)) return false;
-    }
     const bool immediate = engine_class == ExecEngineClass::Immediate;
     const uint64_t function_address = immediate ? 0 : dist_aicore_slot_function_addr(g_dist.runtime, kernel_id);
     const SimtBuildRequestSpec spec{
@@ -99,8 +96,9 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_publish_request(
         static_cast<uint16_t>(args.explicit_dep_count()),
         engine_class,
         0,
+        SimtL0TaskArgsReferenceMask(args),
     };
-    const SimtL0TaskArgsRequestSource source{args, ctx.payload->tensors};
+    const SimtL0TaskArgsRequestSource source{args};
     __gm__ fdwic::cross_core::SimtBuildRequestCell &request =
         dist_simt_cross_core_state().requests[static_cast<uint32_t>(ctx.task_id)];
     if (fdwic::cross_core::PublishReservedSimtBuildRequest<DistCrossCoreAicoreOps>(

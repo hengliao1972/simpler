@@ -90,6 +90,7 @@ struct SimtBuildRequestSpec {
     uint16_t explicit_dep_count;
     ExecEngineClass engine_class;
     uint8_t flags;
+    uint32_t tensor_reference_mask;
 };
 
 struct SimtBuildRequestHeader {
@@ -102,7 +103,8 @@ struct SimtBuildRequestHeader {
     ExecEngineClass engine_class;
     uint8_t flags;
     uint8_t tensor_tags[kExecMaxTensors];
-    uint64_t reserved;
+    uint32_t tensor_reference_mask;
+    uint32_t reserved;
 };
 
 struct SimtBuildRequestLayout {
@@ -112,6 +114,8 @@ struct SimtBuildRequestLayout {
     uint32_t scalar_word_offset;
     uint32_t explicit_dep_word_offset;
     uint32_t written_words;
+    uint32_t tensor_reference_mask;
+    uint32_t inline_tensor_count;
 };
 
 struct alignas(kExecCacheLineBytes) SimtBuildRequestStorage {
@@ -176,21 +180,68 @@ PTO_DEVICE_FUNC inline bool SimtRequestTensorTagValid(TensorArgType tag) {
     return false;
 }
 
-PTO_DEVICE_FUNC inline bool ComputeSimtBuildRequestLayout(
-    uint32_t tensor_count, uint32_t scalar_count, uint32_t explicit_dep_count, SimtBuildRequestLayout &layout
+PTO_DEVICE_FUNC inline uint32_t SimtRequestTensorMaskForCount(uint32_t tensor_count) {
+    return tensor_count >= 32U ? UINT32_MAX : ((uint32_t{1} << tensor_count) - 1U);
+}
+
+PTO_DEVICE_FUNC inline uint32_t SimtRequestReferenceCount(uint32_t reference_mask) {
+    uint32_t count = 0;
+    while (reference_mask != 0) {
+        count += reference_mask & 1U;
+        reference_mask >>= 1U;
+    }
+    return count;
+}
+
+PTO_DEVICE_FUNC inline bool DecodeSimtRequestOutputReference(
+    uint64_t encoded, uint32_t consumer_task_id, uint32_t &producer_task_id, uint32_t &output_slot
 ) {
-    if (tensor_count > kExecMaxTensors || scalar_count > kExecMaxScalars ||
-        explicit_dep_count > kSimtRequestMaxExplicitDependencies) {
+    const int32_t producer = static_cast<int32_t>(static_cast<uint32_t>(encoded));
+    const int16_t slot = static_cast<int16_t>(static_cast<uint16_t>(encoded >> 32U));
+    const uint16_t flags_and_view_rank = static_cast<uint16_t>(encoded >> 48U);
+    if (producer < 0 || static_cast<uint32_t>(producer) >= consumer_task_id || slot < 0 ||
+        static_cast<uint32_t>(slot) >= kExecMaxTensors || flags_and_view_rank != 0) {
         return false;
     }
+    producer_task_id = static_cast<uint32_t>(producer);
+    output_slot = static_cast<uint32_t>(slot);
+    return true;
+}
+
+PTO_DEVICE_FUNC inline uint32_t SimtRequestTensorWordOffset(uint32_t tensor, uint32_t reference_mask) {
+    const uint32_t preceding_mask = tensor == 0U ? 0U : reference_mask & SimtRequestTensorMaskForCount(tensor);
+    return kSimtRequestHeaderWords + tensor * kExecTensorDescWords -
+           SimtRequestReferenceCount(preceding_mask) * (kExecTensorDescWords - 1U);
+}
+
+PTO_DEVICE_FUNC inline bool ComputeSimtBuildRequestLayout(
+    uint32_t tensor_count, uint32_t scalar_count, uint32_t explicit_dep_count, uint32_t tensor_reference_mask,
+    SimtBuildRequestLayout &layout
+) {
+    if (tensor_count > kExecMaxTensors || scalar_count > kExecMaxScalars ||
+        explicit_dep_count > kSimtRequestMaxExplicitDependencies ||
+        (tensor_reference_mask & ~SimtRequestTensorMaskForCount(tensor_count)) != 0) {
+        return false;
+    }
+    const uint32_t reference_count = SimtRequestReferenceCount(tensor_reference_mask);
+    const uint32_t inline_tensor_count = tensor_count - reference_count;
     layout.tensor_word_offset = kSimtRequestHeaderWords;
-    layout.scalar_word_offset = layout.tensor_word_offset + tensor_count * kExecTensorDescWords;
+    layout.scalar_word_offset =
+        layout.tensor_word_offset + inline_tensor_count * kExecTensorDescWords + reference_count;
     layout.explicit_dep_word_offset = layout.scalar_word_offset + scalar_count;
     layout.written_words = layout.explicit_dep_word_offset + explicit_dep_count;
     layout.payload_bytes = layout.written_words * sizeof(uint64_t);
     layout.payload_lines = (layout.payload_bytes + kExecCacheLineBytes - 1U) / kExecCacheLineBytes;
+    layout.tensor_reference_mask = tensor_reference_mask;
+    layout.inline_tensor_count = inline_tensor_count;
     return layout.payload_lines >= 1 && layout.payload_lines <= kSimtRequestMaxPayloadLines &&
            layout.written_words <= kSimtRequestMaxPayloadWords;
+}
+
+PTO_DEVICE_FUNC inline bool ComputeSimtBuildRequestLayout(
+    uint32_t tensor_count, uint32_t scalar_count, uint32_t explicit_dep_count, SimtBuildRequestLayout &layout
+) {
+    return ComputeSimtBuildRequestLayout(tensor_count, scalar_count, explicit_dep_count, 0, layout);
 }
 
 PTO_DEVICE_FUNC inline bool
@@ -205,11 +256,13 @@ ValidateSimtBuildRequestSpec(const SimtBuildRequestSpec &spec, SimtBuildRequestL
         (!immediate && spec.function_id == kExecInvalidFunctionId && spec.function_address == 0)) {
         return false;
     }
-    return ComputeSimtBuildRequestLayout(spec.tensor_count, spec.scalar_count, spec.explicit_dep_count, layout);
+    return ComputeSimtBuildRequestLayout(
+        spec.tensor_count, spec.scalar_count, spec.explicit_dep_count, spec.tensor_reference_mask, layout
+    );
 }
 
 PTO_DEVICE_FUNC inline uint32_t SimtRequestTensorWordOffset(uint32_t tensor) {
-    return kSimtRequestHeaderWords + tensor * kExecTensorDescWords;
+    return SimtRequestTensorWordOffset(tensor, 0);
 }
 
 PTO_DEVICE_FUNC inline uint64_t PackSimtRequestCounts(const SimtBuildRequestSpec &spec) {
@@ -245,11 +298,22 @@ PTO_DEVICE_FUNC bool PackSimtBuildRequest(
         }
         Ops::StorePayloadWord(&destination[3U + group], packed_tags);
     }
-    Ops::StorePayloadWord(&destination[7], 0);
+    Ops::StorePayloadWord(&destination[7], spec.tensor_reference_mask);
 
     uint32_t word = layout.tensor_word_offset;
     for (uint32_t tensor = 0; tensor < spec.tensor_count; ++tensor) {
         const TensorArgType tag = source.TensorTag(tensor);
+        const bool packed_as_reference = (spec.tensor_reference_mask & (uint32_t{1} << tensor)) != 0;
+        if (packed_as_reference != source.TensorIsReference(tensor)) return false;
+        if (packed_as_reference) {
+            if (tag == TensorArgType::OUTPUT) return false;
+            uint32_t producer = 0;
+            uint32_t output_slot = 0;
+            const uint64_t reference = source.TensorWord(tensor, 0);
+            if (!DecodeSimtRequestOutputReference(reference, spec.task_id, producer, output_slot)) return false;
+            Ops::StorePayloadWord(&destination[word++], reference);
+            continue;
+        }
         const uint32_t copied_words = tag == TensorArgType::OUTPUT ? 8U : kExecTensorDescWords;
         for (uint32_t desc_word = 0; desc_word < copied_words; ++desc_word) {
             Ops::StorePayloadWord(&destination[word++], source.TensorWord(tensor, desc_word));
@@ -281,7 +345,8 @@ DecodeSimtBuildRequestHeader(__gm__ const SimtBuildRequestStorage &payload) {
         static_cast<ExecEngineClass>(static_cast<uint8_t>(counts >> 48U)),
         static_cast<uint8_t>(counts >> 56U),
         {},
-        payload.words[7],
+        static_cast<uint32_t>(payload.words[7]),
+        static_cast<uint32_t>(payload.words[7] >> 32U),
     };
     for (uint32_t tensor = 0; tensor < kExecMaxTensors; ++tensor) {
         const uint64_t packed_tags = payload.words[3U + tensor / 8U];
@@ -296,15 +361,29 @@ PTO_DEVICE_FUNC inline bool ValidateSimtBuildRequestPayload(
 ) {
     header = DecodeSimtBuildRequestHeader(payload);
     const SimtBuildRequestSpec spec{
-        header.task_id,      header.function_address,   header.function_id,  header.tensor_count,
-        header.scalar_count, header.explicit_dep_count, header.engine_class, header.flags,
+        header.task_id,
+        header.function_address,
+        header.function_id,
+        header.tensor_count,
+        header.scalar_count,
+        header.explicit_dep_count,
+        header.engine_class,
+        header.flags,
+        header.tensor_reference_mask,
     };
     if (header.reserved != 0 || header.task_id != expected_task_id || !ValidateSimtBuildRequestSpec(spec, layout) ||
         layout.payload_lines != published_lines) {
         return false;
     }
     for (uint32_t tensor = 0; tensor < header.tensor_count; ++tensor) {
-        if (!SimtRequestTensorTagValid(static_cast<TensorArgType>(header.tensor_tags[tensor]))) return false;
+        const TensorArgType tag = static_cast<TensorArgType>(header.tensor_tags[tensor]);
+        if (!SimtRequestTensorTagValid(tag)) return false;
+        if ((header.tensor_reference_mask & (uint32_t{1} << tensor)) == 0) continue;
+        if (tag == TensorArgType::OUTPUT) return false;
+        uint32_t producer = 0;
+        uint32_t output_slot = 0;
+        const uint64_t reference = payload.words[SimtRequestTensorWordOffset(tensor, header.tensor_reference_mask)];
+        if (!DecodeSimtRequestOutputReference(reference, header.task_id, producer, output_slot)) return false;
     }
     for (uint32_t tensor = header.tensor_count; tensor < kExecMaxTensors; ++tensor) {
         if (header.tensor_tags[tensor] != 0) return false;
