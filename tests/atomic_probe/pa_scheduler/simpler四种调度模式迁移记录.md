@@ -1194,3 +1194,20 @@ scheduler mode 决定，不读取 PA task kind、batch、C/V 序列或 Tensor �
 后续若继续消减 replay，必须同时保留并行 request/参数生产能力，例如研究
 可证明完备的多 planner 分工；不能简单把 replay worker 数量降到 1，也不能
 用 PA 固定五 task 或固定 task 类型为任务做静态分片。
+
+### 22.7 已撤销：按 replay rank 确定 request publisher
+
+为同时保留 80 路并行 replay 并删除逐 task tournament，曾按完整物理 block
+拓扑为所有非 Builder worker 建立连续 replay rank，再令
+`publisher_rank = task_id % replay_count`。映射覆盖 1/7/32 block 和动态
+Builder 数，不依赖 PA task 语义；纯协议测试证明每个 task 恰好一个
+publisher，真实 A5 的单 block、2048 满容量和 7 block 跨引擎 INOUT 也通过。
+
+PA B256 五次为 8.013 / 8.051 / 8.095 / 8.068 / 8.173 ms，中位数
+8.068 ms。相对第 22.4 节 8.078 ms 基线只改善约 0.13%，完全落在原样本
+波动内；同时固定映射失去了 first-arriver 自动绕开慢 replay worker 的能力。
+因此实现和新增协议测试均撤销，只保留结果。
+
+这组数据说明，mode4 的 Build tournament 已不是当前端到端主要矛盾。后续应
+先分别测清 request 发布完成前沿、Builder 完成前沿和 Execute 完成前沿，再
+选择优化对象，不能继续凭 atomic 调用数量猜测收益。
