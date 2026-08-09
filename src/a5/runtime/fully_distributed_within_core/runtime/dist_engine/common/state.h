@@ -456,7 +456,8 @@ static_assert(offsetof(SharedPaTensorMapState, insert_completion) % kFdwicShared
 static_assert(sizeof(SharedPaTensorMapState) == 9094784, "shared PA TensorMap sidecar size changed");
 static_assert(alignof(SharedPaTensorMapState) == kCacheLine, "shared PA TensorMap alignment changed");
 
-#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3 || \
+    PTO_FDWIC_SCHEDULER_MODE == 4
 // Cross-core backends keep one immutable execution cell per logical task for
 // the entire invocation. The common prefix owns execution, output, heap and
 // conservative TensorMap contracts; mode-specific state only appends after
@@ -518,7 +519,9 @@ static_assert(
         sizeof(CrossCoreRuntimeState) + kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::DagTaskMetadataCell),
     "cross-core DAG state size changed"
 );
-#elif PTO_FDWIC_SCHEDULER_MODE == 3
+#endif
+
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
 // Dynamic Submit has no random-access host task plan. Scalar publishers fill
 // task-indexed immutable requests, while persistent SIMT warp leaders consume
 // fixed strided task streams. The three lifecycle words are deliberately
@@ -531,6 +534,7 @@ struct alignas(kCacheLine) SimtBuilderLifecycleState {
 static_assert(sizeof(SimtBuilderLifecycleState) == 3 * kCacheLine);
 static_assert(alignof(SimtBuilderLifecycleState) == kCacheLine);
 
+#if PTO_FDWIC_SCHEDULER_MODE == 3
 struct alignas(kCacheLine) SimtCrossCoreOrdinaryState {
     CrossCoreRuntimeState runtime;
     SimtBuilderLifecycleState lifecycle;
@@ -548,6 +552,36 @@ static_assert(
             kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::SimtBuildRequestCell),
     "SIMT cross-core ordinary state size changed"
 );
+#else
+// The DAG mode shares the exact runtime/lifecycle/request prefix with the
+// ordinary SIMT mode. Per-task writer metadata is appended after immutable
+// requests, so request addressing remains identical while dependency lookup
+// has its own independently reset publication controls.
+struct alignas(kCacheLine) SimtCrossCoreDagState {
+    CrossCoreRuntimeState runtime;
+    SimtBuilderLifecycleState lifecycle;
+    fdwic::cross_core::SimtBuildRequestCell requests[kFdwicCrossCoreTaskCapacity];
+    fdwic::cross_core::DagTaskMetadataCell metadata[kFdwicCrossCoreTaskCapacity];
+};
+static_assert(offsetof(SimtCrossCoreDagState, runtime) == 0);
+static_assert(offsetof(SimtCrossCoreDagState, lifecycle) == sizeof(CrossCoreRuntimeState));
+static_assert(
+    offsetof(SimtCrossCoreDagState, requests) == sizeof(CrossCoreRuntimeState) + sizeof(SimtBuilderLifecycleState)
+);
+static_assert(
+    offsetof(SimtCrossCoreDagState, metadata) ==
+    sizeof(CrossCoreRuntimeState) + sizeof(SimtBuilderLifecycleState) +
+        kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::SimtBuildRequestCell)
+);
+static_assert(alignof(SimtCrossCoreDagState) == kCacheLine);
+static_assert(
+    sizeof(SimtCrossCoreDagState) ==
+        sizeof(CrossCoreRuntimeState) + sizeof(SimtBuilderLifecycleState) +
+            kFdwicCrossCoreTaskCapacity *
+                (sizeof(fdwic::cross_core::SimtBuildRequestCell) + sizeof(fdwic::cross_core::DagTaskMetadataCell)),
+    "SIMT cross-core DAG state size changed"
+);
+#endif
 #endif
 #endif
 
@@ -644,6 +678,8 @@ struct DistGlobal {
     CrossCoreDagState cross_core_dag;
 #elif PTO_FDWIC_SCHEDULER_MODE == 3
     SimtCrossCoreOrdinaryState simt_cross_core_ordinary;
+#elif PTO_FDWIC_SCHEDULER_MODE == 4
+    SimtCrossCoreDagState simt_cross_core_dag;
 #endif
 #endif
 };
@@ -699,6 +735,15 @@ static_assert(
     sizeof(DistGlobal) ==
         kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState) + sizeof(SimtCrossCoreOrdinaryState),
     "SIMT cross-core ordinary DistGlobal size changed"
+);
+#elif PTO_FDWIC_SCHEDULER_MODE == 4
+static_assert(
+    offsetof(DistGlobal, simt_cross_core_dag) == kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState),
+    "SIMT cross-core DAG state must append after the existing shared TensorMap state"
+);
+static_assert(
+    sizeof(DistGlobal) == kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState) + sizeof(SimtCrossCoreDagState),
+    "SIMT cross-core DAG DistGlobal size changed"
 );
 #else
 static_assert(

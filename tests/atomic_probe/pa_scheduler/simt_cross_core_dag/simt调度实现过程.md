@@ -3741,7 +3741,7 @@ v9 因此继续在 host 导出阶段计算“精确持续区间的补集”：
 最终按物理 block 重排后的真实 A5 图中，各类均为 256 个样本：
 
 | kind | cross_core_ordinary median/us | SIMT median/us | SIMT min/p95/max us |
-| ---- | -------------------: | -------------: | ------------------: |
+| ---- | ----------------------------: | -------------: | ------------------: |
 | QK | 40.954 | 41.081 | 40.216 / 49.361 / 51.982 |
 | SF | 53.575 | **56.920** | 52.077 / 61.878 / 67.431 |
 | PV | 27.460 | 27.306 | 26.792 / 34.740 / 36.746 |
@@ -3900,14 +3900,12 @@ workload 口径。
 近邻入围项统一复测 11 轮。第一轮新鲜初始化没有剔除，最终排序只采用 11/11
 通过配置的 ACL kernel event 中位数。入围结果如下：
 
-| B | 第 1 名 | median/us | 第 2 名 | median/us | 第 3 名 | median/us |
-| -: | ------- | --------: | ------- | --------: | ------- | --------: |
-| 1 | W16 | 2946.263 | W14 | 3303.954 | W26 | 3307.122 |
-| 2 | W32 | 1646.371 | W28 | 1697.087 | W8 | 1784.520 |
-| 4 | W30 | 1013.554 | W16 | 1041.676 | W15 | 1047.185 |
-| 8 | W5 | **926.038** | W7 | 945.652 | W6 | 952.794 |
-| 16 | W5 | 946.850 | W3 | 947.485 | W4 | 954.408 |
-| 32 | W2 | 950.701 | W1 | 988.489 | W5 | 1006.230 |
+- B1：W16 `2946.263 us`，W14 `3303.954 us`，W26 `3307.122 us`；
+- B2：W32 `1646.371 us`，W28 `1697.087 us`，W8 `1784.520 us`；
+- B4：W30 `1013.554 us`，W16 `1041.676 us`，W15 `1047.185 us`；
+- B8：W5 **`926.038 us`**，W7 `945.652 us`，W6 `952.794 us`；
+- B16：W5 `946.850 us`，W3 `947.485 us`，W4 `954.408 us`；
+- B32：W2 `950.701 us`，W1 `988.489 us`，W5 `1006.230 us`。
 
 本轮扫描范围内的全局最优是 B8/W5 的 926.038 us。B16/W4 与未入选 W6
 只差 0.469 us，B1/W14 与 W26 只差 3.168 us，属于 unlocked device 上的
@@ -3953,3 +3951,34 @@ owner、kind、engine、起点和时长逐项一致；唯一 E2E 轨与顶层 du
 | U0 UBUF 单槽 | 完成 | 64-warp/lane0 纯 SIMT 单槽；CPU 三套、CCEC/ELF 门槛和 A5 同地址 100/100 全部 PASS；G0/G1 四组真机回归 PASS。 |
 | U1 UBUF 多槽/多 task | 完成 | `a20a29e2`；CPU 三套、CCEC/bitcode/mixed ELF 门槛全部 PASS；A5 smoke 1/1 与同地址复用 100/100，四槽 `maxbusy=4`、每槽 generation `0..31`精确闭合。 |
 | U2 UBUF 完整 PA | 功能完成，停止性能优化 | 同源 transport policy、四槽 ordered generation、真实 payload word/tail 与完整 PA oracle 已闭合；共享的按-symbol writer 协议在最终 B1 令 predecessor poll 为 0；CPU 三套和 CCEC/bitcode/mixed ELF 全部 PASS，真机 B1 3/3。由于 UBUF staging 不能消除最终 GM 写，后续只保留功能与共享协议回归。 |
+
+## 24. 生产 Simpler 动态 Submit 迁移
+
+### 24.1 独立状态与复位合同
+
+生产迁移不复制 standalone 的静态 PA task plan。mode 4 与已经闭合的 mode 3
+共用动态 Submit 请求 ABI，状态采用以下布局：
+
+```text
+CrossCoreRuntimeState
+SimtBuilderLifecycleState
+SimtBuildRequestCell[2048]
+DagTaskMetadataCell[2048]
+```
+
+前三段与 `simt_cross_core_ordinary` 的偏移完全一致，使 Scalar publisher 与
+SIMT consumer 可以复用同一请求寻址。DAG metadata 只追加在请求数组之后，控制行
+与 writer payload 分离，不改变公共 execution/output/heap wire protocol。
+
+AICPU 仍是唯一复位方。每轮运行前：
+
+- 公共 runtime 的 fatal、heap、execute-owner、exec/output control 与 ordinary
+  map 控制按既有合同复位；
+- builder lifecycle 复位为 `0/-1/0`；
+- 2048 个 request control 和 2048 个 DAG metadata control 全部置零；
+- request 与 DAG metadata 的不可变 payload 不做无意义清零，只有对应 control
+  发布后才允许 consumer 读取。
+
+新增 mode-4 状态单测 2/2 PASS，并重新运行 mode 1 ordinary、mode 2 DAG、mode 3
+SIMT ordinary 的状态与复位单测 6/6 PASS。此小节只闭合布局和生命周期，不提前
+打开真实 Submit 路由；动态 SIMT DAG builder 尚未接入，因此 A5 为 NOT RUN。

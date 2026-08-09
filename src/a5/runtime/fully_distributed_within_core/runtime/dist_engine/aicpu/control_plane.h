@@ -152,6 +152,8 @@ int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int n
     dist_cross_core_dag_reset(g_dist.cross_core_dag);
 #elif PTO_FDWIC_SCHEDULER_MODE == 3
     dist_simt_cross_core_ordinary_reset(g_dist.simt_cross_core_ordinary);
+#elif PTO_FDWIC_SCHEDULER_MODE == 4
+    dist_simt_cross_core_dag_reset(g_dist.simt_cross_core_dag);
 #endif
 #endif
     g_dist.orch_args = orch_args;
