@@ -440,3 +440,15 @@ median = 173.206 ms
 16 个定向 FDWIC C++ 身份/协议测试全部 PASS；`test_scene_test_cache.py`
 140 项 PASS。全仓 C++/Python 构建仍被 A2/A3 `PTO2TaskPayload` 既有布局
 断言（期望 576，当前 568）阻断，本轮没有改动该架构。
+
+### 12.4 否决每 builder 增加 warp
+
+K=16 固定后，又将每个 builder 从 128 thread/4 warp 单变量提高到
+160 thread/5 warp。该配置能正常 CCEC 构建，PA B256 也完整 PASS，但
+startup→FinalDrain 为 254.568 ms，相对 W4 的 173.206 ms 中位数回退
+约 47%。这不在同期 W4 波动范围内。
+
+本轮只能证明：在 Simpler 真实动态 Submit、K=16 和当前 GM/atomic
+协议下，增加 leader 数量会大幅恶化端到端性能。没有分阶段计数时，
+不把回退唯一归因为某条 atomic 或 VF 资源。W5 已完整撤回，保留
+W4；既然 W5 已是数量级回退，不继续盲测 W8。
