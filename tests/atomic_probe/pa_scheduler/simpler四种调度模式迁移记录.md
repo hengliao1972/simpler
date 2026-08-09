@@ -93,9 +93,82 @@ pytest 会按源码指纹重编 AICore override，但不会代替安装/运行�
 scheduler mode 必须先显式调用存量 `RuntimeBuilder` 重建对应 artifact family，
 再跑上板用例。不允许用新 AICore 与旧 host 的组合解释 raw。
 
-## 5. 下一阶段
+## 5. 四模式 B256 首轮基线
 
-1. 重建四种 scheduler mode 的 A5 shared runtime；
-2. 分别运行同一 PA B256，采集独立进程的 startup 到 FinalDrain 数据；
-3. 核对 1280 task、1024 Kernel、金标、replay/builder 角色和终态；
-4. 再与同负载、同端点的独立调度器数据对比，分析 Simpler 集成差距。
+### 5.1 测试条件与可比边界
+
+四种模式均使用真实 A5 `Case1`、shared TensorMap、32 个物理 block，
+每次由独立 pytest 进程运行。命令只选择 `perf-clock` 或
+`perf-clock-kernel`，没有同时开启泳道、atomic 或 PMU。
+
+`--use-example-exec-time` 明确只允许 A5Sim，不能用于真实 A5；因此本节
+执行的是 Simpler PA 的真实 QK/SF/PV/UP Kernel，并保留数值 golden。它可用于
+四种 Simpler 集成模式之间的同业务横比，但不能与 standalone 的
+`6/28/4/1` 合成负载绝对时间直接相减。
+
+四种模式均满足：
+
+- `Case1` 数值 golden PASS；
+- 1280 个动态 task 闭合；
+- replay worker 每核恰好 1280 次 Submit；
+- `perf-clock-kernel` 恰好统计到 1024 次 Kernel，其中 AIC/AIV 各 512 次；
+- 模式 1/2 为 96 replay + 0 builder，模式 3/4 为 95 replay + 1 builder。
+
+### 5.2 无 Kernel 聚合的低扰动首样本
+
+| 模式 | startup 到 FinalDrain | 角色闭合 | 产物目录 |
+| --- | ---: | --- | --- |
+| `cross_core_ordinary` | 71.365 ms | 96 replay + 0 builder | `TestPagedAttentionUnroll_Case1_20260809_054624` |
+| `cross_core_dag` | 70.748 ms | 96 replay + 0 builder | `TestPagedAttentionUnroll_Case1_20260809_054849` |
+| `simt_cross_core_ordinary` | 144.191 ms | 95 replay + 1 builder | `TestPagedAttentionUnroll_Case1_20260809_055000` |
+| `simt_cross_core_dag` | 1321.880 ms | 95 replay + 1 builder | `TestPagedAttentionUnroll_Case1_20260809_055116` |
+
+这是每种模式的首个正确性闭合样本，只用于识别数量级，不把单样本当稳定
+中位数。尤其 `simt_cross_core_dag` 已比其他模式慢一个数量级，继续盲目跑十轮
+不会增加定位价值，必须先修复协议热点再重复采样。
+
+### 5.3 Kernel 聚合诊断
+
+`perf-clock-kernel` 是另一种 ELF，不能与上一表逐项相减。下表只在同一诊断
+构建族内比较；Kernel 时间与 residual 都是 96 核各自累计后的 core-time，
+不是端到端墙钟。
+
+| 模式 | 端到端 | Kernel 调用 | Kernel core-time | 非 Kernel core-time | Kernel 占比 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `cross_core_ordinary` | 71.442 ms | 1024 | 50.218 ms | 6804.800 ms | 0.733% |
+| `cross_core_dag` | 70.907 ms | 1024 | 48.709 ms | 6755.869 ms | 0.716% |
+| `simt_cross_core_ordinary` | 110.152 ms | 1024 | 51.829 ms | 10520.190 ms | 0.490% |
+| `simt_cross_core_dag` | 1327.920 ms | 1024 | 51.613 ms | 127426.108 ms | 0.040% |
+
+四种模式的 Kernel 调用数完全相同，Kernel core-time 也都在 48.7～51.8 ms；
+SIMT DAG 的数量级回退几乎全部位于调度残差，不能归因于多执行 Kernel 或
+Kernel workload 改变。
+
+### 5.4 当前可证实的性能根因
+
+第一处差距是 builder 拓扑。当前 Simpler 的两种 SIMT 模式只让唯一
+`block0/AIV0` 启动一个 128-thread VF，实际只有 4 个 warp leader 工作；
+standalone 的有效配置可以让多个 AIV builder 并行，二者不是同一供给能力。
+
+第二处、也是当前最大的差距，是动态 DAG writer 查询。当前
+`dist_simt_lookup_dag()` 对每个 INPUT/INOUT 都从 `N-1` 向后扫描
+`[N-H,N)`；默认 `H=64`。每个候选至少包含返回型 atomic control load，
+命中前还会再次读取 control 验证不变；候选未发布时，当前 warp 继续 poll。
+四个 leader 又以 task id 交错前进，因此一次慢 metadata 发布会把同一 wave
+中的其他 lookup 变成等待。
+
+Scalar `cross_core_dag` 也使用同类逆向查询，但 Build 分散在 96 个 Scalar，
+所以首轮没有出现 SIMT 单 builder 下的数量级放大。standalone 的最佳泛化
+记录采用按 symbol 精确前驱和更多 builder，已经把大量 predecessor poll
+消除；它提供优化方向，但其固定 PA workload、builder 数和端点必须先与
+Simpler 动态 Submit 合同逐项对齐，不能直接照抄性能数字。
+
+## 6. 后续收敛顺序
+
+1. 先把 SIMT 唯一 builder 改成按真实 AIV 拓扑扩展的通用多 builder 合同；
+   builder rank、leader stride、启动/完成计数和 host 角色闭合必须一致。
+2. 再独立消减 DAG 的 `O(H × 输入数)` writer 扫描；不得编码 PA task kind
+   或固定 `5 × batch` 图形。
+3. 每一阶段先跑 CPU/协议门槛，再跑 A5 B1/B256 功能和单轮低扰动性能；
+   数量级回退修复后才恢复独立进程多轮采样。
+4. 最后只与同 workload、同 startup→FinalDrain 端点的 standalone 结果横比。
