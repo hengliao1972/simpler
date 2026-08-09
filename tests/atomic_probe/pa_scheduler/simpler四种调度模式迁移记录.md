@@ -331,3 +331,32 @@ AICPU 复位。原 SIMT 热路径仍存在三类重复返回型 atomic：
 CCEC clean build 通过，真实 A5 非 PA 的
 `A5OnboardBd24ExistingInoutChain` 也通过。该项建立在明确的不可变发布合同上，
 不含 PA 特例，予以保留。
+
+## 10. 第二阶段候选：否决按 owner 缩短 metadata 扫描窗
+
+### 10.1 候选与正确性证据
+
+Tensor descriptor 的有效 `owner_task_id` 已作为 fanin 加入，因此从依赖集合
+语义看，region 查询只需寻找 owner 之后、consumer 之前的更新 writer。候选
+据此把 lookup history 收窄为：
+
+```text
+min(H, consumer_task - owner_task - 1)
+```
+
+owner 无效的外部 Tensor 仍使用完整 H。该规则不识别算子类型，公共边界单测、
+Scalar/SIMT DAG CCEC 构建，以及两种 DAG 模式的真实 A5 非 PA Bd24 INOUT 链
+均通过。
+
+### 10.2 端到端否决
+
+mode4 PA B256 三次独立进程结果为 206.913 / 205.614 / 213.672 ms，中位
+206.913 ms；当前保留版三次中位为 185.231 ms，候选回退约 11.7%。这已经超出
+同期波动范围，因此实现代码已完整撤回。
+
+候选确实减少了 metadata control 查询，但本轮没有 builder 分阶段计数，不能把
+回退原因直接断言为某一个后续 atomic。可验证的事实只有：加速 lookup 后，大量
+builder 更早进入 heap/output/exec 共享发布阶段，整体时间反而恶化；“原扫描形成
+自然错峰、消除后放大后段竞争”是下一轮需要用计数验证的假设，不作为既成结论。
+后续若再减少扫描，必须同时观测 lookup 与后续共享发布，而不能只按减少 GM/atomic
+次数判断收益。
