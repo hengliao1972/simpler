@@ -626,12 +626,6 @@ DIST_SIMT_CALLEE bool dist_simt_publish_exec(
         (payload_bytes + fdwic::cross_core::kExecCacheLineBytes - 1U) / fdwic::cross_core::kExecCacheLineBytes;
     if (payload_lines == 0 || payload_lines > fdwic::cross_core::kExecMaxPayloadLines) return false;
     __gm__ uint64_t *control = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&cell->control.state));
-    const uint64_t building = dist_simt_exec_state(
-        static_cast<uint32_t>(fdwic::cross_core::ExecPhase::Building), build_owner,
-        fdwic::cross_core::kExecUnboundOwner, static_cast<uint32_t>(fdwic::cross_core::ExecEngineClass::None), 0,
-        request.task_id
-    );
-    if (dist_simt_atomic_cas(control, 0, building) != 0) return false;
 
     __gm__ uint64_t *payload = const_cast<__gm__ uint64_t *>(cell->payload.words);
     dist_simt_store(payload + 0, request.task_id);
@@ -682,7 +676,13 @@ DIST_SIMT_CALLEE bool dist_simt_publish_exec(
         static_cast<uint32_t>(fdwic::cross_core::ExecPhase::Built), build_owner, fdwic::cross_core::kExecUnboundOwner,
         request.engine_class, payload_lines, request.task_id
     );
-    if (dist_simt_atomic_cas(control, building, built) != building) return false;
+    // Task ids are statically partitioned across (builder, warp) pairs, so a
+    // SIMT execution packet has exactly one build owner. Keep the control
+    // Empty while constructing its unreachable payload, then let the final
+    // CAS both publish Built and fail closed if that ownership invariant is
+    // ever violated. The generic multi-claim Building phase is unnecessary
+    // on this uniquely routed path.
+    if (dist_simt_atomic_cas(control, 0, built) != 0) return false;
     if (request.engine_class != static_cast<uint32_t>(fdwic::cross_core::ExecEngineClass::Immediate)) return true;
 
     __gm__ uint64_t *task = reinterpret_cast<__gm__ uint64_t *>(&task_cells[request.task_id]);

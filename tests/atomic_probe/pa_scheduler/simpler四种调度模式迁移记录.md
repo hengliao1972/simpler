@@ -360,3 +360,21 @@ builder 更早进入 heap/output/exec 共享发布阶段，整体时间反而恶
 自然错峰、消除后放大后段竞争”是下一轮需要用计数验证的假设，不作为既成结论。
 后续若再减少扫描，必须同时观测 lookup 与后续共享发布，而不能只按减少 GM/atomic
 次数判断收益。
+
+## 11. 第二阶段保留项：唯一 SIMT builder 直接发布 Built
+
+SIMT builder 以 `builder_rank * warps + warp` 取得首 task，并以全局 leader 数为
+stride；同一 task 只可能由一个 `(builder, warp)` 构建。旧路径仍沿用多方 Build
+竞争协议，先做 `Empty -> Building` CAS，写 payload 后再做
+`Building -> Built` CAS。
+
+保留版在 control 仍为 Empty 时构造不可见 payload，最后用一次
+`Empty -> Built` CAS 同时完成发布与唯一 owner 校验。如果拓扑错误导致第二个
+builder 到达，CAS 返回值仍会令其 fail-closed。Immediate task 继续执行
+`Built -> Done`，task completion 与依赖可见顺序不变。Scalar 构建路径仍保留
+通用 Building reservation，不受此优化影响。
+
+真实 A5 非 PA Bd24 INOUT 链通过；PA B256 三次独立进程结果为
+183.457 / 184.400 / 188.445 ms，中位 184.400 ms。相对上一保留版 185.231 ms
+中位降低 0.831 ms，约 0.45%。两组范围重叠，仍只认定为符合协议的一次明确
+atomic 消减，不将其描述为主要瓶颈突破。
