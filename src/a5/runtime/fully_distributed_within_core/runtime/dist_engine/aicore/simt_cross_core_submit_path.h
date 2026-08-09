@@ -11,7 +11,7 @@
 
 #pragma once
 
-#if PTO_FDWIC_SCHEDULER_MODE == 3
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
 
 #include "dist_engine/aicore/cross_core_kernel_classification.h"
 #include "dist_engine/aicore/cross_core_simt_request_source.h"
@@ -24,8 +24,18 @@ using fdwic::cross_core::SimtL0TaskArgsRequestSource;
 using fdwic::cross_core::SimtRequestPublishResult;
 using fdwic::cross_core::SimtRequestReserveResult;
 
-PTO_DEVICE_FUNC __gm__ SimtCrossCoreOrdinaryState &dist_simt_cross_core_state() {
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+using DistSimtCrossCoreState = SimtCrossCoreOrdinaryState;
+#else
+using DistSimtCrossCoreState = SimtCrossCoreDagState;
+#endif
+
+PTO_DEVICE_FUNC __gm__ DistSimtCrossCoreState &dist_simt_cross_core_state() {
+#if PTO_FDWIC_SCHEDULER_MODE == 3
     return g_dist.simt_cross_core_ordinary;
+#else
+    return g_dist.simt_cross_core_dag;
+#endif
 }
 
 PTO_DEVICE_FUNC bool dist_simt_cross_core_fail(int32_t task_id, int32_t error_code) {
@@ -265,4 +275,4 @@ dist_simt_cross_core_alloc_compete_first_finish(const DistCompeteFirstTicket &ti
 
 }  // namespace
 
-#endif  // PTO_FDWIC_SCHEDULER_MODE == 3
+#endif  // PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4

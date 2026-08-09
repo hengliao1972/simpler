@@ -3982,3 +3982,33 @@ AICPU 仍是唯一复位方。每轮运行前：
 新增 mode-4 状态单测 2/2 PASS，并重新运行 mode 1 ordinary、mode 2 DAG、mode 3
 SIMT ordinary 的状态与复位单测 6/6 PASS。此小节只闭合布局和生命周期，不提前
 打开真实 Submit 路由；动态 SIMT DAG builder 尚未接入，因此 A5 为 NOT RUN。
+
+### 24.2 动态 Submit 与 A5sim Scalar DAG 语义闭合
+
+本阶段将 mode 4 接入生产 Simpler 的动态 Submit 入口，仍然不使用
+standalone 的静态 PA task plan。每个动态 task 的参数、Tensor 区域、显式
+依赖与 mixed-kernel 信息都先发布到不可变 request cell，再按以下合同
+完成构建：
+
+1. Materialize 真实 output TensorDesc；
+2. 每个 task 都发布 DAG writer metadata，包括 writer 数为零的 task；
+3. 从已发布的前序 metadata 中查找最新的重叠 writer，不允许跳过尚未
+   发布的前序 task；
+4. 合并 descriptor owner、显式依赖与 TensorMap 推导依赖；
+5. 发布不可变 execution packet，执行 owner 只消费 packet，不重读 request。
+
+mode 4 复用 mode 3 已验证的 Scalar request publisher、compete-first 与跨核
+execution packet 协议；独立的 mode-4 状态决定 DAG metadata 存放位置。CPU
+与 A5sim 暂时使用已闭合的 Scalar DAG builder 作为语义参考，用于先证明
+动态 request 到 DAG fanin 和 execution packet 的正确性，而不把构建方式
+伪装成真实 A5 SIMT 路径。
+
+本阶段实测：
+
+- A5sim PA CaseB1：PASS；
+- A5sim PA Case1/B256：PASS；
+- 两组用例均使用 `shared + simt_cross_core_dag`，且走动态 Simpler
+  Submit 入口。
+
+此结果只证明生产动态语义已在模拟器上闭合。真实 A5 所需的持久
+SIMT DAG builder 仍未接入，因此 A5 继续标记为 NOT RUN，不报性能收益。

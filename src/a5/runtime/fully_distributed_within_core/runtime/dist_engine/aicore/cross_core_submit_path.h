@@ -11,7 +11,8 @@
 
 #pragma once
 
-#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3 || \
+    PTO_FDWIC_SCHEDULER_MODE == 4
 
 #include "dist_engine/aicore/cross_core_kernel_classification.h"
 #include "dist_engine/aicore/tensor_map_common.h"
@@ -39,8 +40,10 @@ PTO_DEVICE_FUNC __gm__ CrossCoreRuntimeState &dist_cross_core_runtime_state() {
     return g_dist.cross_core_ordinary;
 #elif PTO_FDWIC_SCHEDULER_MODE == 2
     return g_dist.cross_core_dag.runtime;
-#else
+#elif PTO_FDWIC_SCHEDULER_MODE == 3
     return g_dist.simt_cross_core_ordinary.runtime;
+#else
+    return g_dist.simt_cross_core_dag.runtime;
 #endif
 }
 
@@ -309,7 +312,15 @@ dist_cross_core_publish_map_task(DistSubmitCtx &ctx, const CrossMapValue writer_
     return true;
 }
 
+#if PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 4
+PTO_DEVICE_FUNC __gm__ fdwic::cross_core::DagTaskMetadataCell *dist_cross_core_dag_metadata() {
 #if PTO_FDWIC_SCHEDULER_MODE == 2
+    return &g_dist.cross_core_dag.metadata[0];
+#else
+    return &g_dist.simt_cross_core_dag.metadata[0];
+#endif
+}
+
 PTO_DEVICE_FUNC bool dist_cross_core_dag_prepare_dependencies(const L0TaskArgs &args, DistSubmitCtx &ctx) {
     CrossMapValue writer_entries[fdwic::cross_core::kDagMaxWriterRegions];
     uint32_t writer_count = 0;
@@ -322,7 +333,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_dag_prepare_dependencies(const L0TaskArgs &
         ++writer_count;
     }
     __gm__ fdwic::cross_core::DagTaskMetadataCell &metadata =
-        g_dist.cross_core_dag.metadata[static_cast<uint32_t>(ctx.task_id)];
+        dist_cross_core_dag_metadata()[static_cast<uint32_t>(ctx.task_id)];
     if (fdwic::cross_core::PublishDagTaskMetadata<DistCrossCoreAicoreOps>(
             metadata, static_cast<uint32_t>(ctx.task_id), writer_entries, writer_count
         ) != fdwic::cross_core::DagMetadataPublishResult::Published) {
@@ -353,7 +364,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_dag_prepare_dependencies(const L0TaskArgs &
             int32_t producer = -1;
             const fdwic::cross_core::DagWriterLookupResult lookup =
                 fdwic::cross_core::FindLatestDagWriter<DistCrossCoreAicoreOps>(
-                    g_dist.cross_core_dag.metadata, kFdwicCrossCoreTaskCapacity, query,
+                    dist_cross_core_dag_metadata(), kFdwicCrossCoreTaskCapacity, query,
                     static_cast<uint32_t>(ctx.task_id), static_cast<uint32_t>(g_dist.H), producer
                 );
             if (lookup == fdwic::cross_core::DagWriterLookupResult::Found) {
@@ -545,7 +556,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
     while (true) {
         const int64_t raw_state = DistCrossCoreAicoreOps::Load(&cell.control.state);
         const fdwic::cross_core::DecodedExecState state = fdwic::cross_core::DecodeExecState(raw_state);
-#if PTO_FDWIC_SCHEDULER_MODE == 3
+#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
         // The SIMT builder is fully asynchronous with the Scalar publisher and
         // execute owner: output descriptors may be visible before the exec cell
         // advances from Empty to Building. Empty is therefore pending producer
@@ -797,4 +808,4 @@ dist_cross_core_alloc_compete_first_finish(const DistCompeteFirstTicket &ticket,
 
 }  // namespace
 
-#endif  // PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3
+#endif  // PTO_FDWIC_SCHEDULER_MODE is a cross-core mode.
