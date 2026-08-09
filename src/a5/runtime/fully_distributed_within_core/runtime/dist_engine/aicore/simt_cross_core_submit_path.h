@@ -25,6 +25,16 @@ using fdwic::cross_core::SimtL0TaskArgsRequestSource;
 using fdwic::cross_core::SimtRequestPublishResult;
 using fdwic::cross_core::SimtRequestReserveResult;
 
+#if PTO_FDWIC_SCHEDULER_MODE == 4
+// DAG 模式已有多路持久 Builder，Build 吞吐足以让 Execute 在 replay 后集中
+// 领取；AIC/AIV 两条单调 ticket 流替代每 task 两级 tournament + owner CAS。
+// Ordinary 只有一个 Builder，必须保留逐 Submit 的 Build/Execute 流水，不能
+// 套用此策略。该分支只依赖调度拓扑，不检查 PA task 类型或任务形状。
+constexpr uint32_t kDistSimtAicDispatchControl = 0;
+constexpr uint32_t kDistSimtAivDispatchControl = 1;
+static_assert(kFdwicCrossCoreTaskCapacity > kDistSimtAivDispatchControl);
+#endif
+
 #if PTO_FDWIC_SCHEDULER_MODE == 3
 using DistSimtCrossCoreState = SimtCrossCoreOrdinaryState;
 #else
@@ -38,6 +48,13 @@ PTO_DEVICE_FUNC __gm__ DistSimtCrossCoreState &dist_simt_cross_core_state() {
     return g_dist.simt_cross_core_dag;
 #endif
 }
+
+#if PTO_FDWIC_SCHEDULER_MODE == 4
+PTO_DEVICE_FUNC __gm__ volatile int64_t &dist_simt_cross_core_dispatch_cursor(ExecEngineClass engine) {
+    const uint32_t control = engine == ExecEngineClass::Aic ? kDistSimtAicDispatchControl : kDistSimtAivDispatchControl;
+    return dist_simt_cross_core_state().runtime.execute_owner[control].state;
+}
+#endif
 
 PTO_DEVICE_FUNC bool dist_simt_cross_core_fail(int32_t task_id, int32_t error_code) {
     __gm__ DistCore *self = g_self;
@@ -144,8 +161,144 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_finish_request(
 #endif
     }
     if (acquire_outputs && !dist_cross_core_acquire_outputs(ctx)) return false;
+#if PTO_FDWIC_SCHEDULER_MODE == 4
+    // Execute 由独立的 AIC/AIV ticket 流领取。Submit 热路径只负责发布
+    // immutable request 和返回 orchestration 所需输出；不得再把最早到达
+    // Submit 的 Scalar 固定成等待 Built 的 execute owner。
+    (void)kind;
+    (void)engine_class;
+    return true;
+#else
     return kind != DistSubmitKind::Kernel || dist_cross_core_bind_execution(ctx, engine_class);
+#endif
 }
+
+#if PTO_FDWIC_SCHEDULER_MODE == 4
+enum class DistSimtDispatchResult : uint8_t {
+    Completed = 0,
+    Exhausted = 1,
+    Failed = 2,
+};
+
+PTO_DEVICE_FUNC DistSimtDispatchResult
+dist_simt_cross_core_dispatch_one(__gm__ DistCore *self, uint32_t task_id, ExecEngineClass executor_engine) {
+    if (self == nullptr || task_id >= kFdwicCrossCoreTaskCapacity ||
+        (executor_engine != ExecEngineClass::Aic && executor_engine != ExecEngineClass::Aiv)) {
+        (void)dist_simt_cross_core_fail(static_cast<int32_t>(task_id), PTO2_ERROR_TENSORMAP_PROTOCOL);
+        return DistSimtDispatchResult::Failed;
+    }
+    __gm__ SharedExecCell &cell = dist_simt_cross_core_state().runtime.tasks[task_id];
+    uint32_t polls = 0;
+    while (true) {
+        const int64_t raw_state = DistCrossCoreAicoreOps::Load(&cell.control.state);
+        if (raw_state == 0) {
+            // 最先完成 replay 的 Scalar 用 sealed_task_count 发布真实任务总数。
+            // 尾部 executor 可能在封口前领取到第 N 个 ticket；若 N 已越界，
+            // 这是正常穷尽，不能永久等待一个永远不会发布的 task cell。
+            const int64_t sealed =
+                DistCrossCoreAicoreOps::Load(&dist_simt_cross_core_state().lifecycle.sealed_task_count.state);
+            if (sealed >= 0 && static_cast<int64_t>(task_id) >= sealed) {
+                return DistSimtDispatchResult::Exhausted;
+            }
+            SPIN_WAIT_HINT();
+            if ((++polls & 1023U) == 0 && fdwic_trace_is_fatal(static_cast<int32_t>(task_id))) {
+                return DistSimtDispatchResult::Failed;
+            }
+            continue;
+        }
+        const fdwic::cross_core::DecodedExecState state = fdwic::cross_core::DecodeExecState(raw_state);
+        if (!state.valid || state.task_id != task_id) {
+            (void)dist_simt_cross_core_fail(static_cast<int32_t>(task_id), PTO2_ERROR_TENSORMAP_PROTOCOL);
+            return DistSimtDispatchResult::Failed;
+        }
+        if (state.phase == ExecPhase::Building) {
+            SPIN_WAIT_HINT();
+            if ((++polls & 1023U) == 0 && fdwic_trace_is_fatal(static_cast<int32_t>(task_id))) {
+                return DistSimtDispatchResult::Failed;
+            }
+            continue;
+        }
+        if (state.engine_class != executor_engine) {
+            // AIC/AIV 各自拥有独立 ticket 流，并都会按 task id 扫描。只有
+            // engine 匹配的一侧消费；另一侧在 Builder 发布真实 engine 后
+            // 立即跳过，避免依赖预制的 PA task 表。
+            return DistSimtDispatchResult::Completed;
+        }
+        if (state.phase != ExecPhase::Built) {
+            // 单调 ticket 对每个 engine/task 只分配一次；匹配任务若已被
+            // Claimed/Done，说明存在重复 consumer，不能静默吞掉。
+            (void)dist_simt_cross_core_fail(static_cast<int32_t>(task_id), PTO2_ERROR_TENSORMAP_PROTOCOL);
+            return DistSimtDispatchResult::Failed;
+        }
+        if (!dist_submit_wait_slot_capacity(self, static_cast<int32_t>(task_id))) {
+            return DistSimtDispatchResult::Failed;
+        }
+        ExecToken token{};
+        fdwic::cross_core::ResetExecToken(token);
+        const ExecAcquireResult acquired = fdwic::cross_core::AcquireExecPayload<DistCrossCoreAicoreOps>(
+            cell, task_id, static_cast<uint32_t>(self->core_idx), executor_engine, token,
+            dist_simt_cross_core_state().runtime.fatal
+        );
+        if (acquired == ExecAcquireResult::NotBuilt || acquired == ExecAcquireResult::Lost) continue;
+        if (acquired != ExecAcquireResult::Acquired) {
+            (void)dist_simt_cross_core_fail(static_cast<int32_t>(task_id), PTO2_ERROR_TENSORMAP_PROTOCOL);
+            return DistSimtDispatchResult::Failed;
+        }
+        __gm__ RingSlot *slot = dist_submit_alloc_slot(self);
+        if (slot == nullptr || !dist_cross_core_build_ring_slot(*slot, token)) {
+            if (slot != nullptr) {
+                slot->occupied = false;
+                slot->built = false;
+                --self->occupied_count;
+            }
+            (void)dist_simt_cross_core_fail(static_cast<int32_t>(task_id), PTO2_ERROR_TENSORMAP_PROTOCOL);
+            return DistSimtDispatchResult::Failed;
+        }
+        (void)drain_phase_b(self);
+        return DistSimtDispatchResult::Completed;
+    }
+}
+
+PTO_DEVICE_FUNC bool dist_simt_cross_core_run_executor(__gm__ DistCore *self) {
+    const ExecEngineClass engine = dist_cross_core_executor_engine(self);
+    if (engine != ExecEngineClass::Aic && engine != ExecEngineClass::Aiv) return false;
+    if (dist_cross_core_is_simt_builder_worker(self)) return true;
+    __gm__ volatile int64_t &cursor = dist_simt_cross_core_dispatch_cursor(engine);
+    uint32_t sealed_polls = 0;
+    while (!fdwic_trace_is_fatal()) {
+        const int64_t raw_ticket = DistCrossCoreAicoreOps::FetchAdd(&cursor, int64_t{1});
+        if (g_dist.num_workers <= 0) {
+            return dist_simt_cross_core_fail(-1, PTO2_ERROR_TENSORMAP_PROTOCOL);
+        }
+        const uint64_t maximum_tail_ticket =
+            static_cast<uint64_t>(kFdwicCrossCoreTaskCapacity) + static_cast<uint64_t>(g_dist.num_workers) - 1U;
+        if (raw_ticket < 0 || static_cast<uint64_t>(raw_ticket) > maximum_tail_ticket) {
+            return dist_simt_cross_core_fail(-1, PTO2_ERROR_TENSORMAP_PROTOCOL);
+        }
+        const uint32_t task_id = static_cast<uint32_t>(raw_ticket);
+        if (task_id < kFdwicCrossCoreTaskCapacity) {
+            const DistSimtDispatchResult result = dist_simt_cross_core_dispatch_one(self, task_id, engine);
+            if (result == DistSimtDispatchResult::Failed) return false;
+            if (result == DistSimtDispatchResult::Exhausted) return true;
+            continue;
+        }
+
+        // 恰好发布满容量时，多个 executor 会并发取得 capacity、capacity+1
+        // 等尾票。它们都不得越界访问 task cell；等待 seal 后统一正常退出。
+        while (!fdwic_trace_is_fatal()) {
+            const int64_t sealed =
+                DistCrossCoreAicoreOps::Load(&dist_simt_cross_core_state().lifecycle.sealed_task_count.state);
+            if (sealed >= 0) {
+                if (sealed <= static_cast<int64_t>(kFdwicCrossCoreTaskCapacity)) return true;
+                return dist_simt_cross_core_fail(-1, PTO2_ERROR_TENSORMAP_CAPACITY);
+            }
+            SPIN_WAIT_HINT();
+            if ((++sealed_polls & 1023U) == 0 && fdwic_trace_is_fatal()) return false;
+        }
+    }
+    return false;
+}
+#endif
 
 PTO_DEVICE_FUNC TaskOutputTensors
 dist_simt_cross_core_submit(const MixedKernels *mixed, const L0TaskArgs &args, DistSubmitKind kind) {

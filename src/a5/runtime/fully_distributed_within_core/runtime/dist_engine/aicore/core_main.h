@@ -98,6 +98,11 @@ DIST_API_ATTR PTO_DEVICE_FUNC void DIST_CORE_MAIN_ENTRY(__gm__ Runtime *runtime,
     TRACE_TIMESTAMP(orchestration_end);
 #if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
     if (!simt_builder_worker && !fdwic_trace_is_fatal()) (void)dist_simt_cross_core_seal_requests(self);
+#if PTO_FDWIC_SCHEDULER_MODE == 4
+    // 每个非 builder Scalar 完成自己的 replay 后立即加入对应 engine 的
+    // 中央 ticket 流；快核可与仍在 replay 的核以及持久 Builder 流式并行。
+    if (!simt_builder_worker && !fdwic_trace_is_fatal()) (void)dist_simt_cross_core_run_executor(self);
+#endif
     if (!fdwic_trace_is_fatal()) (void)dist_simt_cross_core_join_builder(self);
 #endif
     // A failed run must not wait on a task ring whose dependency closure is no

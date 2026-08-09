@@ -1088,3 +1088,85 @@ output、多 output、AIC→AIV→AIC deferred 链、重复 INOUT 和交替跨�
 收益证明 publisher 的逐 output descriptor 等待是两种 SIMT simpler 路径的
 通用串行链路。26.1/8.7 ms 仍未达到 2 ms 目标，下一阶段应继续减少全量 replay
 和 Build 任务发放成本，而不是加入 PA task 特例。
+
+## 22. SIMT DAG 改用按执行引擎划分的中央 Execute ticket
+
+### 22.1 为什么只修改 mode4
+
+第 21 章之后，mode4 已有 16 路持久 Builder，Build 供给可以和 replay
+并行。旧 Execute 协议仍在每次 Submit 中让所有同引擎 Scalar 先经过逐 task
+两级 tournament，再由唯一 owner 等待 Built。它同时保留了大量 owner
+竞争和逐 Submit 等待。
+
+本阶段分别实测了两个结构候选：
+
+1. mode3/mode4 都在 replay 结束后集中 Execute：mode3 从约 26.1 ms 回退到
+   38.894 ms，因为唯一 Builder 无法再和逐 Submit Execute 流水重叠；
+2. 只让 mode4 使用集中 Execute：mode3 继续保留原流水，mode4 的多 Builder
+   则能够持续供给 executor。
+
+因此最终只对 mode4 生效。适用条件是“已有多路持久 Builder”这一 scheduler
+拓扑，不是 PA task kind、batch、固定 C/V 序列或 Tensor 形状。
+
+### 22.2 保留协议
+
+mode4 在 runtime 既有 control storage 中复用两个独立的单调 cursor，分别供
+AIC 和 AIV executor 使用：
+
+1. 非 builder Scalar 完成自己的动态 replay 并参与 request seal；
+2. 随即加入自身执行引擎的 ticket 流，与仍在 replay 的 worker 和持久
+   Builder 流式并行；
+3. AIC/AIV 两条流都按 task id 扫描，Builder 发布真实 engine 后，不匹配的
+   一侧立即跳过，匹配的一侧才 claim immutable execution payload；
+4. task cell 尚未发布或处于 Building 时只等待该 cell；已封口且 ticket
+   超过真实 task 数时正常退出；
+5. 恰好 2048 个 task 时，尾部 worker 可以取得 `capacity + k` 的退出票，但
+   不得越界访问 task cell；允许的尾票上界只由 task capacity 和真实 worker
+   数决定；
+6. TensorMap writer 顺序、Build owner、fanin、payload 发布、ring slot 和
+   FinalDrain 合同保持不变。
+
+Submit 热路径不再把最早到达的 Scalar 固定成 Execute owner。Build owner 与
+Execute owner 仍完全独立；只是 Execute 的领取从逐 task 全体竞争变为每个
+引擎的一次单调 ticket。
+
+### 22.3 通用正确性门槛
+
+当前门槛已扩展为十二类，不依赖 PA：
+
+- 1/4/32 block 下的 Build/Execute 到达偏斜；
+- 2047 与 2048 个零参数 AIC/AIV 交替 task；
+- AIC→AIV→AIC deferred 跨角色依赖；
+- 单 task 多 output 分槽消费；
+- 连续 32 个 INOUT writer；
+- 零 Submit；
+- 7 block、17 个质数 task 的纯 AIC、纯 AIV；
+- 7 block 下 AIC/AIV 交替写同一 INOUT region。
+
+四种 scheduler 均完整运行这十二类，合计 **48/48** 个真实 A5
+模式/场景组合数值 golden PASS。2048 满容量用例还验证了并发尾票退出；它的
+零参数 kernel 不访问 TensorMap 或 heap，避免把 task 状态容量与其他容量合同
+混为一谈。本阶段不使用 A5Sim。
+
+### 22.4 PA B256 性能
+
+相同 shared TensorMap、真实 PA B256、startup→FinalDrain `perf-clock` 口径：
+
+| 模式 | 本阶段结果 | 中位数/单样本 | 第 21 章对照 | 变化 |
+| ---- | ---------- | ------------: | -----------: | ---: |
+| `simt_cross_core_ordinary` | 25.894 ms | 单样本 | 26.063 ms | 同量级，未套用新协议 |
+| `simt_cross_core_dag` | 8.078 / 7.976 / 8.179 ms | 8.078 ms | 8.739 ms | 改善约 7.6% |
+
+mode4 三个独立进程都低于旧中位数。收益来自减少必要的返回型 Execute owner
+竞争和解除 Execute 与单次 Submit 的绑定，不代表已经达到 2 ms 目标。
+
+### 22.5 观察合同的独立问题
+
+复核时发现四种新增 cross-core 路径的 shared full-swimlane 尚未接通完整
+Submit 父记录，而 schema-v5 又固定要求每核 1280 条；SIMT builder 合法地
+replay 0 条 Submit，也没有被该旧检查表达。mode3 在 level-1 与 level-4 都能
+独立复现 `dropped=1`，证明它不是本阶段中央 ticket 引入的业务错误。
+
+该问题必须作为单独的观察协议改造：让 Submit 数量和 builder/replay 角色按
+真实 orchestration 动态闭合，并为 Execute ticket 增加准确 atomic site。在
+观察协议完成前，不把半成品 schema 或误导性 atomic 名称混入本性能提交。
