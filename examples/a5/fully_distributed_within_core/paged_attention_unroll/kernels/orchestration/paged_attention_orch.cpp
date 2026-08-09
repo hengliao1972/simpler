@@ -28,11 +28,10 @@
 
 #include "dist_engine/common/target.h"
 
-// A shared TensorMap is a storage contract, not the legacy same-core PA
-// replay protocol. Only same_core + shared uses the fixed Case1,
-// SharedOutputRef, and role-specialized fast path. Cross-core schedulers must
-// use generic Submit APIs so Build ownership, Execute ownership, and output
-// descriptor publication remain operator-independent.
+// `shared TensorMap` 是后端存储合同，不能等同于 legacy same-core PA
+// 的专用回放协议。只有 same_core + shared 才使用固定 Case1、
+// SharedOutputRef 和角色特化的快路径；跨核调度器必须走通用 Submit
+// 接口，才能让构建 owner、执行 owner 和输出描述符协议保持算子无关。
 #if PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE == 0
 #define PTO_FDWIC_SAME_CORE_SHARED_PA_PATH 1
 #else
@@ -216,11 +215,10 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // query: shape=[batch, num_heads, head_dim]
     uint64_t batch = orch_args.tensor(0).ref().shapes[0];
 #if PTO_FDWIC_PERF_CLOCK || PTO_FDWIC_SUBMIT_PMU
-    // perf-clock and submit-pmu-none currently cover only the Case1-shaped PA:
-    // one Alloc plus one QK/SF/PV/UP group per batch, or five Submit calls.
-    // Case2/3 use different block grouping. If this diagnostic build is used
-    // there, the actual count exceeds the expected count and the host must fail
-    // closed instead of treating the intermediate 5*batch Submit as the last.
+    // perf-clock 与 submit-pmu-none 当前只服务与 Case1 同构的 PA：每个 batch 恰好一次
+    // Alloc 和一组 QK/SF/PV/UP，共 5 次 Submit。Case2/3 的 block 分组数
+    // 不同；若误用该诊断构建，最终实际 count 会超过 expected，host 必须
+    // fail closed，不能把中途第 5*batch 次 Submit 冒充为末次。
     rt_perf_clock_expect_submits(static_cast<uint32_t>(5 * batch));
 #endif
     uint64_t num_heads = orch_args.tensor(0).ref().shapes[1];

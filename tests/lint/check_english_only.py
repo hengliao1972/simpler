@@ -6,20 +6,122 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""
-Script to check that all source files and documentation are in English only.
-Detects non-English text (e.g., Chinese, Japanese, Korean, etc.) in source files.
+"""Check documentation and non-comment source text for non-English scripts.
+
+Source comments may be written in Chinese. String literals, identifiers, and
+documentation remain subject to the English-only check.
 """
 
 import argparse
+import io
 import re
 import subprocess
 import sys
+import tokenize
 from pathlib import Path
 from typing import Optional
 
 # Default excluded directories (can be overridden via --exclude)
 DEFAULT_EXCLUDED_PATTERNS = ["3rdparty", "reference", "docs/zh-cn", "README.zh-CN.md"]
+
+C_FAMILY_EXTENSIONS = {".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hxx"}
+PYTHON_EXTENSIONS = {".py", ".pyi"}
+
+
+def _c_raw_string_end(text: str, index: int) -> Optional[int]:
+    """Return the first index after a C++ raw string, or None."""
+    if not text.startswith('R"', index):
+        return None
+    opening = text.find("(", index + 2, min(len(text), index + 19))
+    if opening < 0:
+        return None
+    delimiter = text[index + 2 : opening]
+    if len(delimiter) > 16 or any(char.isspace() or char in "\\()" for char in delimiter):
+        return None
+    terminator = ")" + delimiter + '"'
+    closing = text.find(terminator, opening + 1)
+    return None if closing < 0 else closing + len(terminator)
+
+
+def _c_quoted_literal_end(text: str, index: int) -> Optional[int]:
+    """Return the first index after a regular C/C++ string or character."""
+    if text[index] not in {'"', "'"}:
+        return None
+    quote = text[index]
+    index += 1
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        current = text[index]
+        index += 1
+        if current == quote:
+            break
+    return index
+
+
+def _mask_c_family_comments(text: str) -> str:
+    """Replace C/C++ comments with spaces while preserving strings and lines."""
+    masked = list(text)
+    index = 0
+    size = len(text)
+    while index < size:
+        if text.startswith("//", index):
+            while index < size and text[index] != "\n":
+                masked[index] = " "
+                index += 1
+            continue
+        if text.startswith("/*", index):
+            while index < size:
+                if text[index] != "\n":
+                    masked[index] = " "
+                if text.startswith("*/", index):
+                    if index + 1 < size:
+                        masked[index + 1] = " "
+                    index += 2
+                    break
+                index += 1
+            continue
+
+        # Raw string bodies are code data, not comments. Recognize the R"tag(
+        # opener even when it follows a u8/u/U/L prefix.
+        raw_end = _c_raw_string_end(text, index)
+        if raw_end is not None:
+            index = raw_end
+            continue
+        quoted_end = _c_quoted_literal_end(text, index)
+        if quoted_end is not None:
+            index = quoted_end
+            continue
+        index += 1
+    return "".join(masked)
+
+
+def _mask_python_comments(text: str) -> str:
+    """Replace Python COMMENT tokens with spaces while preserving line layout."""
+    lines = [list(line) for line in text.splitlines(keepends=True)]
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+        for token in tokens:
+            if token.type != tokenize.COMMENT:
+                continue
+            row, start = token.start
+            _, end = token.end
+            for column in range(start, end):
+                lines[row - 1][column] = " "
+    except (IndentationError, tokenize.TokenError):
+        # Fail closed: malformed source is checked without masking.
+        return text
+    return "".join("".join(line) for line in lines)
+
+
+def mask_source_comments(text: str, suffix: str) -> str:
+    """Mask comments for supported source languages; leave docs untouched."""
+    if suffix in C_FAMILY_EXTENSIONS:
+        return _mask_c_family_comments(text)
+    if suffix in PYTHON_EXTENSIONS:
+        return _mask_python_comments(text)
+    return text
 
 
 def get_git_tracked_files(root_dir: Path) -> list[Path]:
@@ -98,7 +200,7 @@ def check_file_english_only(file_path: Path) -> tuple[bool, list[tuple[int, str]
         print(f"Warning: Could not read {file_path}: {e}", file=sys.stderr)
         return True, []  # Skip files we can't read
 
-    has_non_english, violations = contains_non_english(content)
+    has_non_english, violations = contains_non_english(mask_source_comments(content, file_path.suffix.lower()))
 
     return not has_non_english, violations
 
@@ -129,7 +231,7 @@ def _collect_files(files: list[str], excluded_patterns: list[str]) -> Optional[l
 
 def main() -> int:
     """Main function."""
-    parser = argparse.ArgumentParser(description="Check that all source files and documentation are in English only")
+    parser = argparse.ArgumentParser(description="Check docs and non-comment source text for non-English scripts")
     parser.add_argument(
         "files",
         nargs="*",
@@ -189,13 +291,10 @@ def main() -> int:
         print("\nFiles with non-English content:")
         for file_path, _ in failed_files:
             print(f"  - {_display_path(file_path)}")
-        print(
-            "\n⚠ Please ensure all source files and documentation are written in English "
-            "to maintain consistency and accessibility for all contributors."
-        )
+        print("\n⚠ Please keep documentation and non-comment source text in English.")
         return 1
 
-    print("\n✓ All source files and documentation are in English!")
+    print("\n✓ Documentation and non-comment source text are in English!")
     return 0
 
 

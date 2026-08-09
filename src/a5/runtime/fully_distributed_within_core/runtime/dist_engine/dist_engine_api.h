@@ -222,9 +222,8 @@ PTO_DEVICE_FUNC bool dist_shared_pa_alloc_finish(
 );
 #endif
 
-// A perf-clock orchestration explicitly declares the expected number of
-// Submit calls replayed by this core. The API compiles to a no-op in regular
-// builds and does not change the public Submit ABI.
+// perf-clock 专用构建由具体 orchestration 显式声明本核应重放的 Submit
+// 总数。普通构建中该接口编译为空操作，不改变公开 submit ABI。
 PTO_DEVICE_FUNC void dist_perf_clock_expect_submits(uint32_t expected_submits);
 PTO_DEVICE_FUNC void dist_submit_pmu_expect_submits(uint32_t expected_submits);
 
