@@ -123,6 +123,13 @@ def _fdwic_scheduler_mode() -> str:
         raise ValueError(f"Unsupported {FDWIC_SCHEDULER_MODE_ENV}={raw_mode!r}") from exc
 
 
+def _fdwic_perf_clock_builder_cores(scheduler_mode: str) -> int:
+    """Return the exact 32-block artifact builder population for one scheduler."""
+    if scheduler_mode == "simt_cross_core_dag":
+        return 32
+    return 1 if scheduler_mode.startswith("simt_") else 0
+
+
 def _fdwic_scheduler_compile_definition(platform: str, runtime: str) -> str | None:
     """Return the scheduler macro for a mode-aware translation unit."""
 
@@ -1654,7 +1661,7 @@ def _validate_case_fdwic_perf_clock(  # noqa: PLR0912, PLR0915 -- fail-closed ar
         "aiv_cores": 64,
     }
     if cross_core_e2e:
-        expected_builder_cores = 1 if scheduler_mode.startswith("simt_") else 0
+        expected_builder_cores = _fdwic_perf_clock_builder_cores(scheduler_mode)
         expected_scalars.update(
             scheduler_mode=scheduler_mode,
             scheduler_mode_id=FDWIC_SCHEDULER_MODE_IDS[scheduler_mode],
@@ -1717,15 +1724,16 @@ def _validate_case_fdwic_perf_clock(  # noqa: PLR0912, PLR0915 -- fail-closed ar
             raise RuntimeError(f"[{case_label}] {profile} core {core.get('core_id')} elapsed tick closure failed")
 
     if cross_core_e2e:
-        expected_builder_cores = 1 if scheduler_mode.startswith("simt_") else 0
-        if len(builder_rows) != expected_builder_cores or (
-            builder_rows
-            and not (
-                builder_rows[0].get("core_type") == "aiv"
-                and builder_rows[0].get("block_id") == 0
-                and builder_rows[0].get("lane") == 1
-            )
-        ):
+        expected_builder_cores = _fdwic_perf_clock_builder_cores(scheduler_mode)
+        builder_topology = {(core.get("core_type"), core.get("block_id"), core.get("lane")) for core in builder_rows}
+        expected_builder_topology = (
+            {("aiv", block_id, 1) for block_id in range(32)}
+            if scheduler_mode == "simt_cross_core_dag"
+            else {("aiv", 0, 1)}
+            if scheduler_mode.startswith("simt_")
+            else set()
+        )
+        if len(builder_rows) != expected_builder_cores or builder_topology != expected_builder_topology:
             raise RuntimeError(f"[{case_label}] {profile} SIMT builder topology closure failed")
         global_start = min(core["startup_begin"] for core in cores)
         global_end = max(core["final_drain_end"] for core in cores)

@@ -85,7 +85,7 @@ __attribute__((always_inline)) inline __aicore__ void simt_meta_anchor(__gm__ ui
     // attach the real builder's SIMT/DVG stack metadata to KERNEL_ENTRY.
     cce::async_invoke<DistSimtCrossCoreBuild>(
         cce::dim3{kDistSimtBuilderThreads, 1U, 1U}, reinterpret_cast<__gm__ DistSimtCrossCoreBuilderState *>(sink),
-        static_cast<__gm__ DistTaskCell *>(nullptr), 0U, 0U, 0U
+        static_cast<__gm__ DistTaskCell *>(nullptr), 0U, 0U, 0U, 0U, 0U, 0U
     );
 #else
     cce::async_invoke<simt_meta_anchor_kernel>(cce::dim3{1, 1, 1}, sink);

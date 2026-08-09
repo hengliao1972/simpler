@@ -258,7 +258,13 @@ bool is_simt_scheduler(FdwicSchedulerMode mode) {
 
 bool is_simt_builder_worker(FdwicSchedulerMode mode, CoreType core_type, int32_t block_id, int32_t lane) {
     constexpr int32_t kAiv0Lane = 1;
-    return is_simt_scheduler(mode) && core_type == CoreType::AIV && block_id == 0 && lane == kAiv0Lane;
+    if (!is_simt_scheduler(mode) || core_type != CoreType::AIV || block_id < 0 || lane != kAiv0Lane) return false;
+    return mode == FdwicSchedulerMode::SimtCrossCoreDag || block_id == 0;
+}
+
+uint32_t expected_simt_builder_workers(FdwicSchedulerMode mode, uint32_t block_count) {
+    if (mode == FdwicSchedulerMode::SimtCrossCoreDag) return block_count;
+    return mode == FdwicSchedulerMode::SimtCrossCoreOrdinary ? 1U : 0U;
 }
 
 bool build_expected_core_layout(
@@ -2126,7 +2132,7 @@ extern "C" int fdwic_perf_clock_host_export(Runtime *runtime) {
             return -1;
         }
     }
-    const uint32_t expected_builder_cores = is_simt_scheduler(scheduler_mode) ? 1U : 0U;
+    const uint32_t expected_builder_cores = expected_simt_builder_workers(scheduler_mode, aic.cores);
     const uint32_t expected_replay_cores = kExpectedCores - expected_builder_cores;
     if (aic.cores != kExpectedAic || aiv.cores != kExpectedAiv || replay_cores != expected_replay_cores ||
         builder_cores != expected_builder_cores || expected_submits == 0 ||

@@ -523,8 +523,8 @@ static_assert(
 
 #if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
 // Dynamic Submit has no random-access host task plan. Scalar publishers fill
-// task-indexed immutable requests, while persistent SIMT warp leaders consume
-// fixed strided task streams. The three lifecycle words are deliberately
+// task-indexed immutable requests, while topology-ranked persistent SIMT warp
+// leaders consume fixed strided task streams. The three lifecycle words are deliberately
 // isolated so start, seal and finish traffic cannot share an atomic unit.
 struct alignas(kCacheLine) SimtBuilderLifecycleState {
     fdwic::cross_core::SharedExecControl builder_started;

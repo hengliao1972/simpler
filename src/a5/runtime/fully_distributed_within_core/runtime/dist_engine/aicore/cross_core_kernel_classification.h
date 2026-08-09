@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "dist_engine/aicore/cross_core_simt_topology.h"
 #include "dist_engine/common/cross_core_exec_protocol.h"
 
 namespace {

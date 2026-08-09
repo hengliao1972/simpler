@@ -16,15 +16,22 @@
 ## 2. 功能迁移状态
 
 | 模式 | 真实动态 Submit | 独立状态/复位 | 真实 A5 PA B1/B256 | 阶段提交 |
-| --- | --- | --- | --- | --- |
+| ---- | --------------- | ------------- | ------------------ | -------- |
 | `cross_core_ordinary` | 已接通 | 已闭合 | PASS | `405c060f` 及前置提交 |
 | `cross_core_dag` | 已接通 | 已闭合 | PASS | `4ecc6c2f` / `197d8003` / `2d0e0426` |
 | `simt_cross_core_ordinary` | 已接通 | 已闭合 | PASS | `2843d82a` / `7cf087c4` / `b13f1b19` / `f20522e4` |
 | `simt_cross_core_dag` | 已接通 | 已闭合 | PASS | `ba0abef6` / `8bd60f35` / `8d464955` |
 
-SIMT 两种模式均由唯一 `block0/AIV0` Main Scalar 承载持久 builder VF；
-该 Scalar 不 replay orchestration。其他 95 个 Scalar 发布动态请求，Build owner
-与 Execute owner 仍独立。
+SIMT 两种模式都使 Build owner 与 Execute owner 保持独立，但 builder
+拓扑按算法特性区分：
+
+- `simt_cross_core_ordinary` 由唯一 `block0/AIV0` Main Scalar 承载持久
+  builder VF，其他 95 个 Scalar 继续 replay 和竞争执行；
+- `simt_cross_core_dag` 按运行时 block 拓扑让每个 AIV0 承载一个 builder
+  VF，32 block 时即 32 builder + 64 replay。
+
+这一区分只依赖 scheduler mode 与物理 block/lane，不读 PA `TaskKind`、
+batch 或固定 task 图形。
 
 ## 3. 泛化正确性证据
 
@@ -63,7 +70,8 @@ global min(每核 startup increment 前起点)
 ```
 
 - 模式 1/2：96 个 replay worker，0 builder；
-- 模式 3/4：95 个 replay worker，唯一 `block0/AIV0` builder；
+- 模式 3：95 个 replay worker，唯一 `block0/AIV0` builder；
+- 模式 4：每 block 的 AIV0 是 builder；32 block 时为 64 replay + 32 builder；
 - replay worker 必须满足 `submit_count == expected_submit_count > 0`；
 - builder 必须满足 `submit_count == expected_submit_count == 0`；
 - 设备 raw 使用独立 mode 值，host 使用独立 schema
@@ -75,7 +83,7 @@ global min(每核 startup increment 前起点)
 ### 4.3 实测门槛
 
 | 模式 | 用例 | 结果 | worker 闭合 | 单次端到端时间 |
-| --- | --- | --- | --- | ---: |
+| ---- | ---- | ---- | ----------- | -------------: |
 | `cross_core_ordinary` | A5 PA CaseB1 | PASS | 96 replay + 0 builder | 398.216 us |
 | `simt_cross_core_ordinary` | A5 PA CaseB1 | PASS | 95 replay + 1 builder | 1368.150 us |
 
@@ -106,7 +114,7 @@ scheduler mode 必须先显式调用存量 `RuntimeBuilder` 重建对应 artifac
 四种 Simpler 集成模式之间的同业务横比，但不能与 standalone 的
 `6/28/4/1` 合成负载绝对时间直接相减。
 
-四种模式均满足：
+本节记录的是多 builder 改造前基线，四种模式均满足：
 
 - `Case1` 数值 golden PASS；
 - 1280 个动态 task 闭合；
@@ -117,7 +125,7 @@ scheduler mode 必须先显式调用存量 `RuntimeBuilder` 重建对应 artifac
 ### 5.2 无 Kernel 聚合的低扰动首样本
 
 | 模式 | startup 到 FinalDrain | 角色闭合 | 产物目录 |
-| --- | ---: | --- | --- |
+| ---- | --------------------: | -------- | -------- |
 | `cross_core_ordinary` | 71.365 ms | 96 replay + 0 builder | `TestPagedAttentionUnroll_Case1_20260809_054624` |
 | `cross_core_dag` | 70.748 ms | 96 replay + 0 builder | `TestPagedAttentionUnroll_Case1_20260809_054849` |
 | `simt_cross_core_ordinary` | 144.191 ms | 95 replay + 1 builder | `TestPagedAttentionUnroll_Case1_20260809_055000` |
@@ -134,7 +142,7 @@ scheduler mode 必须先显式调用存量 `RuntimeBuilder` 重建对应 artifac
 不是端到端墙钟。
 
 | 模式 | 端到端 | Kernel 调用 | Kernel core-time | 非 Kernel core-time | Kernel 占比 |
-| --- | ---: | ---: | ---: | ---: | ---: |
+| ---- | -----: | ----------: | ---------------: | ------------------: | ----------: |
 | `cross_core_ordinary` | 71.442 ms | 1024 | 50.218 ms | 6804.800 ms | 0.733% |
 | `cross_core_dag` | 70.907 ms | 1024 | 48.709 ms | 6755.869 ms | 0.716% |
 | `simt_cross_core_ordinary` | 110.152 ms | 1024 | 51.829 ms | 10520.190 ms | 0.490% |
@@ -146,7 +154,7 @@ Kernel workload 改变。
 
 ### 5.4 当前可证实的性能根因
 
-第一处差距是 builder 拓扑。当前 Simpler 的两种 SIMT 模式只让唯一
+第一处差距是 builder 拓扑。改造前 Simpler 的两种 SIMT 模式只让唯一
 `block0/AIV0` 启动一个 128-thread VF，实际只有 4 个 warp leader 工作；
 standalone 的有效配置可以让多个 AIV builder 并行，二者不是同一供给能力。
 
@@ -165,10 +173,79 @@ Simpler 动态 Submit 合同逐项对齐，不能直接照抄性能数字。
 
 ## 6. 后续收敛顺序
 
-1. 先把 SIMT 唯一 builder 改成按真实 AIV 拓扑扩展的通用多 builder 合同；
-   builder rank、leader stride、启动/完成计数和 host 角色闭合必须一致。
+1. 先把 DAG SIMT 的唯一 builder 改成按真实 AIV 拓扑扩展的通用多
+   builder 合同；builder rank、leader stride、启动/完成计数和 host
+   角色闭合必须一致。普通 SIMT 保留单 builder，避免无故占用执行核。
 2. 再独立消减 DAG 的 `O(H × 输入数)` writer 扫描；不得编码 PA task kind
    或固定 `5 × batch` 图形。
 3. 每一阶段先跑 CPU/协议门槛，再跑 A5 B1/B256 功能和单轮低扰动性能；
    数量级回退修复后才恢复独立进程多轮采样。
 4. 最后只与同 workload、同 startup→FinalDrain 端点的 standalone 结果横比。
+
+## 7. 第一阶段：按算法特性收敛 builder 拓扑
+
+### 7.1 先做全 AIV0 受控对照
+
+首先不猜测多 builder 是否对两种 SIMT 都有利，而是让 32 个 block 的
+AIV0 全部启动 builder VF，保持其他业务合同不变：
+
+| 模式 | builder/replay | B256 startup→FinalDrain | 相对单 builder 首样本 |
+| ---- | -------------- | ----------------------: | --------------------: |
+| `simt_cross_core_ordinary` | 32 / 64 | 164.629 ms | 由 144.191 ms 回退约 14.2% |
+| `simt_cross_core_dag` | 32 / 64 | 188.424 ms | 由 1321.880 ms 改善约 85.7% |
+
+结论很明确：
+
+- ordinary Build 足够轻，额外 31 个 builder 的供给收益小于丢失 31 个
+  AIV0 replay/执行候选者的代价；
+- DAG Build 存在高频动态 writer 扫描，把 4 个 warp leader 扩展到 128 个
+  leader 后，原先的单 builder 串行瓶颈被大幅摊平。
+
+因此不保留“两种模式一律 32 builder”，而是收敛为模式内部的通用
+拓扑合同：ordinary 单 builder，DAG 每 block 一个 AIV0 builder。
+
+### 7.2 协议改动
+
+多 builder 不是简单地多启动几个 VF，完整合同包括：
+
+1. 以物理 `block_id` 生成 builder rank，不把动态 worker 注册顺序当 ABI；
+2. 每个 builder 的 4 个 warp leader 按
+   `rank * 4 + warp` 取首 task，以 `builder_count * 4` 为 stride；
+3. `builder_started` 计数所有 VF 启动，leader 只在拓扑闭合后消费动态
+   request；
+4. `builder_finished` 以全局 leader 数闭合，FinalDrain 不能在部分 builder
+   退出时提前结束；
+5. builder 传入物理 worker id 作为 Build owner，host 和 Python 产物校验使用
+   相同的 builder/replay 拓扑。
+
+调度代码不根据 PA 的 Alloc/QK/SF/PV/UP 选 builder，也不依赖 1280
+个 task 或 32 block 常量；32 只出现在当前 PA 性能产物的闭合层。
+
+### 7.3 收敛后实测
+
+| 模式/用例 | builder/replay | startup→FinalDrain | 结果 |
+| --------- | -------------- | -----------------: | ---- |
+| ordinary B1 | 1 / 95 | 1.280 ms | golden PASS |
+| DAG B1 | 32 / 64 | 1.692 ms | golden PASS |
+| ordinary B256 独立进程样本 1 | 1 / 95 | 151.831 ms | golden PASS |
+| ordinary B256 独立进程样本 2 | 1 / 95 | 106.935 ms | golden PASS |
+| DAG B256 | 32 / 64 | 188.308 ms | golden PASS |
+
+ordinary B256 两次测量相差约 44.9 ms，证明当前设备上单轮绝对时间
+不适合用于声称小比例收益。本阶段保留 builder 拓扑的依据是 DAG
+模式数量级改善以及两种模式的角色/协议闭合，不是 ordinary 单样本排名。
+
+DAG B256 的 `perf-clock-kernel` 进一步记录到：
+
+- startup→FinalDrain 为 187.592 ms；
+- Kernel 调用数恰好 1024，AIC/AIV 各 512；
+- Kernel core-time 合计 61.231 ms，非 Kernel residual 仍为 17944.972 ms。
+
+因此 32 builder 没有通过少执行 Kernel 伪造收益。但 188 ms 仍显著高于
+Scalar 两种模式的约 71 ms 首基线，下一阶段必须继续消减 DAG 中
+`O(H × 输入数)` 的返回型 atomic writer 扫描，而不是继续增加 builder。
+
+收敛后还在真实 A5 上重跑了非 PA 的
+`A5OnboardBd24ExistingInoutChain`：`simt_cross_core_dag` 数值 golden PASS。
+该用例的 24 block 会动态得到 24 builder，证明设备协议没有把 PA 的
+32 block 当作调度常量。

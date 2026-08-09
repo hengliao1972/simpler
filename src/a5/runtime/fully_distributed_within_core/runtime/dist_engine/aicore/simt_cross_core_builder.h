@@ -13,12 +13,13 @@
 
 #if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
 
+#include "dist_engine/aicore/cross_core_simt_topology.h"
+
 namespace {
 
 constexpr uint32_t kDistSimtBuilderThreads = 128;
 constexpr uint32_t kDistSimtBuilderWarps = kDistSimtBuilderThreads / 32U;
 constexpr int64_t kDistSimtBuilderReset = 0;
-constexpr int64_t kDistSimtBuilderRunning = 1;
 // Use the bounded-wait scale proven by standalone G0. The outer A5 AICPU has a
 // three-second execution threshold, so 30G cycles would let that timeout hide
 // protocol errors. One billion cycles covers the full request window while
@@ -33,16 +34,22 @@ using DistSimtCrossCoreBuilderState = SimtCrossCoreDagState;
 
 PTO_DEVICE_FUNC bool dist_simt_cross_core_is_builder_worker(__gm__ const DistCore *self) {
 #if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
-    // Worker indices follow runtime registration order and do not promise that
-    // every AIC precedes every AIV. AICPU maps the first AIV to physical
-    // block0/AIV0; use that published topology identity to elect one builder
-    // without treating dynamic registration order as a fixed ABI.
-    return self != nullptr && self->role == CoreType::AIV && self->block_id == 0 && self->lane == LANE_AIV0;
+    return dist_cross_core_is_simt_builder_worker(self);
 #else
     (void)self;
     return false;
 #endif
 }
+
+#if !defined(PTO_FDWIC_SIMT_METADATA_ONLY)
+PTO_DEVICE_FUNC uint32_t dist_simt_cross_core_builder_count() {
+#if PTO_FDWIC_SCHEDULER_MODE == 3
+    return 1U;
+#else
+    return g_dist.num_blocks > 0 ? static_cast<uint32_t>(g_dist.num_blocks) : 0U;
+#endif
+}
+#endif
 
 #if defined(__CCE_AICORE__) && defined(__DAV_VEC__) && defined(PTO_FDWIC_SIMT_DEFINE_BUILDER_VF)
 
@@ -728,7 +735,7 @@ DIST_SIMT_CALLEE bool dist_simt_build_request(
 
 static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSimtCrossCoreBuild(
     __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
-    uint64_t heap_size, uint32_t history
+    uint64_t heap_size, uint32_t history, uint32_t builder_rank, uint32_t builder_count, uint32_t builder_owner
 ) {
     const uint32_t thread = static_cast<uint32_t>(threadIdx.x);
     const uint32_t warp = thread / 32U;
@@ -758,29 +765,36 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
         kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::SimtBuildRequestCell)
     );
 #endif
+    const bool topology_valid = builder_count != 0 && builder_rank < builder_count;
     if (thread == 0) {
-        // Match standalone SimtWaitBuilderStart instruction-for-instruction:
-        // thread zero of the sole VF invocation atomically advances Reset to
-        // Running.
+        // Match the standalone multi-builder rendezvous: each VF contributes
+        // one arrival, while active leaders wait until every topology-selected
+        // AIV0 has launched. This prevents a fast low-rank VF from running far
+        // ahead of a delayed builder that owns an interleaved task stream.
         const uint64_t observed = asc_atomic_add(started, static_cast<uint64_t>(1U));
-        if (observed != static_cast<uint64_t>(kDistSimtBuilderReset)) {
-            dist_simt_publish_fatal(fatal, UINT32_MAX, 0);
+        if (!topology_valid || observed >= builder_count) {
+            dist_simt_publish_fatal(fatal, UINT32_MAX, builder_owner);
         } else {
             asc_threadfence();
         }
     }
-    // Production launches one persistent VF invocation. The standalone
-    // builder_count rendezvous for multiple invocations has no business meaning
-    // here. Once thread zero publishes Running, four leaders poll their request
-    // streams directly. A leader arriving early naturally waits on an Empty
-    // request while Scalars observe Running and publish work.
     if (active) {
-        uint32_t task_id = warp;
+        const uint64_t start_begin = clock();
+        while (
+            topology_valid && dist_simt_atomic_load(started) < builder_count &&
+            clock() - start_begin <= kDistSimtBuilderPollBudget && !dist_simt_fatal_observed(fatal)
+        ) {
+        }
+        if (!topology_valid || dist_simt_atomic_load(started) != builder_count) {
+            dist_simt_publish_fatal(fatal, UINT32_MAX, builder_owner);
+        }
+        const uint32_t total_leaders = builder_count * kDistSimtBuilderWarps;
+        uint32_t task_id = builder_rank * kDistSimtBuilderWarps + warp;
         while (!dist_simt_fatal_observed(fatal)) {
             if (task_id >= kFdwicCrossCoreTaskCapacity) {
                 const uint64_t count = dist_simt_atomic_load(sealed);
                 if (count != UINT64_MAX && task_id >= count) break;
-                dist_simt_publish_fatal(fatal, task_id, warp);
+                dist_simt_publish_fatal(fatal, task_id, builder_owner);
                 break;
             }
             // Avoid re-deriving a far offset from the compound task/map state.
@@ -795,11 +809,11 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
                 const uint32_t phase = static_cast<uint32_t>(raw & fdwic::cross_core::kSimtRequestPhaseMask);
                 if (phase == static_cast<uint32_t>(fdwic::cross_core::SimtRequestPhase::Published)) {
                     acquired = dist_simt_decode_request(cell, task_id, &request);
-                    if (!acquired) dist_simt_publish_fatal(fatal, task_id, warp);
+                    if (!acquired) dist_simt_publish_fatal(fatal, task_id, builder_owner);
                     break;
                 }
                 if (raw != 0 && phase != static_cast<uint32_t>(fdwic::cross_core::SimtRequestPhase::Reserved)) {
-                    dist_simt_publish_fatal(fatal, task_id, warp);
+                    dist_simt_publish_fatal(fatal, task_id, builder_owner);
                     break;
                 }
                 const uint64_t count = dist_simt_atomic_load(sealed);
@@ -809,17 +823,19 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
             if (!acquired) {
                 const uint64_t count = dist_simt_atomic_load(sealed);
                 if (!dist_simt_fatal_observed(fatal) && count != UINT64_MAX && task_id >= count) break;
-                if (!dist_simt_fatal_observed(fatal)) dist_simt_publish_fatal(fatal, task_id, warp);
+                if (!dist_simt_fatal_observed(fatal)) dist_simt_publish_fatal(fatal, task_id, builder_owner);
                 break;
             }
-            if (!dist_simt_build_request(state, task_cells, metadata, heap_base, heap_size, history, request, warp)) {
-                dist_simt_publish_fatal(fatal, task_id, warp);
+            if (!dist_simt_build_request(
+                    state, task_cells, metadata, heap_base, heap_size, history, request, builder_owner
+                )) {
+                dist_simt_publish_fatal(fatal, task_id, builder_owner);
                 break;
             }
-            task_id += kDistSimtBuilderWarps;
+            task_id += total_leaders;
         }
         const uint64_t prior_finished = asc_atomic_add(finished, static_cast<uint64_t>(1U));
-        if (prior_finished >= kDistSimtBuilderWarps) dist_simt_publish_fatal(fatal, UINT32_MAX, warp);
+        if (prior_finished >= total_leaders) dist_simt_publish_fatal(fatal, UINT32_MAX, builder_owner);
     }
 }
 
@@ -832,7 +848,7 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
 #if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
 extern "C" PTO_DEVICE_FUNC void fdwic_simt_cross_core_run_builder(
     __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
-    uint64_t heap_size, uint32_t history
+    uint64_t heap_size, uint32_t history, uint32_t builder_rank, uint32_t builder_count, uint32_t builder_owner
 );
 #endif
 
@@ -844,8 +860,17 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_launch_builder(__gm__ DistCore *self) 
     __gm__ DistSimtCrossCoreBuilderState &state = g_dist.simt_cross_core_dag;
 #endif
     if (!dist_simt_cross_core_is_builder_worker(self)) return true;
-    if (DistCrossCoreAicoreOps::Load(&state.lifecycle.builder_started.state) != kDistSimtBuilderReset) {
+    const int32_t num_blocks = g_dist.num_blocks;
+    if (self == nullptr || num_blocks <= 0 || g_dist.num_workers != 3 * num_blocks || self->block_id < 0 ||
+        self->block_id >= num_blocks) {
         return dist_simt_cross_core_fail(self != nullptr ? self->local_index : -1, PTO2_ERROR_TENSORMAP_PROTOCOL);
+    }
+    const uint32_t builder_rank = PTO_FDWIC_SCHEDULER_MODE == 3 ? 0U : static_cast<uint32_t>(self->block_id);
+    const uint32_t builder_count = dist_simt_cross_core_builder_count();
+    const uint32_t builder_owner = static_cast<uint32_t>(self->core_idx);
+    const int64_t started = DistCrossCoreAicoreOps::Load(&state.lifecycle.builder_started.state);
+    if (started < kDistSimtBuilderReset || static_cast<uint64_t>(started) >= builder_count) {
+        return dist_simt_cross_core_fail(self->local_index, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
     const uint64_t heap_base_address = reinterpret_cast<uint64_t>(g_dist.heap_base);
     // The VF definition and async_invoke must belong to the registered entry's
@@ -854,7 +879,7 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_launch_builder(__gm__ DistCore *self) 
     // second local VF.
     fdwic_simt_cross_core_run_builder(
         &state, &g_dist.tasks[0], heap_base_address, static_cast<uint64_t>(g_dist.heap_size),
-        static_cast<uint32_t>(g_dist.H)
+        static_cast<uint32_t>(g_dist.H), builder_rank, builder_count, builder_owner
     );
 #else
     (void)self;
@@ -895,9 +920,21 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_join_builder(__gm__ DistCore *self) {
 #else
     __gm__ DistSimtCrossCoreBuilderState &state = g_dist.simt_cross_core_dag;
 #endif
-    if (DistCrossCoreAicoreOps::Load(&state.lifecycle.builder_started.state) != kDistSimtBuilderRunning ||
-        DistCrossCoreAicoreOps::Load(&state.lifecycle.builder_finished.state) != kDistSimtBuilderWarps ||
-        DistCrossCoreAicoreOps::Load(&state.runtime.fatal.state) != 0) {
+    const int32_t num_blocks = g_dist.num_blocks;
+    if (num_blocks <= 0 || g_dist.num_workers != 3 * num_blocks) {
+        return dist_simt_cross_core_fail(self != nullptr ? self->local_index : -1, PTO2_ERROR_TENSORMAP_PROTOCOL);
+    }
+    const uint32_t builder_count = dist_simt_cross_core_builder_count();
+    const int64_t expected_finished = static_cast<int64_t>(builder_count) * kDistSimtBuilderWarps;
+    uint64_t wd_start = 0;
+    int64_t finished = DistCrossCoreAicoreOps::Load(&state.lifecycle.builder_finished.state);
+    while (finished < expected_finished && DistCrossCoreAicoreOps::Load(&state.runtime.fatal.state) == 0) {
+        SPIN_WAIT_HINT();
+        watchdog(wd_start);
+        finished = DistCrossCoreAicoreOps::Load(&state.lifecycle.builder_finished.state);
+    }
+    if (builder_count == 0 || DistCrossCoreAicoreOps::Load(&state.lifecycle.builder_started.state) != builder_count ||
+        finished != expected_finished || DistCrossCoreAicoreOps::Load(&state.runtime.fatal.state) != 0) {
         return dist_simt_cross_core_fail(self != nullptr ? self->local_index : -1, PTO2_ERROR_TENSORMAP_PROTOCOL);
     }
 #else

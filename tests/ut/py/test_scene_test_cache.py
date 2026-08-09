@@ -753,7 +753,7 @@ def _write_cross_core_e2e_clock_artifact(tmp_path: Path, profile: str, scheduler
         aiv_ordinal = core_id - 32
         block_id = core_id if is_aic else aiv_ordinal // 2
         lane = 0 if is_aic else 1 + aiv_ordinal % 2
-        is_builder = is_simt and not is_aic and block_id == 0 and lane == 1
+        is_builder = is_simt and not is_aic and lane == 1 and (scheduler_mode == "simt_cross_core_dag" or block_id == 0)
         core = {
             "core_id": core_id,
             "core_type": "aic" if is_aic else "aiv",
@@ -784,8 +784,8 @@ def _write_cross_core_e2e_clock_artifact(tmp_path: Path, profile: str, scheduler
         "num_cores": 96,
         "aic_cores": 32,
         "aiv_cores": 64,
-        "replay_cores": 95 if is_simt else 96,
-        "builder_cores": 1 if is_simt else 0,
+        "replay_cores": 64 if scheduler_mode == "simt_cross_core_dag" else 95 if is_simt else 96,
+        "builder_cores": 32 if scheduler_mode == "simt_cross_core_dag" else 1 if is_simt else 0,
         "expected_submits_per_replay_core": 5,
         "global_startup_begin": 100,
         "global_final_drain_end": 395,

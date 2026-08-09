@@ -536,11 +536,11 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
     const ExecEngineClass executor_engine = dist_cross_core_executor_engine(ctx.self);
     if (executor_engine != task_engine) return true;
 #if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__CCE_AICORE__)
-    // The first AIV0 hosts the persistent SIMT builder in mode 3. Its vector
-    // unit cannot execute a linked AIV task until the deferred join, so keep
-    // this one Scalar out of execute-owner election. Every other compatible
-    // worker remains a dynamic candidate.
-    if (ctx.self->role == CoreType::AIV && ctx.self->block_id == 0 && ctx.self->lane == LANE_AIV0) return true;
+    // A topology-selected AIV0 hosts one persistent SIMT builder VF. Its
+    // vector unit cannot execute a linked AIV task until the deferred join, so
+    // keep the complete builder pool out of execute-owner election. Every
+    // remaining engine-compatible worker stays a dynamic candidate.
+    if (dist_cross_core_is_simt_builder_worker(ctx.self)) return true;
 #endif
     // Each compatible worker attempts the dynamic owner CAS once; only the
     // first arrival waits for BUILT. The task-private CAS line does not contend

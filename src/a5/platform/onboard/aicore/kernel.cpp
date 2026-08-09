@@ -52,14 +52,15 @@ class Runtime;
 // dispatcher pair.
 extern "C" __attribute__((weak)) __aicore__ void fdwic_simt_cross_core_run_builder(
     __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
-    uint64_t heap_size, uint32_t history
+    uint64_t heap_size, uint32_t history, uint32_t builder_rank, uint32_t builder_count, uint32_t builder_owner
 ) {
     cce::async_invoke<DistSimtCrossCoreBuild>(
-        cce::dim3{kDistSimtBuilderThreads, 1U, 1U}, state, task_cells, heap_base_address, heap_size, history
+        cce::dim3{kDistSimtBuilderThreads, 1U, 1U}, state, task_cells, heap_base_address, heap_size, history,
+        builder_rank, builder_count, builder_owner
     );
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    // Dedicated builder Scalar waits for the persistent VF; the other 95
-    // Scalars remain independent and continue publishing dynamic requests.
+    // Each AIV0 builder Scalar waits only for its own persistent VF. AIC and
+    // AIV1 Scalars remain independent and publish dynamic requests.
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
 }
 #endif

@@ -503,8 +503,8 @@ struct FdwicAtomicPollBurst {
 // allocates no event records. Same-core interprets the clocks as first/last
 // Submit; cross-core interprets them as startup and FinalDrain. mode proves
 // which interpretation applies. Orchestration still declares
-// expected_submit_count for replay workers; the dedicated SIMT builder
-// legitimately keeps 0/0.
+// expected_submit_count for replay workers; dedicated SIMT builders
+// legitimately keep 0/0.
 struct FdwicPerfClockCoreData {
     uint64_t first_submit_start;
     uint64_t last_submit_end;

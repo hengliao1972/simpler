@@ -71,11 +71,10 @@ DIST_API_ATTR PTO_DEVICE_FUNC void DIST_CORE_MAIN_ENTRY(__gm__ Runtime *runtime,
     }
 
 #if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
-    // Match the role contract proven by the standalone scheduler: the first
-    // AIV0 Main Scalar only hosts the persistent SIMT builder and does not
-    // replay orchestration. Other Scalars publish dynamic requests. Replaying
-    // on the host Scalar would contend with its resident VF, and the dedicated
-    // host's local_index cannot participate in sealing.
+    // Ordinary mode keeps one builder so 95 Scalars remain replay/execution
+    // candidates. Scan-heavy DAG mode uses every AIV0 as a builder, leaving AIC
+    // and AIV1 Scalars to publish requests and execute tasks. A builder Scalar
+    // never replays while its resident VF is active.
     const bool simt_builder_worker = dist_simt_cross_core_is_builder_worker(self);
     if (!fdwic_trace_is_fatal()) (void)dist_simt_cross_core_launch_builder(self);
     // Request slots are reset before the run and each task is published once.

@@ -50,7 +50,7 @@ PTO_DEVICE_FUNC inline void fdwic_perf_clock_worker_begin() {
 #if PTO_FDWIC_SCHEDULER_MODE != 0
     // Cross-core work includes the startup barrier, dynamic Build/Execute,
     // and FinalDrain. Starting before the startup increment gives the
-    // dedicated SIMT builder the same boundary even though it replays no Submit.
+    // dedicated SIMT builders the same boundary even though they replay no Submit.
     g_fdwic_perf_clock_first_submit = get_sys_cnt_aicore();
 #endif
 }
