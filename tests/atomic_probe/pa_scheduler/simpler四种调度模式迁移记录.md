@@ -741,3 +741,31 @@ copy，但已把代价从“95 个 replay actor 每 task 都等”收窄为“1 
 - `outputs/TestPagedAttentionUnroll_Case1_20260809_151947/`；
 - `outputs/TestPagedAttentionUnroll_Case1_20260809_152101/`；
 - `outputs/TestPagedAttentionUnroll_Case1_20260809_152206/`。
+
+### 16.6 SIMT DAG 不另造输出协议
+
+mode4 只在 orchestration 调用层启用第 16.5 节已验证的 deferred API。
+它继续使用 K16/W4 builder 拓扑、现有 DAG metadata 发布和同 task 批量
+fanin lookup；没有添加 mode4 专用的 output cell、新 atomic 或新顺序链。
+
+真实 A5 验证结果：
+
+- 非 PA `A5OnboardBd24CompeteFirstFreshOutput` PASS；
+- PA B1 数值 golden PASS；
+- PA B256 三个独立进程均 PASS，`80 replay + 16 builder` 角色和每核
+  1280 次 Submit 均闭合；
+- startup→FinalDrain 为 **39.792 / 39.361 / 39.224 ms**，中位数
+  **39.361 ms**。相对第 14 章保留版的四样本中位数
+  **172.514 ms** 下降 **133.153 ms / 77.2%**。
+
+三份新数据分别位于：
+
+- `outputs/TestPagedAttentionUnroll_Case1_20260809_152749/`；
+- `outputs/TestPagedAttentionUnroll_Case1_20260809_152852/`；
+- `outputs/TestPagedAttentionUnroll_Case1_20260809_153003/`。
+
+mode4 的 DAG 语义与 builder 并行度没有变，仅去除共有的 replay 全核输出
+等待就从 172.514 ms 降至 39.361 ms。因此之前把 mode4 数量级回退主要
+归因于 DAG lookup 是不完整的；当时更大的共同因素是错误的输出合同。
+当前 39.361 ms 仍不是目标性能，后续再在新基线上分析 publisher 描述符等待、
+SIMT Build 供给和 Execute 进度，不应回到旧基线上微调 DAG 分支。

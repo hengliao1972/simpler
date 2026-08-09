@@ -414,8 +414,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                 FdwicOutputRef li_update = alloc_outs.output_ref(1);
                 FdwicOutputRef mi_update = alloc_outs.output_ref(2);
 #endif
-#elif PTO_FDWIC_SHARED_MAP && \
-    (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3)
+#elif PTO_FDWIC_SHARED_MAP && (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || \
+                               PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4)
                 SharedTaskOutputs alloc_outs =
                     alloc_tensors_deferred_compete_first(3, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                         CYCLE_COUNT_LAP(prof_submit_task);
@@ -518,8 +518,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #else
                     FdwicOutputRef sij_buf = qk_outs.output_ref(0);
 #endif
-#elif PTO_FDWIC_SHARED_MAP && \
-    (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3)
+#elif PTO_FDWIC_SHARED_MAP && (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || \
+                               PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4)
                     SharedTaskOutputs qk_outs = rt_submit_aic_task_deferred_compete_first(
                         FUNC_QK_MATMUL, 1, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                             CYCLE_COUNT_LAP(prof_submit_task);
@@ -615,8 +615,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                     FdwicOutputRef mi = sf_outs.output_ref(1);
                     FdwicOutputRef li = sf_outs.output_ref(2);
 #endif
-#elif PTO_FDWIC_SHARED_MAP && \
-    (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3)
+#elif PTO_FDWIC_SHARED_MAP && (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || \
+                               PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4)
                     SharedTaskOutputs sf_outs = rt_submit_aiv_task_deferred_compete_first(
                         FUNC_SOFTMAX_PREPARE, 3, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                             CYCLE_COUNT_LAP(prof_submit_task);
@@ -690,8 +690,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #else
                     FdwicOutputRef oi_new = pv_outs.output_ref(0);
 #endif
-#elif PTO_FDWIC_SHARED_MAP && \
-    (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3)
+#elif PTO_FDWIC_SHARED_MAP && (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || \
+                               PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4)
                     SharedTaskOutputs pv_outs = rt_submit_aic_task_deferred_compete_first(
                         FUNC_PV_MATMUL, 1, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                             CYCLE_COUNT_LAP(prof_submit_task);
@@ -776,8 +776,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                             }
                         );
                     if (up_outs.producer_task_id < 0 || !up_outs.empty()) return;
-#elif PTO_FDWIC_SHARED_MAP && \
-    (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || PTO_FDWIC_SCHEDULER_MODE == 3)
+#elif PTO_FDWIC_SHARED_MAP && (PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2 || \
+                               PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4)
                     SharedTaskOutputs up_outs = rt_submit_aiv_task_deferred_compete_first(
                         FUNC_ONLINE_UPDATE, 0, params, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
                             CYCLE_COUNT_LAP(prof_submit_task);
