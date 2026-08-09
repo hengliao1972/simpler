@@ -1170,3 +1170,27 @@ replay 0 条 Submit，也没有被该旧检查表达。mode3 在 level-1 与 lev
 该问题必须作为单独的观察协议改造：让 Submit 数量和 builder/replay 角色按
 真实 orchestration 动态闭合，并为 Execute ticket 增加准确 atomic site。在
 观察协议完成前，不把半成品 schema 或误导性 atomic 名称混入本性能提交。
+
+### 22.6 已撤销：单 replay 规划核
+
+为验证“消除重复 replay”是否能继续降低 mode4 端到端时间，曾实现一个完全
+通用的候选：只让 `block0/AIC` 顺序生成 request，保留 16 个 Builder，其余
+79 个非 Builder Scalar 直接加入分引擎 Execute ticket。角色只由物理拓扑和
+scheduler mode 决定，不读取 PA task kind、batch、C/V 序列或 Tensor 形状。
+
+该候选先通过了本章十二类真实 A5 通用边界，包括零 Submit、2048 满容量、
+跨引擎 INOUT、多 output 和 Build/Execute 到达偏斜；因此它在正确性上成立。
+但 PA B256 三个独立进程结果为：
+
+- 8.942 ms：`TestPagedAttentionUnroll_Case1_20260809_213014`；
+- 8.964 ms：`TestPagedAttentionUnroll_Case1_20260809_213147`；
+- 8.853 ms：`TestPagedAttentionUnroll_Case1_20260809_213233`。
+
+中位数 8.942 ms，相对第 22.4 节保留基线 8.078 ms 回退约 10.7%。单规划核
+虽然删除了 79 份重复 replay，却同时把真实参数构造与 request 生产变成一条
+串行供给链，Builder 和 executor 更容易断粮。因此实现、host 角色合同和测试
+夹具均已完整撤销，只保留本条负结果。
+
+后续若继续消减 replay，必须同时保留并行 request/参数生产能力，例如研究
+可证明完备的多 planner 分工；不能简单把 replay worker 数量降到 1，也不能
+用 PA 固定五 task 或固定 task 类型为任务做静态分片。
