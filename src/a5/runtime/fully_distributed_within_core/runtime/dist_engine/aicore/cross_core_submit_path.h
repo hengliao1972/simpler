@@ -644,7 +644,6 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
 
 PTO_DEVICE_FUNC bool dist_cross_core_win_build_tournament(DistSubmitCtx &ctx, bool &won) {
     won = false;
-#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
     if (ctx.self == nullptr || ctx.self->core_idx < 0 || g_dist.num_workers <= 0 ||
         ctx.self->core_idx >= g_dist.num_workers) {
         return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
@@ -674,10 +673,6 @@ PTO_DEVICE_FUNC bool dist_cross_core_win_build_tournament(DistSubmitCtx &ctx, bo
     }
     won = root_observed == expected;
     return true;
-#else
-    won = true;
-    return true;
-#endif
 }
 
 PTO_DEVICE_FUNC bool dist_cross_core_reserve_build(DistSubmitCtx &ctx, bool &build_owner) {

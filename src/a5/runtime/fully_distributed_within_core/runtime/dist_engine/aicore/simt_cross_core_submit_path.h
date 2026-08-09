@@ -61,6 +61,9 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_reserve_request(DistSubmitCtx &ctx, bo
     if (!dist_simt_cross_core_task_valid(ctx)) {
         return dist_simt_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_CAPACITY);
     }
+    bool tournament_winner = false;
+    if (!dist_cross_core_win_build_tournament(ctx, tournament_winner)) return false;
+    if (!tournament_winner) return true;
     __gm__ fdwic::cross_core::SimtBuildRequestCell &request =
         dist_simt_cross_core_state().requests[static_cast<uint32_t>(ctx.task_id)];
     const SimtRequestReserveResult result = fdwic::cross_core::ReserveSimtBuildRequest<DistCrossCoreAicoreOps>(

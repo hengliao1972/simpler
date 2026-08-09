@@ -476,12 +476,11 @@ struct alignas(kCacheLine) CrossCoreRuntimeState {
     fdwic::cross_core::SharedExecCell tasks[kFdwicCrossCoreTaskCapacity];
     fdwic::cross_core::CrossCoreOutputCell<Tensor> outputs[kFdwicCrossCoreTaskCapacity];
     fdwic::cross_core::CrossCoreTensorMapState tensor_map;
-#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
-    // Scalar cross-core 的全部 replay worker 先在 task-private 的分组节点
-    // 竞争，只有每组 winner 再触碰 Build control。复用 same-core 已验证的
-    // 512B 节点间距，避免为同一种 per-task tournament 再造布局。
+    // 全部 cross-core replay worker 先在 task-private 的分组节点竞争，
+    // 只有每组 winner 再触碰全局 Build/request control。Scalar 模式用它
+    // 选 Build owner，SIMT 模式用它选唯一 request publisher。复用
+    // same-core 已验证的 512B 节点间距，不按算子类型裁剪候选核。
     SharedClaimTournamentTask build_tournament[kFdwicCrossCoreTaskCapacity];
-#endif
 };
 using CrossCoreOrdinaryState = CrossCoreRuntimeState;
 static_assert(offsetof(CrossCoreOrdinaryState, fatal) == 0);
@@ -508,11 +507,8 @@ static_assert(
             kFdwicCrossCoreTaskCapacity *
                 (sizeof(fdwic::cross_core::SharedExecControl) + sizeof(fdwic::cross_core::SharedExecCell) +
                  sizeof(fdwic::cross_core::CrossCoreOutputCell<Tensor>)) +
-            sizeof(fdwic::cross_core::CrossCoreTensorMapState)
-#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
-            + kFdwicCrossCoreTaskCapacity * sizeof(SharedClaimTournamentTask)
-#endif
-        ,
+            sizeof(fdwic::cross_core::CrossCoreTensorMapState) +
+            kFdwicCrossCoreTaskCapacity * sizeof(SharedClaimTournamentTask),
     "cross-core ordinary state size changed"
 );
 

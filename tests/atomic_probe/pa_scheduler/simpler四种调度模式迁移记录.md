@@ -833,3 +833,56 @@ Scalar ordinary 的 PA B256 回归也数值 PASS。该版本第一份
 startup→FinalDrain 样本为 **11.058 ms**，相对第 16.3 节的 **24.188 ms**
 单样本改善约 **54.3%**。这里仅证明候选没有以正确性换性能，并记录量级；
 尚未取得多次中位数，且距离 2 ms 目标仍远，不把该数字写成稳定性能结论。
+
+## 18. SIMT request publisher 复用通用两级仲裁
+
+### 18.1 直接竞争的通用问题
+
+mode3/mode4 的唯一 request publisher 原先由全部 replay worker
+直接竞争同一个 task 的 `SimtBuildRequestCell::control`。PA B256 中，
+mode3/mode4 分别有 95/80 个 replay worker；因而每个 task 都会在同一
+地址产生 95/80 路返回型 CAS。这与 Scalar 模式第 17 章已处理的
+Build owner 竞争是同一类硬件约束，没有必要再造一套仲裁布局。
+
+保留版把 `CrossCoreRuntimeState::build_tournament` 变为四种 cross-core
+模式的公共状态，并直接复用
+`dist_cross_core_win_build_tournament()`：
+
+1. 所有合法 replay worker 仍是候选者，不固定 PA 核集合；
+2. 分组只由 `num_workers` 和 `core_idx` 决定；
+3. 每组唯一 winner 再竞争 root，root winner 才会触碰 request control；
+4. SIMT builder 数量、request ABI、TensorMap 插入、fanin、execution payload
+   和 Execute owner 协议均不变。
+
+该改动不读取 PA task kind、batch、Tensor 形状或固定 DAG；小 block
+下候选者少于分组上限时，分组数会按实际 worker 数收缩。
+
+### 18.2 非 PA 边界回归
+
+受影响的 mode3/mode4 分别运行第 17.2 节六类通用边界，合计
+12 个真实 A5 模式/场景组合，全部数值 golden PASS。覆盖范围包括：
+
+- 3/12/96 worker 和非均匀分组；
+- 无 fresh output 的 Build/Execute 到达偏斜；
+- AIC→AIV→AIC deferred 依赖链；
+- 一个 task 的多 output 分槽消费；
+- 同一 region 的重复 INOUT writer 链。
+
+SIMT ordinary/DAG state 和 request protocol 定向 C++ 测试也全部 PASS。
+本阶段没有使用 A5Sim。
+
+### 18.3 PA B256 端到端结果
+
+相同 shared TensorMap、PA B256、startup→FinalDrain `perf-clock`
+口径，每组都是三个独立 pytest 进程：
+
+| 模式 | 保留版三次结果 | 中位数 | 本轮前对照 | 改善 |
+| ---- | -------------- | -----: | ---------: | ---: |
+| `simt_cross_core_ordinary` | 55.534 / 55.914 / 55.332 ms | 55.534 ms | 64.551 ms | 14.0% |
+| `simt_cross_core_dag` | 24.813 / 24.544 / 24.512 ms | 24.544 ms | 39.361 ms | 37.6% |
+
+这些数据证明 request control 的同地址并发是 SIMT 路径的真实大头。
+同时，24.5/55.5 ms 仍远高于 2 ms 目标：两级仲裁只降低了竞争
+扇入，没有消除 80～95 个 worker 对 1,280 个 Submit 的全量 replay。
+后续需要改造 replay/Build/Execute 的任务发放方式，不应继续把同一
+收益误解为 PA DAG 或某种 Tensor 特例。
