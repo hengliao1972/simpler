@@ -249,3 +249,51 @@ Scalar 两种模式的约 71 ms 首基线，下一阶段必须继续消减 DAG �
 `A5OnboardBd24ExistingInoutChain`：`simt_cross_core_dag` 数值 golden PASS。
 该用例的 24 block 会动态得到 24 builder，证明设备协议没有把 PA 的
 32 block 当作调度常量。
+
+## 8. 第二阶段候选：否决 Scalar 有序链内的精确依赖索引
+
+### 8.1 验证目的
+
+为消除 SIMT builder 对每个 INPUT/INOUT 执行的
+`O(H × 输入数)` metadata 逆向扫描，曾验证一条通用候选路径：由严格有序的
+Scalar request publisher 在发布 task N 时，同时发布 writer metadata、查询
+精确前驱并更新按 buffer address 索引；SIMT builder 只消费 request 尾部已经
+解析好的 fanin。
+
+该候选不编码 PA task kind，并处理了三类通用情况：
+
+- 同一 buffer 始终使用相同 region 时，索引直接返回最新 producer；
+- 同一 buffer 出现不同 region 时标记为 ambiguous，回退到有界 metadata 扫描；
+- hash 冲突使用线性探测，索引耗尽同样回退，不改变依赖正确性。
+
+协议单测、CCEC 构建、A5Sim PA B1，以及真实 A5 非 PA 的
+`A5OnboardBd1ExistingInoutChain`、`A5OnboardBd24ExistingInoutChain` 均已通过。
+验证期间还发现：把 writer 与 query 同时保存为两个局部数组会令 CCEC 热函数的
+临时栈接近 2 KiB，造成真实 A5 卡在 request 发布/输出等待；改成两次直接遍历、
+不保存 query 数组后，非 PA 上板正确性恢复。
+
+### 8.2 性能结果
+
+相同 PA B256、shared TensorMap、`simt_cross_core_dag`、startup 到
+FinalDrain 的 `perf-clock` 口径下：
+
+| 实现 | 单次端到端时间 | 相对 188.308 ms 基线 |
+| ---- | -------------: | -------------------: |
+| 32 builder 原 metadata 扫描 | 188.308 ms | 基线 |
+| 精确索引，逐字段跨地址空间读取 | 281.592 ms | 回退约 49.5% |
+| 精确索引，每 Tensor 合并为一次快照 | 282.252 ms | 回退约 49.9% |
+
+把每个 Tensor 的五次 CCEC `noinline` 字段读取合并为一次快照后，端到端时间
+没有改善，说明主要损耗不是函数调用次数，而是把 Tensor region 解析、索引
+invalidate/update、metadata 发布和 fanin 查询放进了所有 task 共用的 Scalar
+有序发布链。该链原本只负责轻量 immutable request 发布，新增工作无法被 32 个
+SIMT builder 并行摊分。
+
+### 8.3 裁决与后续约束
+
+这条候选已完整撤回，不提交实现代码。后续消减 DAG writer 查询必须满足：
+
+1. 不把按 Tensor 的依赖解析搬进全局串行 request 发布链；
+2. 保留通用 region/alias/manual dependency 语义，不以 PA 固定图替代查询；
+3. 优先让索引构建或查询留在多 builder 可并行的位置；
+4. 每个候选先通过非 PA INOUT 链正确性，再以 188.308 ms 为端到端保留门槛。
