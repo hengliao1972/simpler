@@ -810,6 +810,14 @@ Build 尚未发布，不是控制字损坏；Execute 侧继续等待并定期检
   分槽发布和 INOUT 消费；
 - `Bd32RepeatedInoutChain`：96 worker、32 writer，验证同一 region 的
   严格 writer 前驱链。
+- `Bd32ZeroSubmit`：96 worker、零 task，验证只有 startup/FinalDrain 时
+  不臆造 owner、不错误等待不存在的执行工作；
+- `Bd7AicOnlyPrimeTasks`：21 worker、17 个独立 AIC task，验证非 2 次幂
+  task 数、非均匀仲裁分组，以及 AIV 完全无任务时的闭合；
+- `Bd7AivOnlyPrimeTasks`：21 worker、17 个独立 AIV task，反向验证 AIC
+  完全无任务时的闭合；
+- `Bd7AlternatingCrossEngineInout`：17 组 AIC→AIV writer 交接，验证同一
+  region 的跨引擎严格前驱顺序，不依赖 PA 的固定五任务 DAG。
 
 `Bd32BuildExecuteSkewNoFreshOutput` 交替提交 AIC/AIV，并让每个 task 写独立
 subview；它不会因为业务依赖把 Build 人为串行化，能放大 Execute 先看到
@@ -818,12 +826,17 @@ subview；它不会因为业务依赖把 Build 人为串行化，能放大 Execu
 
 ### 17.3 四模式真实 A5 结果
 
-以下四种 scheduler 均运行上述六个 case，合计 24 个模式/场景组合：
+以下四种 scheduler 均运行上述十个 case，合计 40 个模式/场景组合：
 
 - `cross_core_ordinary`：全部数值 golden PASS；
 - `cross_core_dag`：全部数值 golden PASS；
 - `simt_cross_core_ordinary`：全部数值 golden PASS；
 - `simt_cross_core_dag`：全部数值 golden PASS。
+
+后补的四类边界于 2026-08-09 再次在四种 scheduler 上逐一构建三镜像并
+真机运行，16 个模式/场景组合全部数值 golden PASS。零 Submit、单引擎
+空闲和 17-task 非均匀数量均由同一公开 orchestration API 产生，没有增加
+调度器测试专用分支。
 
 同时，cross-core execution/output/TensorMap 协议与 ordinary/DAG state 五组
 C++ 单测全部 PASS。没有运行 A5Sim；SIMT/cross-core 的裁决继续只使用 CCEC

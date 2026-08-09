@@ -586,6 +586,57 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         return;
     }
 
+    if (mode == 38) {
+        // 零 Submit 是调度器的合法边界：所有 worker 仍需完成启动和收尾，
+        // 但不得臆造 Build/Execute owner，也不得把空任务流当作 fatal。
+        return;
+    }
+
+    if (mode == 39 || mode == 40) {
+        // 17 个互不依赖的 task 刻意不对齐 2、4、8 等常见分组宽度。
+        // mode39 只向 AIC 发任务，mode40 只向 AIV 发任务，用来验证另一
+        // 执行引擎完全空闲时，中央 ticket、FinalDrain 和完成计数仍闭合。
+        constexpr uint32_t chunk = 32;
+        const uint32_t chunk_shape[1] = {chunk};
+        const uint64_t task_count = n / chunk;
+        for (uint64_t task = 0; task < task_count; ++task) {
+            const uint32_t offset[1] = {static_cast<uint32_t>(task * chunk)};
+            Tensor input_view = Tensor::view(input, chunk_shape, offset);
+            Tensor output_view = Tensor::view(output, chunk_shape, offset);
+            L0TaskArgs task_args;
+            task_args.add_input(input_view);
+            if (mode == 39) {
+                task_args.add_inout(output_view);
+                task_args.add_scalar(static_cast<uint64_t>(chunk));
+                rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, task_args);
+            } else {
+                task_args.add_output(output_view);
+                task_args.add_scalar(static_cast<uint64_t>(chunk));
+                rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, task_args);
+            }
+        }
+        return;
+    }
+
+    if (mode == 41) {
+        // 同一 INOUT region 在 AIC/AIV 间反复交接。每一对 task 中，AIC
+        // 先重写为 input+7，AIV 再加一；只要 writer 前驱或跨引擎完成发布
+        // 有一次越序，最终值就不会稳定为 input+8。
+        for (uint64_t pair = 0; pair < n; ++pair) {
+            L0TaskArgs fill_args;
+            fill_args.add_input(input);
+            fill_args.add_inout(output);
+            fill_args.add_scalar(n);
+            rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+
+            L0TaskArgs bump_args;
+            bump_args.add_inout(output);
+            bump_args.add_scalar(n);
+            rt_submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_args);
+        }
+        return;
+    }
+
     if (mode == 15) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs left_args;

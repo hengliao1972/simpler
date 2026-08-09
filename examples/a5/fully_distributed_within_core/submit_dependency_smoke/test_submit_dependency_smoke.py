@@ -432,6 +432,34 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 128, "mode": 37},
         },
         {
+            "name": "A5OnboardBd32ZeroSubmit",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 32, "mode": 38},
+        },
+        {
+            "name": "A5OnboardBd7AicOnlyPrimeTasks",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 7},
+            "params": {"n": 17 * 32, "mode": 39},
+        },
+        {
+            "name": "A5OnboardBd7AivOnlyPrimeTasks",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 7},
+            "params": {"n": 17 * 32, "mode": 40},
+        },
+        {
+            "name": "A5OnboardBd7AlternatingCrossEngineInout",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 7},
+            "params": {"n": 17, "mode": 41},
+        },
+        {
             "name": "A5SimBd36TaskOutputViewFanin",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -853,6 +881,18 @@ class TestSubmitDependencySmoke(SceneTestCase):
             return
         if mode == 37:
             args.output[:] = args.input + 38.0
+            return
+        if mode == 38:
+            args.output[:] = -1.0
+            return
+        if mode == 39:
+            args.output[:] = args.input + 7.0
+            return
+        if mode == 40:
+            args.output[:] = args.input * 3.0 + 5.0
+            return
+        if mode == 41:
+            args.output[:] = args.input + 8.0
             return
         if mode == 10:
             args.output[:] = (args.input * 3.0 + 5.0) * 3.0 + 8.0
