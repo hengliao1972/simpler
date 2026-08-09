@@ -598,18 +598,15 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
     while (true) {
         const int64_t raw_state = DistCrossCoreAicoreOps::Load(&cell.control.state);
         const fdwic::cross_core::DecodedExecState state = fdwic::cross_core::DecodeExecState(raw_state);
-#if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
-        // The SIMT builder is fully asynchronous with the Scalar publisher and
-        // execute owner: output descriptors may be visible before the exec cell
-        // advances from Empty to Building. Empty is therefore pending producer
-        // progress here, not corrupt control. Ordinary cross-core modes retain
-        // their strict contract because one Scalar reserves Build first.
+        // Build 与 Execute owner 相互独立。两级 Build 仲裁的局部 loser
+        // 可能先赢得 Execute owner，而 root winner 尚未把 exec cell 从
+        // Empty 推进到 Building；SIMT builder 同样允许这一时序。因此
+        // Empty 表示生产者仍在推进，不是控制字损坏。
         if (raw_state == 0) {
             SPIN_WAIT_HINT();
             if ((++polls & 1023U) == 0 && fdwic_trace_is_fatal(ctx.task_id)) return false;
             continue;
         }
-#endif
         if (!state.valid || state.task_id != static_cast<uint32_t>(ctx.task_id)) {
             return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
         }
@@ -645,8 +642,51 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
     }
 }
 
+PTO_DEVICE_FUNC bool dist_cross_core_win_build_tournament(DistSubmitCtx &ctx, bool &won) {
+    won = false;
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
+    if (ctx.self == nullptr || ctx.self->core_idx < 0 || g_dist.num_workers <= 0 ||
+        ctx.self->core_idx >= g_dist.num_workers) {
+        return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+    }
+    const uint32_t worker_count = static_cast<uint32_t>(g_dist.num_workers);
+    const uint32_t groups =
+        worker_count < kFdwicSharedClaimTournamentMaxGroups ? worker_count : kFdwicSharedClaimTournamentMaxGroups;
+    const uint32_t group = static_cast<uint32_t>(ctx.self->core_idx) % groups;
+    __gm__ SharedClaimTournamentTask &tournament =
+        dist_cross_core_runtime_state().build_tournament[static_cast<uint32_t>(ctx.task_id)];
+    const int64_t expected = -1;
+    const int64_t desired = static_cast<int64_t>(ctx.task_id);
+    const int64_t local_observed = fdwic_trace_atomic_compare_exchange<int64_t>(
+        ctx.task_id, FdwicAtomicSite::CrossCoreBuildTournamentLocal, tournament.local[group].owner.v, expected, desired,
+        /*result_used=*/true
+    );
+    if (local_observed != expected) {
+        if (local_observed != desired) return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+        return true;
+    }
+    const int64_t root_observed = fdwic_trace_atomic_compare_exchange<int64_t>(
+        ctx.task_id, FdwicAtomicSite::CrossCoreBuildTournamentRoot, tournament.root.owner.v, expected, desired,
+        /*result_used=*/true
+    );
+    if (root_observed != expected && root_observed != desired) {
+        return dist_cross_core_fail(ctx.task_id, PTO2_ERROR_TENSORMAP_PROTOCOL);
+    }
+    won = root_observed == expected;
+    return true;
+#else
+    won = true;
+    return true;
+#endif
+}
+
 PTO_DEVICE_FUNC bool dist_cross_core_reserve_build(DistSubmitCtx &ctx, bool &build_owner) {
     build_owner = false;
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
+    bool tournament_winner = false;
+    if (!dist_cross_core_win_build_tournament(ctx, tournament_winner)) return false;
+    if (!tournament_winner) return true;
+#endif
     __gm__ SharedExecCell &cell = dist_cross_core_runtime_state().tasks[static_cast<uint32_t>(ctx.task_id)];
     const ExecBuildReserveResult reservation_result = fdwic::cross_core::ReserveExecBuild<DistCrossCoreAicoreOps>(
         cell, static_cast<uint32_t>(ctx.task_id), static_cast<uint32_t>(ctx.self->core_idx),

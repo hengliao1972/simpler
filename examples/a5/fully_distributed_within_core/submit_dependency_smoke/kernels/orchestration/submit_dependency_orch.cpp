@@ -434,6 +434,158 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         return;
     }
 
+    if (mode == 34) {
+        constexpr uint32_t chunk = 32;
+        const uint32_t chunk_shape[1] = {chunk};
+        const uint64_t task_count = n / chunk;
+        for (uint64_t task = 0; task < task_count; ++task) {
+            const uint32_t offset[1] = {static_cast<uint32_t>(task * chunk)};
+            Tensor input_view = Tensor::view(input, chunk_shape, offset);
+            Tensor output_view = Tensor::view(output, chunk_shape, offset);
+            L0TaskArgs task_args;
+            task_args.add_input(input_view);
+            if ((task & 1U) == 0) {
+                task_args.add_inout(output_view);
+                task_args.add_scalar(static_cast<uint64_t>(chunk));
+                rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, task_args);
+            } else {
+                task_args.add_output(output_view);
+                task_args.add_scalar(static_cast<uint64_t>(chunk));
+                rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, task_args);
+            }
+        }
+        return;
+    }
+
+    if (mode == 35) {
+        constexpr uint32_t chunk = 32;
+        const uint32_t chunk_shape[1] = {chunk};
+        const uint64_t chain_count = n / chunk;
+        for (uint64_t chain = 0; chain < chain_count; ++chain) {
+            const uint32_t offset[1] = {static_cast<uint32_t>(chain * chunk)};
+            Tensor input_view = Tensor::view(input, chunk_shape, offset);
+            Tensor output_view = Tensor::view(output, chunk_shape, offset);
+            TensorCreateInfo left_ci(chunk_shape, 1, DataType::FLOAT32);
+            TensorCreateInfo right_ci(chunk_shape, 1, DataType::FLOAT32);
+
+            L0TaskArgs left_args;
+#if PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE >= 1 && PTO_FDWIC_SCHEDULER_MODE <= 4
+            SharedTaskOutputs left_outputs = rt_submit_aic_task_deferred_compete_first(
+                FUNC_MAKE_LEFT_AIC, 1, left_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    submit_args.add_input(input_view);
+                    submit_args.add_output(left_ci);
+                    submit_args.add_scalar(static_cast<uint64_t>(chunk));
+                }
+            );
+            if (left_outputs.size() != 1) return;
+            FdwicOutputRef left = left_outputs.output_ref(0);
+#else
+            TaskOutputTensors left_outputs = rt_submit_aic_task_compete_first(
+                FUNC_MAKE_LEFT_AIC, left_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    submit_args.add_input(input_view);
+                    submit_args.add_output(left_ci);
+                    submit_args.add_scalar(static_cast<uint64_t>(chunk));
+                }
+            );
+            __gm__ const Tensor &left = left_outputs.get_ref(0);
+#endif
+
+            L0TaskArgs right_args;
+#if PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE >= 1 && PTO_FDWIC_SCHEDULER_MODE <= 4
+            SharedTaskOutputs right_outputs = rt_submit_aiv_task_deferred_compete_first(
+                FUNC_MAKE_RIGHT_AIV, 1, right_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    submit_args.add_input(left);
+                    submit_args.add_output(right_ci);
+                    submit_args.add_scalar(static_cast<uint64_t>(chunk));
+                }
+            );
+            if (right_outputs.size() != 1) return;
+            FdwicOutputRef right = right_outputs.output_ref(0);
+#else
+            TaskOutputTensors right_outputs = rt_submit_aiv_task_compete_first(
+                FUNC_MAKE_RIGHT_AIV, right_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    submit_args.add_input(left);
+                    submit_args.add_output(right_ci);
+                    submit_args.add_scalar(static_cast<uint64_t>(chunk));
+                }
+            );
+            __gm__ const Tensor &right = right_outputs.get_ref(0);
+#endif
+
+            L0TaskArgs fill_args;
+            fill_args.add_input(right);
+            fill_args.add_inout(output_view);
+            fill_args.add_scalar(static_cast<uint64_t>(chunk));
+            rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+        }
+        return;
+    }
+
+    if (mode == 36) {
+        constexpr uint32_t chunk = 32;
+        const uint32_t chunk_shape[1] = {chunk};
+        const uint64_t pair_count = n / chunk;
+        for (uint64_t pair_index = 0; pair_index < pair_count; ++pair_index) {
+            const uint32_t offset[1] = {static_cast<uint32_t>(pair_index * chunk)};
+            Tensor input_view = Tensor::view(input, chunk_shape, offset);
+            Tensor output_view = Tensor::view(output, chunk_shape, offset);
+            TensorCreateInfo first_ci(chunk_shape, 1, DataType::FLOAT32);
+            TensorCreateInfo second_ci(chunk_shape, 1, DataType::FLOAT32);
+
+            L0TaskArgs alloc_args;
+#if PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE >= 1 && PTO_FDWIC_SCHEDULER_MODE <= 4
+            SharedTaskOutputs pair_outputs =
+                alloc_tensors_deferred_compete_first(2, alloc_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    submit_args.add_output(first_ci, second_ci);
+                });
+            if (pair_outputs.size() != 2) return;
+            FdwicOutputRef first = pair_outputs.output_ref(0);
+            FdwicOutputRef second = pair_outputs.output_ref(1);
+#else
+            TaskOutputTensors pair_outputs =
+                alloc_tensors_compete_first(alloc_args, [&](L0TaskArgs &submit_args) PTO_DEVICE_FUNC {
+                    submit_args.add_output(first_ci, second_ci);
+                });
+            __gm__ const Tensor &first = pair_outputs.get_ref(0);
+            __gm__ const Tensor &second = pair_outputs.get_ref(1);
+#endif
+
+            L0TaskArgs first_args;
+            first_args.add_input(input_view);
+            first_args.add_inout(first);
+            first_args.add_scalar(static_cast<uint64_t>(chunk));
+            rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, first_args);
+
+            L0TaskArgs second_args;
+            second_args.add_input(input_view, input_view, input_view);
+            second_args.add_inout(second);
+            second_args.add_scalar(static_cast<uint64_t>(chunk));
+            rt_submit_aiv_task(FUNC_FANIN_AIV, second_args);
+
+            L0TaskArgs merge_args;
+            merge_args.add_input(first, second, first);
+            merge_args.add_inout(output_view);
+            merge_args.add_scalar(static_cast<uint64_t>(chunk));
+            rt_submit_aiv_task(FUNC_FANIN_AIV, merge_args);
+        }
+        return;
+    }
+
+    if (mode == 37) {
+        L0TaskArgs fill_args;
+        fill_args.add_input(input);
+        fill_args.add_inout(output);
+        fill_args.add_scalar(n);
+        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+        for (uint32_t writer = 0; writer < 31; ++writer) {
+            L0TaskArgs bump_args;
+            bump_args.add_inout(output);
+            bump_args.add_scalar(n);
+            rt_submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_args);
+        }
+        return;
+    }
+
     if (mode == 15) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs left_args;

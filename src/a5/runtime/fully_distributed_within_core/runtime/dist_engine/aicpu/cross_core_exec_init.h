@@ -25,6 +25,12 @@ inline void dist_cross_core_runtime_reset(CrossCoreRuntimeState &state) {
         atomic_exchange(state.execute_owner[task].state, int64_t{0}, __ATOMIC_RELAXED);
         atomic_exchange(state.tasks[task].control.state, int64_t{0}, __ATOMIC_RELAXED);
         atomic_exchange(state.outputs[task].control.state, int64_t{0}, __ATOMIC_RELAXED);
+#if PTO_FDWIC_SCHEDULER_MODE == 1 || PTO_FDWIC_SCHEDULER_MODE == 2
+        atomic_exchange(state.build_tournament[task].root.owner.v, int64_t{-1}, __ATOMIC_RELAXED);
+        for (uint32_t group = 0; group < kFdwicSharedClaimTournamentMaxGroups; ++group) {
+            atomic_exchange(state.build_tournament[task].local[group].owner.v, int64_t{-1}, __ATOMIC_RELAXED);
+        }
+#endif
     }
     for (uint32_t bucket = 0; bucket < fdwic::cross_core::kCrossMapBuckets; ++bucket) {
         atomic_exchange(state.tensor_map.tails[bucket].state, int64_t{0}, __ATOMIC_RELAXED);

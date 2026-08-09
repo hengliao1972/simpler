@@ -769,3 +769,67 @@ mode4 的 DAG 语义与 builder 并行度没有变，仅去除共有的 replay �
 归因于 DAG lookup 是不完整的；当时更大的共同因素是错误的输出合同。
 当前 39.361 ms 仍不是目标性能，后续再在新基线上分析 publisher 描述符等待、
 SIMT Build 供给和 Execute 进度，不应回到旧基线上微调 DAG 分支。
+
+## 17. 通用 Build 仲裁与非 PA 边界矩阵
+
+### 17.1 两级仲裁不读取算子语义
+
+Scalar mode1/mode2 原先让所有 replay worker 直接竞争同一个 task 的
+`SharedExecCell`。A5 对同地址返回型 atomic 的并发代价较高，因此复用
+same-core 已验证的 task-private tournament 布局，把一次 Build owner 仲裁
+拆成两层：
+
+1. 全部 worker 按 `core_idx % min(num_workers, 8)` 竞争本组 owner；
+2. 只有各组唯一 winner 再竞争 root owner；
+3. root winner 继续调用原有 `ReserveExecBuild()`，之后的 Materialize、
+   TensorMap 插入、Build payload 发布和 Execute owner 协议不变。
+
+该路径只读取 worker 数、core id 和 task id；不读取 PA `TaskKind`、batch、
+QK/SF/PV/UP，也不裁剪某类 task 的候选核。8 是 tournament 布局已有的最大
+组数，不是 PA 的 C/V 候选数量。
+
+两层仲裁引入了一个必须显式支持的通用时序：local loser 可能先到达 Execute
+绑定，而 root winner 尚未把 execution cell 从 `Empty` 推进到 `Building`。
+Build owner 与 Execute owner 本来就是独立角色，因此 `Empty` 在这里表示
+Build 尚未发布，不是控制字损坏；Execute 侧继续等待并定期检查 fatal。
+
+### 17.2 新增通用边界用例
+
+所有用例都放在存量 `submit_dependency_smoke`，复用已有 AIC/AIV kernel，
+没有新建 PA adapter 或测试专用运行时分支。
+
+- `Bd1BuildExecuteSkewNoFreshOutput`：3 worker、1 task，验证 worker 少于
+  8 时的动态分组和零 fresh output；
+- `Bd4BuildExecuteSkewNoFreshOutput`：12 worker、16 task，验证 worker
+  多于 8 且各组人数不均；
+- `Bd32BuildExecuteSkewNoFreshOutput`：96 worker、128 task，验证
+  Build/Execute 到达次序和独立 region；
+- `Bd32DeferredCrossRoleChain`：32 条链、96 task，验证 AIC→AIV→AIC
+  deferred output 消费；
+- `Bd32DeferredMultiOutput`：16 组、64 task，验证每 task 两个 output、
+  分槽发布和 INOUT 消费；
+- `Bd32RepeatedInoutChain`：96 worker、32 writer，验证同一 region 的
+  严格 writer 前驱链。
+
+`Bd32BuildExecuteSkewNoFreshOutput` 交替提交 AIC/AIV，并让每个 task 写独立
+subview；它不会因为业务依赖把 Build 人为串行化，能放大 Execute 先看到
+`Empty` 的时序。多输出用例通过通用 deferred alloc 一次发布两个 output，
+后续 AIC/AIV 分别写入并合并，不依赖 PA 的三输出 Alloc 图形。
+
+### 17.3 四模式真实 A5 结果
+
+以下四种 scheduler 均运行上述六个 case，合计 24 个模式/场景组合：
+
+- `cross_core_ordinary`：全部数值 golden PASS；
+- `cross_core_dag`：全部数值 golden PASS；
+- `simt_cross_core_ordinary`：全部数值 golden PASS；
+- `simt_cross_core_dag`：全部数值 golden PASS。
+
+同时，cross-core execution/output/TensorMap 协议与 ordinary/DAG state 五组
+C++ 单测全部 PASS。没有运行 A5Sim；SIMT/cross-core 的裁决继续只使用 CCEC
+构建和真实 A5。
+
+Scalar ordinary 的 PA B256 回归也数值 PASS。该版本第一份
+startup→FinalDrain 样本为 **11.058 ms**，相对第 16.3 节的 **24.188 ms**
+单样本改善约 **54.3%**。这里仅证明候选没有以正确性换性能，并记录量级；
+尚未取得多次中位数，且距离 2 ms 目标仍远，不把该数字写成稳定性能结论。

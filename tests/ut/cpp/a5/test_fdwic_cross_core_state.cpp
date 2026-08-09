@@ -41,14 +41,12 @@ TEST(FdwicCrossCoreOrdinaryState, AppendsWithoutMovingTheExistingSharedState) {
     EXPECT_EQ(offsetof(CrossCoreOrdinaryState, execute_owner), 128U);
     EXPECT_EQ(offsetof(CrossCoreOrdinaryState, tasks), 128U + 2048U * sizeof(SharedExecControl));
     EXPECT_EQ(
-        offsetof(CrossCoreOrdinaryState, outputs),
-        128U + 2048U * (sizeof(SharedExecControl) + sizeof(SharedExecCell))
+        offsetof(CrossCoreOrdinaryState, outputs), 128U + 2048U * (sizeof(SharedExecControl) + sizeof(SharedExecCell))
     );
     EXPECT_EQ(
         sizeof(CrossCoreOrdinaryState),
-        128U +
-            2048U * (sizeof(SharedExecControl) + sizeof(SharedExecCell) + sizeof(CrossCoreOutputCell<Tensor>)) +
-            sizeof(CrossCoreTensorMapState)
+        128U + 2048U * (sizeof(SharedExecControl) + sizeof(SharedExecCell) + sizeof(CrossCoreOutputCell<Tensor>)) +
+            sizeof(CrossCoreTensorMapState) + 2048U * sizeof(SharedClaimTournamentTask)
     );
     EXPECT_EQ(offsetof(DistGlobal, shared_pa), kFdwicSharedTensorMapOffset);
     EXPECT_EQ(offsetof(DistGlobal, cross_core_ordinary), kFdwicSharedTensorMapOffset + sizeof(SharedPaTensorMapState));
@@ -67,6 +65,10 @@ TEST(FdwicCrossCoreOrdinaryState, ResetTouchesOnlyAtomicPublicationControls) {
         EXPECT_EQ(state->execute_owner[task].state, 0) << "task=" << task;
         EXPECT_EQ(state->tasks[task].control.state, 0) << "task=" << task;
         EXPECT_EQ(state->outputs[task].control.state, 0) << "task=" << task;
+        EXPECT_EQ(state->build_tournament[task].root.owner.v, -1) << "task=" << task;
+        for (uint32_t group = 0; group < kFdwicSharedClaimTournamentMaxGroups; ++group) {
+            EXPECT_EQ(state->build_tournament[task].local[group].owner.v, -1) << "task=" << task << " group=" << group;
+        }
         EXPECT_TRUE(BytesEqual(
             &state->tasks[task], offsetof(SharedExecCell, payload), sizeof(ExecPayloadStorage), kPayloadPattern
         )) << "task="

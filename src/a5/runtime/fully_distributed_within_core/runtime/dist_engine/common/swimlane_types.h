@@ -158,7 +158,9 @@ enum class FdwicAtomicSite : uint32_t {
     SharedOutputRollbackExchange = 39,
     SharedClaimTournamentLocal = 40,
     SharedClaimTournamentRoot = 41,
-    Count = 42,
+    CrossCoreBuildTournamentLocal = 42,
+    CrossCoreBuildTournamentRoot = 43,
+    Count = 44,
     // Stale private BlockWon helpers still have to parse while the shared
     // submit path is compiled from the same translation unit. Values outside
     // Count are intentionally unencodable: executing one makes the trace
@@ -315,6 +317,8 @@ PTO_DEVICE_FUNC constexpr FdwicAtomicOp fdwic_atomic_site_op(FdwicAtomicSite sit
     case FdwicAtomicSite::SharedMetadataLastWriterCommit:
     case FdwicAtomicSite::SharedClaimTournamentLocal:
     case FdwicAtomicSite::SharedClaimTournamentRoot:
+    case FdwicAtomicSite::CrossCoreBuildTournamentLocal:
+    case FdwicAtomicSite::CrossCoreBuildTournamentRoot:
         return FdwicAtomicOp::CompareExchange;
 #else
     case FdwicAtomicSite::WonRemainingFetchSub:
@@ -378,7 +382,7 @@ PTO_DEVICE_FUNC constexpr bool fdwic_atomic_site_result_used(FdwicAtomicSite sit
 }
 
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kFdwicAtomicReturnReadySiteCount = 36;
+constexpr uint32_t kFdwicAtomicReturnReadySiteCount = 38;
 constexpr uint32_t kFdwicAtomicSourceIssueSiteCount = 6;
 #else
 constexpr uint32_t kFdwicAtomicReturnReadySiteCount = 16;
@@ -652,20 +656,17 @@ constexpr uint32_t kFdwicCompactTraceAuxShift = 21;
 constexpr uint32_t kFdwicCompactTraceAuxBits = 11;
 constexpr uint32_t kFdwicCompactTraceAuxMask = (1U << kFdwicCompactTraceAuxBits) - 1U;
 
-PTO_DEVICE_FUNC constexpr bool fdwic_compact_trace_fields_fit(
-    int32_t task_id, int32_t func_id, FdwicSwimlanePhase phase, uint32_t aux
-) {
+PTO_DEVICE_FUNC constexpr bool
+fdwic_compact_trace_fields_fit(int32_t task_id, int32_t func_id, FdwicSwimlanePhase phase, uint32_t aux) {
     return task_id >= -1 && task_id < static_cast<int32_t>(kFdwicSharedTraceTaskCapacity) && func_id >= -1 &&
            func_id <= 3 && static_cast<uint32_t>(phase) < static_cast<uint32_t>(FdwicSwimlanePhase::Count) &&
            aux <= kFdwicCompactTraceAuxMask;
 }
 
-PTO_DEVICE_FUNC constexpr uint32_t fdwic_pack_compact_trace_fields(
-    int32_t task_id, int32_t func_id, FdwicSwimlanePhase phase, uint32_t aux
-) {
+PTO_DEVICE_FUNC constexpr uint32_t
+fdwic_pack_compact_trace_fields(int32_t task_id, int32_t func_id, FdwicSwimlanePhase phase, uint32_t aux) {
     return (static_cast<uint32_t>(task_id) & kFdwicCompactTraceTaskMask) |
-           ((static_cast<uint32_t>(func_id) & kFdwicCompactTraceFunctionMask)
-            << kFdwicCompactTraceFunctionShift) |
+           ((static_cast<uint32_t>(func_id) & kFdwicCompactTraceFunctionMask) << kFdwicCompactTraceFunctionShift) |
            (static_cast<uint32_t>(phase) << kFdwicCompactTracePhaseShift) | (aux << kFdwicCompactTraceAuxShift);
 }
 
@@ -689,8 +690,7 @@ constexpr size_t kFdwicSharedSubmitClaimBytesPerCore =
     static_cast<size_t>(kFdwicSharedTraceTaskCapacity) * sizeof(FdwicSharedSubmitClaimRecord);
 constexpr size_t kFdwicSwimlaneGenericBytesPerCore =
     static_cast<size_t>(kFdwicSwimlaneDefaultRecordsPerCore) * sizeof(FdwicSwimlaneStorageRecord);
-constexpr size_t kFdwicSwimlaneWorkerBytes =
-    kFdwicSharedSubmitClaimBytesPerCore + kFdwicSwimlaneGenericBytesPerCore;
+constexpr size_t kFdwicSwimlaneWorkerBytes = kFdwicSharedSubmitClaimBytesPerCore + kFdwicSwimlaneGenericBytesPerCore;
 static_assert(kFdwicSwimlaneWorkerBytes == 593920, "shared trace worker stride changed");
 #else
 using FdwicSwimlaneStorageRecord = FdwicSwimlaneRecord;

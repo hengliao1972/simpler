@@ -390,6 +390,48 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 128, "mode": 33},
         },
         {
+            "name": "A5OnboardBd1BuildExecuteSkewNoFreshOutput",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 32, "mode": 34},
+        },
+        {
+            "name": "A5OnboardBd4BuildExecuteSkewNoFreshOutput",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 4},
+            "params": {"n": 512, "mode": 34},
+        },
+        {
+            "name": "A5OnboardBd32BuildExecuteSkewNoFreshOutput",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 4096, "mode": 34},
+        },
+        {
+            "name": "A5OnboardBd32DeferredCrossRoleChain",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 1024, "mode": 35},
+        },
+        {
+            "name": "A5OnboardBd32DeferredMultiOutput",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 512, "mode": 36},
+        },
+        {
+            "name": "A5OnboardBd32RepeatedInoutChain",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 128, "mode": 37},
+        },
+        {
             "name": "A5SimBd36TaskOutputViewFanin",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -792,6 +834,25 @@ class TestSubmitDependencySmoke(SceneTestCase):
             return
         if mode in {9, 32}:
             args.output[:] = (args.input * 2.0 + 3.0) * 3.0 + 8.0
+            return
+        if mode == 34:
+            chunk = 32
+            for task in range(int(params["n"]) // chunk):
+                begin = task * chunk
+                end = begin + chunk
+                if task % 2 == 0:
+                    args.output[begin:end] = args.input[begin:end] + 7.0
+                else:
+                    args.output[begin:end] = args.input[begin:end] * 3.0 + 5.0
+            return
+        if mode == 35:
+            args.output[:] = args.input * 6.0 + 21.0
+            return
+        if mode == 36:
+            args.output[:] = args.input * 5.0 + 30.0
+            return
+        if mode == 37:
+            args.output[:] = args.input + 38.0
             return
         if mode == 10:
             args.output[:] = (args.input * 3.0 + 5.0) * 3.0 + 8.0
