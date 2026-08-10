@@ -1244,7 +1244,7 @@ launch 之后（运行时三阶段候选）：
       -> 原子发布 PLANNED(N)，推进 planned frontier
 
   Build：只领取 task_id < planned frontier
-      -> acquire PLANNED
+      -> return-ready observe PLANNED
       -> invalidate 并读取 RuntimeTaskDesc[N]
       -> Materialize/Register/Fanin/Build
       -> 发布 SharedExecCell=BUILT
@@ -1594,7 +1594,7 @@ Plan producer:
   atomic publish PLANNED(N)
 
 Build consumer:
-  atomic acquire PLANNED(N)
+  return-ready atomic observe PLANNED(N)
   DCCI invalidate payload lines
   DSB
   ordinary load RuntimeTaskDesc[N]
@@ -2210,7 +2210,539 @@ cell 同地址竞争，而是用 AIC/AIV 两条中央 ticket 唯一发放 task�
 11. BlockWon/multicore task 的 portable context 与执行 owner 如何表达？
 12. shared execution payload 是否能复用生产 RingSlot ABI，还是需要独立中间 ABI？
 
-## 17. 更新记录
+## 17. 当前核心困境：怎样只生成一次任务，又不把调度重新串行化
+
+本章是给外部架构评审者的自包含问题说明。前文保留完整实现、内存模型和历史
+实验；如果只想理解当前为什么卡住、哪些约束不能放宽、需要提出什么新协议，
+应先阅读本章。
+
+### 17.1 一句话描述问题
+
+当前 S7 为了禁止 Host 预制 PA 答案，让 96 个 Scalar 都真实回放同一条 callback
+序列，再用每 task 两级 CAS Tournament 选出唯一 Build owner。它已经保证当前
+门槛覆盖的 runtime 输入、动态 shape、task 流和严格 TensorMap 顺序，但尚不支持
+“根据 kernel 结果继续产生后续 task”的结果驱动控制流；同时，它为每个逻辑
+task 支付了 96 份 callback 推进和大量返回型 Atomic。
+
+中央 Build ticket 能把“每 task 96 核竞争”降成“每 task 只发一张票”，但 ticket
+只返回一个整数 task id，并不包含这个 task 的 callback 现场。要让任意 Build
+worker 取得 task id 后立即构建，前面必须先存在一份全局唯一、完整、可跨核读取的
+任务描述。
+
+因此真正的矛盾不是“Tournament 和 FetchAdd 选哪个”，而是：
+
+```text
+怎样在 device 上只执行一次真实 callback，
+生成全局唯一且严格有序的 RuntimeTaskDesc 流，
+同时又不让这条 Plan 生产链成为新的串行瓶颈？
+```
+
+### 17.2 目标与不能放宽的约束
+
+目标是公共 Scalar 调度器，不是只把 PA Case1 做快。任何候选都必须同时满足：
+
+1. Host 只提供真实输入，不得发布 task identity、writer bitset、engine task-id
+   表或 executable count 作为 device 调度答案。
+2. device 不得用固定 PA 公式重新生成 `FullPaTaskPlan`；真实 task 数、顺序和
+   参数必须来自实际 callback/control flow。
+3. 每个逻辑 task 必须获得唯一且连续的 `task_id`，无重复、无缺口；所有 Scalar
+   对这个全局顺序必须有同一种解释。
+4. shared TensorMap 的 metadata side effect 必须严格遵守 task-id 顺序；空
+   writer task 也必须推进完成前沿。
+5. Build owner 与 Execute owner 可以不同，但每个 task 只能 Build 一次、每个
+   executable task 只能 Execute 一次。
+6. A5 Scalar 之间没有 cache coherence；任何跨核 ordinary payload 都必须有
+   明确的 DCCI、DSB、Atomic publish/acquire 合同。
+7. A5 同地址、返回值被消费的 Atomic 会随竞争人口显著变慢；不能用增加一条
+   96 核共享 cursor 的方式假装 Atomic 数量下降就一定更快。
+8. 正确性必须覆盖 G0、短尾 group、动态 shape、INPUT/OUTPUT/INOUT、结果驱动
+   分支、不同 engine class 和非 PA 算子。
+9. 权威性能口径是同 workload、trace-free、startup 起点到 FinalDrain 结束；
+   不同 ELF 的绝对时间不能互相相减。
+
+### 17.3 当前 S7 实际做了什么
+
+当前生产代码没有全局 TaskPlan。96 个 Scalar 分别持有自己的
+`PaOrchestrationState`，执行以下流程：
+
+Host 侧仍会构造 `SharedHostTaskPlan`，但它只用于 launch 前 heap admission 和
+运行后独立 oracle，`InitializeState` 不把 task identity、writer 或 engine
+task-id 表写进 device 状态。当前 `SharedExecCell` 也只有
+`EMPTY/BUILDING/BUILT/CLAIMED/DONE`，不存在 `PLANNED`、
+`planned_frontier` 或 `plan_closed`；所以三级 pipeline 目前确实只是候选设计，
+不是已经隐藏在现有代码里的阶段。
+
+```text
+每个 Scalar：
+  从 runtime context_lens 初始化 callback/orchestration
+  -> 按真实控制流到达 task N
+  -> SubmitCallbackTask(N)
+  -> 参加 per-task G8 Tournament
+       本核执行 1 次 local CAS
+       若成为 8 个 local 代表之一，再执行 1 次 root CAS
+       全体合计 96 次 local CAS、8 次 root CAS，选出 1 个 Build owner
+  -> 95 个 loser 接收相同 SharedOutputRef，继续回放 N+1
+  -> 1 个 winner 完成 Materialize
+       -> 等待 completion[N-1]
+       -> Register metadata(N)
+       -> 发布 completion[N]
+       -> Fanin / Build
+       -> 发布 SharedExecCell[N] = BUILT
+
+全部 96 核回放结束：
+  -> seal(task_count, replay_identity)
+  -> replay_done 到达 96
+  -> AIC/AIV 各用一条 runtime cursor 扫描 [0, task_count)
+  -> 按 exec cell 的 engine class 领取并执行
+  -> FinalDrain 闭合全部 cell、token、kernel 和 completion
+```
+
+对应的正式入口和状态机集中在：
+
+- `RunSchedulerImpl` 的真实 batch/block-group callback 循环；
+- `SubmitCallbackTask` 与 `Claim` 的 per-task Tournament；
+- `FinishSharedWinnerSubmitBody` 的 Materialize/Register/Fanin/Build；
+- `SealSharedReplayIdentity` 与 `replay_done` 的生产封口；
+- `ProgressCrossCoreExec` 的 runtime exec-cell 扫描与执行。
+
+这条路径已经证明“没有预制答案也能正确运行”，但没有证明这是高性能的最终
+任务发现协议。
+
+### 17.4 当前真实性能与已确认的 Claim 成本规模
+
+当前对照 workload 是 B256、PA-G1、real-compute `6/28/4/1`，32 个 AIC Scalar、
+64 个 AIV Scalar，共 1,280 个逻辑 task、1,024 个 executable task。
+
+| 指标 | 当前证据 |
+|---|---:|
+| trace-free startup -> FinalDrain | `2.443455 ms` |
+| 最新 full-swimlane lifecycle | `2.862315 ms` |
+| full-swimlane Submit 全局区间 | `1.067400 ms` |
+| full-swimlane FinalDrain 全局区间 | `1.814815 ms` |
+| QK/PV 的 AIC engine 容量下界 | 约 `575.864 us` |
+| SF/UP 的 AIV engine 容量下界 | 约 `234.224 us` |
+
+最新诊断源为：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260810_140748_1643943/ccec/
+  merged_swimlane.json
+  swimlane_exclusive_analysis.json
+```
+
+上述 full-swimlane 阶段值来自诊断 ELF 的全局区间，不保证彼此是无重叠、可直接
+相加的分段；它们只用于定位业务排布。`2.443455 ms` 才是当前 trace-free
+端到端基线。最初完成 S7 闭合的另一份 full-swimlane lifecycle 为
+`2.902810 ms`，最新诊断运行的 `2.862315 ms` 只说明观测版本处于同一数量级，
+不拿两份诊断 ELF 的差值宣称性能收益。
+
+当前 G8 Tournament 的 Build owner 仲裁为：
+
+```text
+N = 1,280 tasks
+W = 96 workers
+G = 8 local groups
+
+local CAS = W*N = 122,880
+root CAS  = G*N = 10,240
+合计       = 133,120 次 return-ready CAS
+```
+
+其中 1,280 个 winner 之外有 `95*N=121,600` 个 true loser。最新泳道按
+`(block, lane, task_id)` 精确归属后的 loser Atomic 为：
+
+| 角色 | loser 数 | 每核 Atomic 均值 | 单 loser 均值 | Atomic / `claim.lost` |
+|---|---:|---:|---:|---:|
+| AIC 32 核 | 40,517 | `376.690 us` | `0.297506 us` | `85.455%` |
+| AIV 64 核 | 81,083 | `372.920 us` | `0.294351 us` | `84.794%` |
+
+全核 loser Atomic 的 `35.920956 ms` 是重叠的 aggregate core-time，不是墙钟
+时间，不能从 `2.443455 ms` 中直接减掉。但 AIC/AIV 都在每核约 `0.37 ms` 的
+数量级为 Claim loser Atomic 付费，说明减少 96 份 replay/Tournament 值得继续
+研究。
+
+当前 full-swimlane 中所有 Build 完成后才开放 Execute。这是单调 scanner 的
+正确性基线：`replay_done` 前的 `EMPTY` 无法区分 metadata-only 与尚未 Build。
+单纯提前 Execute 主要把 kernel 从 FinalDrain 移到 replay 尾部；96 核仍需完成
+全部 replay，且同步执行 kernel 的 AIC 不能同时推进 callback。即使未来让非 AIC
+Scalar 接走 AIC task 的 Build，直接移出 AIC 关键路径的也只是 Build-side
+Scalar 工作，kernel 数量和 AIC engine 容量下界不会减少。
+
+### 17.5 三种实现不能混成同一个性能故事
+
+| 维度 | 旧 Host 预制两阶段 | 当前 S7 全员 replay | 候选 device 运行时三阶段 |
+|---|---|---|---|
+| task 语义来源 | Host 在 launch 前枚举 | 96 核各自真实 callback | device 上一条逻辑 Plan 流真实 callback |
+| device 内阶段 | Build -> Execute | replay/Claim/Build -> Execute | Plan -> Build -> Execute |
+| callback 执行份数 | device 为 0 | 每 task 96 份 | 目标为每 task 1 份 |
+| Build 上下文 | Host 表加 PA random-access 恢复 | winner 的本地 callback 现场 | `RuntimeTaskDesc[N]` |
+| Build owner | 中央 `FetchAdd(+1)` | per-task G8 Tournament | 从已发布 Plan 前缀领取 |
+| B256 Build owner Atomic | `1,376` 次 FetchAdd | `133,120` 次 CAS | 取决于流式 reservation；尚未实现 |
+| Plan 发布成本 | Host 侧，未计入 device 周期 | 无独立 PlanCell | 每 task descriptor DCCI/publish/acquire |
+| 主要问题 | 预制 PA 答案，不泛化 | 96 倍 replay 与 Atomic | 唯一 Plan 串行链和跨核 descriptor 成本 |
+
+旧版本约 `0.82 ms` 只证明“任务语义已经免费给定后，Build/Execute 后端可以很
+快”。它没有支付 device Plan、真实 callback、descriptor DCCI，也没有支付当前
+96 路 Tournament，因此不是候选三阶段的性能下界，更不能用来宣称 S7 回退比例。
+
+### 17.6 为什么三阶段必须有一份全局唯一 Plan
+
+Build worker 从中央 cursor 取得 task id `N` 后，至少还需要 function、engine、
+动态 shape、view、scalar、create info、INPUT/OUTPUT/INOUT 引用、producer
+task/output slot、writer intent 等信息。单独的整数 `N` 无法通用恢复这些内容。
+
+因此三阶段必须先建立一条全局唯一的 canonical Plan 有序提交流。唯一的是最终
+task 序列与每个 task 的 descriptor；第一版可以只有一个 continuation owner，
+未来也可以在“分区互不重叠、最终有序合并”得到证明后使用多个物理 producer：
+
+```text
+canonical Plan commit stream：
+  当前唯一 continuation owner 持有 callback 现场和 continuation
+  -> 真实产生 task N
+  -> 生成完整 immutable RuntimeTaskDesc[N]
+  -> 发布 PlanCell[N] = PLANNED
+  -> 推进无缺口 planned_frontier
+  -> 继续 callback，产生 N+1
+
+Build worker：
+  只领取 N < planned_frontier
+  -> return-ready observe PLANNED(N)
+  -> invalidate + DSB 后读取 PlanCell[N]
+  -> 仅凭 RuntimeTaskDesc[N] 完成 Build
+```
+
+“全局唯一 Plan”指逻辑上只有一个 task 序列和一份 descriptor，不等于必须先把
+全部 Plan 生成完，也不等于永远绑定一个物理核。它可以逐 task 或逐 chunk 发布，
+让 Build/Execute 消费连续前缀；但任何时刻必须能证明谁唯一持有 callback
+continuation，以及 task id 为什么不会重复、跳号或乱序。
+
+本文把 `planned_frontier` 精确定义为“首个尚未连续发布的 task id”，也就是已经
+发布的连续条目数。有效 Plan 区间始终为 `[0, planned_frontier)`；如果只完成
+task 0..N，frontier 必须等于 `N+1`。后文所有 Build admission 都使用这个定义，
+不把 frontier 当成“最大已发布 task id”。
+
+当前 96 路 replay 还额外提供了 `replay_identity` 一致性对照；改成唯一 Plan
+producer 后，这项“96 份输入/控制流相互校验”的诊断能力会自然消失。候选需要
+明确接受这一变化，或者由 Host 运行后 oracle、descriptor hash、CPU 多 actor
+指纹等独立门槛补回证据，不能继续声称保留了原 seal 的同等含义。
+
+### 17.7 把中央 ticket 直接放进当前 callback 为什么错误
+
+当前 96 个核在同一时刻都处于 task N 的 callback 现场。如果都对
+`build_next.FetchAdd(+1)`，返回值会是：
+
+```text
+N, N+1, N+2, ... N+95
+```
+
+只有取得 N 的核拥有匹配的 callback 现场；其余核拿到了未来 task id，却没有
+未来 task 的参数和 continuation。未来 ticket 已被提前消费，最终形成 missing
+task。
+
+把它改成 `CAS(global_cursor, N-1, N)` 可以保证只选择当前 N，但此时所有 96 核
+仍必须先回放到 N，并对同一地址竞争。它只是把两级 Tournament 换成单地址
+96 路 Claim，没有解决重复 callback，也可能因 A5 同址 Atomic 特性更慢。
+
+中央 ticket 只有在 `PlanCell[N]` 已经存在时才完整：
+
+```text
+ticket(N) + acquire(RuntimeTaskDesc[N]) = task N 的 Build 上下文
+```
+
+### 17.8 canonical Plan 有序提交流有哪几种实现
+
+#### 17.8.1 固定一个物理 Plan owner
+
+一个 Scalar 从头到尾持有 orchestration/continuation，顺序生成 descriptor。
+
+优点：
+
+- task id 可用 owner-local 普通计数器顺序分配，不需要每 task 竞争；
+- callback continuation 不跨核，正确性和内存模型最简单；
+- 可以先生成完整 Plan，再验证 Build ticket 和 descriptor ABI。
+
+风险：
+
+- Plan 生产完全串行，固定占用一个 Scalar；
+- 如果 Plan 每 task 仍包含大量参数解析或 GM 读取，它可能成为新的关键路径；
+- 固定 owner 若是 AIC，会进一步挤占更紧张的 AIC 执行能力；若固定 AIV，也要
+  证明所有算子 callback 都能由该角色运行；
+- 结果驱动的动态分支会迫使该 owner 等待前序 kernel。
+
+这是最容易闭合功能的第一版，不等于最终性能方案。
+
+#### 17.8.2 单逻辑 continuation，按 chunk 迁移物理 owner
+
+每次只允许一个核推进 callback，但生成若干 descriptor 后，把可序列化的
+continuation 发布给下一个 owner。
+
+优点：可以避免永久占用一个核，也能按 engine 压力选择后续 owner；每 chunk
+只做一次 ownership handoff，而不是每 task 96 路 Tournament。
+
+风险：callback continuation 必须成为新的跨核 ABI，不能包含栈地址、私有指针
+或未发布的对象；每次迁移都需要 ordinary payload、DCCI、DSB、Atomic
+publish/acquire。chunk 太小会重新形成 Atomic/DCCI 热点，太大又退化成固定
+串行 owner。异常时还必须证明 continuation 不会丢失或被重复接管。
+
+#### 17.8.3 多 Plan producer 并行生成、最后有序合并
+
+只有 callback/DAG 本身能够被证明分区时，才能让多个 producer 生成互不重叠的
+task 区间。公共 callback 可能有动态 task 数和结果驱动分支，事前通常不知道每个
+分区需要多少连续 task id；简单 FetchAdd 分配 id 不能保证业务顺序。
+
+即使并行生成 descriptor，最终仍需把它们合并为无缺口的总序，并保证 TensorMap
+看到的 task order 与 callback 语义一致。这种方案的 merge/reservation 复杂度
+可能高于当前 Tournament，不能默认可行。
+
+#### 17.8.4 继续 96 路 replay，只优化 election
+
+这是当前 S7 的邻近优化空间，可以试全局精确 CAS、不同 Tournament 层级或其他
+Atomic 拓扑，但它保留 `96*N` callback 工作。除非新协议在 A5 上显著降低同址
+return-ready Atomic，否则性能上限仍受全员 replay 限制。
+
+### 17.9 流式 Plan 下 Build task id 怎样领取
+
+如果先生成完整 Plan 并发布 `plan_closed/final_task_count`，Build 可以使用旧式
+中央 `FetchAdd(+1)`：N 个有效 ticket 加每 worker 一次越界证明，B256 约为
+`N+W=1,376` 次。这最简单，但 Plan 与 Build 完全不重叠。
+
+如果要求 Plan/Build 流水，裸 FetchAdd 不能越过 `planned_frontier`。假设当前
+已经发布 task 0..N，即 `planned_frontier=N+1`，96 个 worker 却继续一次取走
+N+1..N+96 并等待，未来 ticket 就会被提前占住；如果 Plan owner 也来自同一动态
+worker 池，甚至可能所有可运行 worker 都等待未来 Plan，形成活性问题。
+
+流式版本至少要在以下合同中选择并证明一种：
+
+1. **条件 CAS reservation**：读取连续 frontier，只有
+   `build_next < planned_frontier` 时 CAS 领取；失败/空窗次数随时序变化，
+   不能再宣称精确 `N+W`。
+2. **分段 ticket**：Plan 一次发布一个连续 chunk，Build 只在该 chunk 的有界
+   cursor 中 FetchAdd；chunk 切换需要独立的发布与关闭协议。
+3. **固定 Plan owner 加未来票等待的隔离实验**：它违背当前“不得越过
+   frontier”的首选合同，不能进入通用正式路径。即使固定 owner 不参与等待、
+   能持续生产，也仍有无效轮询、持票容量和异常关闭问题，只能用于量化上限。
+4. **ready task queue**：Plan 发布 descriptor 后再投递唯一 ready entry；需要
+   多生产/消费队列、容量和关闭证明，且不能重新产生同址 Claim 热点。
+
+无论采用哪种，Build worker 的 task id 来自 reservation，task 语义来自
+`PlanCell[task_id]`；二者不能再次合并成 PA 特例的随机访问公式。
+
+流式三阶段也不能继续照搬当前 `replay_done` 后的 one-shot Execute scanner。
+Plan 尚未关闭时，task N 的 cell 可能处于 `EMPTY/BUILDING`；单调 cursor 若跳过
+它就会永久丢任务，若占住它等待又会限制所有后续 ready task。候选必须另建
+以下至少一种能力：Build 完成时投递 runtime ready entry、对未 BUILT task 保存
+有界 token 并回访，或者维护可证明无遗漏的 ready summary。这个新增发现协议
+也要计入 Atomic/DCCI 和关闭成本。
+
+### 17.10 Plan 阶段允许做什么、不允许做什么
+
+Plan 是纯 Describe 阶段，只能生成逻辑、不可变、可跨核读取的任务描述：
+
+- 可以保存 `SharedOutputRef(producer_task_id, output_slot)`；
+- 可以保存 shape、view、scalar、create info、engine 和 writer intent；
+- 可以维护产生下一 task 所需的 callback continuation；
+- 不得 Materialize 实际 output TensorDesc；
+- 不得申请 heap、插入 TensorMap、发布 completion 或启动 kernel；
+- 不得保存 planner 栈地址、worker-private pointer 或 PA-only 反推索引。
+
+如果 Plan 阶段提前执行 Build side effect，后续 Build 会重复执行；如果 descriptor
+不包含完整上下文，Build 又会被迫依赖 planner 私有状态或固定 PA 公式，三级分离
+就失去意义。
+
+### 17.11 TensorMap 严格顺序仍是独立串行链
+
+全局 Plan 顺序只定义 task N 是谁，不代表 metadata 已经插入。Build owner 可以
+并行完成 Materialize 和无副作用准备，但 Register 仍必须：
+
+```text
+completion[N-1]
+-> 读取/校验 task N 的 writer delta
+-> publish metadata(N)
+-> completion[N]
+```
+
+Build N 的 fanin lookup 只能接受 `producer < N`。INOUT 必须从按 task 顺序发布的
+writer history 得到前任；Plan 中只能保存逻辑 intent，不能用未来 TensorMap
+状态回答当前依赖。
+
+以下五种状态必须分别存在，不能为了少一个 Atomic 合并：
+
+```text
+PLANNED
+TensorMap insert-complete
+BUILT
+fanin-ready
+DONE
+```
+
+它们回答的是不同问题：任务描述是否可读、metadata 是否按序发布、执行包是否
+构建、依赖是否满足、kernel 是否完成。
+
+### 17.12 A5 内存模型和新增成本
+
+首版应使用 fresh、task-indexed PlanCell，不做 ring 复用、generation、ABA 或
+容量反压。control 与 ordinary payload 必须分 cacheline：
+
+```text
+Plan producer:
+  ordinary store RuntimeTaskDesc[N]
+  DCCI clean-out 全部 payload lines
+  DSB
+  atomic publish PLANNED
+
+Build consumer:
+  return-ready atomic observe PLANNED
+  DCCI invalidate 全部 payload lines
+  DSB
+  ordinary load descriptor
+```
+
+atomic-only line 不做 payload DCCI。`planned_frontier`、`plan_closed`、
+`build_next` 和 continuation owner 也应按 A5 的 Atomic 冲突单元隔离，不能与
+泳道记录或普通 payload 共线。
+
+这里的 return-ready Atomic 只证明 control 观察已经返回，不把它类比成 CPU
+语言内存模型中的 acquire。ordinary descriptor 真正可读依赖随后 exact-range
+invalidate、DSB 与编译器边界；三者不能因为已经看见 `PLANNED` 而省略。
+
+consumer 在 invalidate 之前不能先偷读 ordinary descriptor header 来决定需要
+失效多少 cacheline。第一版要么固定 `RuntimeTaskDesc` 大小和 DCCI 范围，要么让
+atomic control 自带可信的 `task_id/version/payload_lines`。`planned_frontier`
+只负责 admission，不能替代每个 PlanCell 自己的 `PLANNED` acquire；A5 上也不能
+假设对 frontier 和 cell 两个不同 Atomic 地址的远端观察顺序天然等于源码顺序。
+`plan_closed` 最好在同一 atomic-only control 中携带 final task count 和 plan
+hash；若拆成多个地址，就必须另行证明跨地址发布和读取顺序。
+
+三级方案减少的是 96 份 replay/Tournament，但会新增：
+
+- 每 task descriptor 的 GM store/load；
+- payload cacheline 的 clean-out/invalidate；
+- `PLANNED` 发布和读取；
+- 连续 planned frontier 与 plan closed；
+- 可能的 continuation handoff；
+- Build reservation 的返回型 Atomic。
+
+descriptor ABI 和 cacheline 数尚未冻结，因此目前不能宣称三级方案一定比
+`2.443455 ms` 更快。正确的收益条件是：
+
+```text
+省下的重复 callback + Claim Atomic
+>
+Plan 串行时间 + descriptor GM/DCCI + Build reservation
++ 新的负载不均衡与关闭成本
+```
+
+### 17.13 终止与动态控制流必须单独证明
+
+暂时没有可领取 Plan task，不等于 Plan 已结束；Build cursor 追上 published
+frontier，也不等于不会再产生 task。完整结束条件至少需要：
+
+```text
+plan_closed
+&& final_task_count 已冻结
+&& Build reservation 无 outstanding、无 BUILDING、无 in-flight builder
+&& 每个 planned task 恰好闭合为合法 metadata-only 或 executable DONE
+&& final_task_count == 0 时走零任务闭合
+&& final_task_count > 0 时 TensorMap completion == final_task_count-1
+&& AIC/AIV scan 或 ready queue 已关闭
+&& 所有 token == IDLE
+&& engine 无 in-flight
+```
+
+正常路径不允许用含糊的 `terminal` 跳过 missing task；只有已经发布全局 fatal 的
+错误路径可以异常终止，而且 Host 必须能区分“合法 metadata-only”和“本应 Build
+却丢失”。
+
+Plan owner 不能因为自己提前领取未来 Build ticket、占住 Register turn、塞满
+execution token 或同步执行长 kernel 而停止生产，否则可能形成协议自身制造的
+停顿。fatal 路径也必须能够解除 Plan、frontier、TensorMap、fanin 和 execution
+drain 的全部等待，而不是只写一个最终错误码。
+
+如果后续 callback 是否产生 task 依赖某个 kernel 的真实结果，Plan producer 必须
+在该边界暂停并保存 continuation；结果可见后再继续。用固定 DAG 越过这个等待，
+即使 PA Case1 结果正确，也不是通用调度协议。
+
+此时 completion Atomic 只说明“结果可以取得”，并不自动让普通结果 payload
+在另一 Scalar 的 DCache 中可读；Plan producer 还需要结果 payload 自己的
+publish/acquire/invalidate 合同。
+
+因此“等 `plan_closed` 后再开放 Build/Execute”只适用于能够完全 plan-ahead 的
+功能样例。对结果驱动 task，它会形成闭环：Plan 等前序 kernel 结果，而 Execute
+又等 Plan 关闭。通用实现必须允许已发布前缀完成 Build/Execute，再用结果唤醒
+Plan continuation；相应的三段开放期和关闭证明都不可省略。
+
+### 17.14 当前最值得外部评审回答的问题
+
+希望外部方案逐项回答以下问题，而不是只给一个 Atomic 原语名称：
+
+1. 在不使用 Host/PA 预制答案的前提下，谁唯一持有 callback continuation？
+2. 如何只生成一份全局 Plan，又避免固定单核 Plan 成为吞吐瓶颈？
+3. 若迁移 Plan owner，continuation 的通用 ABI、DCCI 和 exactly-once handoff
+   如何定义？
+4. 若多 producer 并行 Plan，怎样在动态 task 数下分配连续 task id，并证明无
+   缺口、无重复且顺序与 callback 语义一致？
+5. 流式 Plan 下，Build worker 如何领取 `N < planned_frontier`，既不越界持票，
+   又不因同地址 CAS/轮询重现当前热点？
+6. `RuntimeTaskDesc` 的最小通用字段是什么？如何支持动态 shape、view、
+   OUTPUT/INOUT、joint task 和结果驱动分支而不塞入 planner-private pointer？
+7. 如何在 Plan/Build overlap 的同时保留逐 task TensorMap 严格插入，不让
+   Register 串行链反向阻塞所有 builder？
+8. Plan、Build 和 Execute 各自使用哪些核？如何避免占用更稀缺的 32 个 AIC
+   Scalar，同时又不写死 PA 的 32C/64V 或 task-kind 分布？
+9. 每个候选的返回型 Atomic 次数、单地址最大并发、DCCI cacheline 数和 GM
+   payload 字节数是多少？
+10. 如何证明 `plan_closed`、Build drain、TensorMap completion 与 Execute drain
+    在正常、G0、短尾、fatal 和结果驱动分支下都能收口？
+11. 方案相对当前 `2.443455 ms` 的理论 break-even 在哪里？哪些收益是墙钟关键
+    路径上的，哪些只是重叠的 core-time？
+12. 第一版最小可证原型应先做“完整 device Plan 后再 Build”，还是直接实现
+    流水；每一步怎样形成可回退的功能和性能门槛？
+
+一个可采纳的答复至少应给出：状态机、owner 转移、内存发布顺序、Atomic/DCCI
+预算、活性证明、通用 descriptor 边界、异常关闭和同合同 A/B 方案。只说“增加
+一级队列”“使用 FetchAdd”或“让多个核并行 Plan”不足以解决当前困境。
+
+### 17.15 当前建议的最小探索顺序
+
+在没有更好的完整协议前，最小、可证、可逐步回退的顺序是：
+
+1. 先用单一逻辑/物理 Plan owner，在 CPU 上证明动态 callback 只生成一份完整
+   descriptor，且与当前 96 份真实 replay 的 task/args 指纹完全一致。
+2. 使用 fresh PlanCell 在 A5 隔离验证多 cacheline descriptor 的
+   publish/acquire，不同时接入 TensorMap 或 Execute。
+3. 对 PA 这类能够 plan-ahead 的 workload，device 上先生成完整 Plan，再用中央
+   Build ticket；这一步不追求 overlap，只证明全局唯一 Plan、Build context 和
+   严格 TensorMap 正确。它不是结果驱动算子的通用终态，后者必须尽早进入流式
+   前缀 Build/Execute，避免等待 `plan_closed` 的环形依赖。
+4. 以该版本测出 Plan 串行时间、descriptor DCCI 和中央 Build ticket 的真实
+   成本，与当前 S7 `2.443455 ms` 做同合同 A/B。
+5. 只有数据证明 Plan 本身不是不可接受的瓶颈，才打开连续 frontier 下的
+   Plan/Build 流水。
+6. 最后再评估 continuation chunk 迁移或可证明的多 producer Plan；不能在基础
+   ABI 尚未闭合时同时引入队列复用、背压和动态 owner 迁移。
+
+这不是对单 Plan owner 最终性能的预判，而是把“唯一 Plan 是否可用”“descriptor
+是否通用”“流水 reservation 是否值得”三个问题分开取证，避免再次用一份看似
+很快但偷用了预制答案的实现掩盖真实代价。
+
+### 17.16 候选方案对照矩阵
+
+| 方案 | 可能获得的结构性收益 | 当前主要缺口 | 当前判断 |
+|---|---|---|---|
+| 当前 S7 | 真实语义和正确性证明最完整 | `96*N` replay、133,120 次 Claim CAS、无 overlap | A5 已闭合，是权威基线 |
+| S7 + runtime Execute ready | 恢复一部分 Build/Execute overlap | 不减少 replay/Tournament；新增 ready 与 drain | 合理的近端轴，但不是唯一 Plan 问题的答案 |
+| 全员 replay + 单全局精确 CAS | 去掉每 task 8 次 root CAS | 保留 `96*N` replay，把竞争合并成单地址 96 核 | 正确性可讨论，A5 性能未证 |
+| 唯一 Plan，closed 后中央 ticket | Build owner 调用可接近 `N+W`，功能证明较简单 | 无 Plan/Build overlap；结果驱动控制流可能成环 | 只适合作为可 plan-ahead workload 的台阶 |
+| streaming 唯一 Plan + frontier reservation + runtime ready | 同时消减重复 replay/Tournament，并允许三段流水 | descriptor ABI、单 producer、DCCI、活性和 drain 风险最大 | 结构性潜力最大，当前完全未实现 |
+| Host/PA 预制 Plan | 后端历史性能较低 | 违反真实 Submit 和端到端计时合同 | 已否决，不能作为回退方案 |
+| MPMC ring/per-builder queue | 可能改善发现或有界容量 | ABA、回收、热点、fairness 和关闭 | 属于后端发现轴，不能替代真实 Plan 来源 |
+
+唯一 Plan 的价值目前只是一个有依据的架构假设：它可能减少 aggregate Scalar
+工作并释放 Build/Execute 流水，但没有证据表明墙钟时间会按 96 倍 replay 或
+Atomic 调用量 `98.966%` 的降幅同比缩短。任何实现都必须回到相同 A5 workload
+和 startup -> FinalDrain trace-free A/B 裁决。
+
+## 18. 更新记录
 
 ### 2026-08-10：明确中央 ticket 的上下文前提与三级 pipeline 候选
 
