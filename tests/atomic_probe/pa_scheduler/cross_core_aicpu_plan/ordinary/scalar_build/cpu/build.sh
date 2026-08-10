@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ $# -gt 1 ]]; then
+    echo "Usage: $0 [swimlane|perf-clock]" >&2
+    exit 1
+fi
+# 目录本身就是 cross-core shared PA 的构建身份，不再接收 private/shared
+# 运行时选择，避免误把 same-core 或 private 产物放进本目录。
+TENSORMAP_MODE="shared"
+TENSORMAP_MODE_ID=1
+BUILD_VARIANT="${1:-swimlane}"
+case "$BUILD_VARIANT" in
+    swimlane)
+        VARIANT_DEFINES=(
+            -DPA_BUILD_SWIMLANE=0
+            -DPA_BUILD_SUBMIT_PMU=0
+            -DPA_BUILD_PERF_CLOCK=0
+        )
+        ;;
+    perf-clock)
+        VARIANT_DEFINES=(
+            -DPA_BUILD_SWIMLANE=0
+            -DPA_BUILD_SUBMIT_PMU=0
+            -DPA_BUILD_PERF_CLOCK=1
+        )
+        ;;
+    *)
+        echo "Unknown CPU build variant: $BUILD_VARIANT (expected swimlane|perf-clock)" >&2
+        exit 1
+        ;;
+esac
+BUILD_DIR="$ROOT_DIR/build/cpu/$TENSORMAP_MODE/$BUILD_VARIANT"
+CXX_BIN="${CXX:-g++}"
+TENSORMAP_RING_CAP=128
+SHARED_INSERT_TURN_GROUPS="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
+case "$SHARED_INSERT_TURN_GROUPS" in
+    1|2|4|8|16|32|64|128) ;;
+    *)
+        echo "PA_SHARED_INSERT_TURN_GROUPS must be a power of two from 1 through 128." >&2
+        exit 1
+        ;;
+esac
+VARIANT_DEFINES+=(
+    "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$SHARED_INSERT_TURN_GROUPS"
+)
+SCHEDULER_BINARY="pa_scheduler_cpu"
+if [[ "$TENSORMAP_MODE" == "shared" &&
+      "$SHARED_INSERT_TURN_GROUPS" != "1" ]]; then
+    SCHEDULER_BINARY="pa_scheduler_cpu_turn_g${SHARED_INSERT_TURN_GROUPS}"
+fi
+
+# CPU 后端只依赖 C++17、pthread 和本目录 common/，不需要 CANN。
+# CXX 可显式指定编译器；未设置时使用系统 g++。
+
+# CPU build 与设备 build 使用平行目录，便于 run.sh 根据 backend 做严格选择，
+# 也避免把 host 回归二进制误当成 A5 产物。
+mkdir -p "$BUILD_DIR"
+
+echo "[CHECK] cross-core atomic/DCCI source coverage"
+PA_ATOMIC_DCCI_COVERAGE_ROOT="$ROOT_DIR" \
+    "${PYTHON:-python3}" \
+    "$ROOT_DIR/../../common/test_atomic_dcci_source_coverage.py"
+
+echo "[BUILD] CPU scheduler executable"
+echo "[BUILD] shared insert-turn groups=$SHARED_INSERT_TURN_GROUPS"
+# -pthread 同时提供编译期线程宏和链接期 pthread 支持；严格告警用于防止
+# CPU 等价层因类型或原子接口变化而静默偏离设备端公共协议。这里固定实例化
+# shared TensorMap，不保留第二种模式的构建分支。
+"$CXX_BIN" -O3 -std=c++17 -pthread -Wall -Wextra -Werror \
+    "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID" \
+    "-DPTO_FDWIC_TENSORMAP_RING_CAP=$TENSORMAP_RING_CAP" \
+    "${VARIANT_DEFINES[@]}" \
+    -I"$ROOT_DIR/common" \
+    "$SCRIPT_DIR/main.cpp" \
+    -o "$BUILD_DIR/$SCHEDULER_BINARY"
+
+# PollBatch 是 common/ 中的设备/CPU 共用模板。这里用普通 C++17 编译器
+# 直接实例化并执行边界自测；任一断言失败都会借助 set -e 阻止构建成功。
+echo "[BUILD] atomic PollBatch boundary self-test"
+"$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+    "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID" \
+    -DPA_BUILD_SWIMLANE=1 \
+    -I"$ROOT_DIR/common" \
+    "$ROOT_DIR/test/test_atomic_poll_batch.cpp" \
+    -o "$BUILD_DIR/test_atomic_poll_batch"
+
+echo "[TEST] atomic PollBatch boundary self-test"
+"$BUILD_DIR/test_atomic_poll_batch"
+
+# shared ring 是当前 ordered writer-delta 的 ordinary-region 原语，隔离
+# 覆盖 seq/ABA、回收与容量预检。PA Case1 当前 ordinary entry 为零，
+# 因此这些门槛仍不能代替后面的完整 96-worker Submit 测试。
+    # 独占 128B completion 覆盖正式的逐 task 严格链：无论是否产生
+    # metadata，每个 Build winner 都必须按 N-1 -> N 发布完成字。
+    # 另覆盖 pending、损坏值与重复发布。
+    echo "[BUILD] shared strict per-task completion self-test"
+    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$SHARED_INSERT_TURN_GROUPS" \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_insert_turn.cpp" \
+        -o "$BUILD_DIR/test_shared_insert_completion"
+
+    echo "[TEST] shared strict per-task completion self-test"
+    "$BUILD_DIR/test_shared_insert_completion"
+
+    # host 只从最终 SchedulerState.context_lens 独立重建结果 oracle，不能
+    # 复用 device helper 形成同错，也不能把 task 身份写回设备状态。该测试覆盖 G0/G1/G2/G4、
+    # mixed 累计 batch_start、TaskAt 元数据、partial group 输出字节、writer
+    # dependency chain，以及测试专用 CLI 的广播/逐 batch 形式。
+    echo "[BUILD] shared independent host-oracle self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_host_task_plan.cpp" \
+        -o "$BUILD_DIR/test_shared_host_task_plan"
+
+    echo "[TEST] shared independent host-oracle self-test"
+    "$BUILD_DIR/test_shared_host_task_plan"
+
+    # 96 个 Scalar 都从运行时 context 独立回放真实 callback 参数；该门槛
+    # 覆盖混合 G0/G1/G2/G4、全部五种 task、动态 shape/view/scalar 和
+    # SharedOutputRef 前驱过滤，并拒绝 Host 预制 task 身份。
+    echo "[BUILD] shared independent replay args self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_random_access_args.cpp" \
+        -o "$BUILD_DIR/test_shared_random_access_args"
+
+    echo "[TEST] shared independent replay args self-test"
+    "$BUILD_DIR/test_shared_random_access_args"
+
+    # 独立 96-thread 门槛证明无预制计划时，每核完整 replay 仍能通过
+    # per-task Tournament 产生唯一 Build owner；即使 worker0 延迟，其他
+    # worker 也能完成全部 task。CPU 结果只证明协议，不冒充 A5 性能。
+    echo "[BUILD] shared no-prebuilt-plan Build protocol self-test"
+    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_build_dispatch.cpp" \
+        -o "$BUILD_DIR/test_shared_build_dispatch"
+
+    echo "[TEST] shared no-prebuilt-plan Build protocol self-test"
+    "$BUILD_DIR/test_shared_build_dispatch"
+
+    for cap in 32 64 128 256 16384; do
+        binary="$BUILD_DIR/test_shared_tensor_map_ring_cap${cap}"
+        echo "[BUILD] isolated shared ordinary-region ring self-test CAP=$cap"
+        "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+            -DPTO_FDWIC_SHARED_MAP=1 \
+            "-DPTO_FDWIC_TENSORMAP_RING_CAP=$cap" \
+            -DPA_BUILD_SWIMLANE=1 \
+            -I"$ROOT_DIR/common" \
+            "$ROOT_DIR/test/test_shared_tensor_map_ring.cpp" \
+            -o "$binary"
+
+        echo "[TEST] isolated shared ordinary-region ring self-test CAP=$cap"
+        "$binary"
+    done
+
+    # shared raw 必须呈现每个 worker 连续的 0..N-1 Submit/Claim；每 task
+    # 全局恰有一个 winner 子区间，loser 不产生 winner 业务子区间。
+    echo "[BUILD] shared all-worker-replay raw-trace self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_sparse_trace.cpp" \
+        -o "$BUILD_DIR/test_shared_sparse_trace"
+
+    echo "[TEST] shared all-worker-replay raw-trace self-test"
+    "$BUILD_DIR/test_shared_sparse_trace"
+
+    # CCEC full-swimlane 的 16B generic raw 仍由 host 恢复成既有 32B
+    # 逻辑记录。该纯主机门槛独立锁定 packed 字段、low32 前/后向回绕、
+    # 生命周期拒绝和 terminal 4B 更新的 cache-line 邻值不变。
+    echo "[BUILD] shared compact generic-trace codec self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -DPA_BUILD_ATOMIC_SWIMLANE=1 \
+        -DPA_BUILD_COMPACT_GENERIC_TRACE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_compact_generic_trace.cpp" \
+        -o "$BUILD_DIR/test_shared_compact_generic_trace"
+
+    echo "[TEST] shared compact generic-trace codec self-test"
+    "$BUILD_DIR/test_shared_compact_generic_trace"
+
+    # fresh-output symbol 与 region ring 是两条独立协议。该用例单独锁定
+    # descriptor 最终封口、只读 fanin、ready descriptor 直写 slot、
+    # 构建后 INOUT writer commit、失败 slot 撤销及非法引用 fail-closed，
+    # 避免只靠完整 96 线程回放偶然覆盖。
+    echo "[BUILD] shared-output symbol self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_output_symbols.cpp" \
+        -o "$BUILD_DIR/test_shared_output_symbols"
+
+    echo "[TEST] shared-output symbol self-test"
+    "$BUILD_DIR/test_shared_output_symbols"
+
+    # 通用 writer-intent 门槛不使用 PA TaskKind/ticket：symbol 锁定
+    # 多跳、跨 cache-line history、乱序和 partial-CAS 终止语义；
+    # ownerless ordinary region 锁定 A->B->C，并验证空 transaction 也
+    # 推进 per-task completion，旧 sidecar turn 保持 canary。
+    echo "[BUILD] generic shared writer-intent self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$SHARED_INSERT_TURN_GROUPS" \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_writer_intent.cpp" \
+        -o "$BUILD_DIR/test_shared_writer_intent"
+
+    echo "[TEST] generic shared writer-intent self-test"
+    timeout --foreground 15s "$BUILD_DIR/test_shared_writer_intent"
+
+    # shared heap 与 region/symbol 协议分开验证：锁定 8 shard、1 KiB
+    # 对齐、首版禁止 wrap、并发唯一分配及 terminal 容量竞争不回滚。
+    echo "[BUILD] shared heap no-wrap reserve self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror -pthread \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_heap_reserve.cpp" \
+        -o "$BUILD_DIR/test_shared_heap_reserve"
+
+    echo "[TEST] shared heap no-wrap reserve self-test"
+    "$BUILD_DIR/test_shared_heap_reserve"
+
+    # shared Claim 使用每 task 两级 CAS Tournament：S5b 的 Alloc 与四类
+    # kernel 都由全部 96 个 Scalar 以 G8 竞争 Build。用例锁定每组一个
+    # root 竞争者、最终唯一 owner、重复 replay 全输，并证明未来 task
+    # 不会覆盖延迟的前序 task。
+    # Claim owner 与 insert-completion 虽复用同一个 task sidecar，但分别
+    # 独占 cache line；Claim 必须保持 insert-completion 与旧 TaskCell
+    # canary 不变，TensorMap 顺序由独立完成链验证。
+    echo "[BUILD] shared Claim Tournament self-test"
+    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_claim_tournament.cpp" \
+        -o "$BUILD_DIR/test_shared_claim_tournament"
+
+    echo "[TEST] shared Claim Tournament self-test"
+    "$BUILD_DIR/test_shared_claim_tournament"
+
+    # Materialize 在触碰 shared cursor 前必须完成数量、引用、shape/stride
+    # 和地址区间预检；这些 reserve 前拒绝路径不能推进 heap。FetchAdd 后
+    # 才暴露的容量竞争则按 terminal 契约保留 overrun 现场。
+    echo "[BUILD] shared winner materialize self-test"
+    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_materialize.cpp" \
+        -o "$BUILD_DIR/test_shared_materialize"
+
+    echo "[TEST] shared winner materialize self-test"
+    "$BUILD_DIR/test_shared_materialize"
+
+    # 通用 payload 协议门槛不能替代 PA adapter：这里逐 kind 锁定真实
+    # tensor/scalar/fanin 形状、completion vend 按值冻结、builder 源污染
+    # 后 cell 不变，以及 Claim 后 token-private dispatch/context 重绑。
+    echo "[BUILD] PA cross-core execution adapter self-test"
+    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_pa_exec_adapter.cpp" \
+        -o "$BUILD_DIR/test_pa_exec_adapter"
+
+    echo "[TEST] PA cross-core execution adapter self-test"
+    "$BUILD_DIR/test_pa_exec_adapter"
+
+    # 扫描器必须只消费已经闭合的 Submit 前缀，并在 token busy 后继续从
+    # 原游标发现后续 task；FinalDrain 还要由 96 个 worker 汇合后在 device
+    # 侧证明每组到达数、唯一 kernel completion 总数和 token=IDLE，不能
+    # 只靠 host 事后拒绝，也不能重新引入逐 task 原子终态扫描。
+    echo "[BUILD] PA cross-core execution scan/drain self-test"
+    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        -DPA_BUILD_PERF_CLOCK=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_cross_core_exec_scan.cpp" \
+        -o "$BUILD_DIR/test_cross_core_exec_scan"
+
+    echo "[TEST] PA cross-core execution scan/drain self-test"
+    "$BUILD_DIR/test_cross_core_exec_scan"
+
+    # 完整 96-worker Submit 精确校验逐 task completion（包括空 writer）、
+    # replay identity seal、loser 零 TensorMap 访问，以及 Build/Execute
+    # owner 跨核分离后直到 FinalDrain 的完整闭合。
+    echo "[BUILD] shared ordered-insert Submit self-test"
+    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
+        -DPTO_FDWIC_SHARED_MAP=1 \
+        "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$SHARED_INSERT_TURN_GROUPS" \
+        -DPA_BUILD_SWIMLANE=1 \
+        -I"$ROOT_DIR/common" \
+        "$ROOT_DIR/test/test_shared_ordered_submit.cpp" \
+        -o "$BUILD_DIR/test_shared_ordered_submit"
+
+    echo "[TEST] shared ordered-insert Submit self-test"
+    timeout --foreground 15s "$BUILD_DIR/test_shared_ordered_submit"
+# set -e 保证编译或链接失败时不会打印 complete，也不会在组合构建中继续
+# 后续步骤；只有成功退出的构建才被本脚本声明为可运行产物。
+echo "[BUILD] complete: $BUILD_DIR/$SCHEDULER_BINARY"
