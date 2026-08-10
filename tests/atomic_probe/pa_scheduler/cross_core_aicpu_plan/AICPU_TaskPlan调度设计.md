@@ -306,6 +306,25 @@ atomic observe PlanCell control
   -> 发布 SharedExecCell 或完成 metadata-only task
 ```
 
+这里的 Register 不能直接复用当前 ordinary Scalar 的
+`FinishSharedWinnerSubmitBody`。该函数为 PA 首例保留了一个已测快路径：
+`ValidatePreparedPaWriterShape` 要求 `ordinary_count==0`，并在取得 turn 后
+只提交 UP 的三个 symbol writer。它能覆盖当前 PA，但不是普通 TensorMap
+的通用合同。SIMT 完整实现必须显式走：
+
+```text
+PrepareSharedTaskWriterDelta
+  -> WaitForSharedTaskInsertTurn
+  -> PublishSharedTaskWriterMetadata
+       -> SharedCheckPreparedTaskAppend
+       -> CommitPreparedSymbolSharedWriterIntentSet
+       -> SharedAppendPreparedTask
+  -> HandoffSharedTaskInsertTurn
+```
+
+因此 `ordinary_count>0` 是 SIMT 模式的强制功能门槛，不能只用 PA
+Case1 的零 ordinary writer 结果宣称泛化完成。
+
 首版在全部 4 个 leader 完成 Build 后才允许 Execute。这样
 `SharedExecCell::Empty` 仍可在 release 后无歧义地解释为 metadata-only；
 若将来做 Build/Execute overlap，必须先增加“尚未 Build”与

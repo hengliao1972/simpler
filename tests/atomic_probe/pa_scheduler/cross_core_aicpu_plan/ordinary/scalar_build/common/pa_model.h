@@ -258,6 +258,21 @@ constexpr uint32_t kTaskCellCapacity = 1U << 16;
 constexpr uint32_t kAicWorkers = 32;
 constexpr uint32_t kAivWorkers = 64;
 constexpr uint32_t kWorkers = kAicWorkers + kAivWorkers;
+// Runtime Plan 的 Build population 与最终 Execute population 是两个
+// 独立合同。ordinary Scalar 默认由 96 个 Scalar 领取 Build ticket；
+// ordinary SIMT 会在自己的构建中把它设为 4 个 warp leader，但仍由
+// 全部 96 个 Scalar 执行和完成 FinalDrain。这里只参数化通用收口数字，
+// 不改变默认 Scalar 路径。
+#ifndef PA_RUNTIME_PLAN_BUILD_WORKERS
+#define PA_RUNTIME_PLAN_BUILD_WORKERS 96
+#endif
+constexpr uint32_t kRuntimePlanBuildWorkers =
+    static_cast<uint32_t>(PA_RUNTIME_PLAN_BUILD_WORKERS);
+static_assert(
+    kRuntimePlanBuildWorkers > 0U &&
+        kRuntimePlanBuildWorkers <= kWorkers,
+    "Runtime Plan Build population must fit the Scalar worker set"
+);
 constexpr uint32_t kRuntimeMaxWorkers = 108;
 constexpr uint32_t kCursorShards = 4;
 // shared Alloc 恢复全部 96 个 worker 参与 Claim。两级 Tournament

@@ -4767,7 +4767,8 @@ inline Metrics Validate(
 ) {
     Metrics metrics;
     // AICPU 按真实 orchestration callback 顺序产生并关闭唯一
-    // Runtime Plan。96 个 Scalar 通过中央 ticket 拆分 PlannedBuild；
+    // Runtime Plan。编译期选定的 Build population 通过中央 ticket拆分
+    // PlannedBuild；
     // task kind 只约束后续 Execute engine，不约束 Build owner
     // 的 AIC/AIV 角色。
     const uint32_t batches = state.config.batches;
@@ -4826,8 +4827,8 @@ inline Metrics Validate(
         state.config.final_barrier_shape <= static_cast<uint32_t>(FinalBarrierShape::ThreeLevel6x4x4);
     const auto final_barrier_shape = static_cast<FinalBarrierShape>(state.config.final_barrier_shape);
 #if PTO_FDWIC_SHARED_MAP
-    // shared cross-core 由 AICPU 先完整关闭 Plan，96 个 Scalar
-    // 通过中央 Build ticket 各自处理一个不相交的 task
+    // shared cross-core 由 AICPU 先完整关闭 Plan，编译期选定的 Build
+    // population 通过中央 ticket 各自处理一个不相交的 task
     // 子集，再用 execution drain 证明消费完成。旧 final-barrier
     // 配置字段只为结构布局保留，不参与协议选择。
     (void)final_barrier_shape;
@@ -4852,9 +4853,11 @@ inline Metrics Validate(
         state.runtime_plan_control.closed_task_count.value ==
             static_cast<int64_t>(task_count) &&
         state.runtime_plan_control.build_next.value ==
-            static_cast<int64_t>(task_count + kWorkers) &&
+            static_cast<int64_t>(
+                task_count + kRuntimePlanBuildWorkers
+            ) &&
         state.runtime_plan_control.build_workers_done.value ==
-            static_cast<int64_t>(kWorkers) &&
+            static_cast<int64_t>(kRuntimePlanBuildWorkers) &&
         state.runtime_plan_control.build_release.value ==
             static_cast<int64_t>(task_count) &&
         state.runtime_plan_control.fatal.value == 0;
@@ -5905,7 +5908,7 @@ inline Metrics Validate(
     );
     Expect(
         shared_runtime_plan_control_ok,
-        "Runtime Plan closes at N and central Build reaches N+96 tickets, 96 arrivals, and release N",
+        "Runtime Plan closes at N and central Build reaches the configured N+W tickets, W arrivals, and release N",
         &metrics
     );
     Expect(

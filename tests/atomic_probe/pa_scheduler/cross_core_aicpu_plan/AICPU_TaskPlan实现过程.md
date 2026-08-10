@@ -426,3 +426,31 @@ TensorMap 插入、Fanin 或 Execute。`asc_dcci_single +
 asc_threadfence` 能被编译也不等于已证明 A5 内存模型。下一阶段
 是复用真实 Build body 并闭合 B1 全链路；当前仍不得宣称
 ordinary SIMT 已实现或已有性能收益。
+
+### 7.4 通用 ordinary writer 门槛与 Build population 参数化
+
+继续审计 Scalar PlannedBuild 时确认：现有
+`FinishSharedWinnerSubmitBody` 会以 `ValidatePreparedPaWriterShape`
+拒绝 `ordinary_count!=0`，正式 PA Register 也只提交 UP 的三个 symbol
+writer。这是 PA 快路径，不是 ordinary TensorMap 的完整实现。SIMT 版
+因此不照搬该 Finish，而把通用链固定为
+`Wait turn → PublishSharedTaskWriterMetadata → Handoff completion`。
+
+新增 `test/test_simt_ordinary_writer_gate.cpp`，直接实例化现有通用
+`PublishSharedTaskWriterDelta` 与 `CollectSharedFanin`，没有复制一套
+测试专用 map。4 个 leader 动态消费 17 个 task，并验证：
+
+- `ordinary_count>0` 时真实发布 bucket slot payload、seq 与 tail；
+- 零 writer task 不写 map，但仍从 N-1 严格交棒到 N；
+- reader 2 刻意等 future writer 5 已发布后再查询同一区域，结果仍只能是
+  `writer 1 < consumer 2`；
+- 重复 completion 与损坏的前序 completion 均 fail-closed。
+
+严格 `-Wall -Wextra -Werror`、ASan+UBSan 与 50 轮普通重复均 PASS。
+
+同时把 Runtime Plan 的 Build population 从固定的 `kWorkers` 抽成
+`kRuntimePlanBuildWorkers`：Scalar 默认值仍是 96，行为和 N+96 终态不变；
+SIMT 构建会显式配置为 4，而 Execute/FinalDrain population 继续保持 96。
+release 等待已从 Scalar arrival 中抽成独立 helper，后续 95 个非 builder
+Scalar 可以只等待 SIMT 的 N+4/4-arrival 收口，不会误增
+`build_workers_done`。

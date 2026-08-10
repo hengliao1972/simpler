@@ -6400,7 +6400,8 @@ PA_DEVICE bool RuntimePlanBuildReleaseReady(
     }
 
     const uint64_t expected_ticket_count =
-        static_cast<uint64_t>(task_count) + kWorkers;
+        static_cast<uint64_t>(task_count) +
+        kRuntimePlanBuildWorkers;
     if (expected_ticket_count > INT64_MAX ||
         TraceAtomicControlLoad<Ops>(
             stats.trace, stats.result, -1,
@@ -6425,7 +6426,7 @@ PA_DEVICE bool RuntimePlanBuildReleaseReady(
             AtomicSite::RuntimePlanWorkersDoneLoad,
             &view.control->build_workers_done.value,
             /*result_used=*/true
-        ) != static_cast<int64_t>(kWorkers) ||
+        ) != static_cast<int64_t>(kRuntimePlanBuildWorkers) ||
         TraceAtomicControlLoad<Ops>(
             stats.trace, stats.result, -1,
             AtomicSite::RuntimePlanBuildReleaseLoad,
@@ -6444,53 +6445,11 @@ PA_DEVICE bool RuntimePlanBuildReleaseReady(
 }
 
 template <typename Ops>
-PA_DEVICE bool ArriveAndWaitRuntimePlanBuildRelease(
+PA_DEVICE bool WaitRuntimePlanBuildRelease(
     PA_GM SchedulerState *state,
     const aicpu_plan::RuntimePlanView &view,
     uint32_t task_count, LocalStats &stats
 ) {
-    // 正常 arrival 只需要一次返回型 FetchAdd。Plan fatal 已在 Attach
-    // acquire；Build 的任何失败都会同时发布 scheduler/Plan fatal，等待
-    // release 的低频分支再观察，不能为每个成功 worker 预付一次热点 Load。
-    const int64_t arrival_old = TraceAtomicControlFetchAdd<Ops>(
-        stats.trace, stats.result, -1,
-        AtomicSite::RuntimePlanWorkersDoneFetchAdd,
-        &view.control->build_workers_done.value, 1,
-        /*result_used=*/true
-    );
-    const aicpu_plan::BuildArrivalStatus arrival =
-        arrival_old < 0 || arrival_old >= static_cast<int64_t>(kWorkers)
-            ? aicpu_plan::BuildArrivalStatus::Invalid
-            : (arrival_old + 1 == static_cast<int64_t>(kWorkers)
-                   ? aicpu_plan::BuildArrivalStatus::Last
-                   : aicpu_plan::BuildArrivalStatus::Arrived);
-    if (arrival == aicpu_plan::BuildArrivalStatus::Fatal ||
-        arrival == aicpu_plan::BuildArrivalStatus::Invalid) {
-        PublishRuntimePlanConsumerFatal<Ops>(state, stats);
-        return false;
-    }
-    if (arrival == aicpu_plan::BuildArrivalStatus::Last) {
-        if (!RuntimePlanBuildReleaseReady<Ops>(
-                state, view, task_count, stats
-            )) {
-            TraceAtomicControlPublish<Ops>(
-                stats.trace, stats.result, -1,
-                AtomicSite::RuntimePlanBuildReleasePublish,
-                &view.control->build_release.value,
-                aicpu_plan::kBuildReleaseFailed
-            );
-            PublishRuntimePlanConsumerFatal<Ops>(state, stats);
-            return false;
-        }
-        Ops::StoreBarrier();
-        TraceAtomicControlPublish<Ops>(
-            stats.trace, stats.result, -1,
-            AtomicSite::RuntimePlanBuildReleasePublish,
-            &view.control->build_release.value,
-            static_cast<int64_t>(task_count)
-        );
-    }
-
     const uint64_t wait_begin = Ops::Now();
     uint32_t wait_polls = 0U;
     const uint32_t poll_region = AtomicPollRegionBegin<Ops>(
@@ -6526,7 +6485,7 @@ PA_DEVICE bool ArriveAndWaitRuntimePlanBuildRelease(
         Ops::SpinHint();
         ++wait_polls;
         // 正常 release 只轮询独占 release line；错误停止线每 256 轮观察
-        // 一次，避免 96 个等待者同时把 Plan/scheduler fatal 变成新热点。
+        // 一次，避免全部等待者同时把 Plan/scheduler fatal 变成新热点。
         if ((wait_polls & 255U) == 0U &&
             (TraceAtomicControlLoad<Ops>(
                  stats.trace, stats.result, -1,
@@ -6550,6 +6509,64 @@ PA_DEVICE bool ArriveAndWaitRuntimePlanBuildRelease(
             return false;
         }
     }
+}
+
+template <typename Ops>
+PA_DEVICE bool ArriveAndWaitRuntimePlanBuildRelease(
+    PA_GM SchedulerState *state,
+    const aicpu_plan::RuntimePlanView &view,
+    uint32_t task_count, LocalStats &stats
+) {
+    // 正常 arrival 只需要一次返回型 FetchAdd。Plan fatal 已在 Attach
+    // acquire；Build 的任何失败都会同时发布 scheduler/Plan fatal，等待
+    // release 的低频分支再观察，不能为每个成功 worker 预付一次热点 Load。
+    const int64_t arrival_old = TraceAtomicControlFetchAdd<Ops>(
+        stats.trace, stats.result, -1,
+        AtomicSite::RuntimePlanWorkersDoneFetchAdd,
+        &view.control->build_workers_done.value, 1,
+        /*result_used=*/true
+    );
+    const aicpu_plan::BuildArrivalStatus arrival =
+        arrival_old < 0 ||
+                arrival_old >=
+                    static_cast<int64_t>(kRuntimePlanBuildWorkers)
+            ? aicpu_plan::BuildArrivalStatus::Invalid
+            : (arrival_old + 1 ==
+                       static_cast<int64_t>(
+                           kRuntimePlanBuildWorkers
+                       )
+                   ? aicpu_plan::BuildArrivalStatus::Last
+                   : aicpu_plan::BuildArrivalStatus::Arrived);
+    if (arrival == aicpu_plan::BuildArrivalStatus::Fatal ||
+        arrival == aicpu_plan::BuildArrivalStatus::Invalid) {
+        PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+        return false;
+    }
+    if (arrival == aicpu_plan::BuildArrivalStatus::Last) {
+        if (!RuntimePlanBuildReleaseReady<Ops>(
+                state, view, task_count, stats
+            )) {
+            TraceAtomicControlPublish<Ops>(
+                stats.trace, stats.result, -1,
+                AtomicSite::RuntimePlanBuildReleasePublish,
+                &view.control->build_release.value,
+                aicpu_plan::kBuildReleaseFailed
+            );
+            PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+            return false;
+        }
+        Ops::StoreBarrier();
+        TraceAtomicControlPublish<Ops>(
+            stats.trace, stats.result, -1,
+            AtomicSite::RuntimePlanBuildReleasePublish,
+            &view.control->build_release.value,
+            static_cast<int64_t>(task_count)
+        );
+    }
+
+    return WaitRuntimePlanBuildRelease<Ops>(
+        state, view, task_count, stats
+    );
 }
 #endif
 
@@ -6950,7 +6967,7 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 break;
             }
             // 每个 worker 只在首次取得越界 ticket 后报到；该分支恰好
-            // 执行一次。last 核验 N+96 和最后插入；W 次 arrival 的
+            // 执行一次。last 核验 N+BuildWorkers 和最后插入；W 次 arrival 的
             // program-order 合同证明已无 in-flight BUILDING。
             runtime_plan_build_released =
                 ArriveAndWaitRuntimePlanBuildRelease<Ops>(
@@ -7036,7 +7053,8 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         orchestration_end = TraceTimestamp<Ops>(stats.trace, stats.result);
     }
 
-    // shared 的 build_release 已证明 AICPU Plan 关闭、N+96 ticket、全部
+    // shared 的 build_release 已证明 AICPU Plan 关闭、N+BuildWorkers
+    // ticket、全部
     // Build worker 报到以及最后 TensorMap completion；每个 worker 在
     // Finish 返回后才允许报到，因此该边界也证明没有 in-flight BUILDING。
     // 越过该边界后 EMPTY 才能解释为 metadata-only task。
