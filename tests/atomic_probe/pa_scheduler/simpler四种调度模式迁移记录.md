@@ -1602,3 +1602,61 @@ producer。PA 中相邻引用只是让这一通用条件实际命中。
 这组门槛覆盖单 task 32 个 fresh output、同一 producer 多 slot、AIV output 被
 AIC 消费、跨来源 fanin 合并和连续 INOUT writer。测试只运行真实 A5，未运行
 A5Sim。
+
+## 30. 用 creator owner 收紧 DAG 历史查询下界
+
+### 30.1 为什么 owner 之前不需要再查
+
+自动 INPUT/INOUT 的依赖由两部分组成：
+
+1. descriptor 的 creator `owner_task_id` 始终单独加入 fanin，用来保留 fresh
+   output 的创建者；
+2. DAG metadata 查询寻找创建之后对同一内存区域发生的最新覆盖写者。
+
+原实现即使一个 task 的全部自动查询 Tensor 都带有效 owner，仍统一扫描
+`[N-H, N)`。但 owner 之前的 writer 不可能比 creator 更新；把它加入结果既不
+改变 owner fanin，也不能成为该 Tensor 的“创建后最新修改者”。因此在以下条件
+全部成立时，可以把本 task 的公共查询下界提高到最早 owner 的后一项：
+
+- 每个需要自动查询的 Tensor 都有合法 owner；
+- owner 与 consumer 属于当前 ring，且 `owner < consumer`；
+- 原有 history 下界更靠后时仍以 history 为准。
+
+只要存在 external Tensor（owner invalid），就完整保留原 `[N-H, N)` 扫描。
+该实现没有跳过 owner 之后的任一 metadata cell，因此连续 INOUT writer 的最新
+依赖语义不变；owner 本身仍由后续 fanin 合并路径校验和保留。
+
+### 30.2 实现边界
+
+Builder 在已经必须完成的 descriptor 区域解析中同时取得最早 owner，并记录
+是否所有自动查询都有 owner。没有增加共享状态、atomic、DCCI、metadata 字段
+或按 Tensor 扩张的新数组，也没有修改发布顺序。条件只来自公开 Tensor owner
+和 history 合同，不读取 PA task kind、batch、固定 task 次序或 shape。
+
+### 30.3 真实 A5 性能
+
+在第 29 章保留版上继续比较，相同 `simt-builder-clock` 口径：
+
+| 指标 | 修改前 | owner 下界 | 变化 |
+| ---- | -----: | ---------: | ---: |
+| `lookup_fanin` | 184,502,159 cycles | 142,073,320 cycles | -23.00% |
+| 六阶段合计 | 309,666,469 cycles | 272,667,259 cycles | -11.95% |
+
+普通 PA B256、startup 到 FinalDrain 五次为：
+
+```text
+修改前：3.28370 / 3.25065 / 3.21345 / 3.28525 / 3.27825 ms
+owner 下界：3.04853 / 3.06703 / 2.97376 / 3.03745 / 3.10850 ms
+中位数：3.27825 -> 3.04853 ms，改善 7.01%
+```
+
+端到端与直接受影响的 lookup 分段一致下降，收益不是用诊断 ELF 的绝对时间
+反推得到。
+
+### 30.4 通用正确性复核
+
+`simt_cross_core_dag` 再次通过第 27.4 节全部 **27/27** 类真实 A5 非 PA
+门槛。其中连续 INOUT chain、跨引擎交替 INOUT、fresh output sub-view、AIV
+output 被 AIC 消费、32 fresh output、历史窗口下界和跨来源 fanin 合并，直接
+覆盖 owner 与后续 writer 的关键组合。全部场景数值 golden PASS；未运行
+A5Sim。

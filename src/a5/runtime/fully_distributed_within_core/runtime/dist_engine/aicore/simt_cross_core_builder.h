@@ -634,6 +634,8 @@ DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
     __gm__ uint64_t *fatal, int32_t producers[]
 ) {
     uint32_t unresolved = 0;
+    uint32_t earliest_owner = UINT32_MAX;
+    bool every_query_has_owner = true;
     // Tensor 区域只由当前 immutable request 决定。先解析一次并保存在
     // leader 本地，避免在 history × writer 的内层循环中反复读取同一份
     // GM descriptor、重算 shape/stride。该消减与算子 task 形状无关。
@@ -655,13 +657,27 @@ DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
                 )) {
                 return false;
             }
+            // creator owner 会在后续 fanin 合并中独立保留。若所有自动
+            // 查询都有 owner，则只需继续寻找 owner 之后的覆盖写者；更早
+            // 的 metadata 不可能产生比 creator 更新的依赖。
+            const uint64_t owner_raw = descriptor[2];
+            if (owner_raw == UINT64_MAX) {
+                every_query_has_owner = false;
+            } else {
+                const uint32_t owner = static_cast<uint32_t>(owner_raw);
+                if (static_cast<uint32_t>(owner_raw >> 32U) != 0 || owner >= request.task_id) return false;
+                if (owner < earliest_owner) earliest_owner = owner;
+            }
             unresolved |= uint32_t{1} << tensor;
         }
     }
     if (unresolved == 0) return true;
     if (metadata == nullptr) return false;
 
-    const uint32_t lower = request.task_id > history ? request.task_id - history : 0U;
+    uint32_t lower = request.task_id > history ? request.task_id - history : 0U;
+    if (every_query_has_owner && earliest_owner != UINT32_MAX && earliest_owner + 1U > lower) {
+        lower = earliest_owner + 1U;
+    }
     for (uint32_t candidate = request.task_id; candidate > lower;) {
         --candidate;
         __gm__ fdwic::cross_core::DagTaskMetadataCell *cell = &metadata[candidate];
