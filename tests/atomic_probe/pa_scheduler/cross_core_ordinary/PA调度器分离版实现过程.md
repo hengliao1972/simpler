@@ -7208,3 +7208,49 @@ A5sim 无输出。完整重建对应 scheduler mode 的 runtime 后问题消失�
 
 这些结果证明第一种模式已经进入真实 PA 动态 Submit 链路并闭合功能正确性；
 尚未完成与 standalone 的端到端性能对齐，也不代表后三种模式已经接通。
+
+## 2026-08-10：撤销预制计划，确定全 Scalar 真实回放迁移合同
+
+### 问题复核
+
+当前 standalone `cross_core_ordinary` 的低时延来自 Host 预先生成完整 Build
+task identity、metadata writer bitset 和 AIC/AIV Execute task-id 表。SIMT 的
+部分路径则在 device 按固定 PA 公式生成同类计划。这些实现可以验证跨核
+payload 与 Execute 状态机，却不能代表真实 Submit 的调度成本。
+
+曾尝试让 worker 0 动态生成同一份全局计划，但在代码落地前复核后撤销：它只
+把串行 planner 从 Host 搬到 device，不满足“每个 Scalar 独立回放真实
+orchestration”的目标，还会新增不可比较的单核瓶颈。该过程态未提交。
+
+### 确定的复用边界
+
+保留：
+
+- per-task 两级 CAS Tournament；
+- stable SharedOutputRef loser 合同；
+- task-indexed execution payload 与 DCCI publish/acquire；
+- `BUILT -> CLAIMED -> DONE`、owner-local token、completion 与 execution
+  drain。
+
+替换：
+
+- 中央 Build ticket 与 random-access PA args 重建；
+- Host metadata writer bitset 和 writer 摘要；
+- Host AIC/AIV task-id 表与预制 executable count；
+- 省略 `replay_done`、只靠中央 ticket exhaustion 收口的终止协议。
+
+### 第一版实现顺序
+
+1. 复制 `same_core` 已验证的逐核 orchestration replay 入口，但 winner 继续
+   发布 `cross_core_ordinary` 的 execution payload。
+2. 每个 task 都执行 `completion[N-1] -> metadata(N) -> completion[N]`；空
+   writer 也推进，保证严格 TensorMap 插入不依赖 Host 分类。
+3. 每核封口相同的 task count 与 replay identity，再通过 `replay_done`
+   证明所有 producer 已停产。
+4. 生产封口后，AIC/AIV 各用一条中央 cursor 扫描真实 execution cell；匹配
+   runtime engine 的唯一 task-id owner 才领取 payload。
+5. CPU 与 CCEC 闭合后运行 A5 B1/B256；这一阶段先看功能，不要求立即恢复旧
+   计划版本的约 `0.82 ms`。
+6. 正确性基线稳定后，再用由 Build winner 动态发布且带 per-entry ready 的
+   role queue 恢复 Build/Execute overlap；不得重新引入 Host 或单 planner
+   答案。
