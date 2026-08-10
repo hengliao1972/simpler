@@ -7299,6 +7299,17 @@ exec cell 只决定谁 Execute。任何一条都不能拿另一条的 owner 或 
   全局末次 Submit，并把这份实际身份写入 replay seal；
 - G0 由 `current_blocks == 0` 自然只产生 Alloc，不需要计划特判。
 
+仅摘要 task/meta 仍不够：`context=1` 与 `context=8192` 都产生 G1 拓扑，但
+descriptor shape 和末 block 有效长度不同。因此 replay seal 还会在每批首个
+Submit 前混入实际 `batch/context_length`；同 task 数、不同业务输入不能再
+碰巧通过 96 核一致性封口。
+
+A5 Scalar 没有 cache coherence。此前启动 DCCI 只覆盖 config、PMU 配置和
+workload，未覆盖紧随其后的 `context_lens`。全员 replay 改为每核直接读取该
+GM 输入后，正式入口在 PMU/Orchestration 窗口内、首个 context load 前，对本轮
+活动 `context_lens` cache line 执行一次 invalidate + DSB，并以独立 DCCI site
+写入泳道；不能依赖首次运行或地址复用时恰好未缓存旧值。
+
 `BuildSharedHostTaskPlan` 暂时只保留为运行前 heap 容量准入和运行后独立结果
 oracle；`InitializeState` 不把其中任何 task、writer 或 Execute 路由写入设备
 状态。后续清理旧 ABI 时会继续删除零值搬运的死表，但不能把 Host oracle 与

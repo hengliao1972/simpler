@@ -1745,6 +1745,7 @@ inline const char *DcciSiteName(uint32_t site) {
         "SharedExecPayloadFlush",
         "SharedExecPayloadInvalidate",
         "SharedExecTokenDescriptorInvalidate",
+        "StartupContextLensInvalidate",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) ==
@@ -1937,6 +1938,12 @@ inline bool DcciRecordSchemaValid(const TraceRecord &record) {
                record.function_id == -1;
     }
     if (site == DcciSite::StartupConfigInvalidate) {
+        return call_count == 1 &&
+               (record.flags & kDcciTrailingDsb) != 0 &&
+               record.task_id == -1 &&
+               record.function_id == -1;
+    }
+    if (site == DcciSite::StartupContextLensInvalidate) {
         return call_count == 1 &&
                (record.flags & kDcciTrailingDsb) != 0 &&
                record.task_id == -1 &&

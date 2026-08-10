@@ -28,17 +28,18 @@ namespace {
 
 using namespace pa_scheduler;
 
-constexpr uint32_t kReplayBatches = 4;
+constexpr uint32_t kReplayBatches = 5;
 constexpr uint32_t kProtocolRuns = 5;
 constexpr uint32_t kDelayedWorker = 0;
 constexpr uint32_t kExpectedReplayTasks =
     (1U + 4U * 0U) + (1U + 4U * 1U) +
-    (1U + 4U * 2U) + (1U + 4U * 4U);
+    (1U + 4U * 2U) + (1U + 4U * 4U) +
+    (1U + 4U * 2U);
 
 static_assert(kWorkers == 96, "A5 Scalar worker count changed");
 static_assert(
-    kExpectedReplayTasks == 32,
-    "mixed G0/G1/G2/G4 replay task count changed"
+    kExpectedReplayTasks == 41,
+    "mixed G0/G1/G2/G4/short-tail replay task count changed"
 );
 
 struct ClaimTestOps {
@@ -111,26 +112,114 @@ void MixFingerprint(uint64_t &hash, uint64_t value) {
     }
 }
 
-uint32_t DynamicReplayTaskCount(
-    const std::array<int32_t, kReplayBatches> &context_lens
+struct DirectReplayTask {
+    uint32_t task_id;
+    uint32_t batch;
+    uint32_t group;
+    TaskKind kind;
+    uint64_t context_length;
+    bool has_following_group;
+    bool is_last_submit;
+};
+
+template <size_t BatchCount, typename Visitor>
+bool VisitDirectReplayTasks(
+    const std::array<int32_t, BatchCount> &context_lens,
+    Visitor visitor, uint32_t &task_count
 ) {
-    PaOrchestrationState orchestration{};
-    InitPaOrchestration(
-        orchestration, kReplayBatches, context_lens.data()
-    );
-    uint32_t task_count = 0;
-    for (uint32_t batch = 0; batch < kReplayBatches; ++batch) {
-        BeginPaBatchForCallback(orchestration, batch);
-        SharedPaBatchPlan batch_plan{};
-        if (!BuildSharedPaBatchPlan(
-                orchestration.current_sequence,
-                task_count, batch_plan
-            ) || batch_plan.batch_start != task_count) {
-            return 0;
+    // 这是测试侧独立 oracle：只从外部 context 输入按 block loop
+    // 枚举 Alloc/QK/SF/PV/UP，不调用生产 batch-plan/task-at helper。
+    task_count = 0;
+    constexpr std::array<TaskKind, 4> kGroupKinds = {
+        TaskKind::Qk, TaskKind::Sf,
+        TaskKind::Pv, TaskKind::Up,
+    };
+    for (uint32_t batch = 0; batch < BatchCount; ++batch) {
+        if (context_lens[batch] < 0) {
+            return false;
         }
-        task_count += batch_plan.task_count;
+        const uint64_t context_length =
+            static_cast<uint64_t>(context_lens[batch]);
+        if (context_length > kSharedPaMaxContextLength) {
+            return false;
+        }
+        const uint64_t block_count =
+            (context_length + kPaBlockSize - 1U) /
+            kPaBlockSize;
+        if (task_count >= kMaxTasks ||
+            !visitor(DirectReplayTask{
+                task_count++, batch, 0, TaskKind::Alloc,
+                context_length, false,
+                block_count == 0 && batch + 1U == BatchCount,
+            })) {
+            return false;
+        }
+
+        uint32_t group = 0;
+        uint64_t block_offset = 0;
+        while (block_offset < block_count) {
+            if (group >= kSharedPaMaxBlockGroups) {
+                return false;
+            }
+            const uint64_t remaining =
+                block_count - block_offset;
+            const uint64_t group_blocks =
+                remaining < kPaBlocksPerRequest
+                ? remaining : kPaBlocksPerRequest;
+            const bool has_following_group =
+                block_offset + group_blocks < block_count;
+            for (TaskKind kind : kGroupKinds) {
+                if (task_count >= kMaxTasks ||
+                    !visitor(DirectReplayTask{
+                        task_count++, batch, group, kind,
+                        context_length,
+                        kind == TaskKind::Up &&
+                            has_following_group,
+                        kind == TaskKind::Up &&
+                            !has_following_group &&
+                            batch + 1U == BatchCount,
+                    })) {
+                    return false;
+                }
+            }
+            block_offset += group_blocks;
+            ++group;
+        }
     }
-    return task_count;
+    return true;
+}
+
+template <size_t BatchCount>
+bool DirectReplayIdentity(
+    const std::array<int32_t, BatchCount> &context_lens,
+    uint32_t &task_count, uint32_t &identity_hash
+) {
+    identity_hash = kSharedReplayIdentityHashSeed;
+    return VisitDirectReplayTasks(
+        context_lens,
+        [&](const DirectReplayTask &task) {
+            if (task.kind == TaskKind::Alloc) {
+                RecordSharedReplayBatchInput(
+                    identity_hash, task.batch,
+                    task.context_length
+                );
+            }
+            const uint8_t meta = EncodeSharedPaTaskMeta(
+                task.kind, task.group,
+                task.has_following_group,
+                task.is_last_submit
+            );
+            if (meta == 0) {
+                return false;
+            }
+            RecordSharedReplayIdentity(
+                identity_hash, task.task_id,
+                task.batch, meta
+            );
+            return true;
+        },
+        task_count
+    );
 }
 
 void ResetTaskProtocol(
@@ -233,53 +322,25 @@ void ReplayDynamicTaskSequence(
     const CoreRole role = worker_id < kAicWorkers
         ? CoreRole::Aic
         : CoreRole::Aiv;
-    PaOrchestrationState orchestration{};
-    InitPaOrchestration(
-        orchestration, kReplayBatches, context_lens.data()
-    );
-
-    uint32_t task_id = 0;
-    for (uint32_t batch = 0; batch < kReplayBatches; ++batch) {
-        BeginPaBatchForCallback(orchestration, batch);
-        SharedPaBatchPlan batch_plan{};
-        if (!BuildSharedPaBatchPlan(
-                orchestration.current_sequence,
-                task_id, batch_plan
-            ) || batch_plan.batch_start != task_id) {
-            worker_evidence.valid = false;
-            return;
-        }
-
-        // 与真实 callback 回放相同：Alloc 在 group loop 之前；每个动态
-        // group 再按 QK/SF/PV/UP 顺序 Submit。这里只验证 owner 仲裁，
-        // 不制造 Host task identity，也不做 random-access 参数恢复。
-        const uint32_t alloc_task = task_id++;
-        RecordReplayClaim(
-            state, worker_id, role, batch, 0,
-            alloc_task, TaskKind::Alloc,
-            task_evidence[alloc_task], worker_evidence
-        );
-        for (uint32_t group = 0;
-             group < batch_plan.group_count; ++group) {
-            constexpr std::array<TaskKind, 4> kGroupKinds = {
-                TaskKind::Qk, TaskKind::Sf,
-                TaskKind::Pv, TaskKind::Up,
-            };
-            for (TaskKind kind : kGroupKinds) {
-                const uint32_t current_task = task_id++;
-                RecordReplayClaim(
-                    state, worker_id, role, batch, group,
-                    current_task, kind,
-                    task_evidence[current_task], worker_evidence
+    uint32_t task_count = 0;
+    worker_evidence.valid = VisitDirectReplayTasks(
+        context_lens,
+        [&](const DirectReplayTask &task) {
+            if (task.kind == TaskKind::Alloc) {
+                MixFingerprint(
+                    worker_evidence.fingerprint,
+                    task.context_length
                 );
             }
-        }
-        if (task_id !=
-            batch_plan.batch_start + batch_plan.task_count) {
-            worker_evidence.valid = false;
-            return;
-        }
-    }
+            RecordReplayClaim(
+                state, worker_id, role, task.batch, task.group,
+                task.task_id, task.kind,
+                task_evidence[task.task_id], worker_evidence
+            );
+            return worker_evidence.valid;
+        },
+        task_count
+    );
 }
 
 bool TournamentStateComplete(
@@ -313,9 +374,14 @@ bool RunNoPrebuiltPlanReplay(
     const std::array<int32_t, kReplayBatches> &context_lens,
     uint32_t run
 ) {
-    const uint32_t dynamic_task_count =
-        DynamicReplayTaskCount(context_lens);
-    if (dynamic_task_count != kExpectedReplayTasks) {
+    uint32_t dynamic_task_count = 0;
+    const bool replay_shape_ok = VisitDirectReplayTasks(
+        context_lens,
+        [](const DirectReplayTask &) { return true; },
+        dynamic_task_count
+    );
+    if (!replay_shape_ok ||
+        dynamic_task_count != kExpectedReplayTasks) {
         std::fprintf(
             stderr,
             "[NO_PREBUILT_PLAN] invalid dynamic task count=%u\n",
@@ -434,39 +500,53 @@ bool RunNoPrebuiltPlanReplay(
     return ok;
 }
 
-bool ReplayIdentitySealRejectsDivergence(SchedulerState &state) {
+bool ReplayIdentitySealRejectsContextDivergence(
+    SchedulerState &state
+) {
     state.fatal.value = 0;
     state.build_dispatch.next_task.value = -1;
-    uint32_t identity = kSharedReplayIdentityHashSeed;
-    RecordSharedReplayIdentity(
-        identity, 0, 0,
-        EncodeSharedPaTaskMeta(
-            TaskKind::Alloc, 0, false, false
-        )
-    );
+    const std::array<int32_t, 1> context_one = {1};
+    const std::array<int32_t, 1> context_full_group = {8192};
+    uint32_t one_task_count = 0;
+    uint32_t full_task_count = 0;
+    uint32_t one_identity = 0;
+    uint32_t full_identity = 0;
+    const bool identities_ok =
+        DirectReplayIdentity(
+            context_one, one_task_count, one_identity
+        ) &&
+        DirectReplayIdentity(
+            context_full_group, full_task_count, full_identity
+        );
     LocalStats first{};
     LocalStats same{};
     LocalStats different{};
     const bool first_ok = SealSharedReplayIdentity<ClaimTestOps>(
-        &state, 1, identity, first
+        &state, one_task_count, one_identity, first
     );
     const bool same_ok = SealSharedReplayIdentity<ClaimTestOps>(
-        &state, 1, identity, same
+        &state, one_task_count, one_identity, same
     );
     const bool mismatch_rejected =
         !SealSharedReplayIdentity<ClaimTestOps>(
-            &state, 1, identity ^ 1U, different
+            &state, full_task_count, full_identity, different
         );
     const uint64_t expected_packed =
-        (static_cast<uint64_t>(identity) << 32U) | 1U;
-    const bool ok = first_ok && same_ok && mismatch_rejected &&
+        (static_cast<uint64_t>(one_identity) << 32U) |
+        one_task_count;
+    const bool ok = identities_ok &&
+        one_task_count == 5 && full_task_count == 5 &&
+        one_identity != full_identity &&
+        first_ok && same_ok && mismatch_rejected &&
         static_cast<uint64_t>(
             state.build_dispatch.next_task.value
         ) == expected_packed &&
         state.fatal.value != 0;
     std::printf(
-        "[NO_PREBUILT_PLAN] replay-identity-seal status=%s\n",
-        ok ? "PASS" : "FAIL"
+        "[NO_PREBUILT_PLAN] replay-context-seal status=%s "
+        "tasks=%u/%u hash=%08x/%08x\n",
+        ok ? "PASS" : "FAIL", one_task_count,
+        full_task_count, one_identity, full_identity
     );
     return ok;
 }
@@ -480,9 +560,9 @@ int main() {
         return 1;
     }
 
-    // 运行时输入覆盖 G0/G1/G2/G4。每个 actor 从 context_len 独立推导
-    // sequence；测试中不存在 Host task plan、task identity 表或中央
-    // Build ticket。
+    // 运行时输入覆盖 G0/G1/G2/G4，以及 8193 token 形成的第二个
+    // 1-block 短尾 group。每个 actor 从 context_len 独立推导 sequence；
+    // 测试中不存在 Host task plan、task identity 表或中央 Build ticket。
     const std::array<int32_t, kReplayBatches> context_lens = {
         0,
         static_cast<int32_t>(
@@ -494,9 +574,12 @@ int main() {
         static_cast<int32_t>(
             4U * kPaBlocksPerRequest * kPaBlockSize
         ),
+        static_cast<int32_t>(
+            kPaBlocksPerRequest * kPaBlockSize + 1U
+        ),
     };
 
-    bool ok = ReplayIdentitySealRejectsDivergence(*state);
+    bool ok = ReplayIdentitySealRejectsContextDivergence(*state);
     for (uint32_t run = 1;
          run <= kProtocolRuns && ok; ++run) {
         ok &= RunNoPrebuiltPlanReplay(

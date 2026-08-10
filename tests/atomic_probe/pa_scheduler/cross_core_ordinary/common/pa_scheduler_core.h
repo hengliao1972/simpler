@@ -1410,6 +1410,22 @@ PA_DEVICE void RecordSharedReplayIdentity(
         hash, static_cast<uint32_t>(encoded_task_meta)
     );
 }
+
+PA_DEVICE void RecordSharedReplayBatchInput(
+    uint32_t &hash, uint32_t batch, uint64_t context_length
+) {
+    // task/meta 只能证明拓扑相同；context=1 与 8192 都产生 G1，却拥有
+    // 不同 shape/current_valid_len。每批把真实 GM 输入也纳入 seal，避免
+    // 96 核在不一致输入上碰巧回放相同 task 数仍通过封口。
+    MixSharedReplayIdentityWord(hash, 0x42544348U);  // "BTCH"
+    MixSharedReplayIdentityWord(hash, batch);
+    MixSharedReplayIdentityWord(
+        hash, static_cast<uint32_t>(context_length)
+    );
+    MixSharedReplayIdentityWord(
+        hash, static_cast<uint32_t>(context_length >> 32U)
+    );
+}
 #endif
 
 template <typename Ops, bool Profile>
@@ -6766,6 +6782,22 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         shared_replay_window_started = true;
 #endif
         orchestration_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
+#if PTO_FDWIC_SHARED_MAP
+        // Host 每轮都会重写 context_lens，而 A5 Scalar 间没有 cache
+        // coherence。正式全员 replay 在第一次 GM load 前，各核必须失效
+        // 本轮活动输入覆盖的 cache line；DCCI 自带 trailing DSB。
+        (void)TraceConfiguredDcciInvalidate<
+            Ops, true
+        >(
+            &stats.trace, -1, -1,
+            DcciSite::StartupContextLensInvalidate,
+            const_cast<PA_GM const int32_t *>(
+                &state->context_lens[0]
+            ),
+            static_cast<uint64_t>(batches) *
+                sizeof(state->context_lens[0])
+        );
+#endif
         InitPaOrchestration(orchestration, batches, &state->context_lens[0]);
 #if PTO_FDWIC_SHARED_MAP
         // 96 个 Scalar 各自回放真实 PA orchestration。任务序列直接由
@@ -6792,6 +6824,10 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
                 replay_ok = false;
                 break;
             }
+            RecordSharedReplayBatchInput(
+                shared_replay_identity_hash, batch,
+                orchestration.current_sequence
+            );
             if (!SubmitCallbackTask<TaskKind::Alloc, Ops, Profile>(
                     state, worker, role, task_count,
                     orchestration, args, batch, context, stats,

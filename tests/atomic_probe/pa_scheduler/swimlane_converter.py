@@ -306,6 +306,7 @@ DCCI_SITE_NAMES = {
     11: "shared_exec_payload_flush",
     12: "shared_exec_payload_invalidate",
     13: "shared_exec_token_descriptor_invalidate",
+    14: "startup_context_lens_invalidate",
 }
 DCCI_OP_NAMES = {
     0: "invalidate",
@@ -326,10 +327,12 @@ DCCI_SITE_OP_IDS = {
     11: 1,
     12: 0,
     13: 0,
+    14: 0,
 }
-DCCI_SHARED_ONLY_SITE_IDS = set(range(8)) | set(range(10, 14))
+DCCI_SHARED_ONLY_SITE_IDS = set(range(8)) | set(range(10, 15))
 DCCI_OBSERVER_SITE_ID = 8
 DCCI_STARTUP_SITE_ID = 9
+DCCI_CONTEXT_LENS_SITE_ID = 14
 DCCI_OP_MASK = 0x3
 DCCI_TRAILING_DSB = 1 << 2
 DCCI_CALL_COUNT_SHIFT = 3
@@ -1028,6 +1031,16 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 if call_count != 1 or task_id != -1 or function_id != -1:
                     raise ValueError(
                         f"fdwic_events[{index}] has invalid startup Dcci fields"
+                    )
+            elif auxiliary == DCCI_CONTEXT_LENS_SITE_ID:
+                if (
+                    tensormap_mode != "shared"
+                    or call_count != 1
+                    or task_id != -1
+                    or function_id != -1
+                ):
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid context-lens Dcci fields"
                     )
             elif (
                 tensormap_mode != "shared"

@@ -878,7 +878,10 @@ enum class DcciSite : uint32_t {
     SharedExecPayloadFlush = 11,
     SharedExecPayloadInvalidate = 12,
     SharedExecTokenDescriptorInvalidate = 13,
-    Count = 14,
+    // 每核真实 replay 会直接读取 Host 写入的 context_lens。A5 Scalar
+    // 无 cache coherence，必须在第一次读取前显式失效活动输入区。
+    StartupContextLensInvalidate = 14,
+    Count = 15,
 };
 
 constexpr uint32_t kDcciOpMask = 0x03U;
@@ -1126,6 +1129,10 @@ static_assert(
 static_assert(
     !DcciSiteIsSharedOnly(DcciSite::StartupConfigInvalidate),
     "startup config invalidate must remain available in both TensorMap modes"
+);
+static_assert(
+    DcciSiteIsSharedOnly(DcciSite::StartupContextLensInvalidate),
+    "shared replay context-lens invalidate must remain shared-only"
 );
 
 #undef PA_MODEL_INLINE

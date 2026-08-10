@@ -640,6 +640,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         rows.extend(
             [
                 [0, 0, 0, -1, -1, "Dcci", 92, 96, 0x30C, 9],
+                [0, 0, 0, -1, -1, "Dcci", 100, 104, 0x10C, 14],
                 [0, 0, 0, -1, -1, "Dcci", 420, 424, 0x31D, 8],
             ]
         )
@@ -659,10 +660,14 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             "dcci.observer_trace_export.clean_out×3.lines3#-1",
             names,
         )
+        self.assertIn(
+            "dcci.startup_context_lens_invalidate.invalidate×1.lines1#-1",
+            names,
+        )
         summary = merged["metadata"]["fdwic_summary"]
-        self.assertEqual(summary["dcci_records"], 2)
-        self.assertEqual(summary["dcci_calls"], 4)
-        self.assertEqual(summary["dcci_lines"], 6)
+        self.assertEqual(summary["dcci_records"], 3)
+        self.assertEqual(summary["dcci_calls"], 5)
+        self.assertEqual(summary["dcci_lines"], 7)
 
     def test_v5_rejects_invalid_startup_dcci_identity(self) -> None:
         capture = _v5_capture(

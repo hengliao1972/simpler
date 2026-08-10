@@ -427,7 +427,7 @@ struct OrderedSubmitTestOps {
     static void BeforePayloadAcquire(uint32_t) {}
 
     static void InvalidateRegion(
-        const void *address, uint64_t bytes
+        const volatile void *address, uint64_t bytes
     ) {
         CountSharedMapAccess(address, bytes);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -585,6 +585,83 @@ bool LegacyTurnsMatch(
     return true;
 }
 
+struct DirectReplayTask {
+    uint32_t task_id;
+    uint32_t batch;
+    uint32_t group;
+    TaskKind kind;
+    uint64_t context_length;
+    bool has_following_group;
+    bool is_last_submit;
+};
+
+template <typename Visitor>
+bool VisitDirectReplayTasks(
+    const volatile int32_t *context_lens, uint32_t batches,
+    Visitor visitor, uint32_t &task_count
+) {
+    // 测试 oracle 独立按 block loop 枚举 callback 顺序；不得调用生产
+    // 侧的批计划或 task-at helper，否则实现和期望同源。
+    task_count = 0;
+    constexpr std::array<TaskKind, 4> kGroupKinds = {
+        TaskKind::Qk, TaskKind::Sf,
+        TaskKind::Pv, TaskKind::Up,
+    };
+    for (uint32_t batch = 0; batch < batches; ++batch) {
+        if (context_lens[batch] < 0) {
+            return false;
+        }
+        const uint64_t context_length =
+            static_cast<uint64_t>(context_lens[batch]);
+        if (context_length > kSharedPaMaxContextLength) {
+            return false;
+        }
+        const uint64_t block_count =
+            (context_length + kPaBlockSize - 1U) /
+            kPaBlockSize;
+        if (task_count >= kMaxTasks ||
+            !visitor(DirectReplayTask{
+                task_count++, batch, 0, TaskKind::Alloc,
+                context_length, false,
+                block_count == 0 && batch + 1U == batches,
+            })) {
+            return false;
+        }
+
+        uint32_t group = 0;
+        uint64_t block_offset = 0;
+        while (block_offset < block_count) {
+            if (group >= kSharedPaMaxBlockGroups) {
+                return false;
+            }
+            const uint64_t remaining =
+                block_count - block_offset;
+            const uint64_t group_blocks =
+                remaining < kPaBlocksPerRequest
+                ? remaining : kPaBlocksPerRequest;
+            const bool has_following_group =
+                block_offset + group_blocks < block_count;
+            for (TaskKind kind : kGroupKinds) {
+                if (task_count >= kMaxTasks ||
+                    !visitor(DirectReplayTask{
+                        task_count++, batch, group, kind,
+                        context_length,
+                        kind == TaskKind::Up &&
+                            has_following_group,
+                        kind == TaskKind::Up &&
+                            !has_following_group &&
+                            batch + 1U == batches,
+                    })) {
+                    return false;
+                }
+            }
+            block_offset += group_blocks;
+            ++group;
+        }
+    }
+    return true;
+}
+
 bool RuntimeExecEvidenceMatches(
     SchedulerState &state, uint32_t task_count,
     uint32_t &cross_owner_tasks
@@ -595,31 +672,17 @@ bool RuntimeExecEvidenceMatches(
         )) {
         return false;
     }
-    uint32_t planned_tasks = 0;
+    uint32_t replayed_tasks = 0;
     uint32_t kernel_tasks = 0;
     cross_owner_tasks = 0;
     bool exact = true;
-    for (uint32_t batch = 0;
-         batch < state.config.batches; ++batch) {
-        SharedPaBatchPlan plan{};
-        exact &= BuildSharedPaBatchPlan(
-            static_cast<uint64_t>(state.context_lens[batch]),
-            planned_tasks, plan
-        );
-        if (!exact) {
-            return false;
-        }
-        for (uint32_t offset = 0;
-             offset < plan.task_count; ++offset) {
-            SharedPaPlannedTask task{};
-            exact &= SharedPaPlannedTaskAt(plan, offset, task);
-            if (!exact) {
-                return false;
-            }
-            const uint32_t task_id = plan.batch_start + offset;
+    const bool replay_ok = VisitDirectReplayTasks(
+        &state.context_lens[0], state.config.batches,
+        [&](const DirectReplayTask &task) {
+            const uint32_t task_id = task.task_id;
             if (task.kind == TaskKind::Alloc) {
                 exact &= state.exec_cells[task_id].control.state == 0;
-                continue;
+                return exact;
             }
             const cross_core::DecodedExecState decoded =
                 cross_core::DecodeExecState(
@@ -647,10 +710,11 @@ bool RuntimeExecEvidenceMatches(
             cross_owner_tasks +=
                 decoded.build_owner != decoded.execute_owner ? 1U : 0U;
             ++kernel_tasks;
-        }
-        planned_tasks += plan.task_count;
-    }
-    return exact && planned_tasks == task_count &&
+            return exact;
+        },
+        replayed_tasks
+    );
+    return replay_ok && exact && replayed_tasks == task_count &&
         kernel_tasks == task_count - state.config.batches;
 }
 
@@ -897,75 +961,149 @@ uint32_t ExpectedClaimGroups(TaskKind kind) {
         ? kSharedClaimTournamentMaxGroups : 0U;
 }
 
-bool ExpectedReplaySeal(
-    const SchedulerState &state, uint32_t task_count,
-    uint64_t &expected_seal
+bool DirectExpectedReplaySeal(
+    const volatile int32_t *context_lens, uint32_t batches,
+    uint32_t &task_count, uint64_t &expected_seal
 ) {
-    uint32_t task_id = 0;
     uint32_t identity_hash = kSharedReplayIdentityHashSeed;
-    for (uint32_t batch = 0;
-         batch < state.config.batches; ++batch) {
-        SharedPaBatchPlan plan{};
-        if (!BuildSharedPaBatchPlan(
-                static_cast<uint64_t>(state.context_lens[batch]),
-                task_id, plan
-            )) {
-            return false;
-        }
-        for (uint32_t offset = 0;
-             offset < plan.task_count; ++offset) {
-            SharedPaPlannedTask task{};
-            if (!SharedPaPlannedTaskAt(plan, offset, task)) {
-                return false;
+    const bool replay_ok = VisitDirectReplayTasks(
+        context_lens, batches,
+        [&](const DirectReplayTask &task) {
+            if (task.kind == TaskKind::Alloc) {
+                RecordSharedReplayBatchInput(
+                    identity_hash, task.batch,
+                    task.context_length
+                );
             }
-            const uint32_t current = plan.batch_start + offset;
-            const bool is_last =
-                task.is_last_in_batch &&
-                batch + 1U == state.config.batches;
             const uint8_t meta = EncodeSharedPaTaskMeta(
-                task.kind, task.group_index,
-                task.has_following_group, is_last
+                task.kind, task.group,
+                task.has_following_group,
+                task.is_last_submit
             );
             if (meta == 0) {
                 return false;
             }
             RecordSharedReplayIdentity(
-                identity_hash, current, batch, meta
+                identity_hash, task.task_id,
+                task.batch, meta
             );
-        }
-        task_id += plan.task_count;
-    }
+            return true;
+        },
+        task_count
+    );
     expected_seal =
         (static_cast<uint64_t>(identity_hash) << 32U) |
         static_cast<uint64_t>(task_count);
-    return task_id == task_count;
+    return replay_ok;
+}
+
+bool ExpectedReplaySeal(
+    const SchedulerState &state, uint32_t task_count,
+    uint64_t &expected_seal
+) {
+    uint32_t replayed_tasks = 0;
+    return DirectExpectedReplaySeal(
+               &state.context_lens[0], state.config.batches,
+               replayed_tasks, expected_seal
+           ) &&
+        replayed_tasks == task_count;
+}
+
+bool RunDirectReplayBoundaryAndSealTest() {
+    const std::array<int32_t, 1> g0_context = {0};
+    std::array<DirectReplayTask, 1> g0_tasks{};
+    uint32_t g0_count = 0;
+    const bool g0_ok = VisitDirectReplayTasks(
+        g0_context.data(), g0_context.size(),
+        [&](const DirectReplayTask &task) {
+            if (task.task_id >= g0_tasks.size()) {
+                return false;
+            }
+            g0_tasks[task.task_id] = task;
+            return true;
+        },
+        g0_count
+    ) &&
+        g0_count == 1 &&
+        g0_tasks[0].kind == TaskKind::Alloc &&
+        g0_tasks[0].batch == 0 &&
+        g0_tasks[0].is_last_submit;
+
+    // 8193 token = 65 blocks：第一组 64 blocks，第二组只有 1 block。
+    // 前置 G0 还锁定“空 batch 仍产生 Alloc”及跨 batch task-id 连续性。
+    const std::array<int32_t, 2> short_tail_contexts = {
+        0, 8193,
+    };
+    std::array<DirectReplayTask, 10> short_tail_tasks{};
+    uint32_t short_tail_count = 0;
+    const bool short_tail_ok = VisitDirectReplayTasks(
+        short_tail_contexts.data(), short_tail_contexts.size(),
+        [&](const DirectReplayTask &task) {
+            if (task.task_id >= short_tail_tasks.size()) {
+                return false;
+            }
+            short_tail_tasks[task.task_id] = task;
+            return true;
+        },
+        short_tail_count
+    ) &&
+        short_tail_count == short_tail_tasks.size() &&
+        short_tail_tasks[0].kind == TaskKind::Alloc &&
+        short_tail_tasks[0].batch == 0 &&
+        !short_tail_tasks[0].is_last_submit &&
+        short_tail_tasks[1].kind == TaskKind::Alloc &&
+        short_tail_tasks[1].batch == 1 &&
+        short_tail_tasks[5].kind == TaskKind::Up &&
+        short_tail_tasks[5].group == 0 &&
+        short_tail_tasks[5].has_following_group &&
+        !short_tail_tasks[5].is_last_submit &&
+        short_tail_tasks[6].kind == TaskKind::Qk &&
+        short_tail_tasks[6].group == 1 &&
+        short_tail_tasks[9].kind == TaskKind::Up &&
+        short_tail_tasks[9].group == 1 &&
+        !short_tail_tasks[9].has_following_group &&
+        short_tail_tasks[9].is_last_submit;
+
+    // context=1 与 8192 的 task 拓扑完全相同（都是 G1），但 shape 和
+    // current_valid_len 不同；replay seal 必须把真实 batch 输入区分开。
+    const std::array<int32_t, 1> context_one = {1};
+    const std::array<int32_t, 1> context_full_group = {8192};
+    uint32_t one_count = 0;
+    uint32_t full_count = 0;
+    uint64_t one_seal = 0;
+    uint64_t full_seal = 0;
+    const bool seal_ok = DirectExpectedReplaySeal(
+            context_one.data(), context_one.size(),
+            one_count, one_seal
+        ) &&
+        DirectExpectedReplaySeal(
+            context_full_group.data(),
+            context_full_group.size(),
+            full_count, full_seal
+        ) &&
+        one_count == 5 && full_count == 5 &&
+        one_seal != full_seal;
+
+    const bool ok = g0_ok && short_tail_ok && seal_ok;
+    std::printf(
+        "[ORDERED_SUBMIT] direct_replay_boundaries=%s "
+        "g0=%u short_tail=%u same_topology_seal=%016llx/%016llx\n",
+        ok ? "PASS" : "FAIL", g0_count, short_tail_count,
+        static_cast<unsigned long long>(one_seal),
+        static_cast<unsigned long long>(full_seal)
+    );
+    return ok;
 }
 
 bool ClaimAndInsertEvidenceMatches(
     const SchedulerState &state, uint32_t task_count
 ) {
-    uint32_t planned_tasks = 0;
+    uint32_t replayed_tasks = 0;
     bool exact = true;
-    for (uint32_t batch = 0;
-         batch < state.config.batches; ++batch) {
-        SharedPaBatchPlan plan{};
-        exact &= BuildSharedPaBatchPlan(
-            static_cast<uint64_t>(
-                state.context_lens[batch]
-            ),
-            planned_tasks, plan
-        );
-        if (!exact) {
-            return false;
-        }
-        for (uint32_t offset = 0;
-             offset < plan.task_count; ++offset) {
-            SharedPaPlannedTask task{};
-            exact &= SharedPaPlannedTaskAt(
-                plan, offset, task
-            );
-            const uint32_t task_id =
-                plan.batch_start + offset;
+    const bool replay_ok = VisitDirectReplayTasks(
+        &state.context_lens[0], state.config.batches,
+        [&](const DirectReplayTask &task) {
+            const uint32_t task_id = task.task_id;
             exact &= OrderedSubmitTestOps::
                     claim_attempts_by_task[task_id].load(
                         std::memory_order_relaxed
@@ -1016,10 +1154,11 @@ bool ClaimAndInsertEvidenceMatches(
                     build_hooks_by_task[task_id].load(
                         std::memory_order_relaxed
                     ) == 1;
-        }
-        planned_tasks += plan.task_count;
-    }
-    exact &= planned_tasks == task_count;
+            return exact;
+        },
+        replayed_tasks
+    );
+    exact &= replay_ok && replayed_tasks == task_count;
     for (uint32_t task = task_count;
          task < kMaxTasks; ++task) {
         exact &=
@@ -1965,6 +2104,8 @@ int main() {
         RunB256FullReplayBudgetContractTest();
     const bool replay_topology_ok =
         RunReplayTopologyContractTest();
+    const bool replay_boundaries_ok =
+        RunDirectReplayBoundaryAndSealTest();
     const bool owner_independence_ok =
         RunBuildExecuteOwnerIndependenceTest();
     const bool task_id_prefix_ok =
@@ -1983,7 +2124,8 @@ int main() {
     const bool cross_batch_ok =
         RunCrossBatchDependencyAndExecutionTest();
     if (!claim_accounting_ok || !full_replay_budget_ok ||
-        !replay_topology_ok || !owner_independence_ok ||
+        !replay_topology_ok || !replay_boundaries_ok ||
+        !owner_independence_ok ||
         !task_id_prefix_ok || !loser_ok ||
         !output_prepare_ok ||
         !fanin_compaction_ok || !efdrain_skip_ok ||

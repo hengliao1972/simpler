@@ -793,15 +793,23 @@ token 全字段复位。因而 96 个 worker 全部
 
 ```text
 task N Materialize + publish fresh SharedOutput descriptor
--> prepare writer delta and verify writer_bit[N]
--> wait previous_metadata_writer(N).completion
--> writer task: publish metadata(N) and writer_completion(N)
--> non-writer task: no TensorMap side effect and no completion handoff
+-> prepare writer delta from the actual callback args
+-> wait completion[N-1]
+-> publish metadata(N), or perform an empty metadata commit
+-> CAS completion[N-1] -> completion[N]
 -> Fanin/Build
 -> publish execution payload(N)
 ```
 
-fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布不需占住 TensorMap 有序链。失去完整 task 前缀的间接证明后，Fanin 必须直接等待每个实际消费的 `(producer, slot).published`；symbol metadata writer 也必须在进入严格串行段前等待自己将要改写的 output target。严格顺序只约束真实 TensorMap metadata side effect，不约束空 writer、Build 包发布或 kernel 执行顺序。执行顺序由 fanin 决定：
+fresh output cell 由 task 唯一 Build owner 独占，它的 descriptor 发布不需占住
+TensorMap 有序链。当前正式协议恢复完整逐 task completion 前缀：空 writer 也
+推进 N，因此 task N 取得 turn 时，所有 producer `<N` 的 descriptor 与 metadata
+提交都已完成。symbol writer 仍可在进入串行段前提前等待自己将改写的 output
+target，把 producer Materialize 的等待留在并行区外，而不是占住全局 turn。
+
+严格顺序约束的是每个 task 的 metadata commit 边界；它不要求 Materialize、
+Fanin/Build、execution payload 发布或 kernel 执行按 task-id 串行。空 writer 只
+承担 completion baton，不伪造 TensorMap 写入。执行顺序仍由 fanin 决定：
 
 - 无依赖 task 可以乱序并发执行；
 - 有依赖 task 必须等 producer completion flag；
@@ -1522,17 +1530,18 @@ cell 同地址竞争，而是用 AIC/AIV 两条中央 ticket 唯一发放 task�
    身份、writer bitset、engine task-id 表或 executable count。
 2. 每次真实 Submit 使用 task-indexed 两级 CAS Tournament 选唯一 Build
    owner；所有 loser 仍取得同一组稳定 SharedOutputRef 后继续回放。
-3. 每个 Scalar 对实际 Submit 身份累计 replay signature；回放结束后以一条
-   atomic seal 比较 `(task_count, signature)`，防止相同 task id 被不同逻辑
-   task 错误合并。
+3. 每个 Scalar 对实际 `batch/context_length` 与 Submit 身份累计 replay
+   signature；回放结束后以一条 atomic seal 比较
+   `(task_count, signature)`，防止相同 task 拓扑但不同动态 shape 被错误合并。
 4. Materialize 在并行区完成；唯一 TensorMap 串行区固定为
    `completion[N-1] -> metadata(N) -> completion[N]`。空 writer 也推进。
 5. Fanin 与 Build 在 completion[N] 发布后离开串行区；lookup 必须拒绝
    `producer >= N`。
 6. executable winner 把 portable payload 发布到
    `SharedExecCell[task_id]`；metadata-only task 不伪造 execution cell。
-7. payload 继续遵守普通写、DCCI clean-out、原子发布；consumer 继续遵守
-   原子 acquire、DCCI invalidate、普通读。
+7. Host 输入、payload 均遵守 A5 无 cache coherence 合同：每核首次读取活动
+   `context_lens` 前先 DCCI invalidate + DSB；payload 继续遵守普通写、DCCI
+   clean-out、原子发布，consumer 继续遵守原子 acquire、DCCI invalidate、普通读。
 8. `replay_done` 是生产封口：在全部 worker 到达前，不能把暂时没有
    `BUILT` 解释成非执行 task，也不能关闭 FinalDrain。
 9. 第一版在生产封口后开放 Execute。AIC/AIV 各用一条中央 cursor 扫描完整
