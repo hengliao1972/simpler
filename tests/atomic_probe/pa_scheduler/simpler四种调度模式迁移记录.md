@@ -1244,3 +1244,38 @@ PA B256 五次为 8.013 / 8.051 / 8.095 / 8.068 / 8.173 ms，中位数
 
 改动后重新运行第 22.3 节十二类边界，四种 scheduler 合计 **48/48** 个真实
 A5 模式/场景组合数值 golden PASS；本阶段未运行 A5Sim。
+
+## 24. 独立的宽参数与 fanin 上限门槛
+
+### 24.1 为什么使用精简 callable
+
+最初把宽参数 kernel 直接加入已有 `submit_dependency_smoke` 综合 callable。
+本机生成的 cross-core AICore 镜像由 3,382,928 B 增至 3,432,480 B 后，包括旧
+用例在内的运行都出现超时；移除该 kernel 后，旧用例立即恢复通过。这个实验
+只能证明综合镜像继续膨胀会改变运行结果，不能把超时误判成 shared TensorMap
+或 32 参数协议失败。
+
+因此新增 `TestSchedulerProtocolBoundary`，只链接一个 AIC writer 和一个 AIV
+宽参数 consumer。边界用例与日常综合 smoke 分离，既能验证公开协议上限，也
+不会让测试代码本身改变其他用例的执行镜像。
+
+### 24.2 三类通用边界
+
+同一份 orchestration 和 golden 覆盖以下三类业务图：
+
+1. **32 Tensor + 16 scalar、无 fanin**：31 个外部 INPUT 加 1 个 INOUT，所有
+   scalar 均由 kernel 求和校验；
+2. **16 个唯一 producer fanin**：16 个 AIC writer 覆盖 31 个不重叠 region，
+   AIV consumer 使用 31 个 view，去重后恰好达到 `kExecMaxFanin=16`；
+3. **31 次命中去重为 1 个 fanin**：单个 writer 产生整块 Tensor，consumer
+   读取 31 个不同 view，验证 Tensor 参数数不能被误当作 producer 数。
+
+这些图只使用公开 Tensor/Input/Inout/Scalar 和动态依赖语义，不包含 PA 的
+Alloc/QK/SF/PV/UP 类型、batch 或固定任务次序。
+
+### 24.3 真实 A5 结果
+
+`cross_core_ordinary`、`cross_core_dag`、`simt_cross_core_ordinary`、
+`simt_cross_core_dag` 分别运行全部三类边界，合计 **12/12** 个模式/场景组合
+数值 golden PASS。连同第 22.3 节原十二类门槛，当前每种新增 scheduler 至少
+覆盖十五类非 PA 业务边界。本阶段未运行 A5Sim。
