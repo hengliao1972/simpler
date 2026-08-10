@@ -96,6 +96,14 @@ DIST_API_ATTR PTO_DEVICE_FUNC void DIST_CORE_MAIN_ENTRY(__gm__ Runtime *runtime,
     dist_submit_replay_orch(runtime);
 #endif
     TRACE_TIMESTAMP(orchestration_end);
+#if PTO_FDWIC_SCHEDULER_MODE == 2
+    // Scalar DAG 的每个 worker 都完整回放同一份动态 orchestration，因此 local_index
+    // 就是本轮真实 task 数。Build owner 在 Submit 返回前已经发布 execution
+    // cell；AIC/AIV 现在分别从中央 cursor 动态领取，不依赖 PA 的任务表。
+    if (!fdwic_trace_is_fatal() && self->local_index >= 0) {
+        (void)dist_cross_core_run_executor(self, static_cast<uint32_t>(self->local_index));
+    }
+#endif
 #if PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4
     if (!simt_builder_worker && !fdwic_trace_is_fatal()) (void)dist_simt_cross_core_seal_requests(self);
 #if PTO_FDWIC_SCHEDULER_MODE == 4

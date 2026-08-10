@@ -1279,3 +1279,63 @@ Alloc/QK/SF/PV/UP 类型、batch 或固定任务次序。
 `simt_cross_core_dag` 分别运行全部三类边界，合计 **12/12** 个模式/场景组合
 数值 golden PASS。连同第 22.3 节原十二类门槛，当前每种新增 scheduler 至少
 覆盖十五类非 PA 业务边界。本阶段未运行 A5Sim。
+
+## 25. Scalar DAG 改用分引擎中央 Execute ticket
+
+### 25.1 候选边界与 ordinary 否决结果
+
+Scalar mode1/mode2 原先都在每个 Kernel Submit 内调用
+`dist_cross_core_bind_execution()`：全部同引擎 replay worker 先竞争
+task-private `execute_owner`，唯一 owner 随后原地等待 execution cell 到
+`Built`。该路径让 Execute owner 仲裁和动态 orchestration 的 1,280 次全核
+replay 绑定在一起。
+
+首版同时让 mode1/mode2 在 replay 后使用 AIC/AIV 两条中央 ticket，真实 PA
+B256 单样本为：
+
+| 模式 | 中央 ticket 单样本 | 本轮前同日单样本 | 结果 |
+| ---- | ------------------ | ---------------- | ---- |
+| `cross_core_ordinary` | 11.347 ms | 11.134 ms | 无收益，完整撤回 |
+| `cross_core_dag` | 4.197 ms | 5.137 ms | 明确入围 |
+
+ordinary 仍依赖逐 Submit 的 Build/Execute 流水；把 Execute 集中到 replay 后会
+损失这部分重叠。因此最终代码只对 scheduler mode2 生效，不把某一后端有效的
+策略扩散到四种模式。
+
+### 25.2 mode2 保留协议
+
+保留版没有新增状态，也不修改 TensorMap、DAG fanin 或 Build owner：
+
+1. 每个 Scalar 仍完整回放动态 orchestration，原 Build tournament、
+   Materialize、DAG 查询和 execution payload 发布保持不变；
+2. Kernel Submit 不再竞争 per-task Execute owner，也不原地等待 `Built`；
+3. replay 完成后，本核 `local_index` 给出这一轮真实 task 数；
+4. 复用不再用于 per-task owner 的 `execute_owner[0/1]`，分别作为 AIC/AIV
+   单调 cursor；
+5. 两条引擎流都按 task id 读取 execution cell，不匹配的引擎立即跳过，匹配
+   引擎等待 `Built` 后唯一取得 immutable payload；
+6. executor 仍使用私有 ring slot，kernel completion 和 FinalDrain 合同不变。
+
+该选择只依赖 scheduler backend 和运行时发布的真实 engine class。实现不读取
+PA task kind、batch、固定五 task 次序、C/V 数量或 Tensor 形状。TensorMap
+metadata 仍由 Build owner 按既有严格顺序发布；中央 Execute cursor 不参与
+metadata 排序。
+
+### 25.3 A5 性能与通用正确性
+
+相同 shared TensorMap、PA B256、startup 到 FinalDrain 的 `perf-clock` 口径，
+保留版五个独立进程为：
+
+```text
+4.14891 / 4.15263 / 4.17302 / 4.18266 / 4.21562 ms
+median = 4.17302 ms
+```
+
+相对本轮前同日 5.13697 ms 单样本约改善 18.8%。由于旧状态尚无同窗口多轮
+中位数，这里只把它作为稳定的量级改善，不把 18.8% 写成严格配对统计。
+
+受影响的 `cross_core_dag` 在真实 A5 上通过第 22.3 节十二类通用边界，并通过
+第 24 章三类宽参数边界，共 **15/15** 个场景。覆盖零 Submit、2047/2048 task
+容量、纯 AIC、纯 AIV、跨引擎 INOUT、Build/Execute 偏斜、多 output、32 个
+Tensor 参数、16 个唯一 fanin 和 fanin 去重。另有 execution/output/TensorMap、
+DAG、SIMT request 和四种 state 共九项 C++ 测试通过。本阶段未运行 A5Sim。

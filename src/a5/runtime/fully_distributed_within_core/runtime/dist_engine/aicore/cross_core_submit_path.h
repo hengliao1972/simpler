@@ -574,12 +574,105 @@ PTO_DEVICE_FUNC ExecEngineClass dist_cross_core_executor_engine(__gm__ DistCore 
     return ExecEngineClass::None;
 }
 
+#if PTO_FDWIC_SCHEDULER_MODE == 2
+constexpr uint32_t kDistCrossCoreAicDispatchControl = 0;
+constexpr uint32_t kDistCrossCoreAivDispatchControl = 1;
+static_assert(kFdwicCrossCoreTaskCapacity > kDistCrossCoreAivDispatchControl);
+
+PTO_DEVICE_FUNC __gm__ volatile int64_t &dist_cross_core_dispatch_cursor(ExecEngineClass engine) {
+    const uint32_t control =
+        engine == ExecEngineClass::Aic ? kDistCrossCoreAicDispatchControl : kDistCrossCoreAivDispatchControl;
+    return dist_cross_core_runtime_state().execute_owner[control].state;
+}
+
+PTO_DEVICE_FUNC bool
+dist_cross_core_dispatch_task(__gm__ DistCore *self, uint32_t task_id, ExecEngineClass executor_engine) {
+    if (self == nullptr || task_id >= kFdwicCrossCoreTaskCapacity ||
+        (executor_engine != ExecEngineClass::Aic && executor_engine != ExecEngineClass::Aiv)) {
+        return dist_cross_core_fail(static_cast<int32_t>(task_id), PTO2_ERROR_TENSORMAP_PROTOCOL);
+    }
+    __gm__ SharedExecCell &cell = dist_cross_core_runtime_state().tasks[task_id];
+    uint32_t polls = 0;
+    while (true) {
+        const int64_t raw_state = DistCrossCoreAicoreOps::Load(&cell.control.state);
+        if (raw_state == 0) {
+            SPIN_WAIT_HINT();
+            if ((++polls & 1023U) == 0 && fdwic_trace_is_fatal(static_cast<int32_t>(task_id))) return false;
+            continue;
+        }
+        const fdwic::cross_core::DecodedExecState state = fdwic::cross_core::DecodeExecState(raw_state);
+        if (!state.valid || state.task_id != task_id) {
+            return dist_cross_core_fail(static_cast<int32_t>(task_id), PTO2_ERROR_TENSORMAP_PROTOCOL);
+        }
+        if (state.phase == ExecPhase::Building) {
+            SPIN_WAIT_HINT();
+            if ((++polls & 1023U) == 0 && fdwic_trace_is_fatal(static_cast<int32_t>(task_id))) return false;
+            continue;
+        }
+        if (state.engine_class != executor_engine || state.phase == ExecPhase::Done) return true;
+        if (state.phase != ExecPhase::Built) {
+            return dist_cross_core_fail(static_cast<int32_t>(task_id), PTO2_ERROR_TENSORMAP_PROTOCOL);
+        }
+        if (!dist_submit_wait_slot_capacity(self, static_cast<int32_t>(task_id))) return false;
+        ExecToken token{};
+        fdwic::cross_core::ResetExecToken(token);
+        const ExecAcquireResult acquired = fdwic::cross_core::AcquireExecPayload<DistCrossCoreAicoreOps>(
+            cell, task_id, static_cast<uint32_t>(self->core_idx), executor_engine, token,
+            dist_cross_core_runtime_state().fatal
+        );
+        if (acquired == ExecAcquireResult::NotBuilt || acquired == ExecAcquireResult::Lost) continue;
+        if (acquired != ExecAcquireResult::Acquired) {
+            return dist_cross_core_fail(static_cast<int32_t>(task_id), PTO2_ERROR_TENSORMAP_PROTOCOL);
+        }
+        __gm__ RingSlot *slot = dist_submit_alloc_slot(self);
+        if (slot == nullptr || !dist_cross_core_build_ring_slot(*slot, token)) {
+            if (slot != nullptr) {
+                slot->occupied = false;
+                slot->built = false;
+                --self->occupied_count;
+            }
+            return dist_cross_core_fail(static_cast<int32_t>(task_id), PTO2_ERROR_TENSORMAP_PROTOCOL);
+        }
+        (void)drain_phase_b(self);
+        return true;
+    }
+}
+
+PTO_DEVICE_FUNC bool dist_cross_core_run_executor(__gm__ DistCore *self, uint32_t task_count) {
+    const ExecEngineClass engine = dist_cross_core_executor_engine(self);
+    if (engine != ExecEngineClass::Aic && engine != ExecEngineClass::Aiv) return false;
+    if (task_count > kFdwicCrossCoreTaskCapacity || g_dist.num_workers <= 0) {
+        return dist_cross_core_fail(-1, PTO2_ERROR_TENSORMAP_CAPACITY);
+    }
+    __gm__ volatile int64_t &cursor = dist_cross_core_dispatch_cursor(engine);
+    while (!fdwic_trace_is_fatal()) {
+        const int64_t raw_ticket = DistCrossCoreAicoreOps::FetchAdd(&cursor, int64_t{1});
+        const uint64_t maximum_tail_ticket =
+            static_cast<uint64_t>(task_count) + static_cast<uint64_t>(g_dist.num_workers) - 1U;
+        if (raw_ticket < 0 || static_cast<uint64_t>(raw_ticket) > maximum_tail_ticket) {
+            return dist_cross_core_fail(-1, PTO2_ERROR_TENSORMAP_PROTOCOL);
+        }
+        if (static_cast<uint64_t>(raw_ticket) >= task_count) return true;
+        if (!dist_cross_core_dispatch_task(self, static_cast<uint32_t>(raw_ticket), engine)) return false;
+    }
+    return false;
+}
+#endif
+
 PTO_DEVICE_FUNC bool dist_cross_core_win_task_tournament(
     DistSubmitCtx &ctx, __gm__ SharedClaimTournamentTask &tournament, FdwicAtomicSite local_site,
     FdwicAtomicSite root_site, bool &won
 );
 
 PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngineClass task_engine) {
+#if PTO_FDWIC_SCHEDULER_MODE == 2
+    // Scalar DAG 在 replay 后由 AIC/AIV 两条中央 ticket 动态领取。
+    // Submit 仍完成 Build 和严格 TensorMap 插入，但不再让所有同引擎
+    // replay worker 为每个 task 竞争 execute owner 并原地等待 BUILT。
+    (void)ctx;
+    (void)task_engine;
+    return true;
+#else
     const ExecEngineClass executor_engine = dist_cross_core_executor_engine(ctx.self);
     if (executor_engine != task_engine) return true;
 #if (PTO_FDWIC_SCHEDULER_MODE == 3 || PTO_FDWIC_SCHEDULER_MODE == 4) && defined(__CCE_AICORE__)
@@ -656,6 +749,7 @@ PTO_DEVICE_FUNC bool dist_cross_core_bind_execution(DistSubmitCtx &ctx, ExecEngi
         (void)drain_phase_b(ctx.self);
         return true;
     }
+#endif
 }
 
 PTO_DEVICE_FUNC bool dist_cross_core_win_task_tournament(
