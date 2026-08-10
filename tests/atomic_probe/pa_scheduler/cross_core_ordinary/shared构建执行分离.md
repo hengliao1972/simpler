@@ -663,6 +663,49 @@ Build owner 与 Execute owner 完全独立，但不强制物理核不同。二�
 仍走同一 execution cell 状态机；跨核时则依赖已经验证的
 payload DCCI publish/acquire 合同。
 
+#### 当前 S7：提前 Execute 的收益边界
+
+当前“全部 Build 结束后才 Execute”不是泳道显示错误，而是第一版 runtime
+scan 的正确性合同：`replay_done == 96` 以前，`EMPTY` exec cell 既可能表示
+“该 task 没有 kernel”，也可能表示“Build winner 尚未发布”；`BUILDING` 也可能
+只是正常的生产中状态。现有 AIC/AIV cursor 对每个 task id 只扫描一次，如果
+在生产封口前跳过这两种状态，又没有 ready queue、回访窗口或 token 保留协议，
+该 task 可能永久丢失。因此当前实现先关闭 replay 生产，再把 `EMPTY` 解释为
+metadata-only task，最后执行单调扫描。
+
+但仅仅解除这个屏障，也不是当前全员 replay 合同下的结构性性能优化：
+
+1. 96 个 Scalar 都必须完整回放全部 1,280 个 Submit；AIC 同步执行 kernel 时，
+   该核不能同时继续自己的 callback replay，`replay_done` 尾部会相应后移。
+2. 已经赢得某个 task 的 AIC 仍要完成 Materialize、严格 Register、Fanin 和
+   Build。若让它先执行另一个 kernel，只是把 Build 延迟转移到严格 TensorMap
+   完成链或 replay 尾部。
+3. 同一 Scalar 上 Build 与 Execute 都消耗 Scalar 时间。没有并行的 Plan/Build
+   生产者或减少 AIC 的回放职责时，“提前 Execute”主要改变工作排布，不能把
+   大量 Scalar 工作从关键路径上消除。
+4. AIV 有 64 个 worker，而 AIC 只有 32 个；真实 kernel 容量下界也以 AIC
+   更重。按当前 6/28/4/1 工作量，仅 QK/PV 的 AIC kernel 容量下界约
+   `575.864 us`，SF/UP 的 AIV 下界约 `234.224 us`。让 AIC 更早执行有利于
+   收敛尾部，但不会自动消除其先前承担的 Build 工作。
+
+本轮泳道中，每核 orchestration replay 中位约为 AIC `1,015.558 us`、AIV
+`1,018.708 us`。AIC winner-heavy 的 Materialize、Register、Fanin、WinnerBuild
+每核累计中位约为 `86.525/28.460/52.083/95.020 us`，合计约 `262.088 us`。
+这些数说明：当前顶多能通过更好的排布提前一部分 AIC kernel，并不能把这
+`262 us` 直接视为可节省时间。
+
+若后续 Runtime Plan 允许非 AIC Scalar 接走 AIC task 的 Build，能够直接从
+AIC 关键路径移出的上限也只是 AIC 原先承担的 Build-side Scalar 工作；QK/PV
+kernel 的执行次数与 AIC engine 容量下界都不会减少。这部分工作还会转移到
+其他 Scalar，并新增 descriptor 发布/获取成本，所以 `262.088 us/core` 只是
+需要继续拆分的现状规模，不是可兑现的端到端收益预测。
+
+因此后续若追求结构性 overlap，应建立独立的 device runtime Plan/descriptor
+生产阶段，让 Build worker 从已发布的通用 descriptor 领取任务，并有意识地
+减少 AIC 在 Plan/Claim/Build 上的责任。TensorMap 的逐 task 严格插入链仍然
+保留；单独打开 replay 前 Execute 只能作为调度排布候选，不能预先宣称端到端
+收益。
+
 #### 6.2.1 旧中央计划版本：S6.69 三 token 有界前视（历史记录）
 
 S6.68-c 的 B256 full-swimlane 无需新增 raw 字段就能用
@@ -1375,6 +1418,61 @@ FetchAdd，确实可以得到 `N+W`，却失去 Plan/Build 流水；若要边发
 `planned_frontier` 发布/观察和 `plan_closed`；这些操作究竟合并成几条 control
 line、哪些消费返回值、轮询多少次，必须等 PlanCell ABI 冻结后才能给出精确
 公式。当前文档不以旧 `1,376` 次掩盖尚未设计完成的 Plan 发布成本。
+
+#### 8.6.5 AIC/AIV Claim loser 的实测 return-ready 成本
+
+本节使用 2026-08-10 的 S7 B256 full-swimlane：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260810_140748_1643943/
+  ccec/merged_swimlane.json
+```
+
+统计方法不是把整个 Claim 区间冒充 Atomic：先定位每个
+`claim.lost#task_id`，再按同一 `(block, lane, task_id)` 匹配其中的
+`shared_claim_tournament_local.compare_exchange` 和可选的
+`shared_claim_tournament_root.compare_exchange` return-ready 区间。泳道中
+`tid=1` 为 AIC Scalar，`tid=2/3` 为两个 AIV Scalar。这样排除了 winner 的
+root CAS，也没有混入其他 AtomicSite。
+
+每个 true loser 必定执行一次 local CAS；每 task 的 8 个 local 代表中，最终
+有 7 个在 root CAS 上失败。因此全局应有 `95*1,280=121,600` 个 loser、
+`121,600` 次 loser 路径 local CAS，以及 `7*1,280=8,960` 次 loser 路径 root
+CAS。本次 raw 数据全部精确闭合：
+
+| 指标 | AIC（32 核） | AIV（64 核） |
+|---|---:|---:|
+| 全部 Claim actor | 40,960 | 81,920 |
+| Build winner | 443 | 837 |
+| true loser | 40,517 | 81,083 |
+| loser 路径 local CAS | 40,517 | 81,083 |
+| loser 路径 root CAS | 3,252 | 5,708 |
+| loser Atomic 聚合 core-time | 12,054.067 us | 23,866.889 us |
+| loser Atomic 每核均值 | **376.690 us** | **372.920 us** |
+| 每核最小/中位/95 分位/最大 | 356.600/376.540/396.554/398.963 us | 351.321/372.680/391.869/401.710 us |
+| 每个 loser 的 Atomic 均值 | 0.297506 us | 0.294351 us |
+| 每个 loser 的 Atomic 中位/95 分位 | 0.276/0.519 us | 0.275/0.510 us |
+| Atomic 占 `claim.lost` 区间 | 85.455% | 84.794% |
+
+local/root 两级本身的 return-ready 延迟分布如下：
+
+| 层级 | AIC 均值/中位/95 分位 | AIV 均值/中位/95 分位 |
+|---|---:|---:|
+| local CAS | 0.275126/0.270/0.440 us | 0.274371/0.270/0.435 us |
+| root CAS | 0.278834/0.271/0.444 us | 0.283831/0.272/0.455 us |
+
+两个角色的结论基本相同：每个 loser 平均为 Atomic 支付约 `0.295 us`，每核在
+整轮 B256 中支付约 `0.37 ms`。AIV 的聚合 core-time 约为 AIC 的两倍，主要是
+64/32 的核数差异，不表示单个 AIV 更慢。全 96 核的 loser Atomic 合计为
+`35.920956 ms` core-time，折合每核均值 `374.177 us`；全部 Claim（winner 与
+loser）合计为 `43.087196 ms` core-time，因此 loser Atomic 占全部 Claim
+core-time 的约 `83.36%`。
+
+这里的 `core-time` 是各核区间求和，不是 Submit 墙钟耗时；不同核上的竞争与
+等待会重叠，不能把 `35.921 ms` 与约 `1.068 ms` 的 Submit 时间直接相减。
+另外，return-ready 是 full-swimlane 诊断 ELF 的观测边界，包含观测包围开销
+以及本核可能遇到的发射/资源等待，不能宣称为去除观测后的纯硬件 CAS 延迟。
+它适合做同一 ELF、同一口径的 AIC/AIV 与候选协议对比。
 
 ### 8.7 为什么脱离 callback 现场后只有 task id 不够
 

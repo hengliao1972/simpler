@@ -7439,3 +7439,50 @@ identity 并成为它的唯一 Build owner。“每个 ordinal 只被 FetchAdd �
 
 旧数据只能回答“在 task 答案已经预制时，跨核 payload 与 Execute 机制可以
 达到什么数量级”；新数据才是后续优化真实 Submit 调度的合法比较起点。
+
+### S7.8 复核提前 Execute 的收益边界与 Claim loser Atomic 成本
+
+本阶段没有修改调度代码，先使用新的 B256 full-swimlane 复核两个设计问题。
+分析源为：
+
+```text
+outputs/pa_scheduler_cross_core_shared_swimlane_20260810_140748_1643943/
+  ccec/merged_swimlane.json
+```
+
+该运行 lifecycle 为 `2.862315 ms`，Submit 区间为 `1.067554 ms`，
+FinalDrain 为 `1.814284 ms`，1,280 个 task、1,024 个 kernel 全部闭合，raw
+记录无丢失。
+
+第一项结论是：当前全部 Build 后才 Execute 是 runtime cell 单次单调扫描的
+正确性基线，但仅解除 `replay_done` 屏障不会形成结构性收益。96 个 Scalar
+仍要完整回放全部 task；AIC 执行 kernel 时不能同时推进自己的 replay，已经
+赢得 Build 的核也仍需完成 Materialize/Register/Fanin/Build。提前 Execute
+主要把一部分 AIC kernel 从 FinalDrain 移到 replay 尾部，当前最多减少部分
+AIC Scalar 的 Build/Execute 排布冲突，不能把 AIC winner-heavy 的约
+`262.088 us/core` 直接视为可节省时间。真正要降低这部分责任，需要独立的
+device runtime Plan/descriptor 生产阶段，而不是只打开扫描屏障。即使让非
+AIC Scalar 接走 AIC task 的 Build，直接收益上限也只是移出 AIC 关键路径的
+Build-side Scalar 工作；kernel 数量和 AIC engine 容量下界不会减少，工作还会
+转移到其他 Scalar，并支付新的 descriptor 发布/获取成本。
+
+第二项结论是：按同一 `(block, lane, task_id)` 把 `claim.lost` 与其中的
+local/root return-ready CAS 精确关联后，AIC 和 AIV 的单核 loser Atomic 成本
+几乎相同：
+
+| 角色 | true loser | local/root CAS | Atomic 聚合 core-time | 每核均值 | Atomic / `claim.lost` |
+|---|---:|---:|---:|---:|---:|
+| AIC 32 核 | 40,517 | 40,517/3,252 | 12,054.067 us | **376.690 us** | 85.455% |
+| AIV 64 核 | 81,083 | 81,083/5,708 | 23,866.889 us | **372.920 us** | 84.794% |
+
+每个 loser 的 Atomic 均值分别为 AIC `0.297506 us`、AIV
+`0.294351 us`；中位数为 `0.276/0.275 us`，95 分位为
+`0.519/0.510 us`。全局 `121,600` 个 loser、`121,600` 次 local CAS 和
+`8,960` 次 root CAS 与 G8 Tournament 公式精确闭合；winner 的 1,280 次
+local CAS 和 1,280 次 root CAS 已排除。
+
+全 96 核 loser Atomic 合计 `35.920956 ms` 是跨核区间求和后的 core-time，
+不是墙钟耗时，不能从 `1.067554 ms` Submit 区间直接相减。return-ready 数值
+也来自 full-swimlane 诊断 ELF，保留观测包围成本；本结果用于同 ELF 下比较
+角色与候选协议，不冒充去除观测后的纯硬件 Atomic 延迟。完整统计表及口径写在
+`shared构建执行分离.md` 的 8.6.5 节。
