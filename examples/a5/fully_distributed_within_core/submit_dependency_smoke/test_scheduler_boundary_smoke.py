@@ -43,6 +43,20 @@ class TestSchedulerProtocolBoundary(SceneTestCase):
                 "core_type": "aiv",
                 "signature": [D.IN] * 31 + [D.INOUT],
             },
+            {
+                "func_id": 2,
+                "name": "EXACT_FANIN16_AIV",
+                "source": "kernels/aiv/fanin16.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN] * 16 + [D.INOUT],
+            },
+            {
+                "func_id": 3,
+                "name": "MAX_OUTPUTS_AIC",
+                "source": "kernels/aic/max_outputs.cpp",
+                "core_type": "aic",
+                "signature": [D.OUT] * 32,
+            },
         ],
     }
 
@@ -68,6 +82,34 @@ class TestSchedulerProtocolBoundary(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 32},
             "params": {"n": 31 * 32, "mode": 2},
         },
+        {
+            "name": "A5OnboardBd32ExactExplicitFanin16",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 16 * 32, "mode": 3},
+        },
+        {
+            "name": "A5OnboardBd32ExplicitAndTensorMapDedup16",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 16 * 32, "mode": 4},
+        },
+        {
+            "name": "A5OnboardBd32MaxFreshOutputs32",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 64, "mode": 5},
+        },
+        {
+            "name": "A5OnboardBd32MaxExistingWriterRegions32",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 64, "mode": 6},
+        },
     ]
 
     def generate_args(self, params):
@@ -86,11 +128,24 @@ class TestSchedulerProtocolBoundary(SceneTestCase):
         args.dump[:] = -1.0
         if mode == 0:
             args.dump[:31] = args.input[0]
-        else:
+        elif mode in {1, 2}:
             args.output[:] = args.input + 7.0
             args.dump[:31] = args.input[::32] + 7.0
-        # 额外验证 16 个 scalar 也完整到达执行 kernel。
-        args.dump[31] = sum(range(1, 17))
+        elif mode in {3, 4}:
+            args.output[:] = args.input + 7.0
+            args.dump[:16] = args.input[::32] + 7.0
+        elif mode == 5:
+            args.dump[:31] = torch.arange(100, 131, dtype=torch.float32)
+            args.dump[32] = 138.0
+        elif mode == 6:
+            args.output[:32] = torch.arange(100, 132, dtype=torch.float32)
+            args.dump[:31] = args.output[:31]
+            args.dump[32] = 138.0
+
+        # 所有宽参消费者都会求和 16 个 scalar，同时校验请求和
+        # execution payload 的 scalar 上限。
+        scalar_slot = 31 if mode in {0, 1, 2, 5, 6} else 16
+        args.dump[scalar_slot] = sum(range(1, 17))
 
 
 if __name__ == "__main__":

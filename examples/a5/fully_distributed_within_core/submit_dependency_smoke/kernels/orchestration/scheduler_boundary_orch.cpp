@@ -15,6 +15,12 @@
 
 #define FUNC_BOUNDARY_WRITER_AIC 0
 #define FUNC_MAX_ARGS_FANIN_AIV 1
+#define FUNC_EXACT_FANIN16_AIV 2
+#define FUNC_MAX_OUTPUTS_AIC 3
+
+constexpr uint32_t kExactFanin = 16;
+constexpr uint32_t kChunk = 32;
+constexpr uint32_t kMaxOutputs = MAX_TENSOR_ARGS;
 
 PTO_DEVICE_FUNC inline void add_max_scalar_args(L0TaskArgs &args) {
     for (uint32_t scalar = 0; scalar < MAX_SCALAR_ARGS; ++scalar) {
@@ -32,18 +38,137 @@ PTO_DEVICE_FUNC inline void submit_wide_reader(const Tensor &source, const Tenso
 }
 
 PTO_DEVICE_FUNC inline void submit_view_reader(const Tensor &source, const Tensor &dump) {
-    constexpr uint32_t chunk = 32;
-    const uint32_t view_shape[1] = {chunk};
+    const uint32_t view_shape[1] = {kChunk};
     Tensor views[MAX_TENSOR_ARGS - 1U];
     L0TaskArgs args;
     for (uint32_t tensor = 0; tensor < MAX_TENSOR_ARGS - 1U; ++tensor) {
-        const uint32_t view_offset[1] = {tensor * chunk};
+        const uint32_t view_offset[1] = {tensor * kChunk};
         views[tensor] = Tensor::view(source, view_shape, view_offset);
         args.add_input(views[tensor]);
     }
     args.add_inout(dump);
     add_max_scalar_args(args);
     rt_submit_aiv_task(FUNC_MAX_ARGS_FANIN_AIV, args);
+}
+
+PTO_DEVICE_FUNC inline void submit_exact_fanin_reader(
+    const Tensor &output, const Tensor &dump, const PTO2TaskId dependencies[kExactFanin], bool infer_from_tensor_map
+) {
+    const uint32_t view_shape[1] = {kChunk};
+    Tensor views[kExactFanin];
+    L0TaskArgs args;
+    for (uint32_t index = 0; index < kExactFanin; ++index) {
+        const uint32_t view_offset[1] = {index * kChunk};
+        views[index] = Tensor::view(output, view_shape, view_offset);
+        if (infer_from_tensor_map) {
+            args.add_input(views[index]);
+        } else {
+            // NO_DEP 让本用例只由显式 task id 建立 fanin，不让 TensorMap
+            // 查询偶然补齐顺序。
+            args.add_no_dep(views[index]);
+        }
+    }
+    args.add_inout(dump);
+    add_max_scalar_args(args);
+    args.set_dependencies(dependencies, kExactFanin);
+    rt_submit_aiv_task(FUNC_EXACT_FANIN16_AIV, args);
+}
+
+PTO_DEVICE_FUNC inline void
+submit_explicit_fanin_case(const Tensor &input, const Tensor &output, const Tensor &dump, bool infer_from_tensor_map) {
+    const uint32_t view_shape[1] = {kChunk};
+    PTO2TaskId dependencies[kExactFanin];
+    for (uint32_t writer = 0; writer < kExactFanin; ++writer) {
+        const uint32_t view_offset[1] = {writer * kChunk};
+        Tensor input_view = Tensor::view(input, view_shape, view_offset);
+        Tensor output_view = Tensor::view(output, view_shape, view_offset);
+        L0TaskArgs writer_args;
+        writer_args.add_input(input_view);
+        writer_args.add_inout(output_view);
+        writer_args.add_scalar(static_cast<uint64_t>(kChunk));
+        TaskOutputTensors writer_result = rt_submit_aic_task(FUNC_BOUNDARY_WRITER_AIC, writer_args);
+        dependencies[writer] = writer_result.task_id();
+    }
+    submit_exact_fanin_reader(output, dump, dependencies, infer_from_tensor_map);
+}
+
+template <typename OutputRef>
+PTO_DEVICE_FUNC inline void submit_max_output_consumers(const OutputRef outputs[kMaxOutputs], const Tensor &dump) {
+    L0TaskArgs wide_args;
+    for (uint32_t slot = 0; slot < kMaxOutputs - 1U; ++slot) {
+        wide_args.add_input(outputs[slot]);
+    }
+    wide_args.add_inout(dump);
+    add_max_scalar_args(wide_args);
+    rt_submit_aiv_task(FUNC_MAX_ARGS_FANIN_AIV, wide_args);
+
+    const uint32_t tail_shape[1] = {1};
+    const uint32_t tail_offset[1] = {kMaxOutputs};
+    Tensor tail_dump = Tensor::view(dump, tail_shape, tail_offset);
+    L0TaskArgs tail_args;
+    tail_args.add_input(outputs[kMaxOutputs - 1U]);
+    tail_args.add_inout(tail_dump);
+    tail_args.add_scalar(uint64_t{1});
+    rt_submit_aic_task(FUNC_BOUNDARY_WRITER_AIC, tail_args);
+}
+
+PTO_DEVICE_FUNC inline void submit_max_fresh_outputs(const Tensor &dump) {
+    const uint32_t output_shape[1] = {1};
+    TensorCreateInfo output_info(output_shape, 1, DataType::FLOAT32);
+    L0TaskArgs producer_args;
+#if PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE >= 1 && PTO_FDWIC_SCHEDULER_MODE <= 4
+    SharedTaskOutputs produced = rt_submit_aic_task_deferred_compete_first(
+        FUNC_MAX_OUTPUTS_AIC, kMaxOutputs, producer_args, [&](L0TaskArgs &args) PTO_DEVICE_FUNC {
+            for (uint32_t slot = 0; slot < kMaxOutputs; ++slot)
+                args.add_output(output_info);
+        }
+    );
+    if (produced.size() != kMaxOutputs) return;
+    FdwicOutputRef output_refs[kMaxOutputs];
+    for (uint32_t slot = 0; slot < kMaxOutputs; ++slot)
+        output_refs[slot] = produced.output_ref(slot);
+    submit_max_output_consumers(output_refs, dump);
+#else
+    TaskOutputTensors produced =
+        rt_submit_aic_task_compete_first(FUNC_MAX_OUTPUTS_AIC, producer_args, [&](L0TaskArgs &args) PTO_DEVICE_FUNC {
+            for (uint32_t slot = 0; slot < kMaxOutputs; ++slot)
+                args.add_output(output_info);
+        });
+    if (produced.size() != kMaxOutputs) return;
+    __gm__ const Tensor *output_refs[kMaxOutputs];
+    for (uint32_t slot = 0; slot < kMaxOutputs; ++slot)
+        output_refs[slot] = &produced.get_ref(slot);
+    // 非 shared 回退只为保持源文件可编译；本边界矩阵实际只运行
+    // shared cross-core 四种模式。
+    L0TaskArgs wide_args;
+    for (uint32_t slot = 0; slot < kMaxOutputs - 1U; ++slot)
+        wide_args.add_input(*output_refs[slot]);
+    wide_args.add_inout(dump);
+    add_max_scalar_args(wide_args);
+    rt_submit_aiv_task(FUNC_MAX_ARGS_FANIN_AIV, wide_args);
+
+    const uint32_t tail_shape[1] = {1};
+    const uint32_t tail_offset[1] = {kMaxOutputs};
+    Tensor tail_dump = Tensor::view(dump, tail_shape, tail_offset);
+    L0TaskArgs tail_args;
+    tail_args.add_input(*output_refs[kMaxOutputs - 1U]);
+    tail_args.add_inout(tail_dump);
+    tail_args.add_scalar(uint64_t{1});
+    rt_submit_aic_task(FUNC_BOUNDARY_WRITER_AIC, tail_args);
+#endif
+}
+
+PTO_DEVICE_FUNC inline void submit_max_existing_writers(const Tensor &output, const Tensor &dump) {
+    const uint32_t output_shape[1] = {1};
+    Tensor output_views[kMaxOutputs];
+    L0TaskArgs producer_args;
+    for (uint32_t slot = 0; slot < kMaxOutputs; ++slot) {
+        const uint32_t output_offset[1] = {slot};
+        output_views[slot] = Tensor::view(output, output_shape, output_offset);
+        producer_args.add_output(output_views[slot]);
+    }
+    rt_submit_aic_task(FUNC_MAX_OUTPUTS_AIC, producer_args);
+    submit_max_output_consumers(output_views, dump);
 }
 
 extern "C" {
@@ -73,11 +198,10 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     if (mode == 1) {
         // 16 个 writer 覆盖 31 个不重叠 region，宽 reader 应得到恰好 16 个
         // 去重后的 producer，覆盖跨核执行包的 fanin 上限。
-        constexpr uint32_t chunk = 32;
         constexpr uint32_t writer_count = 16;
         for (uint32_t writer = 0; writer < writer_count; ++writer) {
-            const uint32_t begin = writer * 2U * chunk;
-            const uint32_t width = writer + 1U == writer_count ? chunk : 2U * chunk;
+            const uint32_t begin = writer * 2U * kChunk;
+            const uint32_t width = writer + 1U == writer_count ? kChunk : 2U * kChunk;
             const uint32_t writer_shape[1] = {width};
             const uint32_t writer_offset[1] = {begin};
             Tensor input_view = Tensor::view(input, writer_shape, writer_offset);
@@ -101,7 +225,22 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         writer_args.add_scalar(n);
         rt_submit_aic_task(FUNC_BOUNDARY_WRITER_AIC, writer_args);
         submit_view_reader(output, dump);
+        return;
     }
+
+    if (mode == 3 || mode == 4) {
+        // mode3 只使用 16 个显式依赖；mode4 让同一组 producer 同时从
+        // TensorMap 与显式依赖命中，验证跨来源去重后仍是 16。
+        submit_explicit_fanin_case(input, output, dump, mode == 4);
+        return;
+    }
+
+    if (mode == 5) {
+        submit_max_fresh_outputs(dump);
+        return;
+    }
+
+    if (mode == 6) submit_max_existing_writers(output, dump);
 }
 
 }  // extern "C"

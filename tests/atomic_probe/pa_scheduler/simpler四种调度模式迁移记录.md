@@ -1339,3 +1339,46 @@ median = 4.17302 ms
 容量、纯 AIC、纯 AIV、跨引擎 INOUT、Build/Execute 偏斜、多 output、32 个
 Tensor 参数、16 个唯一 fanin 和 fanin 去重。另有 execution/output/TensorMap、
 DAG、SIMT request 和四种 state 共九项 C++ 测试通过。本阶段未运行 A5Sim。
+
+## 26. 通用调度协议的第二批上限边界
+
+### 26.1 覆盖缺口
+
+PA Case1 不会自然走到 execution/output/DAG 协议的所有公开上限。
+因此继续扩展独立的 `TestSchedulerProtocolBoundary`，不在 PA orchestration
+中人为堆叠特例。本批增加四类业务无关的图结构：
+
+1. **16 个纯显式 fanin**：16 个 AIC writer 分别写独立 region，AIV
+   consumer 使用 `NO_DEP` 读取这些 region，仅由 16 个显式 task id
+   保证顺序；
+2. **显式与 TensorMap 跨来源去重**：同一组 16 个 producer 既被
+   INPUT region 查询命中，又出现在显式依赖中；最终 fanin 必须仍为
+   16，不能错误累加为 32；
+3. **32 个 fresh output**：单个 AIC task 达到 `MAX_TENSOR_ARGS` 个运行时
+   分配输出，后续 AIV/AIC consumer 验证全部 32 个 descriptor；其中
+   一个 consumer 同时携带 31 个 `FdwicOutputRef`、1 个 inline INOUT 和
+   16 个 scalar；
+4. **32 个 `OUTPUT_EXISTING` writer region**：单个 task 不申请 fresh output，
+   而是一次发布 32 个不重叠的已有 Tensor region，直接覆盖 ordinary
+   TensorMap 和 DAG metadata 的 writer 数量上限。
+
+四类图只使用公开的 Tensor tag、task id、fresh output 和动态 Submit
+语义，不读取 PA task kind、batch、固定五 task 次序或特定 shape。
+
+### 26.2 真实 A5 结果与后续门槛
+
+扩展后的 compact callable 共七类边界。四种 scheduler 分别运行全部
+七类，合计 **28/28** 个模式/场景组合数值 golden PASS：
+
+| scheduler | compact boundary | 结果 |
+| --------- | ---------------- | ---- |
+| `cross_core_ordinary` | 7/7 | PASS |
+| `cross_core_dag` | 7/7 | PASS |
+| `simt_cross_core_ordinary` | 7/7 | PASS |
+| `simt_cross_core_dag` | 7/7 | PASS |
+
+加上第 22.3 节的十二类动态调度边界，现在每种新 scheduler
+至少有 **19 类非 PA 场景**，累计 **76** 个模式/场景组合。后续
+任何性能候选至少必须重跑受影响模式的这 19 类；PA B256 只负责
+性能和该算子的数值回归，不再单独充当调度协议正确性证据。本阶段
+未运行 A5Sim。
