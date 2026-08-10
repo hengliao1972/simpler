@@ -17,10 +17,16 @@
 #define FUNC_MAX_ARGS_FANIN_AIV 1
 #define FUNC_EXACT_FANIN16_AIV 2
 #define FUNC_MAX_OUTPUTS_AIC 3
+#define FUNC_BOUNDARY_WRITER_AIV 4
+#define FUNC_BOUNDARY_NOOP_AIC 5
+#define FUNC_BOUNDARY_NOOP_AIV 6
+#define FUNC_BOUNDARY_DELAYED_WRITER_AIC 7
 
 constexpr uint32_t kExactFanin = 16;
 constexpr uint32_t kChunk = 32;
+constexpr uint32_t kSkewChunk = 256;
 constexpr uint32_t kMaxOutputs = MAX_TENSOR_ARGS;
+constexpr uint32_t kHistoryLowerBound = 64;
 
 PTO_DEVICE_FUNC inline void add_max_scalar_args(L0TaskArgs &args) {
     for (uint32_t scalar = 0; scalar < MAX_SCALAR_ARGS; ++scalar) {
@@ -118,7 +124,8 @@ PTO_DEVICE_FUNC inline void submit_max_fresh_outputs(const Tensor &dump) {
     L0TaskArgs producer_args;
 #if PTO_FDWIC_SHARED_MAP && PTO_FDWIC_SCHEDULER_MODE >= 1 && PTO_FDWIC_SCHEDULER_MODE <= 4
     SharedTaskOutputs produced = rt_submit_aic_task_deferred_compete_first(
-        FUNC_MAX_OUTPUTS_AIC, kMaxOutputs, producer_args, [&](L0TaskArgs &args) PTO_DEVICE_FUNC {
+        FUNC_MAX_OUTPUTS_AIC, kMaxOutputs, producer_args,
+        [&](L0TaskArgs &args) PTO_DEVICE_FUNC {
             for (uint32_t slot = 0; slot < kMaxOutputs; ++slot)
                 args.add_output(output_info);
         }
@@ -169,6 +176,77 @@ PTO_DEVICE_FUNC inline void submit_max_existing_writers(const Tensor &output, co
     }
     rt_submit_aic_task(FUNC_MAX_OUTPUTS_AIC, producer_args);
     submit_max_output_consumers(output_views, dump);
+}
+
+PTO_DEVICE_FUNC inline void submit_mixed_fanin_case(const Tensor &input, const Tensor &output, const Tensor &dump) {
+    const uint32_t view_shape[1] = {kSkewChunk};
+    Tensor output_views[kExactFanin];
+    PTO2TaskId explicit_dependencies[kExactFanin];
+    uint32_t explicit_count = 0;
+
+    for (uint32_t producer = 0; producer < kExactFanin; ++producer) {
+        const uint32_t view_offset[1] = {producer * kSkewChunk};
+        Tensor input_view = Tensor::view(input, view_shape, view_offset);
+        output_views[producer] = Tensor::view(output, view_shape, view_offset);
+        L0TaskArgs writer_args;
+        if ((producer & 1U) == 0) {
+            writer_args.add_input(input_view);
+            writer_args.add_inout(output_views[producer]);
+            writer_args.add_scalar(static_cast<uint64_t>(kSkewChunk));
+            // 让第一个自动依赖 producer 明显晚于其余 writer 完成；如果
+            // consumer 漏掉这条边，数值 golden 会稳定暴露，而不是靠偶然时序。
+            if (producer == 0) {
+                writer_args.add_scalar(uint64_t{12000000});
+                rt_submit_aic_task(FUNC_BOUNDARY_DELAYED_WRITER_AIC, writer_args);
+            } else {
+                rt_submit_aic_task(FUNC_BOUNDARY_WRITER_AIC, writer_args);
+            }
+        } else {
+            writer_args.add_input(input_view);
+            writer_args.add_output(output_views[producer]);
+            writer_args.add_scalar(static_cast<uint64_t>(kSkewChunk));
+            TaskOutputTensors result = rt_submit_aiv_task(FUNC_BOUNDARY_WRITER_AIV, writer_args);
+            // 八个 AIV producer 各重复两次，显式列表本身需要先去重；再与
+            // 八个自动 TensorMap producer 合并，最终恰好达到 fanin=16。
+            explicit_dependencies[explicit_count++] = result.task_id();
+            explicit_dependencies[explicit_count++] = result.task_id();
+        }
+    }
+
+    L0TaskArgs consumer_args;
+    for (uint32_t producer = 0; producer < kExactFanin; ++producer) {
+        if ((producer & 1U) == 0) {
+            consumer_args.add_input(output_views[producer]);
+        } else {
+            consumer_args.add_no_dep(output_views[producer]);
+        }
+    }
+    consumer_args.add_inout(dump);
+    add_max_scalar_args(consumer_args);
+    consumer_args.set_dependencies(explicit_dependencies, explicit_count);
+    rt_submit_aiv_task(FUNC_EXACT_FANIN16_AIV, consumer_args);
+}
+
+PTO_DEVICE_FUNC inline void
+submit_history_lower_bound_case(const Tensor &input, const Tensor &output, const Tensor &dump, uint64_t n) {
+    L0TaskArgs writer_args;
+    writer_args.add_input(input);
+    writer_args.add_output(output);
+    writer_args.add_scalar(n);
+    writer_args.add_scalar(uint64_t{12000000});
+    rt_submit_aic_task(FUNC_BOUNDARY_DELAYED_WRITER_AIC, writer_args);
+
+    // consumer 的 task id 为 64，task0 正好落在默认 H=64 的闭合下界。
+    // 中间 task 不读写 TensorMap，避免把历史窗口边界与 region 容量混算。
+    for (uint32_t task = 1; task < kHistoryLowerBound; ++task) {
+        L0TaskArgs noop_args;
+        if ((task & 1U) == 0) {
+            rt_submit_aic_task(FUNC_BOUNDARY_NOOP_AIC, noop_args);
+        } else {
+            rt_submit_aiv_task(FUNC_BOUNDARY_NOOP_AIV, noop_args);
+        }
+    }
+    submit_wide_reader(output, dump);
 }
 
 extern "C" {
@@ -240,7 +318,17 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         return;
     }
 
-    if (mode == 6) submit_max_existing_writers(output, dump);
+    if (mode == 6) {
+        submit_max_existing_writers(output, dump);
+        return;
+    }
+
+    if (mode == 7) {
+        submit_mixed_fanin_case(input, output, dump);
+        return;
+    }
+
+    if (mode == 8) submit_history_lower_bound_case(input, output, dump, n);
 }
 
 }  // extern "C"

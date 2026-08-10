@@ -503,6 +503,13 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 128, "mode": 15},
         },
         {
+            "name": "A5OnboardBd32TaskOutputViewFanin",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 128, "mode": 15},
+        },
+        {
             "name": "A5SimBd36DelayedRingFanout",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -516,6 +523,13 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 257, "mode": 16},
         },
         {
+            "name": "A5OnboardBd32DelayedRingFanout",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 257, "mode": 16},
+        },
+        {
             "name": "A5SimBd36AicConsumesAivOutput",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -526,6 +540,13 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 17},
+        },
+        {
+            "name": "A5OnboardBd32AicConsumesAivOutput",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
             "params": {"n": 128, "mode": 17},
         },
         {
@@ -568,6 +589,13 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 512, "mode": 29},
         },
         {
+            "name": "A5OnboardBd32FaninRingReuseStress",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 512, "mode": 29},
+        },
+        {
             "name": "A5SimBd36FaninLargeStress",
             "manual": True,
             "platforms": ["a5sim"],
@@ -582,6 +610,13 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "params": {"n": 4096, "mode": 30},
         },
         {
+            "name": "A5OnboardBd32FaninLargeStress",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
+            "params": {"n": 4096, "mode": 30},
+        },
+        {
             "name": "A5SimBd36L0TaskArgsTagPersistence",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
@@ -592,6 +627,13 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "manual": True,
             "platforms": ["a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 14},
+        },
+        {
+            "name": "A5OnboardBd32L0TaskArgsTagPersistence",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 32},
             "params": {"n": 4096, "mode": 14},
         },
         {

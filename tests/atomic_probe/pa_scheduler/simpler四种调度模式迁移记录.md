@@ -1382,3 +1382,78 @@ PA Case1 不会自然走到 execution/output/DAG 协议的所有公开上限。
 任何性能候选至少必须重跑受影响模式的这 19 类；PA B256 只负责
 性能和该算子的数值回归，不再单独充当调度协议正确性证据。本阶段
 未运行 A5Sim。
+
+## 27. 第三批通用边界：跨来源合并、历史下界与真实 A5 拓扑
+
+### 27.1 新发现的覆盖缺口
+
+第 26 章已经分别验证了纯 TensorMap fanin、纯显式 fanin，以及同一组
+producer 被两种来源重复命中后的去重。但它还不能证明以下合同：
+
+1. 自动 TensorMap fanin 与显式 fanin 来自两组不同 producer 时，能够先分别
+   去重、再正确求并集并恰好达到 `kExecMaxFanin=16`；
+2. fanin producer 同时包含 AIC 与 AIV 时，两条执行引擎的完成发布都能被同一
+   consumer 正确消费；
+3. writer 正好位于默认依赖窗口 `H=64` 的下界时，ordinary map 和 DAG
+   metadata 扫描不会产生差一错误；
+4. 仓库中原有的部分通用图只有 `block_dim=36` 上板配置，而本机 A5 明确报告
+   `max_block_dim=32`。这类失败发生在 runtime 启动前，不能用来判断四种
+   scheduler 的协议正确性。
+
+本阶段不修改 PA Case1，也不读取 task kind、batch、固定五 task 次序、C/V
+比例或 Tensor 形状。新增门槛全部由公开 Submit、Tensor tag、task id、
+TensorMap history 和执行引擎语义构成。
+
+### 27.2 两个新增独立边界图
+
+`TestSchedulerProtocolBoundary` 新增以下两类精简图：
+
+1. **跨引擎、跨来源的 16 fanin 并集**：八个 AIC writer 通过普通 INPUT
+   TensorMap 查询成为自动 fanin；八个 AIV writer 通过 `NO_DEP` Tensor 加显式
+   task id 成为显式 fanin。显式数组把每个 AIV task id 重复两次，因此原始
+   explicit count 为 16、去重后为 8；再与 8 个自动 producer 合并，最终必须
+   恰好得到 16 个唯一 fanin。第一个 AIC writer 带可控延迟，consumer 若漏掉
+   这条边会稳定产生数值错误。
+2. **TensorMap 历史窗口闭合下界**：task0 是延迟 AIC writer，task1..63 是
+   不访问 TensorMap 的交替 AIC/AIV 空 task，task64 才读取 task0 写入的 external
+   Tensor。task0 正好满足 `task_id = consumer_id - H`，用于锁定 `H=64` 的闭区间
+   语义，并避免把 region 容量与 history 边界混算。
+
+跨引擎用例把每个 producer 的数据区域固定为 256 个 `float`，即 1024 B 且
+cache-line 对齐。这样多个 writer 的 clean-out 不会命中相邻 writer 的数据行，
+测试观察到的失败才能归因于依赖协议，而不是测试自身制造的 D-cache 行覆盖。
+延迟 writer 单独放在 compact callable 中，不改变正式 runtime 或 PA kernel。
+
+### 27.3 复用既有业务图的 Bd32 门槛
+
+对已有通用 orchestration 只增加 `block_dim=32` 的上板配置，不复制业务实现：
+
+- fresh output 的 sub-view fanin；
+- 延迟 producer 到六个 consumer 的 fanout；
+- AIV fresh output 被 AIC 消费；
+- fanin ring 复用；
+- 96 个 fanout consumer 的长图压力；
+- `L0TaskArgs` INPUT/OUTPUT/INOUT tag 持久性。
+
+这些场景补充了 PA 不具备的 view、跨引擎反向依赖、长 fanout、ring 复用和
+参数标签组合。历史 `Bd36` 用例继续保留，不把本机拓扑限制伪装成源码删除理由。
+
+### 27.4 真实 A5 结果与后续硬门槛
+
+四种 scheduler 均运行上述两个新增图和六个 Bd32 业务图，合计
+**32/32** 个模式/场景组合数值 golden PASS：
+
+| scheduler | 本批新增门槛 | 结果 |
+| --------- | -----------: | ---- |
+| `cross_core_ordinary` | 8/8 | PASS |
+| `cross_core_dag` | 8/8 | PASS |
+| `simt_cross_core_ordinary` | 8/8 | PASS |
+| `simt_cross_core_dag` | 8/8 | PASS |
+
+连同第 22、24、26 章，当前每种新增 scheduler 至少覆盖 **27 类非 PA 场景**，
+累计 **108** 个模式/场景组合。后续性能候选的保留条件调整为：
+
+1. 只修改某一 backend 时，至少重跑该 backend 的 27 类通用门槛；
+2. 修改共享 execution/output/TensorMap/request 协议时，四种模式全部重跑；
+3. PA B256 仍只承担该算子的数值与性能回归，不能替代上述通用门槛；
+4. 本阶段只运行真实 A5，不运行 A5Sim。
