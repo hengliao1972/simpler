@@ -19,9 +19,12 @@ canonical TaskPlan；AICore 不再 96 路重放 callback，而是按 task id 领
 - shared TensorMap 仍严格按 task id 完成 `N-1 -> N` 插入；
 - 公共协议不得依赖 PA 的 task 数、TaskKind 排列或 Host 预制答案。
 
-当前 S0 公共协议已有 CPU、CCEC 和独立 A5 可见性探针证据，但还没有
-真实 AICPU Plan backend、AICore Build 主路径或 PA 端到端结果。文中的
-性能目标是后续验收方向，不是已实现结论。
+当前 ordinary + Scalar 首版已在 CPU 和 A5 闭合：真实 AICPU
+orchestration callback 生成 canonical Plan，96 个 Scalar 使用中央 ticket
+完成 Build，ordinary TensorMap 仍严格按 task id 插入，随后 AIC/AIV
+执行并由 FinalDrain 收口。当前 B1 warm pipeline 已低于 1ms，但 B256
+仍为多毫秒，所以完整目标尚未达成。ordinary SIMT 和两种 DAG 模式
+尚未实现。
 
 ### 1.1 目录与两个正交维度
 
@@ -53,7 +56,8 @@ Host Plan 或 PA task 公式。四种模式共用 AICPU producer、PlanCell wire
 ```text
 Host
   上传 orchestration SO / input / PlanStorageRef
-  启动 AICore，随后启动 AICPU
+  启动 AICPU，同步等待 Plan 完整封口
+  再启动 AICore
 
 AICPU（唯一 Plan producer）
   dist_engine_register
@@ -65,7 +69,7 @@ AICPU（唯一 Plan producer）
     -> 发布 PlanCell[N]
     -> 推进无缺口 planned_frontier
   发布 closed_task_count == planned_frontier
-  唤醒 AICore
+  结束 AICPU 阶段
 
 AICore Build（首版为 Scalar）
   从 build_next 领取 N < closed_task_count
@@ -83,6 +87,11 @@ AIC/AIV Execute
   发布 completion / DONE
   FinalDrain 收口
 ```
+
+当前正式 Host 实现使 AICPU 与 AICore 使用同一 stream，并在
+AICPU launch 后显式 synchronize，因此 Plan-ahead 是真实的两段串行边界，
+不是“AICore 早启动但在 GM 中轮询 Close”。这个选择先简化正确性，
+同时意味着当前 `pipeline_e2e ≈ plan_time + aicore_time`。
 
 Plan-ahead 首版中，Build 看到的必须是已封口的稳定计划：
 
@@ -110,12 +119,19 @@ Plan backend 保持现有 orchestration API 签名，但改变其 device 实现�
 
 Host 不得为这条路径设置 PlanCell 内容。
 
+当前 A5 owner request 只携带 Plan storage 引用、容量、输入 Tensor
+metadata、`context_lens` 和 scalar。task 数、task kind、task identity 和
+dispatch plan 均不是 Host 输入。Host 可在 Plan 生成后使用独立 PA
+oracle 校验 D2H 结果，但 oracle 不进入 device 调度数据流。
+
 ## 3. 公共 Plan ABI 与内存合同
 
 S0 草案位于
 [公共 Plan 协议头](common/aicpu_plan_protocol.h)。其当前结构边界如下：
 
-- `RuntimeTaskPlanHeader` 是 64B，它只是 payload 的公共头；
+- `RuntimeTaskPlanHeader` 是 64B，它只是 payload 的公共头；公共 wire
+  ABI 当前为 v2，header 的 16bit `adapter_data` 由算子 adapter 定义，
+  PA 用它显式携带真实 Alloc callback 的 `batch_start`；
 - 完整无指针 payload 上限是 4416B，共 69 条 64B cache line；
 - payload 容纳公共 header、最多 32 个 Tensor/TensorCreateInfo 或 output
   reference、16 个 scalar 和 16 条显式依赖；
@@ -175,11 +191,20 @@ AICore consumer:
 control 与 payload 分离 cache line。atomic-only line 不存普通 payload，也不执行
 可回写 stale dirty snapshot 的 payload clean-out。
 
+同一 Plan storage 跨 run 复用时还必须处理 Host DMA 与 AICPU cache
+不一致：Host 清零同一 GM 后，AICPU 在读取 cell control 前先丢弃上一轮
+clean-valid control 行，并在统一 `dsb sy + isb` 后再检查 Empty。当前实现
+使用仓内已验证的 `dc civac`；它成立的前提是上一轮唯一 producer 写已经
+`dc cvac + dsb` 变成 clean，之后没有 ordinary writer，且新一轮 AICore
+尚未启动。不得把该协议扩展到可能含 dirty ordinary payload 或并发 atomic
+writer 的 cache line。
+
 ## 4. Build、TensorMap 与 Execute 不变量
 
 1. Plan 是全局唯一、task-id 稠密且无缺口的 immutable descriptor 序列。
 2. Build task id 只来自 runtime `build_next`，任务语义只来自已获取的
-   PlanCell；不调用 PA random-access 公式恢复 args。
+   PlanCell；不调用 PA random-access 公式恢复 args。PA 的 `batch_start`
+   同样来自 PlanCell 的显式 `adapter_data`，固定 offset 只能做一致性校验。
 3. 唯一 Plan producer 加中央 Build ticket 已能保证每个 task 只 Build 一次，
    因此该模式不需要 per-task Build Tournament。
 4. Plan 顺序不等于 TensorMap 已发布。Materialize 可并行，但 task N
@@ -192,12 +217,39 @@ control 与 payload 分离 cache line。atomic-only line 不存普通 payload，
 7. 任一容量、ABI、descriptor、TensorMap 或 publication 错误都必须发布
    fatal 并让所有 worker 收口，不能留在半发布状态死等。
 
-### 4.1 尚未实现的公共边界
+### 4.1 ordinary Scalar 首版的精确收口
+
+Plan 完整 Close 后，96 个 Scalar 只缓存一次稳定的 task 数 `N`，
+然后重复对同一 `build_next` 做返回型 FetchAdd。成功 ticket 为
+`[0, N)`，每个 worker 最后再消费一个越界 ticket，所以终态必须是：
+
+```text
+build_next == N + 96
+workers_done == 96
+build_release == N
+fatal == 0
+```
+
+中央 ticket 只解决“每个 PlanCell 只 Build 一次”，不放宽 TensorMap
+顺序。task N 可以在串行链外完成 Plan acquire 与 Materialize，但 writer
+metadata 发布仍必须等待 completion[N-1]，发布后再推进 completion[N]。
+完成所有 Build 后才发布 release，当前 Execute 是 post-build 扫描，并未实现
+Plan/Build/Execute 流式重叠。
+
+### 4.2 CCEC direct-entry 的核型本地状态
+
+ordinary Scalar 保留 direct PlannedBuild，不恢复旧 callback split。但 CCEC 下
+`LocalStats` 会跨 `noinline` Build/Execute helper 传递引用，不能放在普通栈上。
+因此 AIC 和 AIV 各使用一份 role-specific `[[block_local]] LocalStats`，
+并在每轮入口整体复位。CPU 实现继续使用栈对象。这只是 CCEC
+存储约束，不改变 non-split `WorkerResult` ABI、Plan ticket 协议或调度语义。
+
+### 4.3 尚未实现的公共边界
 
 下列能力不在首版声明范围内：
 
 - Plan/Build 流式重叠、frontier 暂时追平、Build 重访和反压；
-- PlanCell 复用、generation、ABA 和 ring reclaim；
+- generation、ABA、ring reclaim 和不经 Host 全量清零的 PlanCell 循环复用；
 - 多 AICPU producer 的分区与有序合并；
 - 完整 Joint/MixedKernels、multi-core launch 语义和所有 engine 组合；
 - 依赖 kernel 运行结果才能继续生成后续 Plan 的 result-driven
@@ -215,12 +267,12 @@ PA 首例只能使用已有 symbolic `SharedTaskOutputs/FdwicOutputRef` deferred
 | 阶段 | 目标 | 当前状态 |
 | ---- | ---- | -------- |
 | S0 | 固定 Plan ABI、AICPU/AICore 发布合同和正确性门槛 | 已闭合 |
-| S1 | 接通真实 AICPU orchestration SO 和 Plan backend | 独立 producer 已闭合，A5 正式 launch 待接 |
-| S2 | ordinary Scalar Build，CPU 后 A5 B1/B256 | 独立 CPU 状态机已闭合，完整生产路径待接 |
+| S1 | 接通真实 AICPU orchestration SO 和 Plan backend | 已闭合，正式 A5 owner/dispatcher 已通过 |
+| S2 | ordinary Scalar Build，CPU 后 A5 B1/B256 | 已闭合，Plan-only B1 与 full B1/B256 均通过 |
 | S3 | 在同一 Plan ABI 上替换为 ordinary SIMT Build | 未实现 |
 | S4 | 证明 ordinary 闭合后迁移 DAG Scalar Build | 未实现 |
 | S5 | 在 DAG 上替换为 SIMT Build | 未实现 |
-| S6 | 在正确性与观测闭合后做性能收敛 | 未开始 |
+| S6 | 在正确性与观测闭合后做性能收敛 | ordinary Scalar 已有首组无泳道样本，尚未收敛 |
 
 S0 至少需要以下证据：
 
@@ -233,15 +285,38 @@ S0 至少需要以下证据：
 
 性能只在对应功能门槛闭合后记录：
 
-- 权威结果使用无泳道构建，起点是本轮最早的 device worker startup，
-  终点是最后一个 AICore 完成 FinalDrain；
-- 窗口必须包含 AICPU SO 检查与调用、Plan 生成与发布、Build、
-  TensorMap、Execute 和 FinalDrain；
-- SO 首次加载与 callable cache hit 需分组记录，不能只报更快的一组；
+- 权威结果使用无泳道构建，主 pipeline 起点是 AICPU owner
+  launch 之前，终点是最后一个 AICore 完成 FinalDrain 并同步结束；
+- 主 pipeline 必须包含 AICPU 对真实 orchestration 的调用、Plan 生成与
+  发布、Build、TensorMap、Execute 和 FinalDrain，不包含后续 D2H 和 Host
+  oracle；
+- Host 侧 owner DSO 首次加载/handle 初始化当前在主 pipeline 之前，
+  必须将该冷启动成本与已初始化 handle 的重复运行分组记录，不能
+  声称当前 `pipeline_e2e` 已包含 DSO 首次加载；
+- `plan_time` 必须保留为 Path-A Host wall 口径，其中包含 owner
+  launch/sync 固定成本；`producer_exec` 必须独立保留为 AICPU 内部
+  真实 callback + canonical Plan 打包/发布窗口，两者不得混称；
+- `aicore_time` 是 AICore launch/sync Host wall 口径；
+  `startup→FinalDrain` 是排除 Host launch/sync 后的 AICore device 内主体口径，
+  两者也不得互相冒充；
 - 泳道只用于定位 Plan/Build/Execute/Atomic/DCCI 分布，不与无泳道绝对值
   相减；
 - 对照必须使用同一 PA 输入、真实计算负载和 startup→FinalDrain
   边界。
 
-旧 Host 预制/PA 公式方案的约 0.82ms 不是等价基线。当前没有 A5 结果，
-也不能声称已达到 B256 小于 1ms。
+旧 Host 预制/PA 公式方案的约 0.82ms 不是等价基线。当前 ABI v2、真实
+`6,28,4,1` 负载、同一进程 5 轮的 trace-free 中位数为：
+
+| workload | plan_time | producer_exec | aicore_time | startup→FinalDrain | pipeline_e2e |
+| ---- | ----: | ----: | ----: | ----: | ----: |
+| B1 | 168.773us | 103.489us | 207.296us | 156.880us | 371.006us |
+| B256 | 2690.859us | 2626.289us | 2491.516us | 2460.846us | 5180.220us |
+
+B1 首轮仍有 6011.888us Plan/6622.200us pipeline 的 Path-A 冷启动，
+但第 2--5 轮 pipeline 已落在 331--476us；不能把首次执行成本冒充每轮
+callback 成本，也不能把 warm 中位数冒充冷启动。B256 的 warm producer
+本身仍为 2626.289us，完整 pipeline 为 5180.220us，因此小于 1ms 目标
+明确未达成。
+下一步必须先实现 ordinary SIMT，在同一 Plan ABI、ordinary
+TensorMap 语义和 pipeline 口径下与 Scalar 比较；之后才能依次进入
+DAG Scalar/SIMT。

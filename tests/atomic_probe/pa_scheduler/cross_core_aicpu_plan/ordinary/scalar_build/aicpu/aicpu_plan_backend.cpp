@@ -39,6 +39,7 @@ struct PendingPlan {
     alignas(128) uint8_t staged_cell[4608];
     uint32_t payload_lines;
     uint32_t task_id;
+    uint32_t batch_start;
     int32_t function_id;
     uint16_t output_count;
     ObservedTaskKind kind;
@@ -49,6 +50,7 @@ struct PendingPlan {
 
 struct ActiveTicket {
     uint32_t task_id;
+    uint32_t batch_start;
     int32_t function_id;
     ObservedTaskKind kind;
     ObservedEngine engine;
@@ -63,6 +65,7 @@ struct BackendState {
     ActiveTicket active;
     ObservedTaskKind previous_kind;
     uint8_t previous_group;
+    uint32_t current_batch_start;
     bool have_previous;
     bool bound;
     bool closed;
@@ -212,8 +215,17 @@ DistCompeteFirstTicket BeginTask(
         Fail(AicpuPlanBackendStatus::BadSequence);
         return ticket;
     }
+    // batch_start 来自真实 Alloc callback 的位置，并沿当前 callback
+    // continuation 传播；它不是由 task_id 的固定 PA 周期公式恢复。
+    if (kind == ObservedTaskKind::Alloc) {
+        g_backend.current_batch_start = task_id;
+    } else if (!g_backend.have_previous && task_id != 0U) {
+        Fail(AicpuPlanBackendStatus::BadSequence);
+        return ticket;
+    }
     g_backend.active = ActiveTicket{
-        task_id, function_id, kind, engine, group, true,
+        task_id, g_backend.current_batch_start,
+        function_id, kind, engine, group, true,
     };
     g_backend.previous_kind = kind;
     g_backend.previous_group = group;
@@ -261,6 +273,7 @@ bool FinishTask(
             &args, g_backend.active.task_id,
             g_backend.active.function_id,
             static_cast<uint8_t>(g_backend.active.engine), provisional,
+            g_backend.active.batch_start,
             g_backend.pending.staged_cell, &payload_lines,
             &actual_output_count
         ) != 0 ||
@@ -271,6 +284,7 @@ bool FinishTask(
     }
     g_backend.pending.payload_lines = payload_lines;
     g_backend.pending.task_id = g_backend.active.task_id;
+    g_backend.pending.batch_start = g_backend.active.batch_start;
     g_backend.pending.function_id = g_backend.active.function_id;
     g_backend.pending.output_count = actual_output_count;
     g_backend.pending.kind = g_backend.active.kind;

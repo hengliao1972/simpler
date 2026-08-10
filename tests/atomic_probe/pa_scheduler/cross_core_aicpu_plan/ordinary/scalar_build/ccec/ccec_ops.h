@@ -32,6 +32,18 @@ extern "C" __attribute__((noinline)) __aicore__ void pa_execute_real_winner_work
 #error "Compile CcecOps with PA_BUILD_AIC or PA_BUILD_AIV"
 #endif
 
+#if defined(PA_CCEC_BLOCK_LOCAL_STATS)
+extern "C" {
+#if defined(PA_BUILD_AIC)
+[[block_local]] extern pa_scheduler::LocalStats
+    pa_scheduler_plan_local_stats_aic;
+#elif defined(PA_BUILD_AIV)
+[[block_local]] extern pa_scheduler::LocalStats
+    pa_scheduler_plan_local_stats_aiv;
+#endif
+}
+#endif
+
 namespace pa_scheduler_ccec {
 
 using namespace pto;
@@ -177,6 +189,16 @@ struct SubmitPmuContext;
 
 struct CcecOps {
     static constexpr bool kAtomicReturnReadyObserved = true;
+
+#if defined(PA_CCEC_BLOCK_LOCAL_STATS)
+    __aicore__ static inline pa_scheduler::LocalStats &BlockLocalStats() {
+#if defined(PA_BUILD_AIC)
+        return ::pa_scheduler_plan_local_stats_aic;
+#elif defined(PA_BUILD_AIV)
+        return ::pa_scheduler_plan_local_stats_aiv;
+#endif
+    }
+#endif
 
     // AICPU Plan 的 control word 与 ordinary payload 严格分离：control
     // 独占 128B atomic-only cache line。Scalar 侧观察、领取 ticket 和

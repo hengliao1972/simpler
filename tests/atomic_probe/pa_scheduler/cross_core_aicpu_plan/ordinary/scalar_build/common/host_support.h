@@ -870,9 +870,9 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         state->shared_map.reader_done[worker].value = -1;
     }
-    // 先把旧 Claim root/local owner 及 padding 全部恢复 -1；随后只把
-    // root 第二条 atomic line 初始化成 task-specific pending 值。正式
-    // Build 不触碰 owner 字段，也不对任何 atomic-only 地址执行 DCCI。
+    // Plan-ahead 的 Build owner 来自唯一中央 ticket，不再进入旧两级
+    // Tournament。root/local owner 全部恢复 -1 并作为未触碰 canary；root
+    // 第二条 atomic line 只保留严格 N-1 -> N 插入完成链。
     std::memset(
         state->claim_tournament, 0xff,
         sizeof(state->claim_tournament)
@@ -954,13 +954,13 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
 #endif
     }
 #if PTO_FDWIC_SHARED_MAP
-    // Host 只初始化空的调度状态。task identity、metadata writer 分类和
-    // AIC/AIV task-id 序列都由设备真实 replay/Build 结果决定；Host plan
-    // 仅可在运行后作为独立 oracle，绝不能写回 device 调度输入。
-    // -1 是 replay identity seal 的未发布值；首个完成真实 replay 的
-    // Scalar 用 CAS 写入摘要。两条 Execute cursor 从 task 0 开始扫描
-    // runtime exec cell，不存在 Host task-id 表。
+    // Host 只初始化空的调度状态。task identity 与 canonical payload 由
+    // AICPU callback producer 写入外置 Plan；Scalar 只在 Plan close 后
+    // 通过中央 ticket Build。Host plan 仅作运行后独立 oracle，绝不能
+    // 写回 device 调度输入。旧 replay seal/replay_done 不再参与协议，
+    // 必须保持初值；两条 Execute cursor 仍从 task 0 扫描 runtime cell。
     state->replay_identity_seal.line.value = -1;
+    state->replay_done.value = 0;
     state->exec_scan_cursors.aic_next.value = 0;
     state->exec_scan_cursors.aiv_next.value = 0;
     state->runtime_plan_control.planned_frontier.value = 0;
@@ -1396,6 +1396,7 @@ inline const char *TracePhaseName(uint32_t phase) {
         "SharedMaterializePublishTaskOutputsCopy",
         "SharedMaterializePublishTaskOutputsFlush",
         "Dcci",
+        "RuntimePlanBuild",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) == static_cast<uint32_t>(TracePhase::Count),
@@ -1451,6 +1452,18 @@ inline const char *AtomicSiteName(uint32_t site) {
         "SharedExecDrainArrivalPoll",
         "SharedExecDispatchTicket",
         "SharedReplayIdentitySeal",
+        "RuntimePlanFatalLoad",
+        "RuntimePlanFatalPublish",
+        "RuntimePlanClosedLoad",
+        "RuntimePlanFrontierLoad",
+        "RuntimePlanBuildNextFetchAdd",
+        "RuntimePlanBuildNextLoad",
+        "RuntimePlanCellControlLoad",
+        "RuntimePlanWorkersDoneFetchAdd",
+        "RuntimePlanWorkersDoneLoad",
+        "RuntimePlanBuildReleaseLoad",
+        "RuntimePlanBuildReleasePublish",
+        "RuntimePlanLastInsertCompletionLoad",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) ==
@@ -1485,6 +1498,8 @@ inline const char *DcciSiteName(uint32_t site) {
         "SharedExecPayloadInvalidate",
         "SharedExecTokenDescriptorInvalidate",
         "StartupContextLensInvalidate",
+        "RuntimePlanPayloadAcquire",
+        "RuntimePlanStorageRefAcquire",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) ==
@@ -1608,6 +1623,19 @@ inline bool AtomicRecordSchemaValid(const TraceRecord &record, bool atomic_trace
                 site == AtomicSite::SharedMetadataOutputPublishedLoad) &&
                payload > 0 && record.task_id == -1 && record.function_id == -1;
     }
+    if (site >= AtomicSite::RuntimePlanFatalLoad &&
+        site < AtomicSite::Count) {
+        // Runtime Plan 的全局 control 不携带 task 身份；只有
+        // cell-control 双检使用真实 task_id。
+        const bool task_local_control =
+            site == AtomicSite::RuntimePlanCellControlLoad ||
+            site ==
+                AtomicSite::RuntimePlanLastInsertCompletionLoad;
+        if (task_local_control != (record.task_id >= 0) ||
+            record.function_id != -1) {
+            return false;
+        }
+    }
     // insert-turn/output-published 等待只允许每个 Wait episode
     // 一条聚合 PollBatch，禁止损坏 raw 伪装成逐 Load direct 记录。
     if (site == AtomicSite::SharedInsertTurnPoll ||
@@ -1688,83 +1716,86 @@ inline bool DcciRecordSchemaValid(const TraceRecord &record) {
                record.task_id == -1 &&
                record.function_id == -1;
     }
+    if (site == DcciSite::RuntimePlanStorageRefAcquire) {
+        return call_count == 1 &&
+               (record.flags & kDcciTrailingDsb) != 0 &&
+               record.task_id == -1 &&
+               record.function_id == -1;
+    }
     return call_count == 1 && record.task_id >= 0;
 }
 
-// shared 的真实回放边界是稀疏的：每个逻辑 task 只记录 Claim 和 Submit，
-// EfDrain 由 Submit.start -> Claim.start 两个既有端点精确还原；winner
-// 才继续记录 Materialize、Register、Fanin（非 Alloc）和
-// WinnerBuild/AllocComplete 子区间。每个 Materialize 父区间后依次紧跟
+// AICPU Plan-ahead 下没有 96 路 replay、Claim 或 loser。每个 Scalar 只为
+// 自己从中央 ticket 取得并成功 Build 的 task 记录 Materialize、Register、
+// Fanin（非 Alloc）和 WinnerBuild/AllocComplete。每个 Materialize 父区间
+// 后依次紧跟
 // fresh-output publish 及其 copy/flush 两层 detail；每个 Register 后只
 // 跟唯一 SharedRegisterPublishMetadata。output detail 严格嵌在
 // Materialize，metadata 严格嵌在 Register，端点分别还原独占 output-cell
 // 发布，以及 wait、串行 writer metadata 与 handoff。
 // PrepareMap 属于 private TensorMap，不得以零时长 marker 混入 shared raw。
-// 这里复用现有字段逐核闭合身份、顺序、次数和相邻时间边界；每个 winner
+// 这里复用现有字段逐核闭合身份、顺序、次数和相邻时间边界；每个 Build
 // 固定增加四条 detail（outputs + copy + flush + metadata），不增加
 // TraceRecord 字段，更不按 poll 扩张记录。
 // private 编译仍保持无约束，避免改变既有行为。
 struct SharedSparseTraceValidator {
 #if PTO_FDWIC_SHARED_MAP
     explicit SharedSparseTraceValidator(
-        const SharedHostTaskPlan *plan = nullptr
-    ) : plan_(plan) {}
+        const SharedHostTaskPlan *plan = nullptr,
+        uint32_t expected_builds = 0U
+    ) : plan_(plan), expected_builds_(expected_builds),
+        seen_(plan == nullptr ? 0U : plan->total_tasks, 0U) {}
 #endif
 
     bool Observe(const TraceRecord &record) {
 #if PTO_FDWIC_SHARED_MAP
         const auto phase = static_cast<TracePhase>(record.phase);
+        if (phase == TracePhase::RuntimePlanBuild) {
+            if (++runtime_plan_build_count_ != 1U ||
+                record.task_id != -1 || record.function_id != -1 ||
+                record.flags != 0 || record.auxiliary != 0 ||
+                record.end_cycle < record.start_cycle) {
+                return false;
+            }
+            runtime_plan_build_begin_ = record.start_cycle;
+            runtime_plan_build_end_ = record.end_cycle;
+            return true;
+        }
         if (phase == TracePhase::PrepareMap ||
-            phase == TracePhase::EfDrain) {
+            phase == TracePhase::Claim ||
+            phase == TracePhase::Submit) {
             return false;
         }
-        if (phase == TracePhase::Claim) {
-            if (state_ != State::AwaitClaim ||
-                record.task_id != next_task_id_ ||
+        if (phase == TracePhase::Materialize) {
+            if (state_ != State::AwaitMaterialize ||
                 record.end_cycle < record.start_cycle) {
                 return false;
             }
             const SharedHostPlannedTask *task = PlannedTask(record.task_id);
-            if (task == nullptr) {
+            if (task == nullptr || record.task_id < 0 ||
+                static_cast<uint32_t>(record.task_id) >= seen_.size() ||
+                seen_[static_cast<uint32_t>(record.task_id)] != 0U) {
                 return false;
             }
+            seen_[static_cast<uint32_t>(record.task_id)] = 1U;
             task_id_ = record.task_id;
             kind_ = task->kind;
-            claim_begin_ = record.start_cycle;
-            if ((record.flags & ~(kClaimWon | kClaimAttempted)) != 0 ||
-                (record.flags & kClaimAttempted) == 0 ||
-                record.auxiliary !=
-                    (kind_ == TaskKind::Alloc ? 1U : 0U)) {
-                return false;
-            }
-            winner_ = (record.flags & kClaimWon) != 0;
-            function_id_ = winner_ ? ExpectedFunctionId(kind_) : -1;
-            if (record.function_id != function_id_) {
-                return false;
-            }
-            previous_end_ = record.end_cycle;
-            ++claim_count_;
-            ++next_task_id_;
-            if (winner_) {
-                ++winner_count_;
-                if (kind_ == TaskKind::Alloc) {
-                    ++alloc_winner_count_;
-                }
-                state_ = State::AwaitMaterialize;
-            } else {
-                state_ = State::AwaitLoserSubmit;
-            }
-        } else if (phase == TracePhase::Materialize) {
-            if (state_ != State::AwaitMaterialize ||
-                !SameWinnerTask(record) || record.flags != 0 ||
+            function_id_ = ExpectedFunctionId(kind_);
+            winner_ = true;
+            if (!SameWinnerTask(record) || record.flags != 0 ||
                 record.auxiliary !=
                     (kind_ == TaskKind::Alloc ? 1U : 0U) ||
-                record.start_cycle < previous_end_ ||
-                record.end_cycle < record.start_cycle) {
+                record.function_id != function_id_) {
                 return false;
             }
             materialize_begin_ = record.start_cycle;
             materialize_end_ = record.end_cycle;
+            if (record.start_cycle < first_build_child_begin_) {
+                first_build_child_begin_ = record.start_cycle;
+            }
+            if (record.end_cycle > last_build_child_end_) {
+                last_build_child_end_ = record.end_cycle;
+            }
             previous_end_ = record.end_cycle;
             state_ = State::AwaitMaterializeTaskOutputs;
             ++materialize_count_;
@@ -1825,6 +1856,9 @@ struct SharedSparseTraceValidator {
                 return false;
             }
             previous_end_ = record.end_cycle;
+            if (record.end_cycle > last_build_child_end_) {
+                last_build_child_end_ = record.end_cycle;
+            }
             state_ = State::AwaitWinnerTail;
             ++fanin_count_;
         } else if (phase == TracePhase::Register) {
@@ -1840,6 +1874,9 @@ struct SharedSparseTraceValidator {
             register_begin_ = record.start_cycle;
             register_end_ = record.end_cycle;
             previous_end_ = record.end_cycle;
+            if (record.end_cycle > last_build_child_end_) {
+                last_build_child_end_ = record.end_cycle;
+            }
             state_ = State::AwaitRegisterMetadata;
             ++register_count_;
         } else if (
@@ -1871,28 +1908,15 @@ struct SharedSparseTraceValidator {
                 return false;
             }
             previous_end_ = record.end_cycle;
-            state_ = State::AwaitWinnerSubmit;
-            ++winner_tail_count_;
-        } else if (phase == TracePhase::Submit) {
-            const bool winner_submit =
-                state_ == State::AwaitWinnerSubmit && winner_;
-            const bool loser_submit =
-                state_ == State::AwaitLoserSubmit && !winner_;
-            if ((!winner_submit && !loser_submit) ||
-                !SameTask(record) ||
-                record.function_id != function_id_ ||
-                record.flags != (winner_ ? kClaimWon : 0U) ||
-                record.auxiliary !=
-                    (kind_ == TaskKind::Alloc ? 1U : 0U) ||
-                record.start_cycle > claim_begin_ ||
-                record.end_cycle < previous_end_) {
-                return false;
+            if (record.end_cycle > last_build_child_end_) {
+                last_build_child_end_ = record.end_cycle;
             }
-            last_efdrain_begin_ = record.start_cycle;
-            last_efdrain_end_ = claim_begin_;
-            ++efdrain_count_;
-            state_ = State::AwaitClaim;
-            ++submit_count_;
+            state_ = State::AwaitMaterialize;
+            ++winner_tail_count_;
+            ++winner_count_;
+            if (kind_ == TaskKind::Alloc) {
+                ++alloc_winner_count_;
+            }
         }
 #else
         (void)record;
@@ -1902,8 +1926,8 @@ struct SharedSparseTraceValidator {
 
     bool Closed() const {
 #if PTO_FDWIC_SHARED_MAP
-        return state_ == State::AwaitClaim &&
-               efdrain_count_ == claim_count_ &&
+        return state_ == State::AwaitMaterialize &&
+               claim_count_ == 0U && submit_count_ == 0U &&
                materialize_count_ == winner_count_ &&
                materialize_task_outputs_count_ == winner_count_ &&
                materialize_task_outputs_copy_count_ ==
@@ -1915,9 +1939,15 @@ struct SharedSparseTraceValidator {
                fanin_count_ + alloc_winner_count_ ==
                    winner_count_ &&
                winner_tail_count_ == winner_count_ &&
-               submit_count_ == claim_count_ &&
-               (plan_ == nullptr ||
-                claim_count_ == plan_->total_tasks);
+               winner_count_ == expected_builds_ &&
+               runtime_plan_build_count_ == 1U &&
+               runtime_plan_build_end_ >=
+                   runtime_plan_build_begin_ &&
+               (winner_count_ == 0U ||
+                (runtime_plan_build_begin_ <=
+                     first_build_child_begin_ &&
+                 last_build_child_end_ <=
+                     runtime_plan_build_end_));
 #else
         return true;
 #endif
@@ -1982,7 +2012,6 @@ struct SharedSparseTraceValidator {
 private:
 #if PTO_FDWIC_SHARED_MAP
     enum class State {
-        AwaitClaim,
         AwaitMaterialize,
         AwaitMaterializeTaskOutputs,
         AwaitMaterializeTaskOutputsCopy,
@@ -1991,22 +2020,13 @@ private:
         AwaitRegister,
         AwaitRegisterMetadata,
         AwaitWinnerTail,
-        AwaitWinnerSubmit,
-        AwaitLoserSubmit,
     };
 
     const SharedHostPlannedTask *PlannedTask(int32_t task_id) {
-        if (task_id < 0) {
+        if (task_id < 0 || plan_ == nullptr) {
             return nullptr;
         }
-        if (plan_ != nullptr) {
-            return plan_->TaskAt(static_cast<uint32_t>(task_id));
-        }
-        fallback_task_.task_id = static_cast<uint32_t>(task_id);
-        fallback_task_.kind = static_cast<TaskKind>(
-            static_cast<uint32_t>(task_id) % kTasksPerBatch
-        );
-        return &fallback_task_;
+        return plan_->TaskAt(static_cast<uint32_t>(task_id));
     }
 
     static int32_t ExpectedFunctionId(TaskKind kind) {
@@ -2027,18 +2047,21 @@ private:
     }
 
     const SharedHostTaskPlan *plan_;
-    SharedHostPlannedTask fallback_task_{};
-    State state_ = State::AwaitClaim;
+    uint32_t expected_builds_;
+    std::vector<uint8_t> seen_;
+    State state_ = State::AwaitMaterialize;
 #endif
-    int32_t next_task_id_ = 0;
     int32_t task_id_ = -1;
     int32_t function_id_ = -1;
     TaskKind kind_ = TaskKind::Count;
     bool winner_ = false;
-    uint64_t claim_begin_ = 0;
     uint64_t last_efdrain_begin_ = 0;
     uint64_t last_efdrain_end_ = 0;
     uint64_t previous_end_ = 0;
+    uint64_t first_build_child_begin_ = UINT64_MAX;
+    uint64_t last_build_child_end_ = 0;
+    uint64_t runtime_plan_build_begin_ = 0;
+    uint64_t runtime_plan_build_end_ = 0;
     uint64_t materialize_begin_ = 0;
     uint64_t materialize_end_ = 0;
     uint64_t materialize_task_outputs_begin_ = 0;
@@ -2059,6 +2082,7 @@ private:
     uint32_t register_metadata_count_ = 0;
     uint32_t winner_tail_count_ = 0;
     uint32_t submit_count_ = 0;
+    uint32_t runtime_plan_build_count_ = 0;
 };
 
 inline void ExpectedTraceTopology(uint32_t worker, int32_t *block_id, int32_t *lane) {
@@ -2277,6 +2301,10 @@ inline bool ExportSwimlaneRecords(
 ) {
     if (!ValidateTraceHeader(header, "swimlane export")) return false;
 #if PTO_FDWIC_SHARED_MAP
+    // Plan-ahead 不再生成旧 Submit/Claim endpoint sidecar。为了不
+    // 改动既有 Host 调用 ABI，暂时保留 callback 参数，但绝不
+    // 读取、展开或把它伪装成新 Plan 证据。
+    (void)read_submit_claim_records;
     SharedHostTaskPlan shared_plan;
     std::string shared_plan_error;
     if (!BuildSharedHostTaskPlan(
@@ -2321,14 +2349,9 @@ inline bool ExportSwimlaneRecords(
             );
             return false;
         }
-        // core.count 只统计 generic 区的物理记录；shared 的每个
-        // Submit/Claim 在专用 32B 四端点区保存一条，导出后会展开成两个
-        // 逻辑事件，因此 summary 必须继续保持 JSON 事件数口径。
+        // Plan-ahead 只导出 generic 物理记录；旧 Submit/Claim
+        // endpoint sidecar 不再生产，因此物理与逻辑事件数相同。
         producer_summary.records += core.count;
-#if PTO_FDWIC_SHARED_MAP
-        producer_summary.records +=
-            2ULL * state.results[worker].submits;
-#endif
         producer_summary.atomic_calls += core.atomic_calls;
         producer_summary.poll_calls += core.poll_calls;
         producer_summary.poll_batch_records += core.poll_batch_records;
@@ -2381,7 +2404,7 @@ inline bool ExportSwimlaneRecords(
         output,
         "{\n\"l2_swimlane_level\":%u,\n"
         "\"metadata\":{\"tensormap_mode\":\"%s\","
-        "\"submit_topology\":\"all_worker_replay\","
+        "\"submit_topology\":\"aicpu_plan_central_build\","
         "\"clock_freq_hz\":%llu,\"num_cores\":%u,"
         "\"trace_schema_version\":%u,\"final_barrier\":\"%s\","
         "\"winner_workload\":{\"mode\":\"%s\","
@@ -2474,11 +2497,6 @@ inline bool ExportSwimlaneRecords(
         physical_scratch(kTraceRecordsPerCore);
     std::vector<TraceRecord>
         decoded_scratch(kTraceRecordsPerCore);
-#if PTO_FDWIC_SHARED_MAP
-    std::vector<SharedSubmitClaimTraceRecord>
-        submit_claim_scratch(shared_plan.total_tasks);
-    std::vector<TraceRecord> logical_scratch;
-#endif
     constexpr int32_t kTracePhaseCount = static_cast<int32_t>(TracePhase::Count);
     for (uint32_t worker = 0; worker < kWorkers && success; ++worker) {
         // 每次只读取一个 worker 的有效区间；完整 trace 缓冲无需整体回拷。
@@ -2520,12 +2538,12 @@ inline bool ExportSwimlaneRecords(
             break;
         }
 #if PTO_FDWIC_SHARED_MAP
-        if (state.results[worker].submits !=
+        if (state.results[worker].submits >
             shared_plan.total_tasks) {
             std::fprintf(
                 stderr,
-                "Trace core %u submit count %llu differs from "
-                "shared replay size %u.\n",
+                "Trace core %u owns invalid PlannedBuild count "
+                "%llu > %u.\n",
                 worker,
                 static_cast<unsigned long long>(
                     state.results[worker].submits
@@ -2535,35 +2553,9 @@ inline bool ExportSwimlaneRecords(
             success = false;
             break;
         }
-        if (shared_plan.total_tasks != 0 &&
-            !read_submit_claim_records(
-                worker, shared_plan.total_tasks,
-                submit_claim_scratch.data()
-            )) {
-            success = false;
-            break;
-        }
-        if (!ExpandSharedTraceRecords(
-                worker, decoded_scratch.data(), available,
-                submit_claim_scratch.data(), shared_plan,
-                &logical_scratch
-            )) {
-            std::fprintf(
-                stderr,
-                "Trace core %u has an invalid shared "
-                "Submit/Claim endpoint stream.\n",
-                worker
-            );
-            success = false;
-            break;
-        }
-        const TraceRecord *records = logical_scratch.data();
-        const uint32_t logical_available =
-            static_cast<uint32_t>(logical_scratch.size());
-#else
+#endif
         const TraceRecord *records = decoded_scratch.data();
         const uint32_t logical_available = available;
-#endif
         const TraceCoreState &core = header.cores[worker];
         uint64_t core_atomic_calls = 0;
         uint64_t core_poll_calls = 0;
@@ -2581,7 +2573,10 @@ inline bool ExportSwimlaneRecords(
         bool direct_result_used_source_issue = false;
 #if PTO_FDWIC_SHARED_MAP
         SharedSparseTraceValidator sparse_trace_validator(
-            &shared_plan
+            &shared_plan,
+            static_cast<uint32_t>(
+                state.results[worker].submits
+            )
         );
 #else
         SharedSparseTraceValidator sparse_trace_validator;
@@ -2810,6 +2805,7 @@ inline bool AnalyzeSwimlaneRecords(
 ) {
     if (!ValidateTraceHeader(header, "swimlane analysis")) return false;
 #if PTO_FDWIC_SHARED_MAP
+    (void)read_submit_claim_records;
     SharedHostTaskPlan shared_plan;
     std::string shared_plan_error;
     if (!BuildSharedHostTaskPlan(
@@ -2829,10 +2825,6 @@ inline bool AnalyzeSwimlaneRecords(
     constexpr TracePhase kDetailedPhases[] = {
         TracePhase::EfDrain, TracePhase::Claim, TracePhase::Materialize, TracePhase::Register,
     };
-    static_assert(
-        kDetailedPhases[0] == TracePhase::EfDrain,
-        "inferred EfDrain task distribution expects detail slot zero"
-    );
     uint64_t cycles[kWorkers][kTracePhaseCount] = {};
     uint64_t counts[kWorkers][kTracePhaseCount] = {};
 #if PTO_FDWIC_SHARED_MAP
@@ -2853,15 +2845,13 @@ inline bool AnalyzeSwimlaneRecords(
         physical_scratch(kTraceRecordsPerCore);
     std::vector<TraceRecord>
         decoded_scratch(kTraceRecordsPerCore);
-#if PTO_FDWIC_SHARED_MAP
-    std::vector<SharedSubmitClaimTraceRecord>
-        submit_claim_scratch(shared_plan.total_tasks);
-    std::vector<TraceRecord> logical_scratch;
-#endif
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
 #if PTO_FDWIC_SHARED_MAP
         SharedSparseTraceValidator sparse_trace_validator(
-            &shared_plan
+            &shared_plan,
+            static_cast<uint32_t>(
+                state.results[worker].submits
+            )
         );
 #else
         SharedSparseTraceValidator sparse_trace_validator;
@@ -2895,12 +2885,12 @@ inline bool AnalyzeSwimlaneRecords(
             return false;
         }
 #if PTO_FDWIC_SHARED_MAP
-        if (state.results[worker].submits !=
+        if (state.results[worker].submits >
             shared_plan.total_tasks) {
             std::fprintf(
                 stderr,
-                "swimlane analysis rejected worker %u submit "
-                "count %llu; shared replay has %u tasks.\n",
+                "swimlane analysis rejected worker %u PlannedBuild "
+                "count %llu > %u.\n",
                 worker,
                 static_cast<unsigned long long>(
                     state.results[worker].submits
@@ -2909,33 +2899,9 @@ inline bool AnalyzeSwimlaneRecords(
             );
             return false;
         }
-        if (shared_plan.total_tasks != 0 &&
-            !read_submit_claim_records(
-                worker, shared_plan.total_tasks,
-                submit_claim_scratch.data()
-            )) {
-            return false;
-        }
-        if (!ExpandSharedTraceRecords(
-                worker, decoded_scratch.data(), count,
-                submit_claim_scratch.data(), shared_plan,
-                &logical_scratch
-            )) {
-            std::fprintf(
-                stderr,
-                "swimlane analysis rejected worker %u invalid "
-                "shared Submit/Claim endpoint stream.\n",
-                worker
-            );
-            return false;
-        }
-        const TraceRecord *records = logical_scratch.data();
-        const uint32_t logical_count =
-            static_cast<uint32_t>(logical_scratch.size());
-#else
+#endif
         const TraceRecord *records = decoded_scratch.data();
         const uint32_t logical_count = count;
-#endif
         for (uint32_t index = 0;
              index < logical_count; ++index) {
             const TraceRecord &record = records[index];
@@ -2959,42 +2925,6 @@ inline bool AnalyzeSwimlaneRecords(
             }
             const uint32_t phase = static_cast<uint32_t>(record.phase);
             const uint64_t duration = record.end_cycle - record.start_cycle;
-#if PTO_FDWIC_SHARED_MAP
-            // shared raw 不再为 EfDrain 单写记录。Submit 在状态机中闭合时，
-            // 用 Submit.start -> Claim.start 恢复同一业务区间，使控制台
-            // phase 聚合与 task 分布继续保持原口径。
-            if (record.phase ==
-                static_cast<uint16_t>(TracePhase::Submit)) {
-                const uint64_t efdrain_begin =
-                    sparse_trace_validator.LastEfDrainBegin();
-                const uint64_t efdrain_end =
-                    sparse_trace_validator.LastEfDrainEnd();
-                if (efdrain_end < efdrain_begin) {
-                    return false;
-                }
-                const uint64_t efdrain_duration =
-                    efdrain_end - efdrain_begin;
-                const uint32_t efdrain_phase =
-                    static_cast<uint32_t>(TracePhase::EfDrain);
-                cycles[worker][efdrain_phase] += efdrain_duration;
-                ++counts[worker][efdrain_phase];
-                const uint32_t role_index =
-                    state.results[worker].role ==
-                            static_cast<uint64_t>(CoreRole::Aic)
-                        ? 0U
-                        : 1U;
-                const SharedHostPlannedTask *task =
-                    shared_plan.TaskAt(
-                        static_cast<uint32_t>(record.task_id)
-                    );
-                if (task == nullptr) {
-                    return false;
-                }
-                task_durations[role_index][
-                    static_cast<uint32_t>(task->kind)
-                ][0].push_back(efdrain_duration);
-            }
-#endif
             const bool atomic_poll_batch =
                 record.phase == static_cast<int32_t>(TracePhase::Atomic) &&
                 (record.flags & kAtomicPollBatch) != 0;
@@ -3227,16 +3157,12 @@ inline bool AnalyzeSwimlaneRecords(
         const uint64_t drain_release_publish_events =
             atomic_durations[0][kDrainReleasePublishSite].size() +
             atomic_durations[1][kDrainReleasePublishSite].size();
-        const uint64_t expected_local_events =
-            static_cast<uint64_t>(kWorkers) *
-            shared_plan.total_tasks;
-        const uint64_t expected_root_events =
-            static_cast<uint64_t>(
-                kSharedClaimTournamentMaxGroups
-            ) * shared_plan.total_tasks;
-        if (local_events != expected_local_events ||
-            root_events != expected_root_events ||
-            replay_identity_seal_events != kWorkers ||
+        // Plan-ahead 的新 Plan control/cell atomic 尚未接入 raw
+        // site，这里只能严格证明旧 Claim/replay/legacy-ticket
+        // 均未发生，不能用它们伪装新协议已可观测。
+        if (local_events != 0 ||
+            root_events != 0 ||
+            replay_identity_seal_events != 0 ||
             legacy_build_ticket_events != 0 ||
             aic_exec_ticket_events !=
                 expected_aic_exec_ticket_events ||
@@ -3247,8 +3173,8 @@ inline bool AnalyzeSwimlaneRecords(
                 stderr,
                 "shared PA atomic closure failed: "
                 "claim_local_aic=%llu claim_local_aiv=%llu "
-                "claim_local=%llu/%llu claim_root=%llu/%llu "
-                "replay_identity_seals=%llu/%u "
+                "claim_local=%llu/0 claim_root=%llu/0 "
+                "replay_identity_seals=%llu/0 "
                 "legacy_build_tickets=%llu/0 "
                 "exec_tickets_aic=%llu/%llu "
                 "exec_tickets_aiv=%llu/%llu "
@@ -3256,11 +3182,8 @@ inline bool AnalyzeSwimlaneRecords(
                 static_cast<unsigned long long>(aic_local_events),
                 static_cast<unsigned long long>(aiv_local_events),
                 static_cast<unsigned long long>(local_events),
-                static_cast<unsigned long long>(expected_local_events),
                 static_cast<unsigned long long>(root_events),
-                static_cast<unsigned long long>(expected_root_events),
                 static_cast<unsigned long long>(replay_identity_seal_events),
-                kWorkers,
                 static_cast<unsigned long long>(
                     legacy_build_ticket_events
                 ),
@@ -3291,10 +3214,13 @@ inline bool AnalyzeSwimlaneRecords(
         );
         std::printf(
             "[TRACE_ATOMIC_CLOSURE] "
-            "site=SharedReplayIdentitySeal "
-            "compare_exchange=%llu workers=%u\n",
-            static_cast<unsigned long long>(replay_identity_seal_events),
-            kWorkers
+            "legacy_claim_local=%llu legacy_claim_root=%llu "
+            "legacy_build_ticket=%llu legacy_replay_seal=%llu "
+            "expected_all=0\n",
+            static_cast<unsigned long long>(local_events),
+            static_cast<unsigned long long>(root_events),
+            static_cast<unsigned long long>(legacy_build_ticket_events),
+            static_cast<unsigned long long>(replay_identity_seal_events)
         );
         std::printf(
             "[TRACE_ATOMIC_CLOSURE] "
@@ -4840,9 +4766,10 @@ inline Metrics Validate(
     RawExecTokenSnapshotAuthority raw_exec_token_snapshot_authority
 ) {
     Metrics metrics;
-    // 每个 worker 都回放全部 task。S5b 中 Alloc 与四种 kernel task
-    // 都由 96 个 Scalar 参与 Build Claim；task kind 只约束后续
-    // Execute engine，不约束 Build owner 的 AIC/AIV 角色。
+    // AICPU 按真实 orchestration callback 顺序产生并关闭唯一
+    // Runtime Plan。96 个 Scalar 通过中央 ticket 拆分 PlannedBuild；
+    // task kind 只约束后续 Execute engine，不约束 Build owner
+    // 的 AIC/AIV 角色。
     const uint32_t batches = state.config.batches;
 #if PTO_FDWIC_SHARED_MAP
     SharedHostTaskPlan shared_plan;
@@ -4899,25 +4826,38 @@ inline Metrics Validate(
         state.config.final_barrier_shape <= static_cast<uint32_t>(FinalBarrierShape::ThreeLevel6x4x4);
     const auto final_barrier_shape = static_cast<FinalBarrierShape>(state.config.final_barrier_shape);
 #if PTO_FDWIC_SHARED_MAP
-    // shared cross-core 用 replay_done 证明 96 核已停止生产
-    // exec cell，再用 execution drain 证明消费完成；旧 final-barrier
+    // shared cross-core 由 AICPU 先完整关闭 Plan，96 个 Scalar
+    // 通过中央 Build ticket 各自处理一个不相交的 task
+    // 子集，再用 execution drain 证明消费完成。旧 final-barrier
     // 配置字段只为结构布局保留，不参与协议选择。
     (void)final_barrier_shape;
 #endif
 #if PTO_FDWIC_SHARED_MAP
-    // 96 个 Scalar 都独立回放同一轮真实 orchestration。Submit 与 Claim
-    // attempt 都是逐核、逐 task 发生；只有 Build winner 仍是每 task 唯一。
-    const uint64_t expected_submits =
-        static_cast<uint64_t>(kWorkers) * task_count;
-    const uint64_t expected_claims = expected_submits;
-    const uint64_t shared_replay_identity_seal =
-        static_cast<uint64_t>(
-            state.replay_identity_seal.line.value
-        );
-    const bool shared_replay_identity_seal_ok =
-        state.replay_identity_seal.line.value != -1 &&
-        static_cast<uint32_t>(shared_replay_identity_seal) ==
-            task_count;
+    // Plan-ahead 不再有 96 路 Submit/Claim replay。WorkerResult::submits
+    // 表示本核完成的 PlannedBuild 数，全局严格合计 N；
+    // Claim attempt/win 必须始终为 0。
+    const uint64_t expected_submits = task_count;
+    const uint64_t expected_claims = 0;
+    const bool shared_replay_state_idle =
+        state.replay_identity_seal.line.value == -1 &&
+        state.replay_done.value == 0;
+    const bool shared_runtime_plan_storage_ok =
+        aicpu_plan::RuntimePlanStorageRefValid(
+            state.runtime_plan_storage
+        ) &&
+        state.runtime_plan_storage.capacity >= task_count;
+    const bool shared_runtime_plan_control_ok =
+        state.runtime_plan_control.planned_frontier.value ==
+            static_cast<int64_t>(task_count) &&
+        state.runtime_plan_control.closed_task_count.value ==
+            static_cast<int64_t>(task_count) &&
+        state.runtime_plan_control.build_next.value ==
+            static_cast<int64_t>(task_count + kWorkers) &&
+        state.runtime_plan_control.build_workers_done.value ==
+            static_cast<int64_t>(kWorkers) &&
+        state.runtime_plan_control.build_release.value ==
+            static_cast<int64_t>(task_count) &&
+        state.runtime_plan_control.fatal.value == 0;
     const bool shared_exec_scan_cursors_ok =
         state.exec_scan_cursors.aic_next.value ==
             static_cast<int64_t>(
@@ -4940,9 +4880,32 @@ inline Metrics Validate(
         ) &&
         ByteCanaryIsZero(
             state.exec_scan_cursors.aiv_isolation_padding
+        ) &&
+        ByteCanaryIsZero(
+            state.runtime_plan_control.planned_frontier
+                .isolation_padding
+        ) &&
+        ByteCanaryIsZero(
+            state.runtime_plan_control.closed_task_count
+                .isolation_padding
+        ) &&
+        ByteCanaryIsZero(
+            state.runtime_plan_control.build_next
+                .isolation_padding
+        ) &&
+        ByteCanaryIsZero(
+            state.runtime_plan_control.build_workers_done
+                .isolation_padding
+        ) &&
+        ByteCanaryIsZero(
+            state.runtime_plan_control.build_release
+                .isolation_padding
+        ) &&
+        ByteCanaryIsZero(
+            state.runtime_plan_control.fatal.isolation_padding
         );
 
-    // S5b 的 host oracle 直接检查 task-indexed cell，不依赖新增的
+    // Plan-ahead 的 host oracle 直接检查 task-indexed exec cell，不依赖新增的
     // WorkerResult 计数：Alloc 不产生执行包；其余 task 必须 DONE，并由
     // host 独立检查 Build owner 在 96 核范围，以及 Execute owner 与目标
     // engine 角色一致。该公式不能调用 device adapter，避免 device/host
@@ -5144,9 +5107,9 @@ inline Metrics Validate(
     const uint64_t expected_claims =
         static_cast<uint64_t>(batches) * (kWorkers + kAicWorkers + kAivWorkers + kAicWorkers + kAivWorkers);
 #endif
-    // shared Build 使用逐 task 两级 Tournament：每个 task 有 96 次
-    // local CAS、8 次 root CAS。Host 在终态逐节点校验，不把物理 CAS
-    // 数量从 PA task kind 或旧 cursor 推导出来。
+    // shared Build 使用唯一中央 ticket。旧逐 task 两级
+    // Tournament 的 root/local owner 及 atomic trace 必须全程为零；
+    // strict insert completion 只复用 root 的第二条隔离 atomic line。
 
     // 聚合量分为调度核心计数、kernel 分布、前端操作数和最终状态四组，便于定位语义偏差。
     uint64_t first_submit = UINT64_MAX;
@@ -5228,10 +5191,9 @@ inline Metrics Validate(
     bool role_kernel_routing_ok = true;
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     bool compete_first_split_runtime_oracle_ok = true;
+#if !PTO_FDWIC_SHARED_MAP
     const uint64_t expected_split_task_id_sum =
         static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
-#if PTO_FDWIC_SHARED_MAP
-    uint64_t actual_split_task_id_sum = 0;
 #endif
 #endif
 
@@ -5470,9 +5432,14 @@ inline Metrics Validate(
         aic_count += result.role == static_cast<uint32_t>(CoreRole::Aic);
         aiv_count += result.role == static_cast<uint32_t>(CoreRole::Aiv);
 #if PTO_FDWIC_SHARED_MAP
-        worker_shape_ok &= result.submits == task_count;
-        worker_shape_ok &= result.claim_attempts == task_count;
-        worker_shape_ok &= result.claim_wins <= task_count;
+        uint64_t worker_builds_by_kind = 0;
+        for (uint32_t kind = 0; kind < 5U; ++kind) {
+            worker_builds_by_kind += result.wins[kind];
+        }
+        worker_shape_ok &= result.submits <= task_count;
+        worker_shape_ok &= result.claim_attempts == 0;
+        worker_shape_ok &= result.claim_wins == 0;
+        worker_shape_ok &= worker_builds_by_kind == result.submits;
         worker_shape_ok &=
             result.max_occupied <=
                 cross_core::kExecTokensPerWorker;
@@ -5538,8 +5505,13 @@ inline Metrics Validate(
         }
 #endif
         wins += result.claim_wins;
+#if PTO_FDWIC_SHARED_MAP
+        if (result.submits != 0) ++winning_workers;
+        max_worker_wins = std::max(max_worker_wins, result.submits);
+#else
         if (result.claim_wins != 0) ++winning_workers;
         max_worker_wins = std::max(max_worker_wins, result.claim_wins);
+#endif
         heap_guards += result.heap_guards;
         fanin_ready_loads += result.fanin_ready_loads;
         fanin_not_ready_loads += result.fanin_not_ready_loads;
@@ -5579,23 +5551,24 @@ inline Metrics Validate(
         }
 #endif
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+#if PTO_FDWIC_SHARED_MAP
+        // Plan-ahead 直接进入完整 PlannedBuild，不再经过旧
+        // CompeteFirst/Finish 拆分入口。所有旧诊断字段都是
+        // 未触碰 canary，不允许用新 Build 次数伪造旧口径。
+        compete_first_split_runtime_oracle_ok &=
+            result.compete_first_split_caller_state_address == 0 &&
+            result.compete_first_split_finish_state_address == 0 &&
+            result.compete_first_split_finish_calls == 0 &&
+            result.compete_first_split_protocol_errors == 0 &&
+            result.compete_first_split_task_id_sum == 0 &&
+            result.compete_first_split_state_cookie == 0 &&
+            result.compete_first_split_owner_worker_id == 0 &&
+            result.compete_first_split_reserved == 0;
+#else
         const CoreRole expected_role = index < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
         compete_first_split_runtime_oracle_ok &= result.worker_id == index;
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_caller_state_address != 0;
-#if PTO_FDWIC_SHARED_MAP
-        // 每核 caller 都完整回放 0..N-1，因此每核 task_id_sum
-        // 都必须是完整三角和；只有 winner 跨 TU 进入 finish，
-        // finish_calls 仍等于本核 claim_wins。
-        compete_first_split_runtime_oracle_ok &=
-            result.compete_first_split_finish_state_address ==
-                (result.claim_wins == 0
-                     ? 0
-                     : result.compete_first_split_caller_state_address);
-        compete_first_split_runtime_oracle_ok &=
-            result.compete_first_split_finish_calls ==
-                result.claim_wins;
-#else
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_finish_state_address ==
                 result.compete_first_split_caller_state_address;
@@ -5604,46 +5577,39 @@ inline Metrics Validate(
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_task_id_sum ==
                 expected_split_task_id_sum;
-#endif
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_protocol_errors == 0;
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_state_cookie ==
                 (kCompeteFirstSplitStateCookieBase ^ static_cast<uint64_t>(index) ^
                  (static_cast<uint64_t>(static_cast<uint32_t>(expected_role)) << 32U));
-#if PTO_FDWIC_SHARED_MAP
-        actual_split_task_id_sum +=
-            result.compete_first_split_task_id_sum;
-#endif
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_owner_worker_id == index;
         compete_first_split_runtime_oracle_ok &=
             result.compete_first_split_reserved == 0;
 #endif
+#endif
 #if PTO_FDWIC_SHARED_MAP
-        // context_len 是真实 replay 前端的输入，96 核每批都读一次。
-        // 参数构造和 Materialize 仍只由本 task 的唯一 Build
-        // winner 执行，所以其余计数继续由本核 wins[] 精确推导。
+        // callback 参数已由 AICPU producer 编码进 Plan payload。
+        // Scalar 只 Acquire/Decode 并执行完整 Finish，因此旧
+        // replay 参数构造计数必须为 0；Materialize 仍按本核
+        // wins[] （即本核实际 PlannedBuild 分布）精确推导。
         const uint64_t alloc_wins = result.wins[static_cast<uint32_t>(TaskKind::Alloc)];
         const uint64_t qk_wins = result.wins[static_cast<uint32_t>(TaskKind::Qk)];
         const uint64_t sf_wins = result.wins[static_cast<uint32_t>(TaskKind::Sf)];
         const uint64_t pv_wins = result.wins[static_cast<uint32_t>(TaskKind::Pv)];
-        const uint64_t up_wins = result.wins[static_cast<uint32_t>(TaskKind::Up)];
         frontend_worker_counts_ok &=
-            result.context_reads == batches;
+            result.context_reads == 0;
         frontend_worker_counts_ok &=
-            result.views_created == qk_wins + up_wins;
+            result.views_created == 0;
         frontend_worker_counts_ok &=
-            result.dynamic_create_infos == qk_wins + sf_wins;
+            result.dynamic_create_infos == 0;
         frontend_worker_counts_ok &=
-            result.arg_resets == qk_wins + sf_wins + pv_wins + up_wins;
+            result.arg_resets == 0;
         frontend_worker_counts_ok &=
-            result.tensor_args_added ==
-                alloc_wins * 3 +
-                4 * (qk_wins + sf_wins + pv_wins) + 7 * up_wins;
+            result.tensor_args_added == 0;
         frontend_worker_counts_ok &=
-            result.scalar_args_added ==
-                2 * qk_wins + 3 * sf_wins + 2 * pv_wins + 2 * up_wins;
+            result.scalar_args_added == 0;
         frontend_worker_counts_ok &=
             result.materialized_outputs ==
                 alloc_wins * 3 + qk_wins + sf_wins * 3 + pv_wins;
@@ -5668,7 +5634,7 @@ inline Metrics Validate(
             result.final_heap_next >= own_reserved_minimum &&
             (result.final_heap_next == 0 ||
              result.final_heap_next % kOutputAlignment == 0) &&
-            (result.claim_wins != 0 || result.final_heap_next == 0) &&
+            (result.submits != 0 || result.final_heap_next == 0) &&
             (nonzero_output_wins == 0 || result.final_heap_next != 0);
 #else
         frontend_worker_counts_ok &= result.context_reads == batches;
@@ -5769,13 +5735,6 @@ inline Metrics Validate(
     }
     for (bool seen : worker_ids)
         worker_shape_ok &= seen;
-#if defined(PA_COMPETE_FIRST_SPLIT_FINISH) && PTO_FDWIC_SHARED_MAP
-    compete_first_split_runtime_oracle_ok &=
-        actual_split_task_id_sum ==
-            static_cast<uint64_t>(kWorkers) *
-                expected_split_task_id_sum;
-#endif
-
 #if PTO_FDWIC_SHARED_MAP
     // S5b 的 Build owner 角色是竞争结果，不应对 fanin payload
     // 伪造固定 AIC/AIV 分布。业务总量仍为每 group 的
@@ -5832,7 +5791,11 @@ inline Metrics Validate(
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
     Expect(
         compete_first_split_runtime_oracle_ok,
+#if PTO_FDWIC_SHARED_MAP
+        "Plan-ahead leaves every legacy compete-first split field zero",
+#else
         "compete-first caller/finish share one role-specific block-local state",
+#endif
         &metrics
     );
 #endif
@@ -5891,7 +5854,7 @@ inline Metrics Validate(
     Expect(
         submits == expected_submits,
 #if PTO_FDWIC_SHARED_MAP
-        "all 96 workers replay every logical Submit exactly once",
+        "96 Scalar central tickets complete every PlannedBuild exactly once",
 #else
         "replay count is workers * tasks",
 #endif
@@ -5900,7 +5863,7 @@ inline Metrics Validate(
     Expect(
         claims == expected_claims,
 #if PTO_FDWIC_SHARED_MAP
-        "every replayed shared Submit performs one Build Claim attempt",
+        "Plan-ahead performs no legacy Build Claim attempt",
 #else
         "Claim attempt count matches PA topology",
 #endif
@@ -5908,14 +5871,42 @@ inline Metrics Validate(
     );
 #if PTO_FDWIC_SHARED_MAP
     Expect(
-        shared_replay_identity_seal_ok,
-        "all workers agree on one runtime replay identity seal and task count",
+        shared_replay_state_idle,
+        "legacy replay identity seal and replay_done remain untouched",
         &metrics
     );
     std::printf(
-        "[REPLAY_SEAL] task_count=%u identity_hash=%08x\n",
-        static_cast<uint32_t>(shared_replay_identity_seal),
-        static_cast<uint32_t>(shared_replay_identity_seal >> 32U)
+        "[RUNTIME_PLAN] frontier=%lld closed=%lld build_next=%lld "
+        "workers_done=%lld release=%lld fatal=%lld capacity=%u\n",
+        static_cast<long long>(
+            state.runtime_plan_control.planned_frontier.value
+        ),
+        static_cast<long long>(
+            state.runtime_plan_control.closed_task_count.value
+        ),
+        static_cast<long long>(
+            state.runtime_plan_control.build_next.value
+        ),
+        static_cast<long long>(
+            state.runtime_plan_control.build_workers_done.value
+        ),
+        static_cast<long long>(
+            state.runtime_plan_control.build_release.value
+        ),
+        static_cast<long long>(
+            state.runtime_plan_control.fatal.value
+        ),
+        state.runtime_plan_storage.capacity
+    );
+    Expect(
+        shared_runtime_plan_storage_ok,
+        "external Runtime Plan storage reference and capacity are valid",
+        &metrics
+    );
+    Expect(
+        shared_runtime_plan_control_ok,
+        "Runtime Plan closes at N and central Build reaches N+96 tickets, 96 arrivals, and release N",
+        &metrics
     );
     Expect(
         shared_exec_scan_cursors_ok,
@@ -5924,19 +5915,27 @@ inline Metrics Validate(
     );
     Expect(
         shared_scheduler_atomic_padding_ok,
-        "replay seal and Execute cursor isolation padding stays zero",
+        "Plan, replay, and Execute atomic isolation padding stays zero",
         &metrics
     );
     Expect(
-        claim_attempts_by_role[0] ==
-                submits_by_role[0] &&
-            claim_attempts_by_role[1] ==
-                submits_by_role[1],
-        "AIC/AIV replay and Build Claim attempt totals are identical",
+        claim_attempts_by_role[0] == 0 &&
+            claim_attempts_by_role[1] == 0 &&
+            submits_by_role[0] + submits_by_role[1] ==
+                task_count,
+        "AIC/AIV own all PlannedBuilds without legacy Claim or loser work",
         &metrics
     );
 #endif
+#if PTO_FDWIC_SHARED_MAP
+    Expect(
+        wins == 0,
+        "legacy Claim winner count remains zero",
+        &metrics
+    );
+#else
     Expect(wins == task_count, "exactly one winner per task", &metrics);
+#endif
 #if PTO_FDWIC_SHARED_MAP
     if (!cross_core_exec_cells_ok) {
         std::printf(
@@ -6103,6 +6102,15 @@ inline Metrics Validate(
         &metrics
     );
     Expect(
+        shared_runtime_plan_control_ok &&
+            submits == task_count &&
+            shared_insert_completions_ok &&
+            cross_core_exec_cells_ok &&
+            cross_core_exec_payload_validation.protocol_ok,
+        "every acquired Plan cell decodes and finishes before release, strict insert completion, and runtime execution closure",
+        &metrics
+    );
+    Expect(
         legacy_task_completion_canary_ok,
         "shared hot path leaves production TaskCell completion canaries unchanged",
         &metrics
@@ -6115,10 +6123,9 @@ inline Metrics Validate(
 #endif
     Expect(
 #if PTO_FDWIC_SHARED_MAP
-        state.replay_done.value ==
-                static_cast<int64_t>(kWorkers) &&
+        state.replay_done.value == 0 &&
             FinalBarrierStateIsZero(state.final_barrier),
-        "shared replay barrier reaches all workers and legacy final barrier stays unused",
+        "legacy replay and final-barrier counters stay unused",
 #else
         state.replay_done.value ==
                 (flat_final_barrier
@@ -6141,7 +6148,7 @@ inline Metrics Validate(
         frontend_worker_counts_ok,
         kCompiledTensorMapMode == TensorMapBuildMode::Private
             ? "every private worker replays the exact eager frontend counts"
-            : "shared winner-derived heavy args and materialize counts are exact",
+            : "Plan-ahead leaves replay argument counters zero and PlannedBuild materialize counts are exact",
         &metrics
     );
     const uint64_t expected_global_map_inserts =
@@ -6153,17 +6160,12 @@ inline Metrics Validate(
 #endif
     const bool global_frontend_counts_ok =
 #if PTO_FDWIC_SHARED_MAP
-        context_reads ==
-            static_cast<uint64_t>(kWorkers) * batches &&
-        views_created == static_cast<uint64_t>(group_count) * 2 &&
-        dynamic_create_infos ==
-            static_cast<uint64_t>(group_count) * 2 &&
-        arg_resets == static_cast<uint64_t>(group_count) * 4 &&
-        tensor_args_added ==
-            static_cast<uint64_t>(batches) * 3 +
-            static_cast<uint64_t>(group_count) * 19 &&
-        scalar_args_added ==
-            static_cast<uint64_t>(group_count) * 9 &&
+        context_reads == 0 &&
+        views_created == 0 &&
+        dynamic_create_infos == 0 &&
+        arg_resets == 0 &&
+        tensor_args_added == 0 &&
+        scalar_args_added == 0 &&
         materialized_outputs ==
             static_cast<uint64_t>(batches) * 3 +
             static_cast<uint64_t>(group_count) * 5 &&
@@ -6180,7 +6182,10 @@ inline Metrics Validate(
 #endif
     Expect(
         global_frontend_counts_ok,
-        "global PA frontend operation totals are exact", &metrics
+        kCompiledTensorMapMode == TensorMapBuildMode::Shared
+            ? "AICPU owns callback argument construction and Scalar Finish totals are exact"
+            : "global PA frontend operation totals are exact",
+        &metrics
     );
     Expect(
         map_lookups ==
@@ -6392,17 +6397,15 @@ inline Metrics Validate(
     );
 
     // private 三类 Claim 继续核对 production-prefix 四分片 cursor 的
-    // 最终高水位；shared 每 task 用独立两级 Tournament
-    // 产生唯一 Build winner，legacy cursor 必须保持初值。
+    // 最终高水位；shared Plan-ahead 不再使用 Tournament owner。
+    // 只复用 root 的第二条 atomic line 完成严格 N-1 -> N
+    // insert completion，root/local owner 与旧 cursor 都必须保持初值。
 #if PTO_FDWIC_SHARED_MAP
     bool claim_state_ok = true;
     for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
-        const int64_t expected_owner = task_id < task_count
-            ? static_cast<int64_t>(task_id)
-            : -1;
         claim_state_ok &=
             state.claim_tournament[task_id].root.owner.value ==
-                expected_owner;
+                -1;
         claim_state_ok &=
             state.tasks[task_id].deps_prepared ==
                 SharedInsertCompletionInitialValue(task_id);
@@ -6410,7 +6413,7 @@ inline Metrics Validate(
              group < kSharedClaimTournamentMaxGroups; ++group) {
             claim_state_ok &=
                 state.claim_tournament[task_id]
-                    .local[group].owner.value == expected_owner;
+                    .local[group].owner.value == -1;
         }
     }
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
@@ -6425,7 +6428,7 @@ inline Metrics Validate(
     }
     Expect(
         claim_state_ok,
-        "every shared task closes one Tournament root, all local groups participate, and legacy cursors stay unused",
+        "Plan-ahead leaves every legacy Tournament owner and Claim cursor untouched",
         &metrics
     );
 #else
@@ -6458,23 +6461,22 @@ inline Metrics Validate(
     if (state.config.profile_phases != 0) {
         // profile 开关关闭时这些字段允许保持零，避免把可选诊断本身变成语义门禁。
         Expect(
+#if PTO_FDWIC_SHARED_MAP
+            phase_calls[static_cast<uint32_t>(ProfilePhase::Claim)] == 0 &&
+                phase_calls[static_cast<uint32_t>(ProfilePhase::EfDrain)] == 0 &&
+                phase_calls[static_cast<uint32_t>(ProfilePhase::WaitForSlot)] == 0 &&
+                phase_calls[static_cast<uint32_t>(ProfilePhase::HeapGuard)] == 0,
+#else
             phase_calls[static_cast<uint32_t>(ProfilePhase::Claim)] == expected_submits &&
                 phase_calls[static_cast<uint32_t>(ProfilePhase::EfDrain)] == expected_submits &&
                 phase_calls[static_cast<uint32_t>(ProfilePhase::WaitForSlot)] ==
-#if PTO_FDWIC_SHARED_MAP
-                    static_cast<uint64_t>(group_count) * 4 &&
-#else
                     static_cast<uint64_t>(batches) * 4 &&
-#endif
                 phase_calls[static_cast<uint32_t>(ProfilePhase::HeapGuard)] ==
-#if PTO_FDWIC_SHARED_MAP
-                    0,
-#else
                     static_cast<uint64_t>(batches) * 4,
 #endif
             kCompiledTensorMapMode == TensorMapBuildMode::Private
                 ? "private profile calls match Claim/EfDrain/WaitForSlot/HeapGuard"
-                : "shared profile calls match Claim/EfDrain/WaitForSlot without private HeapGuard",
+                : "Plan-ahead profile excludes legacy Claim/EfDrain/WaitForSlot/HeapGuard",
             &metrics
         );
     }
@@ -6524,11 +6526,9 @@ inline Metrics Validate(
                 dcci_lines += core.dcci_lines;
                 const WorkerResult &result = state.results[worker];
 #if PTO_FDWIC_SHARED_MAP
-                // Submit/Claim 专用区按已完成 Submit 数写入 32B 四端点行，
-                // host 展开后恢复为两个 32B 逻辑事件。它不进入
-                // TraceCoreState::count，但必须进入最终 JSON 事件数。
-                trace_shape_ok &= result.submits <= kMaxTasks;
-                logical_trace_records += 2ULL * result.submits;
+                // Plan-ahead 不写旧 Submit/Claim endpoint sidecar，
+                // generic 物理数就是最终逻辑事件数。
+                trace_shape_ok &= result.submits <= task_count;
 #endif
                 const uint64_t worker_kernels = result.kernel_counts[0] + result.kernel_counts[1] +
                                                 result.kernel_counts[2] + result.kernel_counts[3];
@@ -6551,16 +6551,20 @@ inline Metrics Validate(
                 }
                 const uint64_t worker_expected =
 #if PTO_FDWIC_SHARED_MAP
-                    // core.count 只覆盖 generic 物理区：Claim/Submit 已迁到
-                    // 专用 32B 区，不能再计入这个物理公式。winner 追加
+                    // 每个 PlannedBuild 追加
                     // Materialize/Register/metadata/outputs/copy/flush/tail，
                     // 非 Alloc 再追加 Fanin。Alloc 为 7 条、普通为 8 条，
-                    // 即 8*wins - alloc_wins。
-                    8 * result.claim_wins - result.wins[0] +
+                    // 即 8*owned_builds - alloc_builds。
+                    8 * result.submits - result.wins[0] +
 #else
                     6 * result.submits + 2 * result.claim_wins - result.wins[0] +
 #endif
-                    2 * worker_kernels + result.wait_events[0] + result.wait_events[1] + 2 +
+                    2 * worker_kernels + result.wait_events[0] + result.wait_events[1] +
+#if PTO_FDWIC_SHARED_MAP
+                    2 +
+#else
+                    2 +
+#endif
                     core.dcci_records +
                     (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                          ? worker_physical_atomic + 2
@@ -6569,22 +6573,20 @@ inline Metrics Validate(
             }
         }
 #if PTO_FDWIC_SHARED_MAP
-        // generic 物理区内：每 batch 的 Alloc winner 有 7 条；每 group
-        // 的四个普通 winner 子区间有 32 条，四个实际 kernel 的
-        // Kernel/Commit 有 8 条，合计 40 条。Claim/Submit 专用区
-        // 不进入 physical_expected_trace_records。
+        // generic 物理区内：每 batch 的 Alloc Build 有 7 条；每 group
+        // 的四个普通 Build 子区间有 32 条，四个实际 kernel 的
+        // Kernel/Commit 有 8 条，合计 40 条。
         const uint64_t expected_shared_extra_records =
             7ULL * static_cast<uint64_t>(batches) +
             40ULL * static_cast<uint64_t>(group_count);
         const uint64_t physical_expected_trace_records =
             expected_shared_extra_records +
-            trace_wait_records + 2 * kWorkers + dcci_records +
+            trace_wait_records + 2ULL * kWorkers + dcci_records +
             (((state.config.trace_enabled & kTraceAtomicsEnabled) != 0)
                  ? physical_atomic_records + 2 * kWorkers
                  : 0);
         const uint64_t logical_expected_trace_records =
-            physical_expected_trace_records +
-            2ULL * expected_submits;
+            physical_expected_trace_records;
 #else
         const uint64_t physical_expected_trace_records =
             static_cast<uint64_t>(batches) * (static_cast<uint64_t>(kWorkers) * 30 + 17) +
@@ -6595,14 +6597,15 @@ inline Metrics Validate(
         const uint64_t logical_expected_trace_records =
             physical_expected_trace_records;
 #endif
-        // central ticket 的每个逻辑 task 固定 Claim+Submit 两条；EfDrain
-        // 由 Submit.start -> Claim.start 离线还原。Alloc owner 追加
+        // central ticket 的每个 owned task 直接从 Materialize 开始。Alloc owner 追加
         // Materialize/Register/metadata/outputs/copy/flush/AllocComplete 七条，
         // 每个普通 owner 追加
         // Materialize/Register/metadata/outputs/copy/flush/Fanin/
         // WinnerBuild 八条；每组四个实际 kernel 再各有 Kernel+Commit 两条。
-        // private 仍保持既有固定六条 Submit 记录。两个父 span 每核固定
-        // 增加 2 条，真实等待按运行时次数加入。
+        // shared 每核各保留 RuntimePlanBuild 和 FinalDrain 两条
+        // 父 span，不再把 Plan Build 冒充 OrchestrationReplay；
+        // private 仍保持既有父区间口径。
+        // 真实等待按运行时次数加入。
         Expect(trace_shape_ok, "swimlane header and per-worker capacities are valid", &metrics);
         Expect(trace_dropped == 0, "swimlane records fit without drops", &metrics);
         Expect(
@@ -6827,9 +6830,12 @@ inline Metrics Validate(
             min_worker_submits = std::min(min_worker_submits, result.submits);
             max_worker_submits = std::max(max_worker_submits, result.submits);
 #if PTO_FDWIC_SHARED_MAP
-            incomplete_workers +=
-                result.submits != task_count ||
-                result.claim_attempts != task_count;
+            bool worker_incomplete = result.final_occupied != 0;
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+            worker_incomplete |=
+                result.compete_first_split_protocol_errors != 0;
+#endif
+            incomplete_workers += worker_incomplete;
 #else
             incomplete_workers += result.submits != task_count;
 #endif
@@ -6865,17 +6871,22 @@ inline Metrics Validate(
             static_cast<unsigned long long>(max_final_occupied)
         );
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
-        // split caller/finish 的异常只在少数 worker 上首先出现。失败时导出
-        // 不超过 8 个直接证据点，区分“回放提前停止”与“跨 TU ticket/状态
-        // 合同自身报错”；成功路径不增加任何 device 指令或结果字段。
+        // Plan-ahead 不应触碰任何旧 split 字段。失败时最多
+        // 导出 8 个真实非零证据点，不再用“每核完整回放 N”
+        // 作为筛选条件。
         uint32_t reported_split_workers = 0;
         for (uint32_t worker = 0;
              worker < kWorkers && reported_split_workers < 8U;
              ++worker) {
             const WorkerResult &result = state.results[worker];
-            if (result.submits == task_count &&
-                result.claim_attempts == task_count &&
-                result.compete_first_split_protocol_errors == 0) {
+            if (result.compete_first_split_caller_state_address == 0 &&
+                result.compete_first_split_finish_state_address == 0 &&
+                result.compete_first_split_finish_calls == 0 &&
+                result.compete_first_split_protocol_errors == 0 &&
+                result.compete_first_split_task_id_sum == 0 &&
+                result.compete_first_split_state_cookie == 0 &&
+                result.compete_first_split_owner_worker_id == 0 &&
+                result.compete_first_split_reserved == 0) {
                 continue;
             }
             std::printf(

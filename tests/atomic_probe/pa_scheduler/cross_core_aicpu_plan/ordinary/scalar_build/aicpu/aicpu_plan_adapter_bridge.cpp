@@ -21,6 +21,34 @@ using namespace pa_scheduler::aicpu_plan_adapter;
 // store + exact clean；control 也使用 ordinary store + exact clean，返回型
 // atomic observe 由 AIC/AIV consumer 承担。x86 smoke 只替换为顺序一致 fence。
 struct AicpuProducerOps {
+    // Host 通过 DMA/aclrtMemset 重置同一块 GM 后，AICPU 不会自动丢弃
+    // 上一轮留下的 clean-valid control line。AICPU EL0 的 dc ivac 在当前
+    // 环境没有可依赖的契约；仓库 Host-DMA -> AICPU 的已验证协议使用
+    // dc civac + dsb sy + isb。这里允许 civac 的关键前提是：control 的
+    // 唯一写路径 PublishControl 已经执行 cvac + dsb，之后没有 ordinary
+    // store，因此进入下一轮时该 line 必须是 clean-valid，而不是 dirty。
+    // 当前 AICore 还没有启动，也不存在并发 writer。
+    static void DiscardPreviouslyCleanControlLine(
+        const volatile int64_t *address
+    )
+    {
+#if defined(__aarch64__)
+        const uintptr_t line =
+            reinterpret_cast<uintptr_t>(address) & ~uintptr_t{63U};
+        __asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
+#else
+        (void)address;
+#endif
+    }
+
+    static void FinishCacheMaintenance()
+    {
+        StoreBarrier();
+#if defined(__aarch64__)
+        __asm__ volatile("isb" ::: "memory");
+#endif
+    }
+
     static int64_t LoadControl(const volatile int64_t *address)
     {
         return __atomic_load_n(address, __ATOMIC_ACQUIRE);
@@ -145,8 +173,20 @@ extern "C" int32_t aicpu_plan_adapter_initialize(
 {
     RuntimePlanView view{};
     if (!MakeView(control, cells, capacity, view)) return -1;
-    // cells 由 Host/AICPU allocator 以零页提供；这里逐项拒绝非空 control，
-    // 不用 memset 覆盖可能仍被旧 AICore 读取的 payload cache line。
+    // 同一 storage 的上一轮 Published control 可能仍以 clean-valid 形式
+    // 留在 AICPU cache，而本轮 Host aclrtMemset 不会 snoop 它。必须先把
+    // 所有 control 的第一条 64B line 丢弃，统一完成 cache maintenance，
+    // 之后才允许检查 Empty；不能边 invalidate 边 load。
+    for (uint32_t task = 0U; task < capacity; ++task) {
+        AicpuProducerOps::DiscardPreviouslyCleanControlLine(
+            &view.cells[task].control.value
+        );
+    }
+    AicpuProducerOps::FinishCacheMaintenance();
+
+    // cells 由 Host/AICPU allocator 以零页提供或由 Host 对同一地址重新
+    // 清零；这里逐项拒绝非空 control，不覆盖可能仍被 consumer 读取的
+    // payload cache line。
     for (uint32_t task = 0U; task < capacity; ++task) {
         if (AicpuProducerOps::LoadControl(
                 &view.cells[task].control.value
@@ -171,6 +211,7 @@ extern "C" int32_t aicpu_plan_adapter_initialize(
 extern "C" int32_t aicpu_plan_adapter_stage(
     const void *l0_task_args, uint32_t task_id, int32_t function_id,
     uint8_t engine_class, uint8_t provisional_adapter_flags,
+    uint32_t batch_start,
     void *staged_cell, uint32_t *payload_lines, uint16_t *output_count
 )
 {
@@ -190,7 +231,7 @@ extern "C" int32_t aicpu_plan_adapter_stage(
     if (!MakePaRuntimeTaskPlanSpec(
             args, task_id, function_id,
             static_cast<EngineClass>(engine_class),
-            provisional_adapter_flags, spec
+            provisional_adapter_flags, batch_start, spec
         )) {
         return -2;
     }
@@ -232,8 +273,9 @@ extern "C" int32_t aicpu_plan_adapter_publish_staged(
         return -3;
     }
     const EngineClass engine = static_cast<EngineClass>(header.engine_class);
-    if (!ValidatePaAdapterFlags(
-            header.task_id, engine, final_adapter_flags
+    if (!ValidatePaAdapterMetadata(
+            header.task_id, engine, final_adapter_flags,
+            header.adapter_data
         )) {
         return -4;
     }
@@ -250,6 +292,7 @@ extern "C" int32_t aicpu_plan_adapter_publish_staged(
         header.core_num,
         header.require_sync_start,
         0U,
+        header.adapter_data,
         header.tensor_reference_mask,
     };
     const StagedPlanSource source{staged, header, layout};

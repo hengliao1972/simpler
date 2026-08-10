@@ -11,6 +11,8 @@
 
 #include "../common/host_support.h"
 #include "../common/winner_workload_host.h"
+#include "../aicpu/aicpu_plan_owner_abi.h"
+#include "../../../common/protocol_probe/plan_aicpu_loader.h"
 #include "pmu_owner_host.h"
 #include "pmu_probe.h"
 
@@ -144,12 +146,306 @@ struct PmuOptions {
     std::string json_path;
 };
 
+struct AicpuPlanOptions {
+    bool plan_only = false;
+};
+
 using pa_scheduler::host::ConfigureWinnerWorkload;
 using pa_scheduler::host::ParseWinnerWorkloadOptions;
 using pa_scheduler::host::ValidateRealComputeOutputs;
 using pa_scheduler::host::ValidateWinnerWorkloadOptions;
 using pa_scheduler::host::WinnerWorkloadModeName;
 using pa_scheduler::host::WinnerWorkloadOptions;
+
+bool ParseAicpuPlanOptions(
+    int argc, char **argv, AicpuPlanOptions *plan,
+    std::vector<char *> *remaining_argv
+) {
+    if (plan == nullptr || remaining_argv == nullptr) return false;
+    bool plan_only_seen = false;
+    remaining_argv->clear();
+    remaining_argv->push_back(argv[0]);
+    for (int index = 1; index < argc; ++index) {
+        if (std::strcmp(argv[index], "--plan-only") != 0) {
+            remaining_argv->push_back(argv[index]);
+            continue;
+        }
+        if (plan_only_seen) {
+            std::fprintf(stderr, "Specify --plan-only only once.\n");
+            return false;
+        }
+        plan->plan_only = true;
+        plan_only_seen = true;
+    }
+    return true;
+}
+
+std::string ArtifactBesideKernel(
+    const std::string &kernel_path, const char *artifact
+) {
+    const size_t slash = kernel_path.find_last_of('/');
+    if (slash == std::string::npos) return artifact;
+    return kernel_path.substr(0U, slash + 1U) + artifact;
+}
+
+uint64_t OwnerElementBytes(uint8_t dtype) {
+    switch (static_cast<pa_scheduler::DataType>(dtype)) {
+        case pa_scheduler::DataType::Float32:
+        case pa_scheduler::DataType::Int32:
+        case pa_scheduler::DataType::Uint32:
+            return 4U;
+        case pa_scheduler::DataType::Float16:
+        case pa_scheduler::DataType::Bfloat16:
+        case pa_scheduler::DataType::Int16:
+        case pa_scheduler::DataType::Uint16:
+            return 2U;
+        case pa_scheduler::DataType::Int8:
+        case pa_scheduler::DataType::Uint8:
+        case pa_scheduler::DataType::Bool:
+            return 1U;
+        case pa_scheduler::DataType::Int64:
+        case pa_scheduler::DataType::Uint64:
+            return 8U;
+        case pa_scheduler::DataType::Count:
+            return 0U;
+    }
+    return 0U;
+}
+
+bool MakeOwnerTensorMetadata(
+    uint64_t address, const uint32_t *shapes, uint32_t ndims,
+    pa_scheduler::DataType dtype,
+    pa_scheduler::aicpu_owner::TensorMetadata *metadata
+) {
+    using namespace pa_scheduler::aicpu_owner;
+    if (metadata == nullptr || address == 0U || shapes == nullptr ||
+        ndims == 0U || ndims > kMaxTensorDims) {
+        return false;
+    }
+    TensorMetadata tensor{};
+    tensor.buffer_addr = address;
+    tensor.owner_task_raw = UINT64_MAX;
+    tensor.version = 0;
+    tensor.ndims = ndims;
+    tensor.dtype = static_cast<uint8_t>(dtype);
+    tensor.manual_dep = 0U;
+    tensor.is_contiguous = 1U;
+    tensor.child_memory = 0U;
+    uint64_t elements = 1U;
+    for (uint32_t reverse = 0U; reverse < ndims; ++reverse) {
+        const uint32_t dim = ndims - 1U - reverse;
+        if (shapes[dim] == 0U || elements > UINT32_MAX ||
+            shapes[dim] > UINT64_MAX / elements) {
+            return false;
+        }
+        tensor.shapes[dim] = shapes[dim];
+        tensor.strides[dim] = static_cast<uint32_t>(elements);
+        elements *= shapes[dim];
+    }
+    const uint64_t element_bytes = OwnerElementBytes(tensor.dtype);
+    if (element_bytes == 0U || elements > UINT64_MAX / element_bytes) {
+        return false;
+    }
+    tensor.extent_elem_cache = elements;
+    tensor.buffer_bytes = elements * element_bytes;
+    *metadata = tensor;
+    return true;
+}
+
+bool BuildOwnerRequest(
+    pa_scheduler::SchedulerState *state_device, void *runtime_plan_cells,
+    uint32_t capacity, uint32_t batches,
+    pa_scheduler::aicpu_owner::OwnerRequest *request
+) {
+    using namespace pa_scheduler::aicpu_owner;
+    if (state_device == nullptr || runtime_plan_cells == nullptr ||
+        request == nullptr || batches == 0U) {
+        return false;
+    }
+    *request = OwnerRequest{};
+    request->header.magic = kRequestMagic;
+    request->header.version = kRequestVersion;
+    request->header.request_bytes = sizeof(OwnerRequest);
+    request->header.runtime_plan_control = reinterpret_cast<uint64_t>(
+        &state_device->runtime_plan_control);
+    request->header.runtime_plan_cells =
+        reinterpret_cast<uint64_t>(runtime_plan_cells);
+    request->header.context_lens = reinterpret_cast<uint64_t>(
+        &state_device->context_lens[0]);
+    request->header.capacity = capacity;
+    request->header.batches = batches;
+    request->header.tensor_count = 6U;
+    request->header.scalar_count = 1U;
+    request->header.context_tensor_index = 4U;
+
+    constexpr uint32_t kHeads = 16U;
+    constexpr uint32_t kHeadDim = 128U;
+    constexpr uint32_t kBlockSize = 128U;
+    constexpr uint32_t kPhysicalBlocksPerBatch = 64U;
+    constexpr uint32_t kBlockTableWidth = 256U;
+    const uint32_t query_shape[3] = {batches, kHeads, kHeadDim};
+    const uint32_t cache_shape[4] = {
+        batches * kPhysicalBlocksPerBatch, kBlockSize, 1U, kHeadDim,
+    };
+    const uint32_t block_table_shape[2] = {batches, kBlockTableWidth};
+    const uint32_t context_shape[1] = {batches};
+    const uint32_t output_shape[3] = {batches, kHeads, kHeadDim};
+    return MakeOwnerTensorMetadata(
+               UINT64_C(0x200000000), query_shape, 3U,
+               pa_scheduler::DataType::Bfloat16, &request->tensors[0]) &&
+           MakeOwnerTensorMetadata(
+               UINT64_C(0x300000000), cache_shape, 4U,
+               pa_scheduler::DataType::Bfloat16, &request->tensors[1]) &&
+           MakeOwnerTensorMetadata(
+               UINT64_C(0x400000000), cache_shape, 4U,
+               pa_scheduler::DataType::Bfloat16, &request->tensors[2]) &&
+           MakeOwnerTensorMetadata(
+               UINT64_C(0x500000000), block_table_shape, 2U,
+               pa_scheduler::DataType::Int32, &request->tensors[3]) &&
+           MakeOwnerTensorMetadata(
+               request->header.context_lens, context_shape, 1U,
+               pa_scheduler::DataType::Int32, &request->tensors[4]) &&
+           MakeOwnerTensorMetadata(
+               UINT64_C(0x600000000), output_shape, 3U,
+               pa_scheduler::DataType::Float32, &request->tensors[5]) &&
+           ((request->scalars[0] = UINT64_C(0x3f800000)), true);
+}
+
+bool ValidateOwnerResult(
+    const pa_scheduler::aicpu_owner::OwnerResult &result,
+    uint32_t expected_tasks
+) {
+    using namespace pa_scheduler::aicpu_owner;
+    const bool ok =
+        result.magic == kResultMagic &&
+        result.version == kRequestVersion &&
+        result.status == static_cast<int32_t>(OwnerStatus::Ok) &&
+        result.backend.status == 0 &&
+        result.backend.task_count == expected_tasks &&
+        result.backend.begin_count == expected_tasks &&
+        result.backend.finish_count == expected_tasks &&
+        result.backend.published_count == expected_tasks &&
+        result.backend.alloc_count + result.backend.aic_count +
+                result.backend.aiv_count ==
+            expected_tasks &&
+        result.backend.fatal_code == 0 &&
+        result.begin_ns != 0U && result.end_ns >= result.begin_ns;
+    if (!ok) {
+        std::fprintf(
+            stderr,
+            "AICPU Plan owner result mismatch: owner_status=%d "
+            "backend_status=%d tasks=%u/%u begin=%u finish=%u "
+            "published=%u fatal=%d\n",
+            result.status, result.backend.status,
+            result.backend.task_count, expected_tasks,
+            result.backend.begin_count, result.backend.finish_count,
+            result.backend.published_count, result.backend.fatal_code
+        );
+    }
+    return ok;
+}
+
+bool ValidatePlanOnlyCells(
+    const pa_scheduler::aicpu_plan::RuntimePlanControl &control,
+    const std::vector<pa_scheduler::aicpu_plan::RuntimeTaskPlanCell> &cells,
+    const pa_scheduler::host::SharedHostTaskPlan &oracle
+) {
+    using namespace pa_scheduler;
+    using namespace pa_scheduler::aicpu_plan;
+    if (control.planned_frontier.value !=
+            static_cast<int64_t>(oracle.total_tasks) ||
+        control.closed_task_count.value !=
+            static_cast<int64_t>(oracle.total_tasks) ||
+        control.build_next.value != 0 ||
+        control.build_workers_done.value != 0 ||
+        control.build_release.value != kBuildReleasePending ||
+        control.fatal.value != 0 || cells.size() != oracle.total_tasks) {
+        std::fprintf(
+            stderr,
+            "Plan-only control mismatch: frontier=%lld closed=%lld "
+            "build_next=%lld done=%lld release=%lld fatal=%lld tasks=%zu/%u\n",
+            static_cast<long long>(control.planned_frontier.value),
+            static_cast<long long>(control.closed_task_count.value),
+            static_cast<long long>(control.build_next.value),
+            static_cast<long long>(control.build_workers_done.value),
+            static_cast<long long>(control.build_release.value),
+            static_cast<long long>(control.fatal.value),
+            cells.size(), oracle.total_tasks
+        );
+        return false;
+    }
+
+    constexpr uint16_t kOutputsByKind[5] = {3U, 1U, 3U, 1U, 0U};
+    for (uint32_t task_id = 0U; task_id < oracle.total_tasks; ++task_id) {
+        const host::SharedHostPlannedTask *expected =
+            oracle.TaskAt(task_id);
+        const RuntimeTaskPlanCell &cell = cells[task_id];
+        const DecodedPlanCellControl decoded =
+            DecodePlanCellControl(cell.control.value);
+        RuntimeTaskPlanHeader header{};
+        RuntimeTaskPlanLayout layout{};
+        if (expected == nullptr || !decoded.valid ||
+            decoded.phase != PlanCellPhase::Published ||
+            decoded.task_id != task_id ||
+            !ValidateRuntimeTaskPlanPayload(
+                cell.payload, task_id, decoded.payload_lines,
+                header, layout
+            )) {
+            std::fprintf(
+                stderr,
+                "Plan-only canonical payload validation failed at task %u.\n",
+                task_id
+            );
+            return false;
+        }
+        const uint32_t kind = static_cast<uint32_t>(expected->kind);
+        const uint8_t expected_flags = static_cast<uint8_t>(
+            kSharedPaTicketMetaPresent |
+            (expected->is_last_in_batch
+                 ? kSharedPaTicketLastSubmit : 0U) |
+            (expected->has_following_group
+                 ? kSharedPaTicketHasFollowing : 0U) |
+            (expected->group_index << kSharedPaTicketGroupShift) |
+            kind
+        );
+        const EngineClass expected_engine =
+            expected->kind == TaskKind::Alloc
+                ? EngineClass::MetadataOnly
+                : ((expected->kind == TaskKind::Qk ||
+                    expected->kind == TaskKind::Pv)
+                       ? EngineClass::Aic
+                       : EngineClass::Aiv);
+        const uint32_t expected_function =
+            expected->kind == TaskKind::Alloc
+                ? UINT32_MAX
+                : kind - 1U;
+        // Host oracle 只在 AICPU 已完成、Plan 已 D2H 后做事后验证；它不
+        // 参与 producer 或 Scalar 调度。adapter_data 必须携带 producer
+        // 从真实 Alloc callback 维护的 batch_start，不能由 consumer 猜测。
+        if (header.adapter_flags != expected_flags ||
+            header.adapter_data != expected->batch_start ||
+            header.engine_class !=
+                static_cast<uint8_t>(expected_engine) ||
+            header.function_id != expected_function ||
+            header.output_count != kOutputsByKind[kind]) {
+            std::fprintf(
+                stderr,
+                "Plan-only PA identity mismatch at task %u: "
+                "flags=0x%02x/0x%02x batch_start=%u/%u "
+                "engine=%u/%u function=%u/%u "
+                "outputs=%u/%u.\n",
+                task_id, header.adapter_flags, expected_flags,
+                header.adapter_data, expected->batch_start,
+                header.engine_class,
+                static_cast<uint8_t>(expected_engine),
+                header.function_id, expected_function,
+                header.output_count, kOutputsByKind[kind]
+            );
+            return false;
+        }
+    }
+    return true;
+}
 
 const char *PmuModeName(pa_scheduler::ccec_pmu::WindowMode mode) {
     switch (mode) {
@@ -1698,10 +1994,18 @@ int main(int argc, char **argv) {
     // 参数和 ELF 在创建 ACL 资源前完成校验，早期错误不会留下 device、stream 或 kernel handle。
     pa_scheduler::host::Options options;
     PmuOptions pmu_options;
+    AicpuPlanOptions aicpu_plan_options;
     WinnerWorkloadOptions workload_options;
+    std::vector<char *> plan_argv;
     std::vector<char *> pmu_argv;
     std::vector<char *> common_argv;
-    if (!ParseWinnerWorkloadOptions(argc, argv, &workload_options, &pmu_argv) ||
+    if (!ParseAicpuPlanOptions(
+            argc, argv, &aicpu_plan_options, &plan_argv
+        ) ||
+        !ParseWinnerWorkloadOptions(
+            static_cast<int>(plan_argv.size()), plan_argv.data(),
+            &workload_options, &pmu_argv
+        ) ||
         !ParsePmuOptions(
             static_cast<int>(pmu_argv.size()), pmu_argv.data(), &pmu_options, &common_argv
         )) {
@@ -1729,10 +2033,29 @@ int main(int argc, char **argv) {
                 "Default: real-compute, constant, counts=6,28,4,1; "
                 "scalar-nop is the calibration compatibility mode.\n"
             );
+            std::fprintf(
+                stderr,
+                "AICPU Plan producer gate: [--plan-only] (requires "
+                "--batches 1 --runs 1 --no-swimlane).\n"
+            );
         }
         return parse_status == pa_scheduler::host::ParseStatus::Help ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (!ValidateWinnerWorkloadOptions(workload_options)) return EXIT_FAILURE;
+    if (aicpu_plan_options.plan_only &&
+        (options.batches != 1U || options.runs != 1U ||
+         options.trace_enabled || options.trace_atomics ||
+         options.profile_phases || options.analyze_swimlane ||
+         !options.swimlane_json.empty() ||
+         pmu_options.mode != pa_scheduler::ccec_pmu::WindowMode::Off ||
+         !pmu_options.json_path.empty())) {
+        std::fprintf(
+            stderr,
+            "--plan-only requires --batches 1 --runs 1 --no-swimlane "
+            "and forbids PMU/trace/profile outputs.\n"
+        );
+        return EXIT_FAILURE;
+    }
 #if PA_BUILD_SWIMLANE
     // swimlane host 与同目录 kernel 是成套产物；它不允许借旧参数重新开启
     // 已从 device ELF 编译掉的 PMU/phase-profile 路径。
@@ -1775,13 +2098,13 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "The perf-clock build forbids PMU collection and PMU JSON.\n");
         return EXIT_FAILURE;
     }
-    if (options.runs != 1 || options.trace_enabled || options.trace_atomics ||
+    if (options.trace_enabled || options.trace_atomics ||
         options.profile_phases || options.analyze_swimlane ||
         !options.swimlane_json.empty()) {
         std::fprintf(
             stderr,
-            "perf-clock requires one trace-free run: "
-            "--runs 1 --no-swimlane and no trace/profile options.\n"
+            "perf-clock requires --no-swimlane and forbids "
+            "atomic/phase/profile observation.\n"
         );
         return EXIT_FAILURE;
     }
@@ -1909,6 +2232,24 @@ int main(int argc, char **argv) {
         );
         return EXIT_FAILURE;
     }
+
+    ScopedAlignedAclDeviceAllocation owner_request_allocation;
+    if (!owner_request_allocation.Allocate(
+            sizeof(pa_scheduler::aicpu_owner::OwnerRequest),
+            pa_scheduler::aicpu_owner::kAtomicIsolationBytes,
+            "aclrtMalloc(AICPU Plan owner request with 128-byte alignment slack)"
+        )) {
+        return EXIT_FAILURE;
+    }
+    void *owner_request_device = owner_request_allocation.GetAligned();
+    if ((reinterpret_cast<uintptr_t>(owner_request_device) &
+         (pa_scheduler::aicpu_owner::kAtomicIsolationBytes - 1U)) != 0U) {
+        std::fprintf(
+            stderr, "AICPU Plan owner request is not 128-byte aligned: %p\n",
+            owner_request_device
+        );
+        return EXIT_FAILURE;
+    }
 #endif
 
     // 真实 PTO 负载使用独立 GM，不解引用调度器中只用于依赖建模的 synthetic tensor 地址。
@@ -1945,6 +2286,28 @@ int main(int argc, char **argv) {
     }
     if (options.trace_enabled && (reinterpret_cast<uintptr_t>(trace_device) & 63U) != 0) {
         std::fprintf(stderr, "Device swimlane trace is not 64-byte aligned: %p\n", trace_device);
+        return EXIT_FAILURE;
+    }
+
+    plan_protocol_probe::PlanAicpuLoader aicpu_plan_loader;
+    const std::string aicpu_plan_dispatcher_path = ArtifactBesideKernel(
+        options.kernel_path,
+        "libpa_scheduler_plan_dispatcher.so"
+    );
+    const std::string aicpu_plan_owner_path = ArtifactBesideKernel(
+        options.kernel_path,
+        "libpa_scheduler_plan_aicpu.so"
+    );
+    if (aicpu_plan_loader.Initialize(
+            aicpu_plan_dispatcher_path, aicpu_plan_owner_path,
+            stream, static_cast<int32_t>(options.device)
+        ) != 0) {
+        std::fprintf(
+            stderr,
+            "Failed to initialize AICPU Plan owner from %s and %s.\n",
+            aicpu_plan_dispatcher_path.c_str(),
+            aicpu_plan_owner_path.c_str()
+        );
         return EXIT_FAILURE;
     }
 
@@ -1985,6 +2348,10 @@ int main(int argc, char **argv) {
     std::vector<double> final_barrier_spans;
     std::vector<double> final_drain_spans;
     std::vector<double> lifecycle_spans;
+    std::vector<double> plan_times;
+    std::vector<double> plan_producer_times;
+    std::vector<double> aicore_times;
+    std::vector<double> pipeline_times;
     bool execution_ok = true;
     bool all_passed = true;
     bool postprocess_ok = true;
@@ -2149,14 +2516,126 @@ int main(int argc, char **argv) {
             break;
         }
 #endif
+#if PTO_FDWIC_SHARED_MAP
+        alignas(pa_scheduler::aicpu_owner::kAtomicIsolationBytes)
+            pa_scheduler::aicpu_owner::OwnerRequest owner_request{};
+        if (!BuildOwnerRequest(
+                static_cast<pa_scheduler::SchedulerState *>(state_device),
+                runtime_plan_cells_device, kRuntimePlanCapacity,
+                options.batches, &owner_request
+            ) ||
+            !CheckAcl(
+                aclrtMemcpy(
+                    owner_request_device, sizeof(owner_request),
+                    &owner_request, sizeof(owner_request),
+                    ACL_MEMCPY_HOST_TO_DEVICE
+                ),
+                "aclrtMemcpy(H2D AICPU Plan owner request)"
+            )) {
+            std::fprintf(stderr, "Failed to prepare the AICPU Plan request.\n");
+            execution_ok = false;
+            all_passed = false;
+            break;
+        }
+#endif
         void *kernel_args[] = {state_device};
         rtArgsEx_t args_info{};
         args_info.args = kernel_args;
         args_info.argsSize = sizeof(kernel_args);
         rtTaskCfgInfo_t task_config{};
-        // launch 维度是 32 个物理 mixed block；ELF metadata 让每个 block 同时产生 1 AIC + 2 AIV，共 96 worker。
-        // wall time 在同步完成处截止，包含 launch、完整调度、最终 drain 和 stream 同步，但不包含后续 D2H/JSON。
-        const auto wall_begin = std::chrono::steady_clock::now();
+        const pa_scheduler::aicpu_owner::OwnerKernelArgs owner_kernel_args{
+            reinterpret_cast<uint64_t>(owner_request_device),
+            pa_scheduler::aicpu_owner::kOwnerCommandRun,
+            pa_scheduler::aicpu_owner::kRequestVersion,
+        };
+        // pipeline 从 AICPU producer launch 前开始。Plan 必须完整 Close
+        // 并同步后才允许 96 个 Scalar 消费；两阶段之间不做 D2H 或打印。
+        const auto pipeline_begin = std::chrono::steady_clock::now();
+        if (aicpu_plan_loader.Launch(
+                stream, const_cast<pa_scheduler::aicpu_owner::OwnerKernelArgs *>(
+                            &owner_kernel_args),
+                sizeof(owner_kernel_args)
+            ) != 0 ||
+            !CheckAcl(
+                aclrtSynchronizeStream(stream),
+                "aclrtSynchronizeStream(AICPU Plan owner)"
+            )) {
+            execution_ok = false;
+            all_passed = false;
+            break;
+        }
+        const auto plan_end = std::chrono::steady_clock::now();
+        const double plan_us = std::chrono::duration<double, std::micro>(
+            plan_end - pipeline_begin).count();
+
+        if (aicpu_plan_options.plan_only) {
+            pa_scheduler::aicpu_plan::RuntimePlanControl plan_control{};
+            std::vector<pa_scheduler::aicpu_plan::RuntimeTaskPlanCell>
+                plan_cells(launch_plan.total_tasks);
+            if (!CheckAcl(
+                    aclrtMemcpy(
+                        &owner_request.result,
+                        sizeof(owner_request.result),
+                        static_cast<uint8_t *>(owner_request_device) +
+                            offsetof(
+                                pa_scheduler::aicpu_owner::OwnerRequest,
+                                result),
+                        sizeof(owner_request.result),
+                        ACL_MEMCPY_DEVICE_TO_HOST
+                    ),
+                    "aclrtMemcpy(D2H AICPU Plan owner result)"
+                ) ||
+                !CheckAcl(
+                    aclrtMemcpy(
+                        &plan_control, sizeof(plan_control),
+                        &static_cast<pa_scheduler::SchedulerState *>(
+                            state_device)->runtime_plan_control,
+                        sizeof(plan_control), ACL_MEMCPY_DEVICE_TO_HOST
+                    ),
+                    "aclrtMemcpy(D2H Plan control)"
+                ) ||
+                !CheckAcl(
+                    aclrtMemcpy(
+                        plan_cells.data(),
+                        plan_cells.size() * sizeof(plan_cells[0]),
+                        runtime_plan_cells_device,
+                        plan_cells.size() * sizeof(plan_cells[0]),
+                        ACL_MEMCPY_DEVICE_TO_HOST
+                    ),
+                    "aclrtMemcpy(D2H published Plan cells)"
+                ) ||
+                !ValidateOwnerResult(
+                    owner_request.result, launch_plan.total_tasks
+                ) ||
+                !ValidatePlanOnlyCells(
+                    plan_control, plan_cells, launch_plan
+                )) {
+                execution_ok = false;
+                all_passed = false;
+                break;
+            }
+            const double producer_us = static_cast<double>(
+                owner_request.result.end_ns - owner_request.result.begin_ns
+            ) / 1000.0;
+            plan_times.push_back(plan_us);
+            plan_producer_times.push_back(producer_us);
+            aicore_times.push_back(0.0);
+            pipeline_times.push_back(plan_us);
+            std::printf(
+                "[AICPU-PLAN] run=%u mode=plan-only tasks=%u "
+                "plan_time_us=%.3f producer_exec_us=%.3f "
+                "aicore_time_us=0.000 "
+                "pipeline_e2e_us=%.3f status=PASS\n",
+                run, launch_plan.total_tasks, plan_us, producer_us,
+                plan_us
+            );
+            continue;
+        }
+
+        // launch 维度是 32 个物理 mixed block；ELF metadata 让每个 block
+        // 同时产生 1 AIC + 2 AIV，共 96 worker。aicore_time 覆盖 launch、
+        // 完整 FinalDrain 和 stream sync，不包含之后的 D2H/JSON。
+        const auto aicore_begin = std::chrono::steady_clock::now();
         if (!CheckRt(
                 rtKernelLaunchWithHandleV2(
                     kernel_handle, 0, pa_scheduler::kAicWorkers, &args_info, nullptr, stream, &task_config
@@ -2167,8 +2646,46 @@ int main(int argc, char **argv) {
             execution_ok = false;
             break;
         }
-        const auto wall_end = std::chrono::steady_clock::now();
-        const double host_us = std::chrono::duration<double, std::micro>(wall_end - wall_begin).count();
+        const auto aicore_end = std::chrono::steady_clock::now();
+        const double aicore_us = std::chrono::duration<double, std::micro>(
+            aicore_end - aicore_begin).count();
+        const double pipeline_us = std::chrono::duration<double, std::micro>(
+            aicore_end - pipeline_begin).count();
+        const double host_us = aicore_us;
+        if (!CheckAcl(
+                aclrtMemcpy(
+                    &owner_request.result,
+                    sizeof(owner_request.result),
+                    static_cast<uint8_t *>(owner_request_device) +
+                        offsetof(
+                            pa_scheduler::aicpu_owner::OwnerRequest,
+                            result),
+                    sizeof(owner_request.result),
+                    ACL_MEMCPY_DEVICE_TO_HOST
+                ),
+                "aclrtMemcpy(D2H AICPU Plan owner result)"
+            ) ||
+            !ValidateOwnerResult(
+                owner_request.result, launch_plan.total_tasks
+            )) {
+            execution_ok = false;
+            all_passed = false;
+            break;
+        }
+        const double producer_us = static_cast<double>(
+            owner_request.result.end_ns - owner_request.result.begin_ns
+        ) / 1000.0;
+        plan_times.push_back(plan_us);
+        plan_producer_times.push_back(producer_us);
+        aicore_times.push_back(aicore_us);
+        pipeline_times.push_back(pipeline_us);
+        std::printf(
+            "[AICPU-PLAN] run=%u mode=full tasks=%u plan_time_us=%.3f "
+            "producer_exec_us=%.3f aicore_time_us=%.3f "
+            "pipeline_e2e_us=%.3f status=PASS\n",
+            run, launch_plan.total_tasks, plan_us, producer_us,
+            aicore_us, pipeline_us
+        );
         // D2H 同样避开约 1 GiB 的 worker arena：共享前缀用于
         // flag/vend/frontier 校验，末尾 results 单独回传；shared sidecar
         // 在 results 成功回读后再作为独立范围搬回。
@@ -2391,6 +2908,30 @@ int main(int argc, char **argv) {
         }
     }
 
+    const double median_plan_us =
+        plan_times.empty() ? 0.0 : pa_scheduler::host::Median(plan_times);
+    const double median_plan_producer_us =
+        plan_producer_times.empty()
+            ? 0.0
+            : pa_scheduler::host::Median(plan_producer_times);
+    const double median_aicore_us =
+        aicore_times.empty() ? 0.0 : pa_scheduler::host::Median(aicore_times);
+    const double median_pipeline_us =
+        pipeline_times.empty() ? 0.0 : pa_scheduler::host::Median(pipeline_times);
+    if (aicpu_plan_options.plan_only) {
+        std::printf(
+            "[SUMMARY] mode=plan-only runs=%u completed_runs=%zu "
+            "median_plan_time_us=%.3f median_producer_exec_us=%.3f "
+            "median_aicore_time_us=%.3f "
+            "median_pipeline_e2e_us=%.3f execution_status=%s "
+            "semantic_status=%s\n",
+            options.runs, plan_times.size(), median_plan_us,
+            median_plan_producer_us, median_aicore_us,
+            median_pipeline_us,
+            execution_ok ? "PASS" : "FAIL",
+            all_passed ? "PASS" : "FAIL"
+        );
+    } else {
 #if PA_BUILD_PERF_CLOCK
     const double median_startup_to_final_drain_us =
         startup_to_final_drain_spans.empty()
@@ -2401,11 +2942,16 @@ int main(int argc, char **argv) {
     std::printf(
         "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s "
         "median_startup_to_final_drain_us=%.3f "
+        "median_plan_time_us=%.3f median_producer_exec_us=%.3f "
+        "median_aicore_time_us=%.3f "
+        "median_pipeline_e2e_us=%.3f "
         "lifecycle_timing=disabled "
         "execution_status=%s semantic_status=%s postprocess_status=%s\n",
         options.runs, startup_to_final_drain_spans.size(),
         pa_scheduler::host::ActiveFinalBarrierName(options.final_barrier_shape),
-        median_startup_to_final_drain_us,
+        median_startup_to_final_drain_us, median_plan_us,
+        median_plan_producer_us, median_aicore_us,
+        median_pipeline_us,
         execution_ok ? "PASS" : "FAIL",
         all_passed ? "PASS" : "FAIL",
         postprocess_ok ? "PASS" : "FAIL"
@@ -2428,13 +2974,19 @@ int main(int argc, char **argv) {
         "median_startup_barrier_us=%.3f median_final_barrier_us=%.3f "
 #endif
         "median_final_drain_us=%.3f median_lifecycle_us=%.3f "
+        "median_plan_time_us=%.3f median_producer_exec_us=%.3f "
+        "median_aicore_time_us=%.3f "
+        "median_pipeline_e2e_us=%.3f "
         "execution_status=%s semantic_status=%s postprocess_status=%s\n",
         options.runs, spans.size(), pa_scheduler::host::ActiveFinalBarrierName(options.final_barrier_shape),
         median_submit_span_us, median_startup_barrier_us, median_final_barrier_us, median_final_drain_us,
-        median_lifecycle_us, execution_ok ? "PASS" : "FAIL", all_passed ? "PASS" : "FAIL",
+        median_lifecycle_us, median_plan_us, median_plan_producer_us,
+        median_aicore_us, median_pipeline_us,
+        execution_ok ? "PASS" : "FAIL", all_passed ? "PASS" : "FAIL",
         postprocess_ok ? "PASS" : "FAIL"
     );
 #endif
+    }
 
     // 后处理失败也统一走设备资源释放、ELF 卸载和 ACL 收尾，避免文件系统错误遗留运行时上下文。
     bool cleanup_ok = true;
@@ -2456,6 +3008,10 @@ int main(int argc, char **argv) {
     }
 #if PTO_FDWIC_SHARED_MAP
     cleanup_ok &= CheckAcl(
+        aclrtFree(owner_request_allocation.ReleaseRaw()),
+        "aclrtFree(AICPU Plan owner request raw allocation)"
+    );
+    cleanup_ok &= CheckAcl(
         aclrtFree(runtime_plan_allocation.ReleaseRaw()),
         "aclrtFree(RuntimeTaskPlanCell storage raw allocation)"
     );
@@ -2467,6 +3023,7 @@ int main(int argc, char **argv) {
     const rtError_t unload_error =
         registered_all ? rtDevBinaryUnRegister(kernel_handle) : rtBinaryUnLoad(kernel_handle);
     cleanup_ok &= CheckRt(unload_error, "unload mixed AICore ELF");
+    cleanup_ok &= aicpu_plan_loader.Finalize() == 0;
     cleanup_ok &= CheckAcl(aclrtDestroyStream(stream), "aclrtDestroyStream");
     cleanup_ok &= CheckAcl(aclrtResetDevice(options.device), "aclrtResetDevice");
     cleanup_ok &= CheckAcl(aclFinalize(), "aclFinalize");

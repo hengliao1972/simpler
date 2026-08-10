@@ -62,6 +62,7 @@ PHASE_NAMES = {
     "SharedMaterializePublishTaskOutputsFlush": (
         "materialize.publish_shared_output_descriptors.flush_tensor_descs[DCCI]"
     ),
+    "RuntimePlanBuild": "runtime_plan_build",
     # 兼容迁移前已经落盘的 schema-v5 raw；新采集只会写上面的
     # SharedMaterialize* 名称，旧名称仍按其当时的 Register 归属解释。
     "SharedRegisterPublishTaskOutputs": "register.publish_task_outputs",
@@ -86,6 +87,7 @@ V5_PHASES = {
     "SharedRegisterPublishTaskOutputsCopy",
     "SharedRegisterPublishTaskOutputsFlush",
     "Dcci",
+    "RuntimePlanBuild",
 }
 # schema-v5 已有区间足以在离线侧取补集；这些 phase 之外的
 # Atomic、Kernel、RingBp 等是嵌套或 Overlay，不能再从 Submit 扣一次。
@@ -182,6 +184,18 @@ ATOMIC_SITE_NAMES = {
     55: "shared_exec_drain_arrival_poll",
     56: "shared_exec_dispatch_ticket",
     57: "shared_replay_identity_seal",
+    58: "runtime_plan_fatal_load",
+    59: "runtime_plan_fatal_publish",
+    60: "runtime_plan_closed_load",
+    61: "runtime_plan_frontier_load",
+    62: "runtime_plan_build_next_fetch_add",
+    63: "runtime_plan_build_next_load",
+    64: "runtime_plan_cell_control_load",
+    65: "runtime_plan_workers_done_fetch_add",
+    66: "runtime_plan_workers_done_load",
+    67: "runtime_plan_build_release_load",
+    68: "runtime_plan_build_release_publish",
+    69: "runtime_plan_last_insert_completion_load",
 }
 ATOMIC_OP_NAMES = {
     0: "load",
@@ -254,10 +268,24 @@ ATOMIC_SITE_OP_IDS = {
     55: 0,
     56: 2,
     57: 4,
+    58: 0,
+    59: 1,
+    60: 0,
+    61: 0,
+    62: 2,
+    63: 0,
+    64: 0,
+    65: 2,
+    66: 0,
+    67: 0,
+    68: 1,
+    69: 0,
 }
 # 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
 # 返回值都参与协议判断。v3 输入必须与源码语义完全一致。
-ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13, 39, 49, 53}
+ATOMIC_RESULT_UNUSED_SITE_IDS = {
+    0, 3, 6, 7, 13, 39, 49, 53, 59, 68,
+}
 # common/private 的六类等待 Load 与 shared Register insert-turn Load 可以
 # 合并；frontier 扫描和 Claim 即使调用很多次也必须继续保留逐调用记录。
 POLL_BATCH_SITE_OP_IDS = {
@@ -272,14 +300,30 @@ POLL_BATCH_SITE_OP_IDS = {
     24: 0,
     54: 0,
     55: 0,
+    58: 0,
+    60: 0,
+    67: 0,
 }
 SHARED_REGISTER_ATOMIC_SITE_IDS = {19, 20}
-SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 58))
+SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 70))
 SHARED_INSERT_TURN_POLL_SITE_ID = 19
 SHARED_INSERT_TURN_HANDOFF_SITE_ID = 20
 SHARED_OUTPUT_PUBLISHED_POLL_SITE_IDS = {23, 24}
 AGGREGATE_ONLY_POLL_SITE_IDS = {SHARED_INSERT_TURN_POLL_SITE_ID}
 SHARED_CLAIM_TOURNAMENT_SITE_IDS = {40, 41}
+RUNTIME_PLAN_ATOMIC_SITE_IDS = set(range(58, 70))
+RUNTIME_PLAN_CELL_CONTROL_SITE_ID = 64
+RUNTIME_PLAN_TASK_LOCAL_SITE_IDS = {64, 69}
+
+# ``central_ticket`` 是旧 cross-core raw；AICPU Plan-ahead 同样是全局
+# 唯一 Build owner，但不再伪造 Submit/Claim endpoint。两者可以
+# 共用 cross-core execution 的离线派生，不能共用 task 身份来源。
+CENTRAL_BUILD_TOPOLOGIES = {
+    "central_ticket", "aicpu_plan_central_build",
+}
+STRICT_INSERT_TOPOLOGIES = {
+    "all_worker_replay", "aicpu_plan_central_build",
+}
 
 ATOMIC_RESULT_USED = 1 << 4
 ATOMIC_VALUE_ZERO = 1 << 5
@@ -307,6 +351,8 @@ DCCI_SITE_NAMES = {
     12: "shared_exec_payload_invalidate",
     13: "shared_exec_token_descriptor_invalidate",
     14: "startup_context_lens_invalidate",
+    15: "runtime_plan_payload_acquire",
+    16: "runtime_plan_storage_ref_acquire",
 }
 DCCI_OP_NAMES = {
     0: "invalidate",
@@ -328,8 +374,10 @@ DCCI_SITE_OP_IDS = {
     12: 0,
     13: 0,
     14: 0,
+    15: 0,
+    16: 0,
 }
-DCCI_SHARED_ONLY_SITE_IDS = set(range(8)) | set(range(10, 15))
+DCCI_SHARED_ONLY_SITE_IDS = set(range(8)) | set(range(10, 17))
 DCCI_OBSERVER_SITE_ID = 8
 DCCI_STARTUP_SITE_ID = 9
 DCCI_CONTEXT_LENS_SITE_ID = 14
@@ -522,18 +570,20 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 "trace_schema_version=5"
             )
         if submit_topology not in (
-            "all_worker_replay", "central_ticket"
+            "all_worker_replay", "central_ticket",
+            "aicpu_plan_central_build",
         ):
             raise ValueError(
                 "metadata.submit_topology must be all_worker_replay or "
-                "central_ticket for trace_schema_version=5"
+                "central_ticket or aicpu_plan_central_build for "
+                "trace_schema_version=5"
             )
         if (
-            submit_topology == "central_ticket"
+            submit_topology in CENTRAL_BUILD_TOPOLOGIES
             and tensormap_mode != "shared"
         ):
             raise ValueError(
-                "metadata.submit_topology=central_ticket requires shared "
+                "central-build submit_topology requires shared "
                 "TensorMap mode"
             )
     elif tensormap_mode is not None:
@@ -741,6 +791,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
         # 明确承诺为零，下面再逐字段核对。
         "dropped_records": 0,
     }
+    atomic_calls_by_site: dict[int, int] = {}
     v3_clock_rows: dict[int, dict[str, int | bool | None]] = {
         core_id: {"plain": 0, "dependency": 0, "return_ready": None}
         for core_id in range(num_cores)
@@ -749,9 +800,16 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
     v3_return_ready_poll_batch_rows: list[tuple[int, int, bool]] = []
     v5_observer_dcci_rows = {core_id: 0 for core_id in range(num_cores)}
     v4_parent_counts: dict[int, dict[str, int]] = {
-        core_id: {"OrchestrationReplay": 0, "FinalDrain": 0}
+        core_id: {
+            "OrchestrationReplay": 0,
+            "RuntimePlanBuild": 0,
+            "FinalDrain": 0,
+        }
         for core_id in range(num_cores)
     }
+    v4_parent_spans: dict[
+        tuple[int, str], tuple[int, int]
+    ] = {}
     v4_claims: dict[tuple[int, int], tuple[bool, bool, bool]] = {}
     v4_submits: set[tuple[int, int]] = set()
     v4_submit_semantics: dict[tuple[int, int], tuple[bool, bool]] = {}
@@ -851,7 +909,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
             aggregate_only_poll = (
                 auxiliary in AGGREGATE_ONLY_POLL_SITE_IDS
                 or (
-                    submit_topology == "central_ticket"
+                    submit_topology in CENTRAL_BUILD_TOPOLOGIES
                     and auxiliary in SHARED_OUTPUT_PUBLISHED_POLL_SITE_IDS
                 )
             )
@@ -903,9 +961,18 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     auxiliary in ATOMIC_SITE_OP_IDS
                     and auxiliary not in ATOMIC_RESULT_UNUSED_SITE_IDS
                 )
+                if auxiliary in RUNTIME_PLAN_ATOMIC_SITE_IDS:
+                    task_local_control = (
+                        auxiliary in RUNTIME_PLAN_TASK_LOCAL_SITE_IDS
+                    )
+                    if task_local_control != (task_id >= 0):
+                        raise ValueError(
+                            f"fdwic_events[{index}] Runtime Plan Atomic "
+                            f"site={auxiliary} has invalid task_id={task_id}"
+                        )
                 if (
                     auxiliary == SHARED_INSERT_TURN_HANDOFF_SITE_ID
-                    and submit_topology == "all_worker_replay"
+                    and submit_topology in STRICT_INSERT_TOPOLOGIES
                 ):
                     # Scalar cross-core 的全员真实 replay 让每个 task（包括
                     # 空 writer）用返回型 CAS 发布独立 insert completion。
@@ -935,6 +1002,10 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 if result_used:
                     v3_result_used_direct_rows.append((index, core_id, return_ready))
             observed_summary["atomic_records"] += 1
+            atomic_calls_by_site[auxiliary] = (
+                atomic_calls_by_site.get(auxiliary, 0)
+                + (payload if poll_batch else 1)
+            )
             if poll_batch:
                 observed_summary["atomic_calls"] += payload
                 observed_summary["batched_poll_calls"] += payload
@@ -1042,6 +1113,17 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     raise ValueError(
                         f"fdwic_events[{index}] has invalid context-lens Dcci fields"
                     )
+            elif auxiliary == 16:
+                if (
+                    tensormap_mode != "shared"
+                    or call_count != 1
+                    or task_id != -1
+                    or function_id != -1
+                ):
+                    raise ValueError(
+                        f"fdwic_events[{index}] has invalid Runtime Plan "
+                        "storage-ref Dcci fields"
+                    )
             elif (
                 tensormap_mode != "shared"
                 or auxiliary not in DCCI_SHARED_ONLY_SITE_IDS
@@ -1148,12 +1230,17 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         auxiliary,
                     )
                 )
-            if phase in ("OrchestrationReplay", "FinalDrain"):
+            if phase in (
+                "OrchestrationReplay", "RuntimePlanBuild", "FinalDrain",
+            ):
                 if task_id != -1 or function_id != -1 or flags != 0 or auxiliary != 0:
                     raise ValueError(
                         f"fdwic_events[{index}] has invalid schema-v5 parent {phase} fields"
                     )
                 v4_parent_counts[core_id][phase] += 1
+                v4_parent_spans[(core_id, phase)] = (
+                    start_cycle, end_cycle,
+                )
             elif phase == "Submit":
                 if task_id < 0 or flags > 1 or auxiliary > 1:
                     raise ValueError(
@@ -1291,23 +1378,150 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
 
     if trace_schema_version == 5:
         for core_id, counts in v4_parent_counts.items():
-            for phase, count in counts.items():
-                if count != 1:
+            expected_parent_counts = {
+                "OrchestrationReplay": (
+                    0
+                    if submit_topology ==
+                    "aicpu_plan_central_build"
+                    else 1
+                ),
+                "RuntimePlanBuild": (
+                    1
+                    if submit_topology ==
+                    "aicpu_plan_central_build"
+                    else 0
+                ),
+                "FinalDrain": 1,
+            }
+            for phase, expected_count in expected_parent_counts.items():
+                count = counts[phase]
+                if count != expected_count:
                     raise ValueError(
-                        f"core {core_id} requires exactly one schema-v5 {phase}: count={count}"
+                        f"core {core_id} requires {expected_count} "
+                        f"schema-v5 {phase}: count={count}"
+                    )
+        if submit_topology == "aicpu_plan_central_build":
+            # Plan-ahead 没有 Submit/Claim raw。Materialize 是每个中央
+            # ticket owner 的第一条 task 身份证据；只在离线校验器
+            # 中归一成“attempted winner”，不伪造设备记录。
+            if v4_claims or v4_submits or v4_submit_semantics:
+                raise ValueError(
+                    "AICPU Plan central build must not contain legacy "
+                    "Submit/Claim records"
+                )
+            owners_by_task: dict[int, int] = {}
+            for task_key, materializes in v4_materializes.items():
+                if len(materializes) != 1:
+                    raise ValueError(
+                        "AICPU Plan task requires exactly one Materialize "
+                        f"owner at {task_key}: count={len(materializes)}"
+                    )
+                core_id, task_id = task_key
+                previous_owner = owners_by_task.setdefault(
+                    task_id, core_id
+                )
+                if previous_owner != core_id:
+                    raise ValueError(
+                        "AICPU Plan task has multiple Build owners: "
+                        f"task={task_id} owners={previous_owner},{core_id}"
+                    )
+                is_alloc = bool(int(materializes[0][9]))
+                v4_claims[task_key] = (True, True, is_alloc)
+                v4_submit_semantics[task_key] = (True, is_alloc)
+                v4_submits.add(task_key)
+
+            build_child_phases = {
+                "Materialize", "Register", "Fanin", "WinnerBuild",
+                "AllocComplete", "SharedRegisterPublishMetadata",
+                "SharedMaterializePublishTaskOutputs",
+                "SharedMaterializePublishTaskOutputsCopy",
+                "SharedMaterializePublishTaskOutputsFlush",
+            }
+            for row in rows:
+                core_id = int(row[0])
+                phase = str(row[5])
+                plan_evidence = (
+                    phase in build_child_phases
+                    or (
+                        phase == "Atomic"
+                        and int(row[9]) in
+                        RUNTIME_PLAN_ATOMIC_SITE_IDS
+                    )
+                    or (
+                        phase == "Dcci"
+                        and int(row[9]) in (15, 16)
+                    )
+                )
+                if not plan_evidence:
+                    continue
+                parent_start, parent_end = v4_parent_spans[
+                    (core_id, "RuntimePlanBuild")
+                ]
+                if not (
+                    parent_start <= int(row[6]) <= int(row[7])
+                    <= parent_end
+                ):
+                    raise ValueError(
+                        "AICPU Plan Build evidence is outside its per-core "
+                        f"RuntimePlanBuild parent: core={core_id} "
+                        f"phase={phase}"
                     )
         if set(v4_claims) != v4_submits:
             raise ValueError("schema-v5 Claim keys do not match Submit keys")
         task_kind_by_id = _derive_v4_task_kinds(
-            v4_submit_semantics, num_cores, str(submit_topology)
+            v4_submit_semantics, num_cores,
+            (
+                "central_ticket"
+                if submit_topology == "aicpu_plan_central_build"
+                else str(submit_topology)
+            ),
         )
+        if (
+            submit_topology == "aicpu_plan_central_build"
+            and level == 4
+        ):
+            task_count = len(task_kind_by_id)
+            exact_plan_atomic_calls = {
+                61: num_cores,
+                62: task_count + num_cores,
+                63: 1,
+                64: 2 * task_count,
+                65: num_cores,
+                66: 1,
+                68: 1,
+                59: 0,
+                69: 1 if task_count != 0 else 0,
+            }
+            for site, expected_calls in exact_plan_atomic_calls.items():
+                actual_calls = atomic_calls_by_site.get(site, 0)
+                if actual_calls != expected_calls:
+                    raise ValueError(
+                        "AICPU Plan Atomic call count mismatch: "
+                        f"site={ATOMIC_SITE_NAMES[site]} "
+                        f"actual={actual_calls} expected={expected_calls}"
+                    )
+            minimum_plan_atomic_calls = {
+                # 每核 Attach 各有一次终态校验，最后一个
+                # arrival 再对 fatal/closed/release 做一次发布前校验。
+                58: num_cores + 1,
+                60: num_cores + 1,
+                67: num_cores + 1,
+            }
+            for site, minimum_calls in minimum_plan_atomic_calls.items():
+                actual_calls = atomic_calls_by_site.get(site, 0)
+                if actual_calls < minimum_calls:
+                    raise ValueError(
+                        "AICPU Plan Atomic poll closure is incomplete: "
+                        f"site={ATOMIC_SITE_NAMES[site]} "
+                        f"actual={actual_calls} minimum={minimum_calls}"
+                    )
         writer_task_set = set(shared_metadata_writer_tasks)
         metadata_prefix_task_set = set(
             shared_metadata_prefix_tasks
         )
         handoff_task_set = (
             metadata_prefix_task_set
-            if submit_topology == "all_worker_replay"
+            if submit_topology in STRICT_INSERT_TOPOLOGIES
             else writer_task_set
         )
         unknown_writer_tasks = writer_task_set - set(task_kind_by_id)
@@ -1336,7 +1550,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     "prefix"
                 )
             if (
-                submit_topology == "all_worker_replay"
+                submit_topology in STRICT_INSERT_TOPOLOGIES
                 and metadata_prefix_task_set
                 != {
                     task_id
@@ -1370,7 +1584,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 )
             if won and not attempted:
                 raise ValueError(f"schema-v5 Claim won without attempt at {task_key}")
-            if submit_topology == "central_ticket" and (
+            if submit_topology in CENTRAL_BUILD_TOPOLOGIES and (
                 not attempted or not won
             ):
                 raise ValueError(
@@ -1571,7 +1785,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                                 f"{task_key}: count={len(matching_polls)}"
                             )
                         matched_per_symbol_dag_polls += len(matching_polls)
-                    elif submit_topology == "all_worker_replay":
+                    elif submit_topology in STRICT_INSERT_TOPOLOGIES:
                         # same-core shared 仍采用逐 task insert-completion 链：
                         # task N 等 N-1，并由每个 winner 发布自己的 completion。
                         # 真正改写 writer metadata 的 task 仍由 writer 列表独立
@@ -1730,7 +1944,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                             f"matched_registers={matched_per_symbol_dag_polls} "
                             f"all_winners={winner_count}"
                         )
-                elif submit_topology == "all_worker_replay":
+                elif submit_topology in STRICT_INSERT_TOPOLOGIES:
                     predecessor_wait_winner_count = sum(
                         1
                         for (_core_id, task_id), (
@@ -1948,7 +2162,7 @@ def _iter_v5_cross_core_winner_build_pack_spans(
     if (
         trace_schema_version != 5
         or tensormap_mode != "shared"
-        or submit_topology != "central_ticket"
+        or submit_topology not in CENTRAL_BUILD_TOPOLOGIES
     ):
         return
 
@@ -2031,7 +2245,7 @@ def _iter_v5_cross_core_semantic_gap_spans(  # noqa: PLR0912, PLR0915
     if (
         trace_schema_version != 5
         or tensormap_mode != "shared"
-        or submit_topology != "central_ticket"
+        or submit_topology not in CENTRAL_BUILD_TOPOLOGIES
     ):
         return
 
@@ -2413,6 +2627,12 @@ def _iter_v5_residual_spans(  # noqa: PLR0912
 ) -> Iterator[tuple[int, int, int, int, int, str]]:
     """只用既有 Submit/child 边界生成逐段补集，不改 raw ABI。"""
 
+    if submit_topology == "aicpu_plan_central_build":
+        # Plan-ahead 没有 Submit endpoint；它的全核父区间由
+        # RuntimePlanBuild raw 直接给出。用 Materialize 反推虚假
+        # Submit 会重新引入已删除的 replay 语义。
+        return
+
     submits_by_lane: dict[tuple[int, int], list[tuple[Any, ...]]] = {}
     submit_by_task: dict[tuple[int, int, int], tuple[Any, ...]] = {}
     children_by_task: dict[tuple[int, int, int], list[tuple[Any, ...]]] = {}
@@ -2484,7 +2704,7 @@ def _iter_v5_residual_spans(  # noqa: PLR0912
                 gap_name = "submit_residual"
                 if (
                     tensormap_mode == "shared"
-                    and submit_topology == "central_ticket"
+                    and submit_topology in CENTRAL_BUILD_TOPOLOGIES
                     and previous_phase == "Claim"
                     and child[5] == "Materialize"
                 ):
@@ -2558,7 +2778,7 @@ def _iter_v5_shared_register_derived_spans(
             int(parent[2]),
             int(parent[3]),
         )
-        if submit_topology == "all_worker_replay":
+        if submit_topology in STRICT_INSERT_TOPOLOGIES:
             has_predecessor = any(
                 prefix_task < task_id
                 for prefix_task in metadata_prefix_tasks
@@ -2581,7 +2801,7 @@ def _iter_v5_shared_register_derived_spans(
         publishes_metadata = task_id in metadata_writer_tasks
         publishes_insert_completion = (
             task_id in metadata_prefix_tasks
-            if submit_topology == "all_worker_replay"
+            if submit_topology in STRICT_INSERT_TOPOLOGIES
             else publishes_metadata
         )
         yield (
@@ -3120,7 +3340,10 @@ def convert(  # noqa: PLR0912, PLR0915
                 elif phase == "commit":
                     name = f"commit#{task_id}"
                     thread_id = kernel_thread_id
-                elif phase in ("orchestration_replay", "final_drain"):
+                elif phase in (
+                    "orchestration_replay", "runtime_plan_build",
+                    "final_drain",
+                ):
                     name = phase
                     thread_id = scalar_thread_id
                 else:

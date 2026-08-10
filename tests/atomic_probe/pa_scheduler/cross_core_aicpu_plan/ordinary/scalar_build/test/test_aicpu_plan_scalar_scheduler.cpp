@@ -191,7 +191,8 @@ bool BuildArgsForKind(
 bool PublishOneCallbackTask(
     const RuntimePlanView &view, PaOrchestrationState &orchestration,
     TaskArgs &args, LocalStats &stats, uint32_t batch,
-    uint32_t group_index, TaskKind kind, bool has_following_group,
+    uint32_t batch_start, uint32_t group_index, TaskKind kind,
+    bool has_following_group,
     bool last, uint32_t &next_task_id,
     std::vector<ProducerRecord> &records
 )
@@ -220,7 +221,7 @@ bool PublishOneCallbackTask(
     if (adapter_flags == 0U ||
         !MakePaRuntimeTaskPlanSpec(
             args, task_id, FunctionId(kind), engine,
-            adapter_flags, spec
+            adapter_flags, batch_start, spec
         )) {
         return false;
     }
@@ -264,12 +265,14 @@ bool ProducePlanFromPaCallbacks(
             kSharedPaMaxContextLength) {
             return false;
         }
+        // 与真实 AICPU producer 一致：LastSubmit 是 batch 边界，不是
+        // Plan 终点。空 batch 的 Alloc 必须独立闭合该 batch。
         const bool alloc_is_last =
-            orchestration.current_blocks == 0U &&
-            batch + 1U == context_lens.size();
+            orchestration.current_blocks == 0U;
+        const uint32_t batch_start = next_task_id;
         if (!PublishOneCallbackTask(
                 view, orchestration, args, stats, batch,
-                0U, TaskKind::Alloc, false, alloc_is_last,
+                batch_start, 0U, TaskKind::Alloc, false, alloc_is_last,
                 next_task_id, records
             )) {
             return false;
@@ -286,27 +289,25 @@ bool ProducePlanFromPaCallbacks(
                 orchestration.current_blocks;
             if (!PublishOneCallbackTask(
                     view, orchestration, args, stats, batch,
-                    group_index, TaskKind::Qk, false, false,
+                    batch_start, group_index, TaskKind::Qk, false, false,
                     next_task_id, records
                 ) ||
                 !PublishOneCallbackTask(
                     view, orchestration, args, stats, batch,
-                    group_index, TaskKind::Sf, false, false,
+                    batch_start, group_index, TaskKind::Sf, false, false,
                     next_task_id, records
                 ) ||
                 !PublishOneCallbackTask(
                     view, orchestration, args, stats, batch,
-                    group_index, TaskKind::Pv, false, false,
+                    batch_start, group_index, TaskKind::Pv, false, false,
                     next_task_id, records
                 )) {
                 return false;
             }
-            const bool up_is_last =
-                !has_following &&
-                batch + 1U == context_lens.size();
+            const bool up_is_last = !has_following;
             if (!PublishOneCallbackTask(
                     view, orchestration, args, stats, batch,
-                    group_index, TaskKind::Up, has_following,
+                    batch_start, group_index, TaskKind::Up, has_following,
                     up_is_last, next_task_id, records
                 )) {
                 return false;
@@ -370,7 +371,8 @@ bool HeaderMatchesDecodedArgs(
     }
     SharedPaTaskMeta meta{};
     return DecodeSharedPaTaskMeta(
-        header.adapter_flags, header.task_id, meta
+        header.adapter_flags, header.task_id,
+        header.adapter_data, meta
     ) &&
         EngineForKind(meta.kind) ==
             static_cast<EngineClass>(header.engine_class) &&
@@ -596,8 +598,36 @@ void RunCase(
     uint32_t expected_metadata = 0U;
     uint32_t expected_aic = 0U;
     uint32_t expected_aiv = 0U;
+    std::vector<uint32_t> expected_batch_starts;
+    std::vector<uint32_t> expected_batch_ends;
+    expected_batch_starts.reserve(context_lens.size());
+    expected_batch_ends.reserve(context_lens.size());
+    uint32_t expected_task_cursor = 0U;
+    for (const int32_t context_length : context_lens) {
+        Expect(context_length >= 0, "negative test context length");
+        const uint32_t blocks =
+            (static_cast<uint32_t>(context_length) + kPaBlockSize - 1U) /
+            kPaBlockSize;
+        const uint32_t groups =
+            (blocks + kPaBlocksPerRequest - 1U) /
+            kPaBlocksPerRequest;
+        const uint32_t tasks_in_batch = 1U + 4U * groups;
+        expected_batch_starts.push_back(expected_task_cursor);
+        expected_task_cursor += tasks_in_batch;
+        expected_batch_ends.push_back(expected_task_cursor - 1U);
+    }
+    Expect(
+        expected_task_cursor == task_count,
+        "test oracle batch boundaries do not cover the Plan"
+    );
+
     uint32_t last_count = 0U;
+    uint32_t batch = 0U;
     for (uint32_t task = 0U; task < task_count; ++task) {
+        while (batch + 1U < expected_batch_ends.size() &&
+               task > expected_batch_ends[batch]) {
+            ++batch;
+        }
         Expect(records[task].task_id == task, "producer task ids are not contiguous");
         if (records[task].engine == EngineClass::MetadataOnly) {
             ++expected_metadata;
@@ -608,9 +638,34 @@ void RunCase(
         } else {
             Fail("producer emitted an unknown engine class");
         }
+        const bool expected_last = task == expected_batch_ends[batch];
+        Expect(
+            records[task].last == expected_last,
+            "producer LastSubmit marker is not on the batch boundary"
+        );
+        RuntimeTaskPlanHeader header{};
+        RuntimeTaskPlanLayout layout{};
+        Expect(
+            AcquireRuntimeTaskPlan<CpuPlanOps>(
+                fixture.view, task, header, layout
+            ) == PlanAcquireResult::Acquired,
+            "cannot reacquire produced Plan cell for boundary validation"
+        );
+        Expect(
+            header.adapter_data == expected_batch_starts[batch],
+            "Plan adapter_data does not carry the explicit batch_start"
+        );
+        Expect(
+            ((header.adapter_flags & kSharedPaTicketLastSubmit) != 0U) ==
+                expected_last,
+            "serialized LastSubmit marker differs from the batch oracle"
+        );
         if (records[task].last) ++last_count;
     }
-    Expect(last_count == 1U && records.back().last, "Plan terminal callback marker mismatch");
+    Expect(
+        last_count == context_lens.size() && records.back().last,
+        "Plan must carry exactly one LastSubmit marker per batch"
+    );
 
     CaseState state(task_count);
     RunBuildWorkers(fixture, task_count, state);

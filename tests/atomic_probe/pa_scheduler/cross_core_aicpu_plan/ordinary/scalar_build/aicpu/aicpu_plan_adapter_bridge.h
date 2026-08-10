@@ -20,6 +20,7 @@ int32_t aicpu_plan_adapter_initialize(
 int32_t aicpu_plan_adapter_stage(
     const void *l0_task_args, uint32_t task_id, int32_t function_id,
     uint8_t engine_class, uint8_t provisional_adapter_flags,
+    uint32_t batch_start,
     void *staged_cell, uint32_t *payload_lines, uint16_t *output_count
 );
 

@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""按物理 scalar lane 生成 standalone PA Submit 的严格排他 cycle 报告。"""
+"""按物理 scalar lane 生成 standalone PA 的严格排他 cycle 报告。"""
 
 from __future__ import annotations
 
@@ -150,6 +150,30 @@ OVERLAY_PHASES = (
     "Replay",
     "Alloc",
     "DrainWon",
+)
+
+AICPU_PLAN_CENTRAL_BUILD_TOPOLOGY = "aicpu_plan_central_build"
+AICPU_PLAN_BUILD_PHASES = (
+    "Materialize",
+    "Register",
+    "Fanin",
+    "WinnerBuild",
+    "AllocComplete",
+)
+AICPU_PLAN_METRICS = (
+    "runtime_plan_build",
+    "materialize",
+    "register",
+    "fanin",
+    "winner_build",
+    "alloc_complete",
+    "planned_build_union",
+    "runtime_plan_build_residual",
+    "build_to_final_drain_residual",
+    "final_drain",
+    "final_drain_kernel_union",
+    "final_drain_residual",
+    "worker_completion",
 )
 
 SUBMIT_PARTITION_METRICS = (
@@ -1913,10 +1937,440 @@ def _residual_breakdown(
     }
 
 
+def _analyze_aicpu_plan_central_build(  # noqa: PLR0912, PLR0915
+    input_path: Path,
+    frequency_hz: int,
+    trace_schema_version: int,
+    events: Sequence[Event],
+    num_cores: int,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """以真实 RuntimePlanBuild 父区间闭合 Plan-ahead Build。"""
+
+    if trace_schema_version != 5 or metadata.get("tensormap_mode") != "shared":
+        raise ValueError("AICPU Plan central Build requires shared trace_schema_version=5")
+
+    forbidden_phases = {
+        "Submit",
+        "Claim",
+        "OrchestrationReplay",
+        "EfDrain",
+        "PrepareMap",
+        "Build",
+        "Replay",
+        "Alloc",
+    }
+    forbidden_counts = Counter(event.phase for event in events if event.phase in forbidden_phases)
+    if forbidden_counts:
+        raise ValueError(
+            f"AICPU Plan central Build forbids legacy replay phases: counts={dict(sorted(forbidden_counts.items()))}"
+        )
+
+    runtime_builds_by_lane = _group_v4_parents(events, "RuntimePlanBuild")
+    final_drains_by_lane = _group_v4_parents(events, "FinalDrain")
+    runtime_build_by_lane = {lane_key: rows[0] for lane_key, rows in runtime_builds_by_lane.items()}
+
+    task_events: dict[tuple[int, int], list[Event]] = defaultdict(list)
+    materializes: dict[tuple[int, int], Event] = {}
+    for event in events:
+        if event.phase not in AICPU_PLAN_BUILD_PHASES:
+            continue
+        if event.task_id < 0:
+            raise ValueError(f"row {event.row_index} {event.phase} requires a Plan task ID")
+        parent = runtime_build_by_lane[event.lane_key]
+        if not (parent.start_cycle <= event.start_cycle <= event.end_cycle <= parent.end_cycle):
+            raise ValueError(f"row {event.row_index} {event.phase} is outside RuntimePlanBuild row {parent.row_index}")
+        task_key = (event.core_id, event.task_id)
+        task_events[task_key].append(event)
+        if event.phase == "Materialize":
+            previous = materializes.setdefault(task_key, event)
+            if previous is not event:
+                raise ValueError(f"AICPU Plan task {task_key} has duplicate Materialize rows")
+
+    if set(task_events) != set(materializes):
+        missing = sorted(set(task_events) - set(materializes))
+        raise ValueError(f"AICPU Plan Build child has no Materialize ownership: task_keys={missing[:8]}")
+    owner_by_task_id: dict[int, int] = {}
+    for (core_id, task_id), materialize in materializes.items():
+        previous_owner = owner_by_task_id.setdefault(task_id, core_id)
+        if previous_owner != core_id:
+            raise ValueError(
+                f"AICPU Plan task has multiple Materialize owners: task={task_id} owners={previous_owner},{core_id}"
+            )
+        if materialize.auxiliary not in (0, 1):
+            raise ValueError(f"AICPU Plan task {(core_id, task_id)} Materialize Alloc marker must be 0 or 1")
+        is_alloc = materialize.function_id == -1
+        if bool(materialize.auxiliary) != is_alloc:
+            raise ValueError(f"AICPU Plan task {(core_id, task_id)} Materialize function_id/Alloc identity is invalid")
+    task_ids = sorted(owner_by_task_id)
+    if not task_ids or task_ids != list(range(task_ids[-1] + 1)):
+        raise ValueError(f"AICPU Plan Materialize task IDs must cover global 0..N-1 exactly once: task_ids={task_ids}")
+
+    children_by_task: dict[int, list[Event]] = {}
+    task_envelopes_by_lane: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    for task_key, task_children in task_events.items():
+        core_id, task_id = task_key
+        ordered = sorted(
+            task_children,
+            key=lambda event: (
+                event.start_cycle,
+                event.end_cycle,
+                event.row_index,
+            ),
+        )
+        counts = Counter(event.phase for event in ordered)
+        materialize = materializes[task_key]
+        is_alloc = materialize.function_id == -1
+        expected_counts = {
+            "Materialize": 1,
+            "Register": 1,
+            "Fanin": int(not is_alloc),
+            "WinnerBuild": int(not is_alloc),
+            "AllocComplete": int(is_alloc),
+        }
+        if any(counts[phase] != count for phase, count in expected_counts.items()):
+            raise ValueError(
+                f"AICPU Plan task {task_key} has invalid Build phase counts: "
+                f"actual={dict(counts)} expected={expected_counts}"
+            )
+        if any(event.function_id != materialize.function_id for event in ordered):
+            raise ValueError(f"AICPU Plan task {task_key} Build function identity is invalid")
+        expected_order = (
+            ["Materialize", "Register", "AllocComplete"]
+            if is_alloc
+            else ["Materialize", "Register", "Fanin", "WinnerBuild"]
+        )
+        if [event.phase for event in ordered] != expected_order:
+            raise ValueError(f"AICPU Plan task {task_key} has invalid Build phase order")
+        for previous, current in zip(ordered, ordered[1:]):
+            if previous.end_cycle != current.start_cycle:
+                raise ValueError(
+                    f"AICPU Plan task {task_key} Build phases {previous.phase}/{current.phase} are not adjacent"
+                )
+        envelope_cycles = ordered[-1].end_cycle - ordered[0].start_cycle
+        if sum(event.duration for event in ordered) != envelope_cycles:
+            raise AssertionError(f"AICPU Plan task {task_key} Build envelope does not close")
+        children_by_task[materializes[task_key].row_index] = ordered
+        task_envelopes_by_lane[ordered[0].lane_key].append((ordered[0].start_cycle, ordered[-1].end_cycle))
+
+    for lane_key, envelopes in task_envelopes_by_lane.items():
+        ordered_envelopes = sorted(envelopes)
+        for previous, current in zip(ordered_envelopes, ordered_envelopes[1:]):
+            if current[0] < previous[1]:
+                raise ValueError(f"core/lane {lane_key} has overlapping PlannedBuild tasks")
+
+    (
+        detail_by_register,
+        outputs_by_owner,
+        copies_by_outputs,
+        flushes_by_outputs,
+        output_placement,
+    ) = _associate_shared_register_details(
+        events,
+        children_by_task,
+        trace_schema_version,
+        "shared",
+    )
+    if output_placement != "materialize":
+        raise ValueError("AICPU Plan central Build requires Materialize-owned task-output publication")
+    shared_metadata_ordering = str(metadata.get("shared_metadata_ordering", "global_writer_chain"))
+    register_breakdown = _build_register_breakdown(
+        children_by_task,
+        detail_by_register,
+        outputs_by_owner,
+        copies_by_outputs,
+        flushes_by_outputs,
+        output_placement,
+        num_cores,
+        trace_schema_version,
+        "shared",
+        shared_metadata_ordering,
+    )
+    materialize_breakdown = _build_materialize_breakdown(
+        children_by_task,
+        outputs_by_owner,
+        copies_by_outputs,
+        flushes_by_outputs,
+        output_placement,
+        num_cores,
+        trace_schema_version,
+        "shared",
+    )
+    assert register_breakdown is not None
+    assert materialize_breakdown is not None
+    for breakdown in (register_breakdown, materialize_breakdown):
+        included = breakdown["semantics"].pop("included_in_submit_additive_totals")
+        breakdown["semantics"]["included_in_runtime_plan_build_additive_totals"] = included
+
+    kernels_by_final_drain, final_drain_kernel_rows = _associate_kernels_to_parents(
+        events, final_drains_by_lane, parent_name="FinalDrain"
+    )
+    kernels = [event for event in events if event.phase == "Kernel"]
+    orphan_kernel_rows = sorted(event.row_index for event in kernels if event.row_index not in final_drain_kernel_rows)
+    if orphan_kernel_rows:
+        raise ValueError(f"AICPU Plan Kernel must be contained by FinalDrain: orphan_rows={orphan_kernel_rows[:8]}")
+
+    per_core: list[dict[str, Any]] = []
+    for core_id in range(num_cores):
+        block_id, lane, role = _standalone_topology(core_id)
+        lane_key = (core_id, lane)
+        runtime_build = runtime_build_by_lane[lane_key]
+        final_drain = final_drains_by_lane[lane_key][0]
+        if final_drain.start_cycle < runtime_build.end_cycle:
+            raise ValueError(f"core {core_id} FinalDrain overlaps RuntimePlanBuild")
+        owned_children = sorted(
+            (event for task_key, children in task_events.items() if task_key[0] == core_id for event in children),
+            key=lambda event: (
+                event.start_cycle,
+                event.end_cycle,
+                event.row_index,
+            ),
+        )
+        planned_build_union = _interval_union_cycles([(event.start_cycle, event.end_cycle) for event in owned_children])
+        planned_build_sum = sum(event.duration for event in owned_children)
+        if planned_build_union != planned_build_sum:
+            raise ValueError(f"core {core_id} PlannedBuild child intervals overlap")
+        build_residual = runtime_build.duration - planned_build_union
+        if build_residual < 0:
+            raise ValueError(f"core {core_id} RuntimePlanBuild partition is negative")
+        final_kernel_union = _interval_union_cycles(
+            [(kernel.start_cycle, kernel.end_cycle) for kernel in kernels_by_final_drain[final_drain.row_index]]
+        )
+        final_residual = final_drain.duration - final_kernel_union
+        if final_residual < 0:
+            raise ValueError(f"core {core_id} FinalDrain partition is negative")
+        transition = final_drain.start_cycle - runtime_build.end_cycle
+        worker_completion = final_drain.end_cycle - runtime_build.start_cycle
+        metrics = {
+            "runtime_plan_build": runtime_build.duration,
+            "materialize": sum(event.duration for event in owned_children if event.phase == "Materialize"),
+            "register": sum(event.duration for event in owned_children if event.phase == "Register"),
+            "fanin": sum(event.duration for event in owned_children if event.phase == "Fanin"),
+            "winner_build": sum(event.duration for event in owned_children if event.phase == "WinnerBuild"),
+            "alloc_complete": sum(event.duration for event in owned_children if event.phase == "AllocComplete"),
+            "planned_build_union": planned_build_union,
+            "runtime_plan_build_residual": build_residual,
+            "build_to_final_drain_residual": transition,
+            "final_drain": final_drain.duration,
+            "final_drain_kernel_union": final_kernel_union,
+            "final_drain_residual": final_residual,
+            "worker_completion": worker_completion,
+        }
+        if (
+            sum(
+                metrics[name]
+                for name in (
+                    "materialize",
+                    "register",
+                    "fanin",
+                    "winner_build",
+                    "alloc_complete",
+                )
+            )
+            != planned_build_union
+        ):
+            raise AssertionError(f"core {core_id} PlannedBuild phase partition does not close")
+        if planned_build_union + build_residual != runtime_build.duration:
+            raise AssertionError(f"core {core_id} RuntimePlanBuild partition does not close")
+        if final_kernel_union + final_residual != final_drain.duration:
+            raise AssertionError(f"core {core_id} FinalDrain partition does not close")
+        if runtime_build.duration + transition + final_drain.duration != worker_completion:
+            raise AssertionError(f"core {core_id} worker completion partition does not close")
+        per_core.append(
+            {
+                "core_id": core_id,
+                "block_id": block_id,
+                "lane": lane,
+                "role": role,
+                "planned_build_count": sum(task_key[0] == core_id for task_key in task_events),
+                "runtime_plan_build_start_cycle": runtime_build.start_cycle,
+                "runtime_plan_build_end_cycle": runtime_build.end_cycle,
+                "final_drain_start_cycle": final_drain.start_cycle,
+                "final_drain_end_cycle": final_drain.end_cycle,
+                "metrics_cycles": metrics,
+            }
+        )
+
+    aggregate_metrics = {
+        metric: sum(core["metrics_cycles"][metric] for core in per_core) for metric in AICPU_PLAN_METRICS
+    }
+    planned_phase_sum = sum(
+        aggregate_metrics[name]
+        for name in (
+            "materialize",
+            "register",
+            "fanin",
+            "winner_build",
+            "alloc_complete",
+        )
+    )
+    runtime_build_partition = (
+        aggregate_metrics["planned_build_union"] + aggregate_metrics["runtime_plan_build_residual"]
+    )
+    final_drain_partition = aggregate_metrics["final_drain_kernel_union"] + aggregate_metrics["final_drain_residual"]
+    worker_completion_partition = (
+        aggregate_metrics["runtime_plan_build"]
+        + aggregate_metrics["build_to_final_drain_residual"]
+        + aggregate_metrics["final_drain"]
+    )
+    if planned_phase_sum != aggregate_metrics["planned_build_union"]:
+        raise AssertionError("aggregate PlannedBuild phase partition does not close")
+    if runtime_build_partition != aggregate_metrics["runtime_plan_build"]:
+        raise AssertionError("aggregate RuntimePlanBuild partition does not close")
+    if final_drain_partition != aggregate_metrics["final_drain"]:
+        raise AssertionError("aggregate FinalDrain partition does not close")
+    if worker_completion_partition != aggregate_metrics["worker_completion"]:
+        raise AssertionError("aggregate worker completion partition does not close")
+    if register_breakdown["aggregate_core_work"]["metrics_cycles"]["parent"] != aggregate_metrics["register"]:
+        raise AssertionError("Register breakdown parent does not match RuntimePlanBuild Register total")
+    if materialize_breakdown["aggregate_core_work"]["metrics_cycles"]["parent"] != aggregate_metrics["materialize"]:
+        raise AssertionError("Materialize breakdown parent does not match RuntimePlanBuild Materialize total")
+
+    role_statistics: dict[str, Any] = {}
+    for role, expected_count in (
+        ("aic", EXPECTED_AIC_CORES),
+        ("aiv", EXPECTED_AIV_CORES),
+    ):
+        role_cores = [core for core in per_core if core["role"] == role]
+        if len(role_cores) != expected_count:
+            raise ValueError(f"role {role} has {len(role_cores)} cores, expected {expected_count}")
+        role_statistics[role] = {
+            "core_count": len(role_cores),
+            "metrics": {
+                metric: _distribution([core["metrics_cycles"][metric] for core in role_cores])
+                for metric in AICPU_PLAN_METRICS
+            },
+        }
+
+    overlays = {}
+    for phase in OVERLAY_PHASES:
+        phase_events = [event for event in events if event.phase == phase]
+        overlays[phase] = {
+            "event_count": len(phase_events),
+            "aggregate_duration_cycles": sum(event.duration for event in phase_events),
+            "included_in_additive_totals": False,
+        }
+
+    runtime_builds = list(runtime_build_by_lane.values())
+    global_start = min(parent.start_cycle for parent in runtime_builds)
+    global_end = max(parent.end_cycle for parent in runtime_builds)
+    closure = {
+        "planned_build_phase_partition": {
+            "parent_cycles": aggregate_metrics["planned_build_union"],
+            "real_phase_cycles": planned_phase_sum,
+            "exact": True,
+        },
+        "runtime_plan_build_partition": {
+            "parent_cycles": aggregate_metrics["runtime_plan_build"],
+            "planned_build_union_plus_residual_cycles": runtime_build_partition,
+            "exact": True,
+        },
+        "final_drain_partition": {
+            "parent_cycles": aggregate_metrics["final_drain"],
+            "kernel_union_plus_residual_cycles": final_drain_partition,
+            "exact": True,
+        },
+        "worker_completion_partition": {
+            "parent_cycles": aggregate_metrics["worker_completion"],
+            "runtime_plan_build_plus_transition_plus_final_drain_cycles": (worker_completion_partition),
+            "exact": True,
+        },
+    }
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "input": str(input_path),
+        "capture": {
+            "trace_schema_version": trace_schema_version,
+            "tensormap_mode": "shared",
+            "submit_topology": AICPU_PLAN_CENTRAL_BUILD_TOPOLOGY,
+            "shared_metadata_ordering": shared_metadata_ordering,
+            "clock_freq_hz": frequency_hz,
+            "core_count": num_cores,
+            "event_count": len(events),
+            "task_count_global": len(task_ids),
+            "planned_build_count": len(task_events),
+        },
+        "validation": {
+            "status": "PASS",
+            "dropped_records": 0,
+            "core_ids_complete": True,
+            "role_map_complete": True,
+            "task_ids_global_contiguous_unique_build_ownership": True,
+            "runtime_plan_build_parent_exactly_one_per_core": True,
+            "final_drain_parent_exactly_one_per_core": True,
+            "submit_records": 0,
+            "claim_records": 0,
+            "orchestration_replay_records": 0,
+            "legacy_lap_records": 0,
+            "planned_build_task_chain_exact": True,
+            "runtime_plan_build_partition_exact": True,
+            "build_to_final_drain_non_overlapping": True,
+            "final_drain_partition_exact": True,
+            "worker_completion_partition_exact": True,
+            "kernel_unique_parent_complete": True,
+            "register_publish_metadata_exactly_one_per_register": True,
+            "register_metadata_partition_exact": True,
+            "materialize_publish_task_outputs_exactly_one_per_parent": True,
+            "materialize_partition_exact": True,
+            "task_output_placement": output_placement,
+        },
+        "semantics": {
+            "cycle_arithmetic": "raw_integer_cycles",
+            "tensormap_mode": "shared",
+            "submit_topology": AICPU_PLAN_CENTRAL_BUILD_TOPOLOGY,
+            "task_identity": (
+                "one real Materialize owner per global Runtime Plan task; no Submit or Claim rows are synthesized"
+            ),
+            "runtime_plan_build_children": [
+                *AICPU_PLAN_BUILD_PHASES,
+                "RuntimePlanBuildResidual",
+            ],
+            "runtime_plan_build_residual": (
+                "RuntimePlanBuild minus the interval union of real "
+                "Materialize/Register/Fanin/WinnerBuild/AllocComplete spans; "
+                "includes Plan attach, central-ticket control, arrival/release, "
+                "and untraced scalar gaps"
+            ),
+            "build_to_final_drain_residual": ("observed gap from RuntimePlanBuild.end to FinalDrain.start"),
+            "final_drain_children": ["KernelUnion", "FinalDrainResidual"],
+            "worker_completion_children": [
+                "RuntimePlanBuild",
+                "BuildToFinalDrainResidual",
+                "FinalDrain",
+            ],
+            "overlay_phases": list(OVERLAY_PHASES),
+            "overlays_are_additive": False,
+            "p95_method": "nearest_rank",
+        },
+        "global_runtime_plan_build_makespan": {
+            "start_cycle": global_start,
+            "end_cycle": global_end,
+            "duration_cycles": global_end - global_start,
+            "duration_us": ((global_end - global_start) * 1_000_000 / frequency_hz),
+            "semantics": ("cross-core wall-clock envelope of real RuntimePlanBuild parents; not aggregate core-work"),
+        },
+        "aggregate_core_work": {
+            "metrics_cycles": aggregate_metrics,
+            "closure": closure,
+            "semantics": "sum of per-core cycles; not wall-clock duration",
+        },
+        "materialize_breakdown": materialize_breakdown,
+        "register_breakdown": register_breakdown,
+        "per_role_core_statistics": role_statistics,
+        "kernel_containment": {
+            "total_events": len(kernels),
+            "inside_final_drain_events": len(final_drain_kernel_rows),
+            "orphan_events": 0,
+        },
+        "overlays": overlays,
+        "per_core": per_core,
+    }
+
+
 def analyze_capture(  # noqa: PLR0912, PLR0915
     input_path: Path,
 ) -> dict[str, Any]:
-    """读取 schema-v3/v4 raw，完成全部门禁后返回可 JSON 序列化报告。"""
+    """读取 schema-v3/v5 raw，完成全部门禁后返回可 JSON 序列化报告。"""
 
     input_path = Path(input_path)
     (
@@ -1950,6 +2404,16 @@ def analyze_capture(  # noqa: PLR0912, PLR0915
     )
     if len(core_by_block_lane) != num_cores or set(core_by_block_lane.values()) != set(range(num_cores)):
         raise ValueError("block/lane to core mapping is incomplete")
+
+    if submit_topology == AICPU_PLAN_CENTRAL_BUILD_TOPOLOGY:
+        return _analyze_aicpu_plan_central_build(
+            input_path,
+            frequency_hz,
+            trace_schema_version,
+            events,
+            num_cores,
+            metadata,
+        )
 
     submits_by_lane, task_ids = _validate_and_group_submits(events, submit_topology)
     task_kind_by_id: dict[int, int] | None = None

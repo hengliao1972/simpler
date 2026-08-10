@@ -255,7 +255,8 @@ bool AcquiredTaskMatches(
         header.engine_class != static_cast<uint8_t>(expected.spec.engine_class) ||
         header.adapter_flags != expected.spec.adapter_flags ||
         header.core_num != expected.spec.core_num || header.require_sync_start != expected.spec.require_sync_start ||
-        header.reserved0 != 0U || header.reserved1 != 0U ||
+        header.reserved0 != 0U ||
+        header.adapter_data != expected.spec.adapter_data ||
         header.tensor_reference_mask != expected.spec.tensor_reference_mask ||
         header.abi_version != kRuntimePlanAbiVersion) {
         return false;
@@ -313,6 +314,7 @@ LogicalTask MakeMixedLayoutTask(uint32_t task_id)
     task.spec.explicit_dep_count = kMaxExplicitDependencies;
     task.spec.engine_class = EngineClass::Aiv;
     task.spec.adapter_flags = SampleHasFollowing;
+    task.spec.adapter_data = UINT16_C(0x3456);
     task.spec.core_num = 7;
     task.spec.require_sync_start = 1U;
 
@@ -420,6 +422,7 @@ LogicalTask MakePaSampleTask(
         (last_in_batch ? static_cast<uint32_t>(SampleLastInBatch) : 0U) |
         (last_in_plan ? static_cast<uint32_t>(SampleLastInPlan) : 0U)
     );
+    task.spec.adapter_data = static_cast<uint16_t>(batch_start);
     task.spec.core_num = -1;
     task.spec.require_sync_start = kind == SampleTaskKind::VectorUp ? 1U : 0U;
 

@@ -18,11 +18,13 @@
 // CPU 后端直接实例化与设备端相同的公共调度器；这里只消去 AICore 地址空间
 // 修饰符，不另写一套简化状态机，因此它可以承担协议和边界回归。
 #include "../common/pa_scheduler_core.h"
+#include "cpu_plan_producer.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -32,6 +34,10 @@ namespace {
 #if PA_BUILD_PERF_CLOCK
 thread_local uint32_t g_perf_clock_read_count = 0;
 #endif
+
+struct FreeDeleter {
+    void operator()(void *pointer) const noexcept { std::free(pointer); }
+};
 
 template <uint32_t Count>
 inline void EmitNops() {
@@ -188,6 +194,28 @@ struct CpuOps {
 
     static inline int64_t FetchAdd(volatile int64_t *address, int64_t value) {
         return __atomic_fetch_add(address, value, __ATOMIC_ACQ_REL);
+    }
+
+    // Runtime Plan 的控制字在 CPU 协议回归里同样必须经过原子接口。
+    // 三个窄接口与 A5 CCEC Ops 同名，公共调度器因而不会为 CPU 复制一套
+    // build-ticket 状态机；acquire/release 只表达 x86 测试的 happens-before，
+    // 不把 CPU cache coherence 冒充成 A5 的 DCCI 行为。
+    static inline int64_t LoadControl(volatile int64_t *address) {
+        return __atomic_fetch_add(
+            address, static_cast<int64_t>(0), __ATOMIC_ACQUIRE
+        );
+    }
+
+    static inline int64_t FetchAddControl(
+        volatile int64_t *address, int64_t value
+    ) {
+        return __atomic_fetch_add(address, value, __ATOMIC_ACQ_REL);
+    }
+
+    static inline void PublishControl(
+        volatile int64_t *address, int64_t value
+    ) {
+        __atomic_store_n(address, value, __ATOMIC_RELEASE);
     }
 
     static inline int64_t FetchMax(volatile int64_t *address, int64_t value, uint64_t &retries) {
@@ -382,6 +410,36 @@ int main(int argc, char **argv) {
     // SchedulerState 很大，放到 heap 而不是主线程栈；trace 继续保持独立的
     // 64 字节对齐区域，以复用设备端完全相同的二进制布局。
     std::unique_ptr<pa_scheduler::SchedulerState> state(new pa_scheduler::SchedulerState);
+    constexpr uint32_t kPlanCapacity =
+        pa_scheduler::kRuntimePlanConsumerCapacity;
+    constexpr size_t kPlanBytes =
+        static_cast<size_t>(kPlanCapacity) *
+        sizeof(pa_scheduler::aicpu_plan::RuntimeTaskPlanCell);
+    static_assert(
+        kPlanBytes % pa_scheduler::aicpu_plan::kAtomicIsolationBytes == 0U,
+        "aligned_alloc requires the Runtime Plan byte count to be alignment-sized"
+    );
+    // PlanCell 约 4.5 KiB，不能再内嵌进已接近 1 GiB 的 SchedulerState。
+    // CPU 与正式 Host 一样单独分配整块 128B 对齐区域；Host 只配置 storage
+    // descriptor，唯一 planner 才会写 task identity 和 payload。
+    std::unique_ptr<
+        pa_scheduler::aicpu_plan::RuntimeTaskPlanCell, FreeDeleter
+    > plan_cells(
+        static_cast<pa_scheduler::aicpu_plan::RuntimeTaskPlanCell *>(
+            std::aligned_alloc(
+                pa_scheduler::aicpu_plan::kAtomicIsolationBytes,
+                kPlanBytes
+            )
+        )
+    );
+    if (plan_cells == nullptr) {
+        std::fprintf(
+            stderr,
+            "Cannot allocate %zu-byte 128B-aligned Runtime Plan storage.\n",
+            kPlanBytes
+        );
+        return EXIT_FAILURE;
+    }
     void *trace_memory = nullptr;
     if (options.trace_enabled) {
         trace_memory = std::aligned_alloc(64, pa_scheduler::kTraceBytes);
@@ -397,6 +455,9 @@ int main(int argc, char **argv) {
     std::vector<double> final_barrier_spans;
     std::vector<double> final_drain_spans;
     std::vector<double> lifecycle_spans;
+    std::vector<double> plan_times;
+    std::vector<double> scalar_times;
+    std::vector<double> pipeline_e2e_times;
     bool all_passed = true;
     bool postprocess_ok = true;
 #if PA_BUILD_PERF_CLOCK
@@ -407,7 +468,20 @@ int main(int argc, char **argv) {
     // runs>1 表示同进程热运行，不等价于多个独立首轮。
     for (uint32_t run = 1; run <= options.runs; ++run) {
         pa_scheduler::host::InitializeState(state.get(), options);
+        std::memset(plan_cells.get(), 0, kPlanBytes);
+        if (!pa_scheduler::host::ConfigureRuntimePlanStorage(
+                state.get(), plan_cells.get(), kPlanCapacity
+            )) {
+            std::fprintf(
+                stderr,
+                "Cannot configure the external Runtime Plan storage.\n"
+            );
+            all_passed = false;
+            break;
+        }
 #if PTO_FDWIC_SHARED_MAP
+        // 这份 Host plan 只用于既有 heap admission 与最终 oracle；它既不
+        // 写 Runtime Plan storage，也不向 Scalar 提供 task identity。
         pa_scheduler::host::SharedHostTaskPlan launch_plan;
         pa_scheduler::host::SharedHostHeapAdmission heap_admission;
         std::string admission_error;
@@ -444,6 +518,31 @@ int main(int argc, char **argv) {
         if (options.trace_enabled) {
             pa_scheduler::host::InitializeTraceHeader(trace_header);
         }
+        // Plan-ahead 首版先让独立 planner 线程完整执行 PA callback 并 Close。
+        // 这对应正式 AICPU 的单 producer 生命周期。plan_time、Scalar-only
+        // 和 producer 起点到 FinalDrain/worker join 的 pipeline_e2e 分开记录，
+        // 不能用后两者的边界把 Plan 成本藏起来。
+        pa_scheduler::cpu_plan::ProductionResult plan_result{};
+        const auto pipeline_begin = std::chrono::steady_clock::now();
+        const auto plan_begin = pipeline_begin;
+        std::thread planner([&]() {
+            plan_result =
+                pa_scheduler::cpu_plan::ProducePaRuntimePlan<CpuOps>(
+                    state.get()
+                );
+        });
+        planner.join();
+        const auto plan_end = std::chrono::steady_clock::now();
+        if (!plan_result.ok) {
+            std::fprintf(
+                stderr,
+                "Runtime Plan producer failed before CPU workers start "
+                "(published=%u).\n",
+                plan_result.task_count
+            );
+            all_passed = false;
+            break;
+        }
         const auto wall_begin = std::chrono::steady_clock::now();
         // 固定创建 96 个参与者：worker 0..31 扮演 AIC，32..95 扮演 AIV。
         // 每个线程仍会进入公共 started_count 屏障，再共同回放完整 task 流。
@@ -476,7 +575,26 @@ int main(int argc, char **argv) {
         for (std::thread &worker : workers)
             worker.join();
         const auto wall_end = std::chrono::steady_clock::now();
-        const double host_us = std::chrono::duration<double, std::micro>(wall_end - wall_begin).count();
+        const double plan_us =
+            std::chrono::duration<double, std::micro>(
+                plan_end - plan_begin
+            ).count();
+        const double host_us =
+            std::chrono::duration<double, std::micro>(
+                wall_end - wall_begin
+            ).count();
+        const double pipeline_e2e_us =
+            std::chrono::duration<double, std::micro>(
+                wall_end - pipeline_begin
+            ).count();
+        std::printf(
+            "[PIPELINE] tasks=%u metadata=%u AIC=%u AIV=%u "
+            "plan_time_us=%.3f scalar_time_us=%.3f "
+            "pipeline_e2e_us=%.3f storage=%zu bytes\n",
+            plan_result.task_count, plan_result.metadata_count,
+            plan_result.aic_count, plan_result.aiv_count,
+            plan_us, host_us, pipeline_e2e_us, kPlanBytes
+        );
         if (real_compute) {
             const size_t output_begin =
                 static_cast<size_t>(pa_scheduler::winner_workload::kSharedInputTiles) *
@@ -550,6 +668,9 @@ int main(int argc, char **argv) {
         final_barrier_spans.push_back(metrics.final_barrier_span_us);
         final_drain_spans.push_back(metrics.final_drain_span_us);
         lifecycle_spans.push_back(metrics.lifecycle_span_us);
+        plan_times.push_back(plan_us);
+        scalar_times.push_back(host_us);
+        pipeline_e2e_times.push_back(pipeline_e2e_us);
         // 分析只打印统计，导出则写 raw JSON；两者失败都标记 postprocess，
         // 与调度语义失败分开报告，便于区分协议问题和产物问题。
         if (options.analyze_swimlane &&
@@ -601,6 +722,14 @@ int main(int argc, char **argv) {
     // host 准入可以在第一个 worker 启动前拒绝本轮，此时没有可统计样本。
     // 显式输出 0 和 completed_runs=0，避免把空 vector 交给 Median()。
 #if PA_BUILD_PERF_CLOCK
+    const double median_plan_us =
+        plan_times.empty() ? 0.0 : pa_scheduler::host::Median(plan_times);
+    const double median_scalar_us =
+        scalar_times.empty() ? 0.0 : pa_scheduler::host::Median(scalar_times);
+    const double median_pipeline_e2e_us =
+        pipeline_e2e_times.empty()
+            ? 0.0
+            : pa_scheduler::host::Median(pipeline_e2e_times);
     const double median_startup_to_final_drain_us =
         startup_to_final_drain_spans.empty()
             ? 0.0
@@ -609,15 +738,26 @@ int main(int argc, char **argv) {
               );
     std::printf(
         "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s "
+        "median_plan_time_us=%.3f median_scalar_time_us=%.3f "
+        "median_pipeline_e2e_us=%.3f "
         "median_startup_to_final_drain_us=%.3f "
         "lifecycle_timing=disabled semantic_status=%s postprocess_status=%s\n",
         options.runs, startup_to_final_drain_spans.size(),
         pa_scheduler::host::ActiveFinalBarrierName(options.final_barrier_shape),
+        median_plan_us, median_scalar_us, median_pipeline_e2e_us,
         median_startup_to_final_drain_us,
         all_passed ? "PASS" : "FAIL",
         postprocess_ok ? "PASS" : "FAIL"
     );
 #else
+    const double median_plan_us =
+        plan_times.empty() ? 0.0 : pa_scheduler::host::Median(plan_times);
+    const double median_scalar_us =
+        scalar_times.empty() ? 0.0 : pa_scheduler::host::Median(scalar_times);
+    const double median_pipeline_e2e_us =
+        pipeline_e2e_times.empty()
+            ? 0.0
+            : pa_scheduler::host::Median(pipeline_e2e_times);
     const double median_submit_span_us =
         spans.empty() ? 0.0 : pa_scheduler::host::Median(spans);
     const double median_startup_barrier_us =
@@ -638,6 +778,8 @@ int main(int argc, char **argv) {
             : pa_scheduler::host::Median(lifecycle_spans);
     std::printf(
         "[SUMMARY] runs=%u completed_runs=%zu final_shape=%s "
+        "median_plan_time_us=%.3f median_scalar_time_us=%.3f "
+        "median_pipeline_e2e_us=%.3f "
         "median_submit_span_us=%.3f "
 #if PTO_FDWIC_SHARED_MAP
         "median_startup_arrival_spread_us=%.3f median_dispatch_exit_spread_us=%.3f "
@@ -650,6 +792,7 @@ int main(int argc, char **argv) {
         pa_scheduler::host::ActiveFinalBarrierName(
             options.final_barrier_shape
         ),
+        median_plan_us, median_scalar_us, median_pipeline_e2e_us,
         median_submit_span_us, median_startup_barrier_us,
         median_final_barrier_us, median_final_drain_us,
         median_lifecycle_us, all_passed ? "PASS" : "FAIL",

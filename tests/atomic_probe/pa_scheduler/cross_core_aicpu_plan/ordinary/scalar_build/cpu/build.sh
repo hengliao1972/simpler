@@ -24,7 +24,7 @@ BUILD_VARIANT="${1:-swimlane}"
 case "$BUILD_VARIANT" in
     swimlane)
         VARIANT_DEFINES=(
-            -DPA_BUILD_SWIMLANE=0
+            -DPA_BUILD_SWIMLANE=1
             -DPA_BUILD_SUBMIT_PMU=0
             -DPA_BUILD_PERF_CLOCK=0
         )
@@ -68,6 +68,18 @@ fi
 # 也避免把 host 回归二进制误当成 A5 产物。
 mkdir -p "$BUILD_DIR"
 
+# 三层 Plan 门槛分别锁定 ABI/PA adapter、外置 GM storage，以及动态 callback
+# producer 到 96 个 Scalar 中央 ticket 的状态机。它们都先于完整调度器执行，
+# 便于把 wire/storage 错误与后续 Materialize/Register/Execute 错误分开定位。
+echo "[TEST] Runtime Plan ABI and PA adapter gates"
+"$SCRIPT_DIR/build_protocol.sh"
+
+echo "[TEST] Runtime Plan external-storage wiring gate"
+"$SCRIPT_DIR/build_storage.sh"
+
+echo "[TEST] AICPU Plan -> Scalar central-ticket protocol gate"
+"$SCRIPT_DIR/build_plan_scheduler_gate.sh"
+
 echo "[CHECK] cross-core atomic/DCCI source coverage"
 PA_ATOMIC_DCCI_COVERAGE_ROOT="$ROOT_DIR" \
     "${PYTHON:-python3}" \
@@ -101,9 +113,9 @@ echo "[TEST] atomic PollBatch boundary self-test"
 
 # shared ring 是当前 ordered writer-delta 的 ordinary-region 原语，隔离
 # 覆盖 seq/ABA、回收与容量预检。PA Case1 当前 ordinary entry 为零，
-# 因此这些门槛仍不能代替后面的完整 96-worker Submit 测试。
+# 因此这些门槛仍不能代替后面的完整 96-worker Plan Build 测试。
     # 独占 128B completion 覆盖正式的逐 task 严格链：无论是否产生
-    # metadata，每个 Build winner 都必须按 N-1 -> N 发布完成字。
+    # metadata，每个唯一 Build owner 都必须按 N-1 -> N 发布完成字。
     # 另覆盖 pending、损坏值与重复发布。
     echo "[BUILD] shared strict per-task completion self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
@@ -132,34 +144,6 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] shared independent host-oracle self-test"
     "$BUILD_DIR/test_shared_host_task_plan"
 
-    # 96 个 Scalar 都从运行时 context 独立回放真实 callback 参数；该门槛
-    # 覆盖混合 G0/G1/G2/G4、全部五种 task、动态 shape/view/scalar 和
-    # SharedOutputRef 前驱过滤，并拒绝 Host 预制 task 身份。
-    echo "[BUILD] shared independent replay args self-test"
-    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
-        -DPTO_FDWIC_SHARED_MAP=1 \
-        -DPA_BUILD_SWIMLANE=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_random_access_args.cpp" \
-        -o "$BUILD_DIR/test_shared_random_access_args"
-
-    echo "[TEST] shared independent replay args self-test"
-    "$BUILD_DIR/test_shared_random_access_args"
-
-    # 独立 96-thread 门槛证明无预制计划时，每核完整 replay 仍能通过
-    # per-task Tournament 产生唯一 Build owner；即使 worker0 延迟，其他
-    # worker 也能完成全部 task。CPU 结果只证明协议，不冒充 A5 性能。
-    echo "[BUILD] shared no-prebuilt-plan Build protocol self-test"
-    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
-        -DPTO_FDWIC_SHARED_MAP=1 \
-        -DPA_BUILD_SWIMLANE=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_build_dispatch.cpp" \
-        -o "$BUILD_DIR/test_shared_build_dispatch"
-
-    echo "[TEST] shared no-prebuilt-plan Build protocol self-test"
-    "$BUILD_DIR/test_shared_build_dispatch"
-
     for cap in 32 64 128 256 16384; do
         binary="$BUILD_DIR/test_shared_tensor_map_ring_cap${cap}"
         echo "[BUILD] isolated shared ordinary-region ring self-test CAP=$cap"
@@ -175,21 +159,10 @@ echo "[TEST] atomic PollBatch boundary self-test"
         "$binary"
     done
 
-    # shared raw 必须呈现每个 worker 连续的 0..N-1 Submit/Claim；每 task
-    # 全局恰有一个 winner 子区间，loser 不产生 winner 业务子区间。
-    echo "[BUILD] shared all-worker-replay raw-trace self-test"
-    "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
-        -DPTO_FDWIC_SHARED_MAP=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_sparse_trace.cpp" \
-        -o "$BUILD_DIR/test_shared_sparse_trace"
-
-    echo "[TEST] shared all-worker-replay raw-trace self-test"
-    "$BUILD_DIR/test_shared_sparse_trace"
-
-    # CCEC full-swimlane 的 16B generic raw 仍由 host 恢复成既有 32B
-    # 逻辑记录。该纯主机门槛独立锁定 packed 字段、low32 前/后向回绕、
-    # 生命周期拒绝和 terminal 4B 更新的 cache-line 邻值不变。
+    # 16B generic raw 仍由 host 恢复成 32B 逻辑记录。该门槛
+    # 只锁定历史 ABI/codec：packed 字段、low32 前/后向回绕、生命周期拒绝
+    # 和 terminal 4B 更新的 cache-line 邻值不变；不把它宣称为 Plan
+    # 正式路径中 Submit/Claim 的证据。
     echo "[BUILD] shared compact generic-trace codec self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
@@ -247,24 +220,6 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] shared heap no-wrap reserve self-test"
     "$BUILD_DIR/test_shared_heap_reserve"
 
-    # shared Claim 使用每 task 两级 CAS Tournament：S5b 的 Alloc 与四类
-    # kernel 都由全部 96 个 Scalar 以 G8 竞争 Build。用例锁定每组一个
-    # root 竞争者、最终唯一 owner、重复 replay 全输，并证明未来 task
-    # 不会覆盖延迟的前序 task。
-    # Claim owner 与 insert-completion 虽复用同一个 task sidecar，但分别
-    # 独占 cache line；Claim 必须保持 insert-completion 与旧 TaskCell
-    # canary 不变，TensorMap 顺序由独立完成链验证。
-    echo "[BUILD] shared Claim Tournament self-test"
-    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
-        -DPTO_FDWIC_SHARED_MAP=1 \
-        -DPA_BUILD_SWIMLANE=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_claim_tournament.cpp" \
-        -o "$BUILD_DIR/test_shared_claim_tournament"
-
-    echo "[TEST] shared Claim Tournament self-test"
-    "$BUILD_DIR/test_shared_claim_tournament"
-
     # Materialize 在触碰 shared cursor 前必须完成数量、引用、shape/stride
     # 和地址区间预检；这些 reserve 前拒绝路径不能推进 heap。FetchAdd 后
     # 才暴露的容量竞争则按 terminal 契约保留 overrun 现场。
@@ -281,7 +236,8 @@ echo "[TEST] atomic PollBatch boundary self-test"
 
     # 通用 payload 协议门槛不能替代 PA adapter：这里逐 kind 锁定真实
     # tensor/scalar/fanin 形状、completion vend 按值冻结、builder 源污染
-    # 后 cell 不变，以及 Claim 后 token-private dispatch/context 重绑。
+    # 后 cell 不变，以及 Execute token Claim 后的 private
+    # dispatch/context 重绑；这不是已移除的 Build Tournament Claim。
     echo "[BUILD] PA cross-core execution adapter self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
@@ -293,7 +249,7 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] PA cross-core execution adapter self-test"
     "$BUILD_DIR/test_pa_exec_adapter"
 
-    # 扫描器必须只消费已经闭合的 Submit 前缀，并在 token busy 后继续从
+    # 扫描器必须只消费已经闭合的 Build 发布前缀，并在 token busy 后继续从
     # 原游标发现后续 task；FinalDrain 还要由 96 个 worker 汇合后在 device
     # 侧证明每组到达数、唯一 kernel completion 总数和 token=IDLE，不能
     # 只靠 host 事后拒绝，也不能重新引入逐 task 原子终态扫描。
@@ -308,20 +264,39 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] PA cross-core execution scan/drain self-test"
     "$BUILD_DIR/test_cross_core_exec_scan"
 
-    # 完整 96-worker Submit 精确校验逐 task completion（包括空 writer）、
-    # replay identity seal、loser 零 TensorMap 访问，以及 Build/Execute
-    # owner 跨核分离后直到 FinalDrain 的完整闭合。
-    echo "[BUILD] shared ordered-insert Submit self-test"
-    "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
-        -DPTO_FDWIC_SHARED_MAP=1 \
-        "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$SHARED_INSERT_TURN_GROUPS" \
-        -DPA_BUILD_SWIMLANE=1 \
-        -I"$ROOT_DIR/common" \
-        "$ROOT_DIR/test/test_shared_ordered_submit.cpp" \
-        -o "$BUILD_DIR/test_shared_ordered_submit"
+# 正式 CPU main 不再以旧 96×N replay/Claim/Tournament 用例代表整体
+# 合同。这里直接运行与设备共用的调度器，B1/B256 均必须闭合
+# Plan attach、N+96 ticket、Materialize、严格 TensorMap 插入、
+# Fanin、Execute 与 FinalDrain。用 scalar-nop=0 只消除 CPU 假计算负载，
+# 不放宽任何调度状态断言。
+FUNCTIONAL_ARGS=(
+    --runs 1
+    --winner-workload scalar-nop
+    --nop-count 0
+)
 
-    echo "[TEST] shared ordered-insert Submit self-test"
-    timeout --foreground 15s "$BUILD_DIR/test_shared_ordered_submit"
+if [[ "$BUILD_VARIANT" == "swimlane" ]]; then
+    echo "[TEST] formal CPU main swimlane B1"
+    timeout --foreground 120s \
+        "$BUILD_DIR/$SCHEDULER_BINARY" \
+        --batches 1 "${FUNCTIONAL_ARGS[@]}"
+
+    echo "[TEST] formal CPU main swimlane binary B256 (trace-free functional gate)"
+    timeout --foreground 120s \
+        "$BUILD_DIR/$SCHEDULER_BINARY" \
+        --batches 256 --no-swimlane "${FUNCTIONAL_ARGS[@]}"
+else
+    echo "[TEST] formal CPU main perf-clock B1"
+    timeout --foreground 120s \
+        "$BUILD_DIR/$SCHEDULER_BINARY" \
+        --batches 1 --no-swimlane "${FUNCTIONAL_ARGS[@]}"
+
+    echo "[TEST] formal CPU main perf-clock B256"
+    timeout --foreground 120s \
+        "$BUILD_DIR/$SCHEDULER_BINARY" \
+        --batches 256 --no-swimlane "${FUNCTIONAL_ARGS[@]}"
+fi
+
 # set -e 保证编译或链接失败时不会打印 complete，也不会在组合构建中继续
 # 后续步骤；只有成功退出的构建才被本脚本声明为可运行产物。
 echo "[BUILD] complete: $BUILD_DIR/$SCHEDULER_BINARY"

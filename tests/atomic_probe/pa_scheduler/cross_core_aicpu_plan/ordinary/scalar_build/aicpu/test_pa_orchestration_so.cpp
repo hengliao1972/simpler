@@ -235,6 +235,7 @@ int main(int argc, char **argv)
         const uint8_t group = expected_group[task];
         const bool has_following = task == 9U;
         const bool last_in_batch = task == 4U || task == 13U;
+        const uint16_t expected_batch_start = task < 5U ? 0U : 5U;
         const uint8_t expected_flags = static_cast<uint8_t>(
             0x80U | (last_in_batch ? 0x40U : 0U) |
             (has_following ? 0x20U : 0U) |
@@ -243,8 +244,9 @@ int main(int argc, char **argv)
         ok &= Check(
             header.task_id == task &&
             header.adapter_flags == expected_flags &&
+            header.adapter_data == expected_batch_start &&
             header.output_count == expected_outputs[kind],
-            "task identity/flags/output arity mismatch"
+            "task identity/flags/batch_start/output arity mismatch"
         );
         const uint8_t expected_engine =
             kind == 0U ? 0U : ((kind == 1U || kind == 3U) ? 1U : 2U);
@@ -257,6 +259,58 @@ int main(int argc, char **argv)
         );
     }
 
+    // 在完全相同的 control/cells 地址上模拟正式 Host 的下一轮：先清零
+    // 同一份 GM storage，再重新 bind -> callback -> close。x86 本身是
+    // cache coherent 的，因此这里只负责锁死协议顺序和同地址复用语义；
+    // AICPU 对 Host DMA stale clean line 的真机门槛由 CCEC --runs 2 覆盖。
+    ok &= Check(
+        bind(&backend_config) != 0,
+        "same-address reuse without Host reset must reject Published cells"
+    );
+    std::memset(control_memory, 0, sizeof(RuntimePlanControl));
+    std::memset(
+        cells_memory, 0,
+        kExpectedTasks * sizeof(RuntimeTaskPlanCell)
+    );
+    ok &= Check(bind(&backend_config) == 0, "same-address second bind failed");
+    if (ok) entry(args);
+    ok &= Check(close() == 0, "same-address second close failed");
+    const AicpuPlanBackendResult reused_result = result();
+    ok &= Check(
+        reused_result.status == 0 &&
+        reused_result.task_count == kExpectedTasks &&
+        reused_result.begin_count == kExpectedTasks &&
+        reused_result.finish_count == kExpectedTasks &&
+        reused_result.published_count == kExpectedTasks &&
+        reused_result.alloc_count == 2U &&
+        reused_result.aic_count == 6U &&
+        reused_result.aiv_count == 6U,
+        "same-address second producer run did not close exactly"
+    );
+    ok &= Check(
+        control->planned_frontier.value == kExpectedTasks &&
+        control->closed_task_count.value == kExpectedTasks &&
+        control->fatal.value == 0,
+        "same-address second Plan close/frontier/fatal mismatch"
+    );
+    for (uint32_t task = 0U; task < kExpectedTasks; ++task) {
+        const DecodedPlanCellControl decoded =
+            DecodePlanCellControl(cells[task].control.value);
+        RuntimeTaskPlanHeader header{};
+        RuntimeTaskPlanLayout layout{};
+        const uint16_t expected_batch_start = task < 5U ? 0U : 5U;
+        ok &= Check(
+            decoded.valid && decoded.phase == PlanCellPhase::Published &&
+            decoded.task_id == task &&
+            ValidateRuntimeTaskPlanPayload(
+                cells[task].payload, task,
+                decoded.payload_lines, header, layout
+            ) &&
+            header.adapter_data == expected_batch_start,
+            "same-address second PlanCell is not canonical published payload"
+        );
+    }
+
     std::free(cells_memory);
     std::free(control_memory);
     dlclose(handle);
@@ -266,6 +320,7 @@ int main(int argc, char **argv)
         << backend_result.task_count
         << " alloc/aic/aiv=" << backend_result.alloc_count << '/'
         << backend_result.aic_count << '/' << backend_result.aiv_count
+        << " producer_runs=2 same_address_reuse=yes"
         << '\n';
     return 0;
 }

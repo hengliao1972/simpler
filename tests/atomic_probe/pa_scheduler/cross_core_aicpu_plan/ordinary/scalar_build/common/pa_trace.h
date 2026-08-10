@@ -117,11 +117,15 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedBuildDispatchTicket:
         case AtomicSite::SharedExecDispatchTicket:
         case AtomicSite::SharedExecDrainArrive:
+        case AtomicSite::RuntimePlanBuildNextFetchAdd:
+        case AtomicSite::RuntimePlanWorkersDoneFetchAdd:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
         case AtomicSite::CompletionVendExchange:
         case AtomicSite::CompletionFlagExchange:
         case AtomicSite::SharedExecDrainReleasePublish:
+        case AtomicSite::RuntimePlanFatalPublish:
+        case AtomicSite::RuntimePlanBuildReleasePublish:
             return AtomicOp::Exchange;
         case AtomicSite::ClaimMax:
         case AtomicSite::FrontierMax:
@@ -170,6 +174,12 @@ PA_DEVICE int32_t TraceAtomicPollBatchIndex(AtomicSite site) {
             return 6;
         case AtomicSite::SharedExecDrainArrivalPoll:
             return 7;
+        case AtomicSite::RuntimePlanClosedLoad:
+            return 8;
+        case AtomicSite::RuntimePlanBuildReleaseLoad:
+            return 9;
+        case AtomicSite::RuntimePlanFatalLoad:
+            return 10;
         default:
             return -1;
     }
@@ -193,6 +203,12 @@ PA_DEVICE AtomicSite TraceAtomicPollBatchSite(uint32_t index) {
             return AtomicSite::SharedExecDrainReleasePoll;
         case 7:
             return AtomicSite::SharedExecDrainArrivalPoll;
+        case 8:
+            return AtomicSite::RuntimePlanClosedLoad;
+        case 9:
+            return AtomicSite::RuntimePlanBuildReleaseLoad;
+        case 10:
+            return AtomicSite::RuntimePlanFatalLoad;
         default:
             return AtomicSite::Count;
     }
@@ -1075,6 +1091,122 @@ PA_DEVICE int64_t TraceAtomicFetchAdd(
         trace, result, task_id, site, AtomicOp::FetchAdd, begin, end, result_used, return_ready
     );
     return old;
+#endif
+}
+
+// Runtime Plan control 的三个 Ops 接口不能直接复用普通
+// TraceAtomicLoad/FetchAdd/Exchange：CPU 门槛中 LoadControl 是
+// fetch_add(0)，PublishControl 则保留 release-store 语义；强行换成
+// Ops::Load/Exchange 会改写 trace-free/perf-clock 热路径。下面的
+// wrapper 只包围已有 control 原语，不增加原子或 DCCI。
+template <typename Ops>
+PA_DEVICE int64_t TraceAtomicControlLoad(
+    TraceContext &trace, WorkerResult &result, int32_t task_id,
+    AtomicSite site, PA_GM volatile int64_t *address,
+    bool result_used = true
+) {
+#if PA_BUILD_TRACE_FREE
+    (void)trace;
+    (void)result;
+    (void)task_id;
+    (void)site;
+    (void)result_used;
+    return Ops::LoadControl(address);
+#else
+    if (!AtomicSwimlaneEnabled(trace)) {
+        return Ops::LoadControl(address);
+    }
+    const bool poll_batch =
+        result_used &&
+        AtomicPollBatchEnabled(trace, site, AtomicOp::Load);
+    const int32_t poll_index = poll_batch
+        ? TraceAtomicPollBatchIndex(site)
+        : -1;
+    const bool first_in_batch =
+        poll_batch &&
+        (trace.poll_burst.active_mask &
+         (1U << static_cast<uint32_t>(poll_index))) == 0;
+    const uint64_t begin =
+        !poll_batch || first_in_batch ? Ops::Now() : 0;
+    const int64_t old = Ops::LoadControl(address);
+    if (poll_batch) {
+        CountAtomicCall(trace, result, true);
+        AccumulateAtomicPollCall<Ops>(
+            trace, result, site, begin
+        );
+        return old;
+    }
+    const bool return_ready =
+        result_used && Ops::kAtomicReturnReadyObserved;
+    const uint64_t end = result_used
+        ? Ops::NowAfterAtomicResult(old)
+        : Ops::Now();
+    WriteAtomicTrace<Ops>(
+        trace, result, task_id, site, AtomicOp::Load,
+        begin, end, result_used, return_ready,
+        old == 0
+    );
+    return old;
+#endif
+}
+
+template <typename Ops>
+PA_DEVICE int64_t TraceAtomicControlFetchAdd(
+    TraceContext &trace, WorkerResult &result, int32_t task_id,
+    AtomicSite site, PA_GM volatile int64_t *address,
+    int64_t value, bool result_used = true
+) {
+#if PA_BUILD_TRACE_FREE
+    (void)trace;
+    (void)result;
+    (void)task_id;
+    (void)site;
+    (void)result_used;
+    return Ops::FetchAddControl(address, value);
+#else
+    if (!AtomicSwimlaneEnabled(trace)) {
+        return Ops::FetchAddControl(address, value);
+    }
+    const uint64_t begin = Ops::Now();
+    const int64_t old = Ops::FetchAddControl(address, value);
+    const bool return_ready =
+        result_used && Ops::kAtomicReturnReadyObserved;
+    const uint64_t end = result_used
+        ? Ops::NowAfterAtomicResult(old)
+        : Ops::Now();
+    WriteAtomicTrace<Ops>(
+        trace, result, task_id, site, AtomicOp::FetchAdd,
+        begin, end, result_used, return_ready
+    );
+    return old;
+#endif
+}
+
+template <typename Ops>
+PA_DEVICE void TraceAtomicControlPublish(
+    TraceContext &trace, WorkerResult &result, int32_t task_id,
+    AtomicSite site, PA_GM volatile int64_t *address,
+    int64_t value
+) {
+#if PA_BUILD_TRACE_FREE
+    (void)trace;
+    (void)result;
+    (void)task_id;
+    (void)site;
+    Ops::PublishControl(address, value);
+#else
+    if (!AtomicSwimlaneEnabled(trace)) {
+        Ops::PublishControl(address, value);
+        return;
+    }
+    const uint64_t begin = Ops::Now();
+    Ops::PublishControl(address, value);
+    const uint64_t end = Ops::Now();
+    WriteAtomicTrace<Ops>(
+        trace, result, task_id, site, AtomicOp::Exchange,
+        begin, end, /*result_used=*/false,
+        /*return_ready=*/false
+    );
 #endif
 }
 

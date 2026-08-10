@@ -45,6 +45,29 @@ constexpr uint8_t kValidAdapterFlags = static_cast<uint8_t>(
     (2U << kSharedPaTicketGroupShift) |
     static_cast<uint32_t>(TaskKind::Pv)
 );
+constexpr uint32_t kValidBatchStart =
+    kTaskId - (1U + 2U * 4U +
+               (static_cast<uint32_t>(TaskKind::Pv) -
+                static_cast<uint32_t>(TaskKind::Qk)));
+
+constexpr uint32_t BatchStartForAdapterFlags(uint8_t flags)
+{
+    const TaskKind kind = static_cast<TaskKind>(
+        flags & kSharedPaTicketKindMask
+    );
+    const uint32_t group =
+        (flags >> kSharedPaTicketGroupShift) &
+        kSharedPaTicketGroupMask;
+    if (kind >= TaskKind::Count || group >= kSharedPaMaxBlockGroups) {
+        return 0U;
+    }
+    const uint32_t offset = kind == TaskKind::Alloc
+        ? 0U
+        : 1U + group * 4U +
+              (static_cast<uint32_t>(kind) -
+               static_cast<uint32_t>(TaskKind::Qk));
+    return offset <= kTaskId ? kTaskId - offset : 0U;
+}
 
 [[noreturn]] void Fail(const char *message)
 {
@@ -374,7 +397,8 @@ void TestFullPaAdapterRoundTrip()
     Expect(
         MakePaRuntimeTaskPlanSpec(
             source.args, kTaskId, static_cast<int32_t>(kFunctionId),
-            EngineClass::Aic, kValidAdapterFlags, spec
+            EngineClass::Aic, kValidAdapterFlags,
+            kValidBatchStart, spec
         ),
         "MakePaRuntimeTaskPlanSpec rejected a valid PA task"
     );
@@ -411,6 +435,10 @@ void TestFullPaAdapterRoundTrip()
     Expect(
         header.adapter_flags == kValidAdapterFlags,
         "PA adapter flags changed across Plan wire"
+    );
+    Expect(
+        header.adapter_data == kValidBatchStart,
+        "PA batch provenance changed across Plan wire"
     );
     Expect(header.tensor_count == 5U, "tensor count changed across Plan wire");
     Expect(header.scalar_count == 3U, "scalar count changed across Plan wire");
@@ -556,7 +584,8 @@ void ExpectMakeSpecRejected(
     Expect(
         !MakePaRuntimeTaskPlanSpec(
             args, kTaskId, function_id, engine_class,
-            adapter_flags, spec
+            adapter_flags,
+            BatchStartForAdapterFlags(adapter_flags), spec
         ),
         message
     );
@@ -571,7 +600,8 @@ void ExpectPipelineRejected(
     RuntimeTaskPlanSpec spec{};
     if (!MakePaRuntimeTaskPlanSpec(
             args, kTaskId, function_id, engine_class,
-            adapter_flags, spec
+            adapter_flags,
+            BatchStartForAdapterFlags(adapter_flags), spec
         )) {
         return;
     }
@@ -676,6 +706,16 @@ void TestInvalidPaSourcesFailClosed()
 void TestInvalidMetadataFailsClosed()
 {
     SourceTask source;
+    RuntimeTaskPlanSpec bad_provenance_spec{};
+    Expect(
+        !MakePaRuntimeTaskPlanSpec(
+            source.args, kTaskId,
+            static_cast<int32_t>(kFunctionId), EngineClass::Aic,
+            kValidAdapterFlags, kValidBatchStart + 1U,
+            bad_provenance_spec
+        ),
+        "PA task with inconsistent explicit batch provenance was accepted"
+    );
     ExpectMakeSpecRejected(
         source.args, static_cast<int32_t>(kFunctionId),
         EngineClass::MetadataOnly, kValidAdapterFlags,

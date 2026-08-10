@@ -23,6 +23,20 @@
 #include "../common/winner_workload.h"
 #include "../common/pa_scheduler_core.h"
 
+#if defined(PA_CCEC_BLOCK_LOCAL_STATS)
+// direct Plan entry 与旧 callback split 是两个独立概念。这里只把会跨
+// noinline helper 传引用的 LocalStats 放在每个物理 Scalar 自己的
+// block-local 区域，避免 CCEC 后端错误复用普通栈槽；调度流程仍是单 TU
+// 的 Plan -> Build -> Execute，且 WorkerResult 继续保持 non-split ABI。
+extern "C" {
+#if defined(PA_BUILD_AIC)
+[[block_local]] pa_scheduler::LocalStats pa_scheduler_plan_local_stats_aic;
+#elif defined(PA_BUILD_AIV)
+[[block_local]] pa_scheduler::LocalStats pa_scheduler_plan_local_stats_aiv;
+#endif
+}
+#endif
+
 #define PA_CCEC_OPS_DEFINE_REAL_WORKLOAD 1
 #include "ccec_ops.h"
 #undef PA_CCEC_OPS_DEFINE_REAL_WORKLOAD

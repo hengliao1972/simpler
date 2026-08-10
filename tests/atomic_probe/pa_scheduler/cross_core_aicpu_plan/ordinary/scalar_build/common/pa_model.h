@@ -83,7 +83,8 @@
 #endif
 
 // S0 的 fail-closed 门禁在 S2 接入真实 shared sidecar 后解除。模式仍由
-// 三镜像统一的构建身份与 manifest 锁定，不能把 shared 目录指向 private 实现。
+// Host、AICore 与 AICPU 产物统一由构建身份和 manifest 锁定，不能把
+// shared 目录指向 private 实现。
 
 // 三类证据链在编译期严格互斥：swimlane 保存普通阶段与 atomic 记录，
 // submit-pmu 只保留 PMU 窗口；无泳道性能构建只增加 startup 与
@@ -742,7 +743,12 @@ enum class TracePhase : int32_t {
     // 区域级 DCCI 记录是 scalar 调度泳道的 overlay；它不参与 Submit
     // 排他分段，也不复用 Atomic 的 flags/auxiliary 编号。
     Dcci = 24,
-    Count = 25,
+    // AICPU Plan-ahead 模式下每个 Scalar 的真实 Build 父区间：
+    // 从首次 acquire Plan storage/closed 开始，到本核取得越界
+    // ticket、完成 worker arrival 并观察到 build_release 为止。
+    // 它不是 orchestration replay，也不增加 TraceRecord 字段。
+    RuntimePlanBuild = 25,
+    Count = 26,
 };
 
 // AtomicSite 按 standalone PA 中真实出现的源码调用点分类。编号写入 TraceRecord::auxiliary，
@@ -832,7 +838,22 @@ enum class AtomicSite : uint32_t {
     // 回放得到的 task_count 与顺序身份摘要。它只做一致性封口，不发布
     // task 身份，也不参与 Build owner 决策。
     SharedReplayIdentitySeal = 57,
-    Count = 58,
+    // AICPU Runtime Plan 的 control word 全部是独占 128B 的
+    // atomic-only 行。站点只能在旧 raw id 后 append；全局
+    // control 使用 task_id=-1，cell control 使用真实 task_id。
+    RuntimePlanFatalLoad = 58,
+    RuntimePlanFatalPublish = 59,
+    RuntimePlanClosedLoad = 60,
+    RuntimePlanFrontierLoad = 61,
+    RuntimePlanBuildNextFetchAdd = 62,
+    RuntimePlanBuildNextLoad = 63,
+    RuntimePlanCellControlLoad = 64,
+    RuntimePlanWorkersDoneFetchAdd = 65,
+    RuntimePlanWorkersDoneLoad = 66,
+    RuntimePlanBuildReleaseLoad = 67,
+    RuntimePlanBuildReleasePublish = 68,
+    RuntimePlanLastInsertCompletionLoad = 69,
+    Count = 70,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -854,7 +875,9 @@ constexpr uint32_t kAtomicPollBatch = 1U << 7;
 constexpr uint32_t kAtomicRetriesShift = 8;
 constexpr uint32_t kAtomicPollCountShift = 8;
 constexpr uint32_t kAtomicPollCountMax = 0x00ffffffU;
-constexpr uint32_t kAtomicPollBatchSiteCount = 8;
+// closed/release 等待与旧 8 类等待一样，每个 episode 只写
+// 一条 PollBatch；逻辑调用数仍通过 flags[31:8] 精确闭合。
+constexpr uint32_t kAtomicPollBatchSiteCount = 11;
 static_assert(kAtomicPollBatchSiteCount <= 32, "PollBatch enable mask supports at most 32 compact indices");
 
 // DCCI 与 Atomic 使用同一个 32B TraceRecord，但拥有完全独立的 raw ABI。
@@ -893,7 +916,13 @@ enum class DcciSite : uint32_t {
     // 每核真实 replay 会直接读取 Host 写入的 context_lens。A5 Scalar
     // 无 cache coherence，必须在第一次读取前显式失效活动输入区。
     StartupContextLensInvalidate = 14,
-    Count = 15,
+    // AICPU 发布的 canonical Plan payload 是 Scalar Build 的独立输入
+    // 对象，不能与 exec-cell payload 或旧 replay descriptor 混合归因。
+    RuntimePlanPayloadAcquire = 15,
+    // Host 只发布外置 Plan cell 的基址/容量 wire ABI；每个 Scalar 在
+    // MakeRuntimePlanView 前 exact acquire 该普通 cache line。
+    RuntimePlanStorageRefAcquire = 16,
+    Count = 17,
 };
 
 constexpr uint32_t kDcciOpMask = 0x03U;
@@ -922,11 +951,15 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedBuildDispatchTicket:
         case AtomicSite::SharedExecDispatchTicket:
         case AtomicSite::SharedExecDrainArrive:
+        case AtomicSite::RuntimePlanBuildNextFetchAdd:
+        case AtomicSite::RuntimePlanWorkersDoneFetchAdd:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
         case AtomicSite::CompletionVendExchange:
         case AtomicSite::CompletionFlagExchange:
         case AtomicSite::SharedExecDrainReleasePublish:
+        case AtomicSite::RuntimePlanFatalPublish:
+        case AtomicSite::RuntimePlanBuildReleasePublish:
             return AtomicOp::Exchange;
         case AtomicSite::ClaimMax:
         case AtomicSite::FrontierMax:
@@ -967,6 +1000,8 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedOutputRollbackExchange:
         case AtomicSite::SharedExecCompletionVendPublish:
         case AtomicSite::SharedExecDrainReleasePublish:
+        case AtomicSite::RuntimePlanFatalPublish:
+        case AtomicSite::RuntimePlanBuildReleasePublish:
             return false;
         case AtomicSite::StartupPoll:
         case AtomicSite::FatalPoll:
@@ -1018,6 +1053,16 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedExecDrainArrive:
         case AtomicSite::SharedExecDrainReleasePoll:
         case AtomicSite::SharedExecDrainArrivalPoll:
+        case AtomicSite::RuntimePlanFatalLoad:
+        case AtomicSite::RuntimePlanClosedLoad:
+        case AtomicSite::RuntimePlanFrontierLoad:
+        case AtomicSite::RuntimePlanBuildNextFetchAdd:
+        case AtomicSite::RuntimePlanBuildNextLoad:
+        case AtomicSite::RuntimePlanCellControlLoad:
+        case AtomicSite::RuntimePlanWorkersDoneFetchAdd:
+        case AtomicSite::RuntimePlanWorkersDoneLoad:
+        case AtomicSite::RuntimePlanBuildReleaseLoad:
+        case AtomicSite::RuntimePlanLastInsertCompletionLoad:
             return true;
         case AtomicSite::Count:
             return false;
@@ -1043,6 +1088,12 @@ PA_MODEL_INLINE constexpr int32_t AtomicPollBatchIndex(AtomicSite site) {
             return 6;
         case AtomicSite::SharedExecDrainArrivalPoll:
             return 7;
+        case AtomicSite::RuntimePlanClosedLoad:
+            return 8;
+        case AtomicSite::RuntimePlanBuildReleaseLoad:
+            return 9;
+        case AtomicSite::RuntimePlanFatalLoad:
+            return 10;
         default:
             return -1;
     }
@@ -1066,6 +1117,12 @@ PA_MODEL_INLINE constexpr AtomicSite AtomicPollBatchSite(uint32_t index) {
             return AtomicSite::SharedExecDrainReleasePoll;
         case 7:
             return AtomicSite::SharedExecDrainArrivalPoll;
+        case 8:
+            return AtomicSite::RuntimePlanClosedLoad;
+        case 9:
+            return AtomicSite::RuntimePlanBuildReleaseLoad;
+        case 10:
+            return AtomicSite::RuntimePlanFatalLoad;
         default:
             return AtomicSite::Count;
     }
@@ -1145,6 +1202,14 @@ static_assert(
 static_assert(
     DcciSiteIsSharedOnly(DcciSite::StartupContextLensInvalidate),
     "shared replay context-lens invalidate must remain shared-only"
+);
+static_assert(
+    DcciSiteIsSharedOnly(DcciSite::RuntimePlanPayloadAcquire),
+    "runtime Plan payload acquire must remain shared-only"
+);
+static_assert(
+    DcciSiteIsSharedOnly(DcciSite::RuntimePlanStorageRefAcquire),
+    "runtime Plan storage-ref acquire must remain shared-only"
 );
 
 #undef PA_MODEL_INLINE

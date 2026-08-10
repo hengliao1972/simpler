@@ -786,16 +786,27 @@ PA_DEVICE bool WaitForPreparedSharedWriterOutputs(
     return true;
 }
 
-template <typename Ops, bool Profile, typename PmuContext>
+template <
+    typename Ops, bool Profile, SharedFinishMode FinishMode,
+    typename PmuContext
+>
 PA_DEVICE bool FinishSharedWinnerSubmitBody(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     const TaskArgs &args, SubmitContext &context, LocalStats &stats,
-    PmuContext &pmu_context, const CallbackSubmitTicket &ticket
+    PmuContext &pmu_context, const CallbackSubmitTicket &ticket,
+    uint32_t planned_batch_start
 ) {
     const uint32_t task_id = ticket.task_id;
     SharedPaTaskMeta task_meta{};
-    if (ticket.won == 0 ||
-        !DecodeSharedPaTaskMeta(ticket.reserved, task_id, task_meta) ||
+    const bool task_meta_valid =
+        FinishMode == SharedFinishMode::PlannedBuild
+        ? DecodeSharedPaTaskMeta(
+              ticket.reserved, task_id, planned_batch_start, task_meta
+          )
+        : DecodeLegacySharedPaTaskMeta(
+              ticket.reserved, task_id, task_meta
+          );
+    if (ticket.won == 0 || !task_meta_valid ||
         !SharedPaFunctionIdMatches(
             task_meta.kind, true,
             static_cast<int32_t>(ticket.function_id)
@@ -1253,9 +1264,18 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         ProfilePhase::ReplayTail, build_begin, build_end
     );
 
-    return CloseSharedCallbackSubmit<Ops, Profile>(
-        state, stats, ticket, task_meta, kind
-    );
+    if constexpr (FinishMode == SharedFinishMode::Replay) {
+        return CloseSharedCallbackSubmit<Ops, Profile>(
+            state, stats, ticket, task_meta, kind
+        );
+    }
+    // PlannedBuild 的唯一身份来自 AICPU closed Plan。这里已经完整发布
+    // TensorMap completion 或 exec cell；Submit/replay 封口属于另一套
+    // 协议，绝不能在此重复执行。每核只累计自己实际领取并完成的 Build。
+    ++stats.result.submits;
+    ++stats.result.wins[KindIndex(kind)];
+    ++worker.local_index;
+    return true;
 }
 
 #endif  // PA_SCHEDULER_COMMON_PA_SHARED_SUBMIT_PATH_H

@@ -73,6 +73,8 @@ __aicore__ bool ConsumeCell(
         return false;
     }
 
+    // 包括承载 adapter_data 的 header word2 在内，每一个 advertised
+    // payload word 都必须与 consumer 独立重算的 oracle 完全一致。
     for (uint32_t word = 0U; word < decoded.payload_lines * 8U; ++word) {
         const uint64_t actual = cell->payload.words[word];
         const uint64_t expected = ExpectedPayloadWordForShape(shape, layout, nonce, word);

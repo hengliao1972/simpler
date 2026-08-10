@@ -35,7 +35,7 @@
 
 namespace pa_scheduler::aicpu_plan {
 
-constexpr uint32_t kRuntimePlanAbiVersion = 1U;
+constexpr uint32_t kRuntimePlanAbiVersion = 2U;
 constexpr uint32_t kPlanCacheLineBytes = 64U;
 constexpr uint32_t kAtomicIsolationBytes = 128U;
 constexpr uint32_t kMaxRuntimeTasks = 32768U;
@@ -117,6 +117,9 @@ struct RuntimeTaskPlanSpec {
     int16_t core_num;
     uint8_t require_sync_start;
     uint8_t reserved;
+    // 算子 adapter 自己定义的 16bit provenance。公共协议只负责原样
+    // 搬运；PA 用它显式携带 batch_start，其他算子可以定义自己的语义。
+    uint16_t adapter_data;
     uint32_t tensor_reference_mask;
 };
 
@@ -134,13 +137,14 @@ struct RuntimeTaskPlanHeader {
     int16_t core_num;
     uint8_t require_sync_start;
     uint8_t reserved0;
-    uint16_t reserved1;
+    uint16_t adapter_data;
     uint8_t tensor_tags[kMaxTaskTensors];
     uint32_t tensor_reference_mask;
     uint32_t abi_version;
 };
 
 static_assert(sizeof(RuntimeTaskPlanHeader) == kPlanCacheLineBytes, "runtime Plan header must be one line");
+static_assert(offsetof(RuntimeTaskPlanHeader, adapter_data) == 22U, "runtime Plan adapter-data offset changed");
 static_assert(offsetof(RuntimeTaskPlanHeader, tensor_tags) == 24U, "runtime Plan tag offset changed");
 static_assert(offsetof(RuntimeTaskPlanHeader, tensor_reference_mask) == 56U, "runtime Plan ref-mask offset changed");
 
@@ -547,7 +551,7 @@ AICPU_PLAN_DEVICE uint64_t RuntimeTaskPlanHeaderWord(
                 ) << 16U) |
                (static_cast<uint64_t>(header.require_sync_start) << 32U) |
                (static_cast<uint64_t>(header.reserved0) << 40U) |
-               (static_cast<uint64_t>(header.reserved1) << 48U);
+               (static_cast<uint64_t>(header.adapter_data) << 48U);
     }
     if (word >= 3U && word <= 6U) {
         uint64_t tags = 0U;
@@ -593,6 +597,7 @@ AICPU_PLAN_DEVICE bool PackRuntimeTaskPlan(
     header.adapter_flags = spec.adapter_flags;
     header.core_num = spec.core_num;
     header.require_sync_start = spec.require_sync_start;
+    header.adapter_data = spec.adapter_data;
     for (uint32_t tensor = 0U; tensor < spec.tensor_count; ++tensor) {
         header.tensor_tags[tensor] = tags[tensor];
     }
@@ -678,7 +683,7 @@ AICPU_PLAN_DEVICE RuntimeTaskPlanHeader DecodeRuntimeTaskPlanHeader(
     );
     header.require_sync_start = static_cast<uint8_t>(word2 >> 32U);
     header.reserved0 = static_cast<uint8_t>(word2 >> 40U);
-    header.reserved1 = static_cast<uint16_t>(word2 >> 48U);
+    header.adapter_data = static_cast<uint16_t>(word2 >> 48U);
     for (uint32_t group = 0U; group < 4U; ++group) {
         const uint64_t tag_word = payload.words[3U + group];
         for (uint32_t index = 0U; index < 8U; ++index) {
@@ -712,9 +717,10 @@ AICPU_PLAN_DEVICE bool ValidateRuntimeTaskPlanPayload(
         header.core_num,
         header.require_sync_start,
         header.reserved0,
+        header.adapter_data,
         header.tensor_reference_mask,
     };
-    if (header.reserved1 != 0U || header.abi_version != kRuntimePlanAbiVersion ||
+    if (header.abi_version != kRuntimePlanAbiVersion ||
         header.task_id != expected_task_id ||
         !ComputeRuntimeTaskPlanLayout(spec, header.tensor_tags, layout) ||
         layout.payload_lines != published_lines) {

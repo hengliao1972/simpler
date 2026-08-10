@@ -214,8 +214,9 @@ PA_DEVICE bool PaTensorTag(TensorTag source, TensorArgType &target)
 // 由 PA adapter 解释。公共 Plan 层原样搬运它，不应知道 Alloc/QK/SF/PV/UP。
 // 这里同时锁定 task-id 局部位置与执行引擎，避免合法 wire 被错误业务
 // meta 解释后送入另一类 engine。
-PA_DEVICE bool ValidatePaAdapterFlags(
-    uint32_t task_id, EngineClass engine_class, uint8_t encoded
+PA_DEVICE bool ValidatePaAdapterMetadata(
+    uint32_t task_id, EngineClass engine_class, uint8_t encoded,
+    uint16_t batch_start
 )
 {
     if ((encoded & kSharedPaTicketMetaPresent) == 0U ||
@@ -244,9 +245,13 @@ PA_DEVICE bool ValidatePaAdapterFlags(
           (kind != TaskKind::Alloc && kind != TaskKind::Up)))) {
         return false;
     }
-    const uint32_t task_offset =
-        SharedPaTaskOffset(kind, group_index);
-    if (task_id < task_offset) return false;
+    const uint32_t task_offset = SharedPaTaskOffset(kind, group_index);
+    // batch_start 是 AICPU 从真实 Alloc callback 维护并随 Plan 发布的
+    // provenance。固定 PA offset 只在 adapter 内交叉校验这份显式元数据，
+    // 不再用于 Scalar 从 task_id 反推出业务语义。
+    if (batch_start > task_id || task_id - batch_start != task_offset) {
+        return false;
+    }
 
     const EngineClass expected_engine =
         kind == TaskKind::Alloc
@@ -378,13 +383,16 @@ PA_DEVICE bool ValidatePaPlanSource(
 PA_DEVICE bool MakePaRuntimeTaskPlanSpec(
     const TaskArgs &args, uint32_t task_id, int32_t function_id,
     EngineClass engine_class, uint8_t adapter_flags,
+    uint32_t batch_start,
     RuntimeTaskPlanSpec &spec
 )
 {
     uint32_t reference_mask = 0U;
     uint16_t output_count = 0U;
-    if (!ValidatePaAdapterFlags(
-            task_id, engine_class, adapter_flags
+    if (batch_start > UINT16_MAX ||
+        !ValidatePaAdapterMetadata(
+            task_id, engine_class, adapter_flags,
+            static_cast<uint16_t>(batch_start)
         ) ||
         !ValidatePaPlanSource(
             args, task_id, reference_mask, output_count
@@ -412,6 +420,7 @@ PA_DEVICE bool MakePaRuntimeTaskPlanSpec(
             args.launch_spec.require_sync_start ? 1U : 0U
         ),
         0U,
+        static_cast<uint16_t>(batch_start),
         reference_mask,
     };
     return true;
@@ -446,8 +455,9 @@ PA_DEVICE bool DecodePaRuntimeTaskPlan(
         static_cast<EngineClass>(header.engine_class);
     const bool metadata_only =
         engine_class == EngineClass::MetadataOnly;
-    if (!ValidatePaAdapterFlags(
-            header.task_id, engine_class, header.adapter_flags
+    if (!ValidatePaAdapterMetadata(
+            header.task_id, engine_class, header.adapter_flags,
+            header.adapter_data
         ) ||
         (metadata_only
              ? header.function_id != aicpu_plan::kInvalidFunctionId

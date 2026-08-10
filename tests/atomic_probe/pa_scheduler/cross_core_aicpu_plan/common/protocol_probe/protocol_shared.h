@@ -20,7 +20,7 @@ constexpr uint64_t kProbeMagic = UINT64_C(0x50354135504c414e);
 constexpr uint64_t kProducerResultMagic = UINT64_C(0x50524f4455434552);
 constexpr uint64_t kConsumerResultMagic = UINT64_C(0x434f4e53554d4552);
 constexpr uint32_t kProbeVersion = 2U;
-constexpr uint32_t kRuntimePlanAbiVersion = 1U;
+constexpr uint32_t kRuntimePlanAbiVersion = 2U;
 constexpr uint32_t kCacheLineBytes = 64U;
 constexpr uint32_t kAtomicIsolationBytes = 128U;
 constexpr uint32_t kMaxTasks = 1280U;
@@ -104,7 +104,7 @@ struct RuntimeTaskPlanHeader {
     int16_t core_num;
     uint8_t require_sync_start;
     uint8_t reserved0;
-    uint16_t reserved1;
+    uint16_t adapter_data;
     uint8_t tensor_tags[kMaxTaskTensors];
     uint32_t tensor_reference_mask;
     uint32_t abi_version;
@@ -230,6 +230,7 @@ struct DecodedCellControl {
 };
 
 static_assert(sizeof(RuntimeTaskPlanHeader) == 64U, "Plan header layout changed");
+static_assert(offsetof(RuntimeTaskPlanHeader, adapter_data) == 22U, "Plan adapter-data offset changed");
 static_assert(offsetof(RuntimeTaskPlanHeader, tensor_tags) == 24U, "Plan tag offset changed");
 static_assert(offsetof(RuntimeTaskPlanHeader, tensor_reference_mask) == 56U, "Plan mask offset changed");
 static_assert(sizeof(RuntimeTaskPlanStorage) == 4416U, "Plan storage layout changed");
@@ -363,6 +364,16 @@ PLAN_PROTOCOL_HD inline PayloadLayout LayoutForKind(uint32_t kind)
     return PayloadLayout{tensors, scalars, dependencies, words, (words + 7U) / 8U};
 }
 
+// ABI2 的 adapter_data 是算子 adapter 自定义的 16-bit provenance。
+// Probe 不复用 PA 语义，而是为每个 task 生成非零、可由独立 consumer
+// oracle 重算的值，确保 wire word2 的高 16 bit 真正跨 AICPU/AIV 传递。
+PLAN_PROTOCOL_HD inline uint16_t AdapterDataForShape(const TaskShape &shape)
+{
+    const uint32_t mixed = shape.task_id * 37U + shape.batch_start * 11U +
+        shape.batch * 7U + shape.group * 3U + shape.kind;
+    return static_cast<uint16_t>(1U + mixed % UINT16_MAX);
+}
+
 PLAN_PROTOCOL_HD inline uint64_t HeaderWord(
     const TaskShape &shape, const PayloadLayout &layout, uint32_t word)
 {
@@ -381,7 +392,8 @@ PLAN_PROTOCOL_HD inline uint64_t HeaderWord(
         (static_cast<uint64_t>(layout.scalar_count) << 16U) |
         (static_cast<uint64_t>(layout.explicit_dep_count) << 32U);
     if (word == 2U) return static_cast<uint64_t>(engine) |
-        (static_cast<uint64_t>(flags) << 8U) | (UINT64_C(1) << 16U);
+        (static_cast<uint64_t>(flags) << 8U) | (UINT64_C(1) << 16U) |
+        (static_cast<uint64_t>(AdapterDataForShape(shape)) << 48U);
     if (word >= 3U && word <= 6U) {
         uint64_t tags = 0U;
         const uint32_t base = (word - 3U) * 8U;
