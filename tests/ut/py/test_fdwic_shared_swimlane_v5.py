@@ -362,6 +362,23 @@ def _shared_capture(level=1):  # noqa: PLR0912
     }
 
 
+def _shared_cross_core_capture():
+    raw = _shared_capture(level=1)
+    rows = []
+    lanes = [0] * _SYNTHETIC_AIC_CORES + [
+        1 + ordinal % 2 for ordinal in range(_SYNTHETIC_AIV_CORES)
+    ]
+    for core, lane in enumerate(lanes):
+        start = 1_000_000 + core * 10_000
+        _append_row(rows, core, lane, -1, -1, "OrchestrationReplay", start, start + 1_000)
+        _append_row(rows, core, lane, core, 0, "Kernel", start + 1_100, start + 1_300)
+        _append_row(rows, core, lane, -1, -1, "FinalDrain", start + 1_000, start + 1_500)
+    raw["metadata"]["scheduler_mode"] = "cross_core_dag"
+    raw["fdwic_events"] = rows
+    _refresh_summary(raw)
+    return raw
+
+
 @pytest.fixture
 def shared_level1_raw(tmp_path):
     path = tmp_path / "l2_swimlane_records.json"
@@ -405,6 +422,45 @@ def test_shared_v5_level1_converts_and_closes_exclusive_model(shared_level1_raw,
     assert "materialize.publish_shared_output_descriptors#0" in names
     assert "register.wait_insert_turn.ld_dev×0#0" in names
     assert "register.wait_insert_turn.ld_dev×1#1" in names
+
+
+def test_shared_v5_cross_core_uses_real_parent_hierarchy_without_fake_submits(tmp_path):
+    raw_path = tmp_path / "cross_core_raw.json"
+    raw_path.write_text(json.dumps(_shared_cross_core_capture()), encoding="utf-8")
+
+    data = read_perf_data(raw_path)
+    assert data["scheduler_mode"] == "cross_core_dag"
+    assert not any(row["phase"] in {"Submit", "Claim"} for row in data["fdwic_events"])
+
+    report = analyze_data(data, raw_path)
+    assert report["validation"]["status"] == "PASS"
+    assert report["capture"]["task_count_per_core"] == 0
+
+    merged = tmp_path / "cross_core_merged.json"
+    generate_chrome_trace_json(
+        data["tasks"],
+        merged,
+        fdwic_events=data["fdwic_events"],
+        trace_schema_version=5,
+        clock_freq_hz=data["clock_freq_hz"],
+        fdwic_num_cores=data["num_cores"],
+        fdwic_core_types=data["core_types"],
+        fdwic_scheduler_mode=data["scheduler_mode"],
+    )
+    names = {event.get("name") for event in json.loads(merged.read_text(encoding="utf-8"))["traceEvents"]}
+    assert "orchestration_replay" in names
+    assert "final_drain" in names
+    assert "f0#0" in names
+
+
+def test_shared_v5_same_core_does_not_accept_cross_core_shape(tmp_path):
+    raw = _shared_cross_core_capture()
+    raw["metadata"]["scheduler_mode"] = "same_core"
+    raw_path = tmp_path / "wrong_same_core_raw.json"
+    raw_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Submit IDs must be"):
+        read_perf_data(raw_path)
 
 
 def test_shared_v5_claim_attempted_matches_full_alloc_tournament_contract(shared_level1_raw):

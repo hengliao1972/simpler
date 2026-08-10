@@ -23,6 +23,7 @@ try:
         FdwicV4Model,
         SubmitPartition,
         find_containing_event,
+        validate_and_partition_v4,
     )
 except ImportError:
     from fdwic_swimlane_schema import (  # type: ignore[no-redef]
@@ -33,6 +34,7 @@ except ImportError:
         FdwicV4Model,
         SubmitPartition,
         find_containing_event,
+        validate_and_partition_v4,
     )
 
 SHARED_V5_PHASES = frozenset(
@@ -94,6 +96,10 @@ SHARED_V5_ATOMIC_SITE_NAMES = (
     "SharedOutputRollbackExchange",
     "SharedClaimTournamentLocal",
     "SharedClaimTournamentRoot",
+    "CrossCoreBuildTournamentLocal",
+    "CrossCoreBuildTournamentRoot",
+    "CrossCoreExecuteTournamentLocal",
+    "CrossCoreExecuteTournamentRoot",
 )
 SHARED_V5_ATOMIC_OP_NAMES = ("Load", "Exchange", "FetchAdd", "FetchMax", "CompareExchange")
 SHARED_V5_ATOMIC_SITE_OP_IDS = {
@@ -139,6 +145,10 @@ SHARED_V5_ATOMIC_SITE_OP_IDS = {
     39: 1,
     40: 4,
     41: 4,
+    42: 4,
+    43: 4,
+    44: 4,
+    45: 4,
 }
 SHARED_V5_ATOMIC_RESULT_UNUSED_SITE_IDS = frozenset({0, 3, 6, 7, 13, 39})
 SHARED_V5_POLL_BATCH_SITE_OP_IDS = {1: 0, 2: 0, 5: 0, 11: 0, 12: 0, 14: 0, 19: 0}
@@ -250,6 +260,7 @@ def validate_and_partition_v5(  # noqa: PLR0912, PLR0915
     num_cores: int,
     core_types: Sequence[str],
     level: int,
+    scheduler_mode: str | None = None,
 ) -> FdwicV4Model:
     """Validate the shared PA schema-v5 hierarchy and build an exclusive model.
 
@@ -257,6 +268,24 @@ def validate_and_partition_v5(  # noqa: PLR0912, PLR0915
     only. Unsupported task plans fail closed instead of being interpreted as
     the fixed ``Alloc,QK,SF,PV,UP`` sequence.
     """
+
+    if scheduler_mode is None:
+        scheduler_mode = "same_core" if any(str(row.get("phase")) == "Submit" for row in fdwic_events) else "cross_core"
+    valid_scheduler_modes = {
+        "same_core",
+        "cross_core_ordinary",
+        "cross_core_dag",
+        "simt_cross_core_ordinary",
+        "simt_cross_core_dag",
+    }
+    if scheduler_mode not in valid_scheduler_modes and scheduler_mode != "cross_core":
+        raise ValueError(f"shared schema-v5 has invalid scheduler mode {scheduler_mode!r}")
+    if scheduler_mode != "same_core":
+        # Cross-core Build/Execute 已与逐核 Submit replay 解耦。它的完整观察
+        # 合同只有相邻的 OrchestrationReplay/FinalDrain 父区间以及真实
+        # Kernel/Atomic/DCCI 行；复用 v4 的通用父区间模型，不伪造 1280 个
+        # same-core Submit/Claim。
+        return validate_and_partition_v4(fdwic_events, num_cores, core_types)
 
     if level not in (1, 4):
         raise ValueError(f"shared schema-v5 supports only level 1 or 4, got {level}")

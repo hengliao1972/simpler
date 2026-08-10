@@ -196,6 +196,7 @@ def analyze_data(  # noqa: PLR0912, PLR0915
             int(data.get("num_cores", 0)),
             data.get("core_types") or [],
             int(data.get("l2_swimlane_level", 0)),
+            data.get("scheduler_mode"),
         )
     frequency_hz = int(data.get("clock_freq_hz", 0))
     if frequency_hz <= 0:

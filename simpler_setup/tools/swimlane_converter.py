@@ -336,6 +336,7 @@ def _append_fdwic_dist_engine_events(  # noqa: PLR0912, PLR0915
     clock_freq_hz=0,
     num_cores=0,
     core_types=None,
+    scheduler_mode=None,
 ):
     """Append fully_distributed_within_core AICore-runtime spans.
 
@@ -381,6 +382,7 @@ def _append_fdwic_dist_engine_events(  # noqa: PLR0912, PLR0915
                 4
                 if any(str(event["phase"]) in {"Atomic", "ClockBaseline", "Dcci"} for event in fdwic_events)
                 else 1,
+                scheduler_mode,
             )
         )
         residual_factor = 1_000_000.0 / float(clock_freq_hz)
@@ -1366,7 +1368,13 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     if trace_schema_version == 4:
         validate_and_partition_v4(fdwic_events, num_cores, core_types)
     elif trace_schema_version == 5:
-        validate_and_partition_v5(fdwic_events, num_cores, core_types, level)
+        validate_and_partition_v5(
+            fdwic_events,
+            num_cores,
+            core_types,
+            level,
+            str(metadata.get("scheduler_mode") or "same_core"),
+        )
 
     out = {
         "l2_swimlane_level": level,
@@ -1390,6 +1398,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         out["core_types"] = core_types
     if trace_schema_version == 5:
         out["tensormap_mode"] = "shared"
+        out["scheduler_mode"] = str(metadata.get("scheduler_mode") or "same_core")
     return out
 
 
@@ -1895,6 +1904,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     clock_freq_hz=0,
     fdwic_num_cores=0,
     fdwic_core_types=None,
+    fdwic_scheduler_mode=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -1966,6 +1976,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             clock_freq_hz=clock_freq_hz,
             num_cores=fdwic_num_cores,
             core_types=fdwic_core_types,
+            scheduler_mode=fdwic_scheduler_mode,
         )
         with open(output_path, "w") as f:
             json.dump({"displayTimeUnit": "ns", "traceEvents": events}, f, indent=2)
@@ -3398,6 +3409,7 @@ def main():
             clock_freq_hz=data.get("clock_freq_hz", 0),
             fdwic_num_cores=data.get("num_cores", 0),
             fdwic_core_types=data.get("core_types"),
+            fdwic_scheduler_mode=data.get("scheduler_mode"),
         )
         exclusive_output = None
         if data.get("trace_schema_version") in (4, 5) and data.get("fdwic_events"):

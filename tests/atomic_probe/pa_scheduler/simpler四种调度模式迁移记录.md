@@ -1706,3 +1706,72 @@ owner 和 lookup producer；第二次算出的 `address/lo/hi` 没有任何消�
 A5 非 PA 场景，两个 compact 测试类全部数值 golden PASS。覆盖 owner、manual
 dependency、OUTPUT_EXISTING、NO_DEP、连续 INOUT、32 fresh output、16 fanin
 和跨引擎 output/view；未运行 A5Sim。
+
+## 32. 补齐五种 Simpler 路径的真实泳道闭合
+
+### 32.1 问题不在 same-core 迁移
+
+`same_core` 早已是 Simpler 真实路径的基线实现。本阶段没有重复迁移
+same-core，而是用它作为同一 PA B256、同一真实 A5 环境下的对照，
+并补齐新增四种 cross-core 路径的泳道导出能力。
+
+原 schema-v5 把“每个 worker 都有 1,280 个 Submit/Claim”当成共享
+TensorMap 的通用合同。这个合同只属于 same-core：cross-core 的
+Build/Execute 已与逐核 Submit replay 解耦，因此导出时会被误判为
+`dropped=1`。修正后按 scheduler role 分开两套观察合同：
+
+- `same_core` 仍严格展开并校验每核 1,280 个 Submit/Claim，不放宽
+  原有 PA 闭合要求；
+- 四种 cross-core 不伪造 Submit/Claim，只校验每核相邻的
+  `OrchestrationReplay`/`FinalDrain` 父区间、真实 Kernel 归属、Atomic/DCCI
+  记录与计数器闭合；
+- cross-core 复用固定端点区的第一个槽仅保存 64-bit SYS_CNT
+  锚点，用来还原 compact record 的 low32 时钟，不生成业务事件；
+- raw metadata 明确输出 `scheduler_mode`，converter 和 analyzer 按模式
+  选择层级合同；把 cross-core Build/Execute tournament 的四个 CAS
+  站点收入 schema-v5 Atomic ABI。
+
+### 32.2 五种路径的真实 A5 结果
+
+口径为 PA Case1 B256、32 AIC + 64 AIV、1,280 个动态 task，其中
+1,024 个真实 Kernel。五份 raw、merged 和 exclusive analysis 全部 PASS，
+`dropped_records=0`：
+
+| 模式 | 泳道顶层时间 | Atomic 逻辑调用 | DCCI 已观察调用 |
+| ---- | ----: | ----: | ----: |
+| `same_core` | 1,762.459 us | 128,620 | 4,480 |
+| `cross_core_ordinary` | 11,061.452 us | 193,703 | 384 |
+| `cross_core_dag` | 4,346.950 us | 226,190 | 384 |
+| `simt_cross_core_ordinary` | 25,623.983 us | 303,146 | 384 |
+| `simt_cross_core_dag` | 3,171.180 us | 186,694 | 384 |
+
+cross-core 的 384 次 DCCI 仅是当前已经接入 wrapper 的 startup 和 observer
+记录。公共协议中部分 `FlushRegion/InvalidateRegion` 仍直接调用
+`DistCrossCoreAicoreOps`，所以不把 384 解释为完整业务 DCCI 数量。
+
+### 32.3 standalone 只能暂作特定实现上界，不得当作通用对照
+
+same-core 本轮泳道为 1.762 ms，standalone 同口径泳道约 1.779 ms，
+说明不存在一个让所有 Simpler 路径普遍变慢的 Kernel 或上板因素。
+但四种 standalone cross-core 并没有与 Simpler 执行同等的动态任务生成，
+因而原绝对时间不能继续当作通用调度器基线：
+
+1. Scalar `cross_core_ordinary/cross_core_dag` 由 host 根据 PA 的
+   `batches/context_lens`、`Alloc/QK/SF/PV/UP`、`1+4×group_count`、输出大小
+   和执行引擎生成 dispatch plan，再由 central Build ticket 领取。
+   central ticket 本身是通用机制，但这份 plan 生成器和按 task id 恢复参数的
+   adapter 是 PA 专用实现；
+2. `simt_cross_core_ordinary/simt_cross_core_dag` 并非消费同一份 host
+   dispatch plan，也没有 central Build ticket。SIMT builder 直接使用
+   `task_id % 5` 及固定 PA 公式推导 kind、engine、Tensor/scalar/fanin、
+   output size，并按 builder/warp 静态分片。这是更强的 PA 特化，
+   不能被称为通用 SIMT 调度能力；
+3. Simpler 四种新路径确实执行真实算子 orchestration。mode1/mode2
+   为 `96×1280`，mode3 为 `95×1280`，mode4 为 `80×1280` 次
+   Build tournament local 物理记录。这些冗余是真实的，但不能用
+   已经预知 PA 答案的 standalone 数字来宣称通用实现存在同等改善空间。
+
+后续可比实现必须使用同一合同：由真实 orchestration Submit 动态生成
+不含 PA TaskKind 的通用 `TaskPlanEntry`，Scalar 与 SIMT 再消费同一份计划。
+Host 只能初始化空缓冲和控制字，可在运行后独立生成 oracle，不得把
+task identity、engine、output 规模等 dispatch 答案提前发布给调度器。

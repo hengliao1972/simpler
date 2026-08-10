@@ -478,10 +478,24 @@ PTO_DEVICE_FUNC inline void fdwic_swimlane_flush_core(__gm__ DistCore *self) {
     if (core == nullptr || g_fdwic_swimlane_records == nullptr || records_per_core == 0) return;
 #if PTO_FDWIC_SHARED_MAP
     uint32_t observer_slot = UINT32_MAX;
+#if PTO_FDWIC_SCHEDULER_MODE == 0
     if (g_fdwic_swimlane_shared_submit_count != kFdwicSharedTracePhase1TaskCount &&
         g_fdwic_swimlane_dropped_records != UINT32_MAX) {
         ++g_fdwic_swimlane_dropped_records;
     }
+#else
+    // Cross-core 调度不再要求每个 Scalar 回放完整 Submit 流，因此固定的
+    // Submit/Claim 区域没有逐 task 端点。复用首个端点槽保存一个 64-bit
+    // SYS_CNT 锚点，供 host 展开 16B compact record 的 low32 时钟；它不是
+    // 伪造的 Submit 记录，也不进入业务事件计数。
+    __gm__ FdwicSharedSubmitClaimRecord *anchor_record =
+        fdwic_swimlane_shared_submit_claim_records(g_fdwic_swimlane_records);
+    anchor_record[0].claim_begin = 0;
+    anchor_record[0].claim_end_and_winner = 0;
+    anchor_record[0].submit_begin = fdwic_swimlane_detail_now();
+    anchor_record[0].submit_end = 0;
+    g_fdwic_swimlane_shared_submit_count = 1;
+#endif
     if (fdwic_atomic_swimlane_enabled()) {
         const uint64_t generic_bytes =
             static_cast<uint64_t>(g_fdwic_swimlane_record_count + 1U) * sizeof(FdwicSwimlaneStorageRecord);

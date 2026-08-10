@@ -511,7 +511,9 @@ bool validate_header_and_counts(
         summary.poll_calls += core_state.poll_calls;
         summary.poll_batch_records += core_state.poll_batch_records;
 #if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SCHEDULER_MODE == 0
         summary.records += 2ULL * kFdwicSharedTracePhase1TaskCount;
+#endif
         summary.dcci_calls += core_state.dcci_calls;
         summary.dcci_lines += core_state.dcci_lines;
         summary.dcci_records += core_state.dcci_records;
@@ -1323,6 +1325,168 @@ bool validate_and_write_shared_core(
     observed.dropped_records += core_state.dropped;
     return true;
 }
+
+#if PTO_FDWIC_SCHEDULER_MODE != 0
+bool validate_and_write_shared_cross_core(
+    const FdwicSwimlaneHeader *header, const FdwicSwimlaneRecord *records, uint32_t count, uint32_t core,
+    int32_t expected_block, int32_t expected_lane, uint32_t level, std::ofstream &out, bool &first,
+    TraceSummary &observed
+) {
+    const FdwicSwimlaneCoreState &core_state = header->cores[core];
+    if (core_state.core_idx != static_cast<int32_t>(core) || core_state.block_id != expected_block ||
+        core_state.lane != expected_lane) {
+        LOG_ERROR(
+            "fdwic shared cross-core swimlane invalid worker identity: worker=%u core=%d block=%d/%d lane=%d/%d",
+            core, core_state.core_idx, core_state.block_id, expected_block, core_state.lane, expected_lane
+        );
+        return false;
+    }
+
+    uint32_t atomic_records = 0;
+    uint64_t atomic_calls = 0;
+    uint64_t poll_calls = 0;
+    uint32_t poll_batch_records = 0;
+    uint32_t clock_records = 0;
+    uint32_t plain_clock_records = 0;
+    uint32_t dependency_clock_records = 0;
+    uint32_t dcci_records = 0;
+    uint64_t dcci_calls = 0;
+    uint64_t dcci_lines = 0;
+    uint32_t observer_records = 0;
+    uint32_t startup_records = 0;
+    uint32_t orchestration_records = 0;
+    uint32_t final_drain_records = 0;
+    FdwicSwimlaneRecord orchestration{};
+    FdwicSwimlaneRecord final_drain{};
+    std::vector<FdwicSwimlaneRecord> kernels;
+
+    for (uint32_t index = 0; index < count; ++index) {
+        const FdwicSwimlaneRecord &record = records[index];
+        const auto phase = static_cast<FdwicSwimlanePhase>(record.phase);
+        bool valid = record.end_cycle >= record.start_cycle && record.phase < kFdwicSwimlanePhaseCount &&
+                     record.task_id >= -1 && record.func_id >= -1;
+        if (phase == FdwicSwimlanePhase::Atomic) {
+            valid = valid && level >= kFdwicAtomicSwimlaneLevel && atomic_record_schema_valid(record);
+            ++atomic_records;
+            const uint32_t calls = atomic_record_call_count(record);
+            atomic_calls += calls;
+            if ((record.flags & kFdwicAtomicPollBatch) != 0) {
+                poll_calls += calls;
+                ++poll_batch_records;
+            }
+        } else if (phase == FdwicSwimlanePhase::Dcci) {
+            valid = valid && level >= kFdwicAtomicSwimlaneLevel && dcci_record_schema_valid(record);
+            ++dcci_records;
+            dcci_calls += dcci_record_call_count(record);
+            dcci_lines += dcci_record_line_count(record);
+            if (record.aux == static_cast<uint16_t>(FdwicDcciSite::ObserverTraceExport)) ++observer_records;
+            if (record.aux == static_cast<uint16_t>(FdwicDcciSite::StartupConfigInvalidate)) ++startup_records;
+        } else if (phase == FdwicSwimlanePhase::ClockBaseline) {
+            valid = valid && level >= kFdwicAtomicSwimlaneLevel && clock_record_schema_valid(record);
+            ++clock_records;
+            if ((record.flags & kFdwicClockAtomicDependency) != 0) {
+                ++dependency_clock_records;
+            } else {
+                ++plain_clock_records;
+            }
+        } else {
+            // Cross-core 的完整观察只承诺 worker 顶层父区间、Kernel 和
+            // atomic/DCCI 事实，不把不存在的逐核 Submit/Claim 伪造成事件。
+            valid = valid && phase != FdwicSwimlanePhase::Submit && phase != FdwicSwimlanePhase::Claim &&
+                    ordinary_record_schema_valid(record);
+            if (phase == FdwicSwimlanePhase::OrchestrationReplay) {
+                orchestration = record;
+                ++orchestration_records;
+            } else if (phase == FdwicSwimlanePhase::FinalDrain) {
+                final_drain = record;
+                ++final_drain_records;
+            } else if (phase == FdwicSwimlanePhase::Kernel) {
+                kernels.push_back(record);
+            }
+        }
+        if (!valid) {
+            LOG_ERROR(
+                "fdwic shared cross-core swimlane invalid record: worker=%u index=%u phase=%u(%s) task=%d "
+                "func=%d start=%llu end=%llu flags=0x%08x aux=%u",
+                core, index, record.phase, phase_name(record.phase), record.task_id, record.func_id,
+                static_cast<unsigned long long>(record.start_cycle), static_cast<unsigned long long>(record.end_cycle),
+                record.flags, record.aux
+            );
+            return false;
+        }
+        if (!first) out << ",";
+        out << "\n    [" << core_state.core_idx << ", " << core_state.block_id << ", " << core_state.lane << ", "
+            << record.task_id << ", " << record.func_id << ", \"" << phase_name(record.phase) << "\", "
+            << record.start_cycle << ", " << record.end_cycle << ", " << record.flags << ", " << record.aux << "]";
+        first = false;
+    }
+
+    const bool parents_closed = orchestration_records == 1 && final_drain_records == 1 &&
+                                orchestration.end_cycle == final_drain.start_cycle;
+    if (!parents_closed) {
+        LOG_ERROR(
+            "fdwic shared cross-core parent closure failed: worker=%u orchestration=%u final=%u adjacent=%d", core,
+            orchestration_records, final_drain_records,
+            orchestration_records == 1 && final_drain_records == 1 &&
+                    orchestration.end_cycle == final_drain.start_cycle ?
+                1 :
+                0
+        );
+        return false;
+    }
+    for (const auto &kernel : kernels) {
+        const bool in_orchestration = interval_contains(orchestration, kernel);
+        const bool in_final_drain = interval_contains(final_drain, kernel);
+        if (in_orchestration == in_final_drain) {
+            LOG_ERROR(
+                "fdwic shared cross-core Kernel must belong to one parent: worker=%u task=%d start=%llu end=%llu",
+                core, kernel.task_id, static_cast<unsigned long long>(kernel.start_cycle),
+                static_cast<unsigned long long>(kernel.end_cycle)
+            );
+            return false;
+        }
+    }
+
+    bool counters_closed = false;
+    if (level >= kFdwicAtomicSwimlaneLevel) {
+        counters_closed =
+            atomic_records == static_cast<uint64_t>(core_state.atomic_calls) - core_state.poll_calls +
+                                  core_state.poll_batch_records &&
+            atomic_calls == core_state.atomic_calls && poll_calls == core_state.poll_calls &&
+            poll_batch_records == core_state.poll_batch_records && clock_records == 2 && plain_clock_records == 1 &&
+            dependency_clock_records == 1 && dcci_records == core_state.dcci_records &&
+            dcci_calls == core_state.dcci_calls && dcci_lines == core_state.dcci_lines && observer_records == 1 &&
+            startup_records == 1;
+    } else {
+        counters_closed = atomic_records == 0 && atomic_calls == 0 && poll_calls == 0 && poll_batch_records == 0 &&
+                          clock_records == 0 && dcci_records == 0 && dcci_calls == 0 && dcci_lines == 0;
+    }
+    if (!counters_closed) {
+        LOG_ERROR(
+            "fdwic shared cross-core counter closure failed: worker=%u atomic=%u/%u calls=%llu/%u "
+            "poll=%llu/%u batches=%u/%u dcci=%u/%u clock=%u",
+            core, atomic_records,
+            core_state.atomic_calls - core_state.poll_calls + core_state.poll_batch_records,
+            static_cast<unsigned long long>(atomic_calls), core_state.atomic_calls,
+            static_cast<unsigned long long>(poll_calls), core_state.poll_calls, poll_batch_records,
+            core_state.poll_batch_records, dcci_records, core_state.dcci_records, clock_records
+        );
+        return false;
+    }
+
+    observed.records += count;
+    observed.atomic_records += atomic_records;
+    observed.clock_baseline_records += clock_records;
+    observed.atomic_calls += atomic_calls;
+    observed.poll_calls += poll_calls;
+    observed.poll_batch_records += poll_batch_records;
+    observed.dcci_records += dcci_records;
+    observed.dcci_calls += dcci_calls;
+    observed.dcci_lines += dcci_lines;
+    observed.dropped_records += core_state.dropped;
+    return true;
+}
+#endif
 #endif
 
 std::string output_path_from_prefix(const std::string &prefix) {
@@ -1695,11 +1859,13 @@ extern "C" int fdwic_swimlane_host_export(Runtime *runtime) {
     std::vector<FdwicSwimlaneStorageRecord> physical_scratch(max_core_records);
     std::vector<FdwicSwimlaneRecord> decoded_scratch(max_core_records);
     std::vector<FdwicSharedSubmitClaimRecord> submit_claim_scratch(kFdwicSharedTracePhase1TaskCount);
+#if PTO_FDWIC_SCHEDULER_MODE == 0
     std::vector<FdwicSwimlaneRecord> logical_scratch;
     std::vector<uint32_t> winner_counts(kFdwicSharedTracePhase1TaskCount);
     std::vector<std::array<uint32_t, kFdwicSharedClaimTournamentMaxGroups>> root_group_counts(
         kFdwicSharedTracePhase1TaskCount
     );
+#endif
 #else
     FdwicSwimlaneRecord *scratch = nullptr;
     if (max_core_records != 0) {
@@ -1743,6 +1909,9 @@ extern "C" int fdwic_swimlane_host_export(Runtime *runtime) {
     out << "  \"metadata\": {\n";
 #if PTO_FDWIC_SHARED_MAP
     out << "    \"tensormap_mode\": \"shared\",\n";
+    out << "    \"scheduler_mode\": \""
+        << scheduler_mode_name(static_cast<FdwicSchedulerMode>(runtime->fdwic_build_identity.scheduler_mode))
+        << "\",\n";
 #endif
     out << "    \"clock_freq_hz\": " << header->freq_hz << ",\n";
     out << "    \"num_cores\": " << header->num_cores << ",\n";
@@ -1811,8 +1980,12 @@ extern "C" int fdwic_swimlane_host_export(Runtime *runtime) {
         const uint32_t count = header->cores[c].count;
 #if PTO_FDWIC_SHARED_MAP
         const uint64_t worker_base = records_base + static_cast<uint64_t>(c) * kFdwicSwimlaneWorkerBytes;
+#if PTO_FDWIC_SCHEDULER_MODE == 0
         const size_t submit_claim_bytes =
             static_cast<size_t>(kFdwicSharedTracePhase1TaskCount) * sizeof(FdwicSharedSubmitClaimRecord);
+#else
+        const size_t submit_claim_bytes = sizeof(FdwicSharedSubmitClaimRecord);
+#endif
         if (runtime->host_api.copy_from_device(
                 submit_claim_scratch.data(), reinterpret_cast<const void *>(worker_base), submit_claim_bytes
             ) != 0) {
@@ -1847,6 +2020,7 @@ extern "C" int fdwic_swimlane_host_export(Runtime *runtime) {
                 return fail_export();
             }
         }
+#if PTO_FDWIC_SCHEDULER_MODE == 0
         if (!expand_shared_records(
                 expected_lanes[c] == 0, expected_blocks[c], decoded_scratch.data(), count, submit_claim_scratch.data(),
                 logical_scratch
@@ -1864,6 +2038,15 @@ extern "C" int fdwic_swimlane_host_export(Runtime *runtime) {
             );
             return fail_export();
         }
+#else
+        if (!validate_and_write_shared_cross_core(
+                header, decoded_scratch.data(), count, c, expected_blocks[c], expected_lanes[c], level, out, first,
+                observed
+            )) {
+            LOG_ERROR("fdwic shared cross-core swimlane core %u schema-v5 validation failed: records=%u", c, count);
+            return fail_export();
+        }
+#endif
 #else
         if (count != 0) {
             const uint64_t core_offset =
@@ -1887,6 +2070,7 @@ extern "C" int fdwic_swimlane_host_export(Runtime *runtime) {
         }
     }
 #if PTO_FDWIC_SHARED_MAP
+#if PTO_FDWIC_SCHEDULER_MODE == 0
     for (uint32_t task_id = 0; task_id < kFdwicSharedTracePhase1TaskCount; ++task_id) {
         if (winner_counts[task_id] != 1) {
             LOG_ERROR(
@@ -1917,6 +2101,7 @@ extern "C" int fdwic_swimlane_host_export(Runtime *runtime) {
             }
         }
     }
+#endif
 #endif
     const bool summary_closed =
         observed.records == summary.records && observed.atomic_records == summary.atomic_records &&
