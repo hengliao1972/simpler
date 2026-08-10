@@ -6,24 +6,26 @@
 | ---- | ---- |
 | 目标 | 让 task 的构建 owner 与 kernel 执行 owner 可以是不同物理核 |
 | 2026-08-10 合同修正 | Host 预制 Build/Execute task 表和单 device planner 均已否决：两者都提前提供 PA task 身份，不代表真实 Submit 调度。目标改为 96 个 Scalar 各自回放真实 orchestration，每次 Submit 用 per-task Tournament 选唯一 Build owner；Execute 只消费 winner 动态发布的通用执行包 |
-| 当前落地阶段 | 先恢复全 Scalar replay、逐 task 严格 TensorMap 完成链和 `replay_done` 生产封口；第一版在封口后由 AIC/AIV 双 cursor 扫描真实 `exec_cell`，不使用 Host task-id 表。功能闭合后再评估动态 role queue 以恢复 Build/Execute overlap |
+| 当前落地阶段 | S7 无预制计划基线已闭合 CPU、CCEC 和 A5 B1/B256：全 Scalar 真实 replay、per-task Tournament、逐 task 严格 TensorMap 完成链、`replay_done` 生产封口，以及封口后 AIC/AIV runtime cell scan 都已进入正式路径 |
 | 本文性质 | 持续更新的架构与内存模型设计记录 |
 | 可继续复用 | task-indexed immutable payload、`EMPTY -> BUILDING -> BUILT -> CLAIMED -> DONE`、跨核 DCCI publish/acquire、owner-local token、kernel completion 和分组 execution drain |
-| 必须替换 | 中央 Build ticket、Host AIC/AIV task-id 表、稀疏 writer bitset、依赖预制 executable count 的收口，以及跳过 `replay_done` 的终止协议 |
+| 已完成替换 | 中央 Build ticket、Host AIC/AIV task-id 表、稀疏 writer bitset、依赖预制 executable count 的收口，以及跳过 `replay_done` 的终止协议已从正式路径删除 |
 | A5 跨核发布探针 | S2 已完成，100 轮共 3200 case 通过 |
-| A5 PA 功能/性能 | 唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束。S6.96 相对冻结 S6.93 基线的 6 对正序＋6 对反序 A/B 中，中位从 `843.900 us` 降至 `835.266 us`，改善 `8.635 us / 1.023%`，候选胜 `10/12` 对；配对改善中位 `8.626 us`；CPU、CCEC、A5 B1/B256、完整泳道和终态全部 PASS |
-| 历史 S4 Execute election | K2 首版曾通过 CPU B1/B256 和 A5 B1/B256，现已被 S6.68-b 的角色中央 ticket 替代，仅作为历史证据保留 |
+| A5 PA 功能/性能 | 唯一裁决口径为最早 startup 起点到最后 FinalDrain 结束。S7 无预制计划 B1/B256 业务终态和泳道 analyzer 均 PASS；B256 full-swimlane lifecycle 为 `2.902810 ms`；修正 task0 覆盖起点后，同合同 perf-clock 为 `2.443455 ms` |
+| 当前状态 ABI | 旧 Host Build/Execute 表共 `53,120 B` 已收缩为 replay seal 和 AIC/AIV scan cursor 三个独立 `128 B` 槽，合计 `384 B`；shared ABI generation 为 16 |
+| 历史 S4/S6 Execute election | K2 与 Host 预制角色表/中央 ticket 版本仅作为历史证据，不再描述当前运行时协议 |
 | S5 Build 拓扑 | S5a 已通过 CPU/CCEC/A5；S5b 五类 task 全 96/G8 已通过 CPU/CCEC/A5 B1/B256，物理 Claim CAS 精确闭合 |
-| 当前验证缺口 | 新合同尚需依次闭合 CPU、CCEC 和 A5 B1/B256；旧中央计划版本的约 `0.82 ms` 只作为历史性能参考，不能作为新合同已经达到的性能结论 |
+| 当前验证缺口 | 当前 S7 是 replay 封口后才 Execute 的正确性基线；后续仍需用 winner 动态发布的 role queue 恢复 Build/Execute overlap。旧预制计划版本约 `0.82 ms` 与新合同不等价，不做直接回退百分比 |
+| 下一架构候选（尚未实现） | 若希望重新使用低次数中央 Build ticket，必须先由真实 device callback 动态发布通用 `RuntimeTaskDesc`，形成 `TaskPlan -> Build -> Execute` 三级 pipeline；不得恢复 Host 计划或 PA 固定公式反推 |
 | 明确非目标 | 不引入 `try_wait`、engine continuation 或“kernel 运行期间同一 Scalar 继续调度” |
 
 本文先定义需要证明的内存合同，不预设最终一定采用中央队列、per-core 队列或 task-indexed cell。任何候选实现都必须先通过本文列出的跨核发布、唯一执行和生命周期门槛，再讨论性能；只有引入 cell 复用时才需要回收门槛。
 
 相关现状与证据：
 
-- [shared_tensormap_PA业务与性能分析.md](shared_tensormap_PA业务与性能分析.md)
-- [ATOMIC_USAGE_GUIDE.md](../ATOMIC_USAGE_GUIDE.md)
-- [cache_preload_usage_guide.md](../cache_preload_usage_guide.md)
+- [shared_tensormap_PA业务与性能分析.md](../shared_tensormap_PA业务与性能分析.md)
+- [ATOMIC_USAGE_GUIDE.md](../../ATOMIC_USAGE_GUIDE.md)
+- [cache_preload_usage_guide.md](../../cache_preload_usage_guide.md)
 
 ## 1. 要解决的问题
 
@@ -141,8 +143,8 @@ completion vend 是 heap 进度快照，不是 output 数据地址或内存所�
 | A5 ordinary payload 发布/取得 | S2 独立 CCEC 跨核探针 | 不依赖 kernel-end 自动 DCCI，延迟注入和多 cacheline 均读到精确值 |
 | DCache preload 可选性能 hint | S2 先在关闭时闭合正确性，再于 S2/S3a/S3b 做编译变体 A/B | on/off 合同完全相同，只保留正确性不变且性能稳定改善的位置 |
 | 使用 shared payload 本身的代价 | S3a task-indexed cell，仍映射给 Build owner | 正确性不变，单独量出 publication/copy 税 |
-| args/context/vend/fanin 交接 | S3b 已证明跨核取得成立；S6.68-b 已由 AIC/AIV 双中央 Execute ticket 动态决定 owner，不再预路由 K2，也不强制异核 | CPU B1/B256 与 A5 B1/B256 的 task/descriptor/fanin/vend/completion 精确校验一致 |
-| Execute 唯一领取 | S6.68-b 双角色中央 ticket | 每个可执行 task 只出现在一张角色表一次；每个表项只由一个 FetchAdd ordinal 取得，CAS 冲突直接报协议错误 |
+| args/context/vend/fanin 交接 | S3b 已证明跨核取得成立；S7 由 AIC/AIV runtime cursor 扫描 Build winner 实际发布的 cell，不使用 Host 角色表，也不强制 Build/Execute 异核 | CPU B1/B256 与 A5 B1/B256 的 task/descriptor/fanin/vend/completion 精确校验一致 |
+| Execute 唯一领取 | S7 的 AIC/AIV runtime task-id scan | 两个角色各扫描完整 `[0, task_count)`，cell 中的 runtime engine class 决定哪一类消费；该 task-id 的唯一扫描 owner 再以 `BUILT -> CLAIMED` CAS 验证状态 |
 | executor 本地容量与全局 backlog 解耦 | S0–S5 先用单 token 闭合协议；S6.22 扩为两个，S6.69 以 A5 冻结 A/B 固定为三个 | 有空 token 才发射 CAS；领取后立即检查依赖，任一 owner-local ready task 优先执行 |
 | Build owner 扩大到其他 Scalar | S5 已完成全 96 Scalar Build | 不借助跨核发布的正确性掩盖 Build 角色变化 |
 | 复用、队列和回收 | S6 性能/容量优化 | task-indexed 单轮先闭合；需复用时才引入 generation/ABA 证明 |
@@ -155,7 +157,7 @@ completion vend 是 heap 进度快照，不是 output 数据地址或内存所�
 
 ### 3.1 `built` 的写入顺序只适用于本核
 
-当前 [pa_frontend.h](same_core/common/pa_frontend.h#L1829) 中 `BuildSlotPayload()` 的顺序是：
+当前 [pa_frontend.h](../same_core/common/pa_frontend.h#L1829) 中 `BuildSlotPayload()` 的顺序是：
 
 ```text
 occupied = true
@@ -170,7 +172,7 @@ PopulateSlotPayload(...)
 
 ### 3.2 `occupied/built` 不是 atomic，而且与 payload 共线
 
-当前 [LocalSlot](same_core/common/pa_model.h#L1668) 的前两个字节是普通 `bool occupied/built`。它们既没有 atomic exactly-once 语义，也与 header/payload 共用 cacheline。
+当前 [LocalSlot](../same_core/common/pa_model.h#L1668) 的前两个字节是普通 `bool occupied/built`。它们既没有 atomic exactly-once 语义，也与 header/payload 共用 cacheline。
 
 A5 已经实测：一条 line 上若同时存在 ordinary dirty 快照和其他核更新的 atomic word，后续 DCCI 可能把 atomic 新值冲回旧值。因此共享执行槽的状态控制字必须放在独立 atomic-only cacheline，payload DCCI 绝不能覆盖它。
 
@@ -195,7 +197,7 @@ args[local_context_index] = &slot.local_context
 args[global_context_index] = &slot.global_context
 ```
 
-代码见 [pa_frontend.h](same_core/common/pa_frontend.h#L1752)。因此有两种完全不同的消费方式：
+代码见 [pa_frontend.h](../same_core/common/pa_frontend.h#L1752)。因此有两种完全不同的消费方式：
 
 1. **执行核直接使用同一份共享 slot**：这些绝对地址仍有效，但 slot 在 kernel 完成前不能回收，且 executor 不得修改共享 payload；
 2. **执行核复制 active prefix 到自己的 execution token**：所有 self-pointer 必须重建，不能原样复制 `args[]`；这会增加一轮 shared GM 读和 owner-token GM 写。
@@ -222,38 +224,41 @@ Executor binding：block/lane/sub_block/engine token/local context/workspace
 
 ### 3.6 当前 fanin 会在 slot 中原地修改
 
-[SlotReady](same_core/common/pa_scheduler_core.h#L564) 在 shared 模式下会把已经 ready 的 fanin 前缀从 private slot 中移除，并修改 `fanin[]/fanin_count`。
+[SlotReady](../same_core/common/pa_scheduler_core.h#L564) 在 shared 模式下会把已经 ready 的 fanin 前缀从 private slot 中移除，并修改 `fanin[]/fanin_count`。
 
 共享执行 payload 应在 `BUILT` 后保持不可变，否则 executor 的普通写会形成 dirty cacheline，给后续 DCCI 和复用带来 stale writeback 风险。当前不恢复每核 4 个完整 `LocalSlot`，而是采用固定容量为 4 的紧凑领取状态：
 
-- `SharedExecCell[]` 保存全局 payload；尚未领取的 task id 保留在 host 发布的
-  AIC/AIV immutable 角色表中，cell 可处于 `EMPTY/BUILDING/BUILT`；
+- `SharedExecCell[]` 保存全局 payload；尚未领取的 task 只由其
+  task-id 固定 cell 表示，不存在 Host AIC/AIV immutable 角色表；
+- `replay_done` 到达 96 前不开放 Execute；因此扫描阶段中，严格插入已完成
+  且仍为 `EMPTY` 的 cell 可以确定是 metadata-only task，可执行 task
+  必须已经 `BUILT`；
+- AIC/AIV 各以一条 runtime cursor 分批领取连续 task id，两类都扫描
+  `[0, task_count)`，再以 cell 中的 runtime engine class 筛选自己的工作；
 - 每个 executor 固定四个紧凑 execution token；至少两个 token 为 `IDLE` 时
-  才允许取得本角色下一批、最多两个 ordinal 的 Execute ticket；
-- ticket owner 先进入 `WAITING_BUILT`，看到 `BUILT` 后完成 Claim，保存
-  immutable shared payload 地址，在所选 token 中重建 executor-local
-  dispatch，并立即完成第一次 fanin 检查；
-- 较早 token 未 ready 时仍允许有界前视，但新批任一 token 首次观察后若仍是
-  `WAITING_BUILT`，本次调度边界不再继续预领；后续边界仍可推进四槽；
-- 任一已领取 token ready 时，Execute 优先于新 Execute ticket 和新 Build。
+  才取得最多两个连续 task id；角色匹配的 `BUILT` cell 经
+  `BUILT -> CLAIMED` 后绑定 token，随后 invalidate payload、重建
+  executor-local dispatch 并立即检查 fanin；
+- 任一已绑定 token ready 时立即 Execute；未 ready 任务只修改
+  executor-local token，不回写 immutable shared payload。
 
 不应直接在共享 payload 上复用现有原地压缩逻辑。
 
 ### 3.7 `CompleteTask` 隐含使用同核保存的 `worker.heap_next`
 
-当前 [CompleteTask](same_core/common/pa_scheduler_core.h#L542) 把 `worker.heap_next` 写入 task vend。shared Materialize 成功预留 output heap 后，会把 `reservation.aggregate_vend` 写入 Build owner 的 `worker.heap_next`；Build 和 Execute 同核时，后续 `CompleteTask()` 消费的正是这份快照。
+当前 [CompleteTask](../same_core/common/pa_scheduler_core.h#L542) 把 `worker.heap_next` 写入 task vend。shared Materialize 成功预留 output heap 后，会把 `reservation.aggregate_vend` 写入 Build owner 的 `worker.heap_next`；Build 和 Execute 同核时，后续 `CompleteTask()` 消费的正是这份快照。
 
 分离之后，executor 的 `worker.heap_next` 是另一个 worker 的状态，不得冒充该 task 在 Materialize 时冻结的 vend。执行包必须显式携带 completion-vend 快照，或者 shared heap 协议另行定义 task 级 vend。该 vend 只是 heap 进度快照，不是 output 地址或内存所有权 token。
 
 ### 3.8 当前 `StoreBarrier()` 不是新 payload 的发布协议
 
-CCEC 的 [StoreBarrier](same_core/ccec/ccec_ops.h#L237) 为刻意的 no-op；现有 SharedOutput/TensorMap payload 依靠显式 `FlushRegion()` 完成 DCCI+DSB。
+CCEC 的 [StoreBarrier](../same_core/ccec/ccec_ops.h#L237) 为刻意的 no-op；现有 SharedOutput/TensorMap payload 依靠显式 `FlushRegion()` 完成 DCCI+DSB。
 
 新执行包必须调用自己的显式 payload flush。不能在普通写后只调用 `StoreBarrier()`，也不能假设紧随其后的 atomic 自动让相邻普通 payload 对远端可见。
 
 ## 4. 已经由 A5 探针建立的内存规则
 
-以下不是候选优化，而是当前 A5/CANN 9.1 已有证据支持的工程边界。完整依据见 [ATOMIC_USAGE_GUIDE.md](../ATOMIC_USAGE_GUIDE.md)。
+以下不是候选优化，而是当前 A5/CANN 9.1 已有证据支持的工程边界。完整依据见 [ATOMIC_USAGE_GUIDE.md](../../ATOMIC_USAGE_GUIDE.md)。
 
 ### 4.1 以 64B cacheline 为最小协议单位
 
@@ -431,7 +436,7 @@ same-core 优化已经形成一条必须延续到 cross-core 的经验：**控�
 
 “owner-private”只表示没有其他核并发访问，不表示它不在 GM。当前 `WorkerState::LocalSlot` 虽是本 worker 私有，物理上仍是 GM 对象，同样可能付出 DCache miss。因此 owner-private GM 只用于必须跨 Submit/等待点存活的 token 状态，不应冒充临时 staging。
 
-现有 `same_core` 中的 [SharedTaskWriterDelta](same_core/common/pa_shared_submit_path.h#L19) 就是可复用的结构模式：先在调用栈上的 trivial object 中准备 ordinary entry、bucket/局部序号和 symbol key，取得有序插入资格后才消费这份不可变计划，不在热串行段重复扫描 GM/args。cross-core execution payload 应复制这个模式，而不是在 Materialize/Register/Fanin 每一阶段都去修改 shared cell。
+现有 `same_core` 中的 [SharedTaskWriterDelta](../same_core/common/pa_shared_submit_path.h#L19) 就是可复用的结构模式：先在调用栈上的 trivial object 中准备 ordinary entry、bucket/局部序号和 symbol key，取得有序插入资格后才消费这份不可变计划，不在热串行段重复扫描 GM/args。cross-core execution payload 应复制这个模式，而不是在 Materialize/Register/Fanin 每一阶段都去修改 shared cell。
 
 开发时的默认数据流必须是：
 
@@ -519,7 +524,7 @@ executor-private binding 也必须区分两类：立即 ready 且在当前调用
 
 本节只在 5.5 的“减少 GM 触碰次数”结构门槛已满足后才启用。`dc_preload` 不得用来给反复读写 shared payload、分段 DCCI 或过大 GM token 擦屁股。
 
-现有 [cache_preload_usage_guide.md](../cache_preload_usage_guide.md) 已证明：A5 上 `dc_preload` 是可能被硬件当成 NOP 的性能 hint，不是可见性、顺序或所有权原语；128B/384B publish 和 128B consume 定向模型存在稳定改善，但不能直接外推为新 execution payload 的收益。
+现有 [cache_preload_usage_guide.md](../../cache_preload_usage_guide.md) 已证明：A5 上 `dc_preload` 是可能被硬件当成 NOP 的性能 hint，不是可见性、顺序或所有权原语；128B/384B publish 和 128B consume 定向模型存在稳定改善，但不能直接外推为新 execution payload 的收益。
 
 因此首版只**预留编译期可消除的 hook**，默认关闭，不把 preload 写入协议 ABI：
 
@@ -557,6 +562,37 @@ Execute owner:
 - 小 payload 立即读写时 hint 成本可能大于收益，不硬编码距离/密度阈值；S2/S3a 先扫描，S3b 再用真实跨核调度做配对 A/B；
 - 若做滚动预取，只对后续仍在 payload 有效范围内的未来 line 发 hint，不能越过 `payload_lines` 触及相邻 cell。
 
+### 5.8 S7 当前调度尾状态 ABI
+
+当前 `SchedulerState` 尾部不再保存 Host 预制 Build/Execute 计划。除
+`exec_cell[]`、每核 execution token、fatal 和 drain 状态外，调度发现
+机制只需三条全局 Atomic：
+
+| 状态 | 业务含义 | 物理布局 |
+| ---- | -------- | -------- |
+| `replay_identity_seal.line` | 首个完成回放的 Scalar 发布 `(identity_hash, task_count)`，其他 Scalar 只做一致性对照 | 独立 `128 B` 冲突单元 |
+| `exec_scan_cursors.aic_next` | AIC 类 worker 扫描完整 runtime cell 空间的下一 task id | 独立 `128 B` 冲突单元 |
+| `exec_scan_cursors.aiv_next` | AIV 类 worker 扫描完整 runtime cell 空间的下一 task id | 独立 `128 B` 冲突单元 |
+
+每个 `128 B` 槽由一条 `64 B AtomicLine` 和一条 `64 B` 隔离
+padding/canary 组成，不做 DCCI。它们在 A5 的 `128 B` Atomic 冲突单元上
+互不重叠，避免 replay seal、AIC cursor 和 AIV cursor 相互干扰。
+
+旧 `SharedBuildDispatchState` 与 `SharedExecDispatchState` 分别为
+`18,112 B` 和 `35,008 B`，共 `53,120 B`；当前三个槽共
+`384 B`，减少 `52,736 B`。收缩后：
+
+- `kCrossCoreExecStateBytes = 19,441,088`;
+- non-split `sizeof(SchedulerState) = 1,059,046,656`;
+- split `sizeof(SchedulerState) = 1,059,052,800`;
+- shared build identity ABI generation 为 **16**。
+
+AtomicSite 57 继续保持 append-only 数值，当前语义名为
+`SharedReplayIdentitySeal`；AtomicSite 42 `SharedBuildDispatchTicket` 仅是历史
+raw ABI 占位，正式路径不得发射。任何再次向这个尾状态加入
+task identity、writer bitset、AIC/AIV task-id 表或 executable count 的改动，
+都是重新引入预制调度答案，不属于当前合同。
+
 ## 6. 完整发布与执行协议
 
 ### 6.1 Build owner
@@ -576,10 +612,12 @@ Execute owner:
 8. Build owner 不再读写 immutable payload；Execute owner由独立协议产生
 ```
 
-`SharedPaBatchPlan` 只允许作为每个 Scalar 栈上的当批 orchestration
-状态，用于校验当前真实回放的 task 顺序；它不能写入 GM，也不能成为其他
-Scalar 消费的全局答案。Host task 表、单 device planner 和中央 Build
-ticket 都不属于本合同。
+当前正式路径不构造 `SharedPaBatchPlan/FullPaTaskPlan`，也不调用
+`BuildSharedPaBatchPlan/SharedPaPlannedTaskAt`。每个 Scalar 仅保留真实
+`PaOrchestrationState`：`BeginPaBatchForCallback` 读取 runtime context，
+`while (block_offset < current_blocks)` 决定实际 group，callback 直接使用当前现场。
+这是正在发生的回放状态，不是提前列举 task 答案的本地计划。Host task 表、
+本地/单 device planner 和中央 Build ticket 都不属于本合同。
 
 task-indexed cell 与 task id 一一对应，本轮不复用；因此本阶段没有容量反压、
 generation 或 ABA。若未来改成有界 ring，再单独建立回收合同。
@@ -612,7 +650,8 @@ AIC 和 AIV 各扫描完整 task-id 区间，但两条 cursor 分开：
 
 第一版故意在 `replay_done` 后才开放 Execute，因此没有
 `WAITING_BUILT`，也没有 Build/Execute overlap。它是正确性基线，不是最终
-性能形态。待 CPU、CCEC 和 A5 闭合后，再评估动态 role queue：
+性能形态。CPU、CCEC 和 A5 B1/B256 已经闭合；下一阶段可评估动态
+role queue：
 
 - queue entry 必须由真实 Submit/Build winner 动态发布；
 - 不得由 Host 或单 planner 生成；
@@ -745,7 +784,7 @@ engine final wait
 
 在 task-indexed 首版中，`DONE` 是本轮终态，device 不执行 `DONE -> FREE`。host 在 kernel 结束后校验每个 cell 的唯一 owner、completion 和终态，从而先把“跨核交接”与“设备侧回收”彻底拆开。
 
-FinalDrain 中，每核证明本角色 Execute cursor 已越界且四个 token 均已复位后，按
+FinalDrain 中，每核证明本角色 runtime scan cursor 已到达终端且四个 token 均已复位后，按
 `block_id % 16` 对所属 `exec_drain.arrivals[group]` 执行一次 FetchAdd。
 当前 32 block、每 block 1 AIC + 2 AIV 的拓扑使每组精确包含 6 个 worker。
 同一个 64-bit arrival word 的低 8 位累加 worker 到达数，高位累加该 worker
@@ -753,26 +792,29 @@ FinalDrain 中，每核证明本角色 Execute cursor 已越界且四个 token �
 `FetchAdd(1 + (completed << 8))`。低位最大为 6，不会向完成数字段进位。
 
 这份合计足以在 device 内证明本轮全部 kernel 已完成，前提来自现有合同而非
-统计猜测：中央 Build ticket 给出完整 task 集；角色 Execute ticket 使每个
-kernel 只有一个 Execute owner，`BUILT -> CLAIMED` CAS 继续验证 cell 状态；
-placement 只在 completion flag 和 cell `DONE` 均发布成功后递增；每核又必须
-等角色 cursor 越界、四个 token 清空且 engine
-无 in-flight 才能到达。因此 16 组全部到齐且完成数合计等于计划显式
-发布的 `executable_task_count`，即可推出所有可执行 task 恰好完成，不能由
-重复完成补齐缺口。公共收口不允许用“每 batch 一个 Alloc”之类算子形状反推
-该数量；host 算子计划器还必须独立重建预期值并与发布值交叉校验。
+统计猜测：96 个 Scalar 已经以 `replay_done` 证明不再生产新 cell；
+AIC/AIV 两条 runtime cursor 各自唯一分发完整 task-id 区间；角色匹配的
+cell 仍以 `BUILT -> CLAIMED` CAS 验证唯一 Execute owner；placement 只在
+completion flag 和 cell `DONE` 均发布成功后递增；每核又必须等自己的
+scanner 耗尽、四个 token 清空且 engine 无 in-flight 才能到达。
 
-非 root 发布后即可结束；固定 root 只读取 16 个分组 word，确认每组低位为 6、
-高位合计为计划 kernel 数后结束整个 device kernel。它不再串行读取 1280 个
-cell control 和 1280 个 completion flag。host 在 kernel 返回后仍逐 task
-校验 owner、cell、flag 和 payload，保留精确故障定位；这不是设备收口的替代。
-反向 release 继续不需要，但证明不再依赖一层独立 replay barrier：每个
-worker 只有在 Build ticket 与本角色 Execute ticket 都返回越界后才能进入
-FinalDrain；已经取得但仍为 `EMPTY/BUILDING` 的 task 保留在本核
-`WAITING_BUILT` token 中，不能提前发布 drain arrival；arrival 又要求两个
-token 全字段复位。因而 96 个 worker 全部
-到达同时证明所有 builder 已退出、所有可执行 cell 已完成，root 再核对显式
-`executable_task_count` 后成为全局收口点。缺失 cell 或缺失到达仍由既有
+16 组全部到齐后，固定 root 从实际 `exec_cell[0..task_count)` 终态
+动态计数 executable task：严格插入完成且 cell 为 `EMPTY` 的 task 是
+metadata-only，可执行 task 必须为 `DONE`。root 比较这个动态数量与
+16 组 arrival 中累计的 completion 数；不读 Host
+`executable_task_count`，不按 PA task kind 或“每 batch 一个 Alloc”之类形状反推。
+这样仍可推出所有可执行 task 恰好完成，不能用重复完成补齐缺口。
+
+非 root 发布后即可结束；固定 root 读取 16 个分组 word，确认每组低位为 6，
+再扫描 runtime cell 终态并完成上述动态数量对照后结束整个 device kernel。
+Host 在 kernel 返回后仍逐 task 校验 owner、cell、flag 和 payload，保留精确
+故障定位；这不是设备收口的替代。
+
+当前收口明确依赖 `replay_done`：它证明所有 builder 已经停止生产。
+每个 worker 只有在自己的 runtime scan cursor 到达终端、全部四个 token
+复位且 engine 无 in-flight 后才能发布 drain arrival。因而 96 个 worker
+全部到达同时证明所有 runtime scan 和已领取工作已排空。缺失 cell
+或缺失到达仍由既有
 2 秒 device watchdog 发布 fatal，不能退化成永久自旋。
 
 有界复用版才需要特别求证：新增加的 `DONE(g) -> FREE(g+1)` 与既有 completion atomic 之间采用什么硬件顺序。不能仅因源码中两个 atomic 前后相邻，就默认所有远端核观察顺序一致。
@@ -844,20 +886,28 @@ max(
 )
 ```
 
-因此当前实现采用有界 admission 的 work-conserving list scheduling：每个
-兼容 Scalar 最多从 Built queue 领取四个 task。每次取得所有权后立即检查
-依赖；owner-local token 中只要有 ready task 就优先 Execute。四个已领取 task
-都未 ready、或队列暂时没有可领取 task 时，该 Scalar 才领取一个 Build
-ticket。不同 Scalar 上的 Build 和 Execute 可以重叠；同一 Scalar 上已开始的
-Build 与同步 kernel 都不做抢占。
+上式是长期性能目标，不是 S7 首版已经达成的调度形态。当前正式基线为：
 
-首版明确不做 producer-driven Ready queue。`SharedExecCell[task_id]` 固定槽
-继续承载 payload；AIC/AIV 角色 ticket 唯一发放 task id，executor 可先在
-`WAITING_BUILT` token 中持有该 id，再用 `BUILT -> CLAIMED` CAS 验证发布状态。
-基础数据已证明两槽和三槽持续饱和，并以冻结 A/B 验收四槽；这不等于需要在
-Claim 前构造 ready summary。
+```text
+96 Scalar 完整真实 replay/Build
+-> replay identity seal + replay_done 封口
+-> AIC/AIV runtime cursor 扫描 cell
+-> 四个 owner-local token 内优先执行 ready task
+```
 
-#### 7.1.1 S6.70 严格 Register 链的下一候选
+因此 S7 基线中 Build 与 Execute **尚未 overlap**，也不存在“等待
+`BUILT` 时去领取新 Build ticket”这条路径。这是为了先证明无 Host/单
+planner 答案的业务正确性，并不把串行的两大阶段宣称为最终性能模型。
+后续若恢复 work-conserving list scheduling，必须由真实 Build winner 动态发布
+per-entry ready 的 role queue，而不能再次使用 Host 角色表或中央 Build
+ticket。无论发现结构如何改变，同一 Scalar 上已开始的 Build 与同步
+kernel 都不做抢占。
+
+#### 7.1.1 S6.70 严格 Register 链的下一候选（旧中央计划历史）
+
+本节的 grouped drainer 候选依赖当时的中央 Build ticket 和 Host writer
+摘要，不是 S7 正式协议的当前候选。下文仅保留当时的瓶颈证据与
+已考虑过的协议风险，不得用其 `Build ticket` 前提解释现行代码。
 
 S6.69 三 token 的 full-swimlane 继续保留了逐 task 的严格插入链。对
 `task 0 -> task 1279` 的 1,280 个 Register 逐项重建后，得到：
@@ -933,7 +983,11 @@ Materialize/Build owner 来得太晚，而是每个 task 都把一次返回型�
 startup→FinalDrain 交错 A/B 裁决。若 DCCI/组内等待抵消收益，完整撤回，
 不削弱现有逐 task completion 合同。
 
-### 7.2 改调度器前必须补齐的基础数据
+### 7.2 旧中央计划版本的调度数据（历史）
+
+本节记录的 Execute ticket、`WAITING_BUILT` 与 Build/Execute overlap 属于
+S6 历史版本。S7 当前在 `replay_done` 后才开放 Execute，不存在同样的
+Build/Execute 交错口径；若动态 role queue 落地，需按新协议重建基础数据。
 
 现有 `2026-08-03` B256 full-swimlane 已提供第一条结构证据：1024 个 kernel
 中只有 158 个落在 EfDrain、52 个落在 OrchestrationTail，**814 个落在
@@ -1062,6 +1116,465 @@ planner 预制的第二份答案。
 最多三个未 ready task，且已实测改善完整周期。只有 A5 数据证明“四槽同时长期
 未 ready”仍是主要瓶颈时，才重新评估 ready summary。
 
+### 8.6 为什么旧中央 Build ticket 不需要 Tournament
+
+旧预制计划版的 Build owner 不是在真实 callback 内产生，而是由一条全局
+`build_dispatch.next_task` 分配：
+
+```text
+Host 生成 task[0..N) 的 batch/kind/group/route 等索引
+        ↓
+96 个 Scalar 对同一 next_task 执行 FetchAdd(+1)
+        ↓
+返回值 N 唯一分配给某个 Scalar
+        ↓
+DecodeSharedBuildDispatchTask(N)
+        ↓
+BindSharedPaTaskForRandomAccess(...)
+        ↓
+构造 task N 并进入 Materialize/Register/Fanin/Build
+```
+
+返回型 `FetchAdd` 已经保证每个有效 ordinal 只交给一个核，因此该版本不需要
+per-task Tournament。B256 的物理 Build ticket 调用数是：
+
+```text
+1,280 个有效 ticket + 96 个 worker 各一次越界证明 = 1,376
+```
+
+但真正让旧路径能够 Build 的并非 `task_id` 本身，而是：
+
+```text
+task_id
++ Host 预制的 task identity/route
++ PA 专用随机访问恢复公式
+= 可供 Build 使用的 callback context
+```
+
+因此旧约 `0.82 ms` 代表的是“答案已经索引化后的分发”，不是单纯换了一条
+更快的 Atomic。S7 不允许再用这组数据直接评价 Tournament 的纯仲裁成本。
+
+#### 8.6.1 “预制 TaskPlan + 两阶段”与“运行时三阶段”怎样计数
+
+这里的“两阶段/三阶段”只统计 **A5 kernel 启动后的 device 运行时
+pipeline**，不是按源码里能否找到一个名为 plan 的结构来计数。这是两种方案
+最容易混淆的地方。
+
+旧方案确实存在 `SharedHostTaskPlan`，但它在 kernel launch 之前由 Host 根据
+`context_lens` 和 PA 固定公式一次性生成，再写入 `build_dispatch`、
+`exec_dispatch` 和 metadata-writer bitset。对 device 来说，完整答案从一开始
+就已经是只读输入：没有 device Plan owner、没有 `PLANNED` 发布状态、没有
+Plan frontier，也没有 Plan drain。kernel 启动后只有两个可并行消费阶段：
+
+```text
+launch 之前（不属于 device pipeline）：
+  Host PA 公式
+      -> SharedHostTaskPlan
+      -> Build identity/route 表 + Execute AIC/AIV task-id 表
+      -> H2D
+
+launch 之后（旧两阶段）：
+  Build：next_task.FetchAdd(+1)
+      -> 查预制表
+      -> PA random-access 恢复 callback 参数
+      -> Materialize
+      -> 按 Host writer bitset 等待前一个实际 metadata writer
+      -> Register/Fanin/Build
+      -> 发布 SharedExecCell=BUILT
+
+  Execute：AIC/AIV Execute ticket
+      -> 查预制 task-id 表
+      -> 等待/读取 SharedExecCell
+      -> kernel/completion
+      -> DONE
+```
+
+当前讨论的三阶段方案则不允许 Host 提前给出 task identity。Plan 是 launch 后
+真实执行的一段 device 工作，它与 Build、Execute 一样需要独立的所有权、
+发布协议、前沿和结束条件：
+
+```text
+launch 之后（运行时三阶段候选）：
+  Plan/Describe：真实 callback/orchestration
+      -> 生成完整 RuntimeTaskDesc[N]
+      -> payload clean-out + DSB
+      -> 原子发布 PLANNED(N)，推进 planned frontier
+
+  Build：只领取 task_id < planned frontier
+      -> acquire PLANNED
+      -> invalidate 并读取 RuntimeTaskDesc[N]
+      -> Materialize/Register/Fanin/Build
+      -> 发布 SharedExecCell=BUILT
+
+  Execute：领取实际 BUILT 的兼容 engine task
+      -> acquire portable payload
+      -> kernel/completion
+      -> DONE
+```
+
+所以，旧方案的 Host Plan 只是 **device 的预制输入**；新方案的 Runtime Plan
+才是 **device 内可与下游重叠的生产阶段**。如果把 Host 预处理也按逻辑步骤
+计入，旧方案当然也可以写成“Host Plan + Device Build + Device Execute”；但
+这样会掩盖两个决定性的事实：Host Plan 的时间不在 A5 调度周期内，且它不
+承担任何 A5 跨核发布和动态生产封口成本。本文后续统一使用“旧预制两阶段”
+和“运行时三阶段”这两个名称。
+
+#### 8.6.2 三种协议不能混为同一个演进阶段
+
+当前已经落地的 S7 既不是旧预制两阶段，也还不是运行时三阶段。三者的精确
+关系如下：
+
+| 维度 | 旧预制 TaskPlan + 两阶段 | 当前 S7 全员真实 replay | 运行时 TaskPlan + 三阶段候选 |
+|---|---|---|---|
+| task 身份来源 | Host 在 launch 前用 PA 公式枚举 | 96 个 Scalar 各自执行真实 callback | device Plan producer 执行真实 callback |
+| Plan 是否是 device 工作 | 否；只读表已经 H2D 完成 | 没有独立 Plan stage；callback 现场与 Claim/Build 融合 | 是；Plan 是独立生产阶段 |
+| Build owner | 全局 `FetchAdd` 返回唯一 ordinal | 每 task 两级 CAS Tournament | 中央 ticket 或其他消费者协议，从已发布 descriptor 中领取 |
+| Build 上下文 | 预制 identity + PA random-access 公式恢复 | winner 直接拥有当前 callback 现场 | `RuntimeTaskDesc[N]` 完整携带通用逻辑 Build 上下文 |
+| 每个 task 的 callback 回放次数 | device 为 0 | 96 | 原则上 1 个逻辑 Plan 生产者；物理实现仍待确定 |
+| device Plan descriptor 发布 | 无 | 无；winner 直接进入 Build | 有；DCCI/DSB 后发布 `PLANNED`，消费者 invalidate 后读取 |
+| Build 可领取上界 | launch 时已知固定 `task_count` | 所有核按自己的 replay 顺序前进 | 只能到 `planned_frontier`，不能领取尚未描述的未来 task |
+| 生产封口 | Host 表长度天然封口 | `replay_done == 96` 与 replay identity seal | `plan_closed + final_task_count`，再分别闭合 Build/Execute drain |
+| 三段是否流式重叠 | device 只有 Build/Execute，可按预制表交错 | 当前基线先闭合 replay/Build，再扫描 Execute；尚未 overlap | 目标是 Plan、Build、Execute 随各自前沿流式重叠 |
+| TensorMap metadata 顺序 | Host writer bitset 给出前一个实际 writer，只在 writer 间建立稀疏顺序链 | 每个 task 都执行 N-1 -> N completion chain，空 writer 也推进 | 第一版沿用 S7 全 task completion chain；不能用 Plan frontier 代替它 |
+| 动态控制流 | 只能表达 Host 可提前推导的任务 | 由真实 callback 自然表达 | 由 Plan producer 真实推进；遇到依赖 kernel 结果的分支必须停住 |
+| A5 端到端口径 | 不含 Host Plan 生成/H2D 前置工作 | 含 96 路 replay 和 Tournament | 必须包含 device Plan、descriptor 发布、Build 和 Execute |
+
+最关键的不是“把旧表从 Host 搬到 GM 里再命名为 RuntimeTaskDesc”，而是下面
+四项必须同时改变：
+
+1. **生成者改变**：从 Host PA 公式变成 device 真实 callback；
+2. **生成时机改变**：从 launch 前全量完成变成 launch 后逐 task 动态发布；
+3. **内容合同改变**：从“PA identity 索引 + 随机访问恢复”变成无需 PA 公式即可
+   Build 的完整通用逻辑 descriptor；
+4. **生命周期改变**：新增 `PLANNED`、planned frontier、plan closed，以及
+   Plan/Build/Execute 三段各自的生产和 drain 证明。
+
+少任何一项，都可能只是旧预制计划的改名版本，而不是这里讨论的运行时三级
+pipeline。
+
+三种协议中，中央 ticket 返回 `N` 后取得 Build 上下文的方式可以压缩成下面
+三条等式：
+
+```text
+旧预制两阶段：
+  ticket(N) + HostDispatch[N] + PA random-access 公式
+  = task N 的 Build 上下文
+
+当前 S7：
+  callback(N) 的本地栈现场 + per-task Tournament winner
+  = task N 的 Build 上下文
+
+运行时三阶段：
+  ticket(N) + acquire(RuntimeTaskDesc[N] == PLANNED)
+  = task N 的 Build 上下文
+```
+
+因此，单独增加一级 Plan pipeline **可以解决中央 ticket 只有 task id、没有
+callback context 的问题**，但前提是这一级真的发布完整 descriptor。若
+`RuntimeTaskDesc[N]` 仍只有 `(task_id, kind, group)`，Build 端仍需调用 PA
+固定公式补全 shape、引用和 writer intent，那么问题并未解决，只是把旧 Host
+索引表改成了 device 生成的 PA 索引表。
+
+#### 8.6.3 四种 Build owner 协议的 Atomic 数量与竞争宽度
+
+先固定 B256 PA-G1 的符号，避免把“逻辑 task 数”“物理 Atomic 调用数”和
+“同地址并发人口”混成一个数：
+
+```text
+N = 256 batches * 5 tasks = 1,280 tasks
+W = 96 Scalar workers
+G = 8 Tournament local groups
+L = W / G = 12 candidates per local address
+E = 256 batches * 4 kernel tasks = 1,024 executable tasks
+Q = 2 task ids per Execute ticket
+```
+
+下表 **只比较 Build owner 仲裁**。startup、TensorMap completion、execution
+cell、fanin、heap 和 FinalDrain 的 Atomic 另列，不能重复加到某一候选头上：
+
+| 协议 | B256 物理 owner Atomic | 地址拓扑 | 单地址最大 return-ready 并发 | 是否消费返回值 |
+|---|---:|---|---:|---|
+| 旧 Host 预制计划＋中央 Build ticket | `N+W = 1,376` 次 `FetchAdd(+1)` | 整轮共用一条 `next_task` | 最多 96；实际随 worker 退场下降 | 是；旧值就是唯一 task ordinal，越界旧值证明退出 |
+| 当前 S7 G8 local 层 | `W*N = 122,880` 次 CAS | 每 task 8 条独立 local owner line | 每条最多 12 | 是；判断本核是否成为组代表 |
+| 当前 S7 G8 root 层 | `G*N = 10,240` 次 CAS | 每 task 1 条独立 root owner line | 每条最多 8 | 是；判断组代表是否成为最终 Build owner |
+| 当前 S7 G8 合计 | `133,120` 次 CAS | `1,280 * (8+1)` 条 task-indexed owner line | local 12、root 8 | 全部是 return-ready |
+| 全员 replay＋单全局精确 CAS 候选 | `W*N = 122,880` 次 `CAS(cursor,N-1,N)` | 所有 task 共用一条 cursor | 最多 96，且迟到的 N 会与更后的 task 共线 | 是；判断当前 callback N 是否取得推进权 |
+| 运行时三级 pipeline＋Build reservation 候选 | 至少 `N = 1,280` 次成功 owner RMW；失败/收口调用数尚未冻结 | 预计一条 Build cursor，或按 frontier 分片 | 单 cursor 时最多 96 | 是；只能领取已经连续发布的 descriptor，不能用无条件 FetchAdd 越过 frontier |
+
+当前 S7 相比中央 ticket，多出的不是 `1,280` 与 `1,376` 之间的小差别，而是
+96 份真实 callback replay 都必须参加每 task local CAS，随后每个 local 组再有
+一份 root CAS：
+
+```text
+S7 / central-ticket 调用量 = 133,120 / 1,376 = 96.744...
+调用数消减比例             = 1 - 1,376 / 133,120 = 98.966%
+```
+
+但 A5 的代价不能只按总次数比较。当前经基础探针支持的工作模型是：
+
+```text
+T_same_address(K) ~= A + B*K
+```
+
+其中 `K` 是同一时段对同一地址、且必须消费返回值的竞争人口。不同地址之间
+存在并行度，所以 `133,120` 次分散 CAS 不等价于把单条 CAS 延迟相加；反过来，
+旧方案的 `1,376` 次中央 FetchAdd 虽少，却把所有 task 的流量压到同一 cache line，仍会
+形成可见的串行热点。
+
+仓内同一 ELF 的 B256 mixed Atomic 探针已经直接对照过这两种拓扑：
+
+| 模式 | 物理 Atomic 数 | device span 中位数 | 最慢单核 elapsed 中位数 |
+|---|---:|---:|---:|
+| empty | 0 | `16.535 us` | `6.615 us` |
+| 当前 per-task G8 CAS | 133,120 | `556.900 us` | `554.644 us` |
+| 中央 FetchAdd ticket | 1,376 | `253.851 us` | `251.557 us` |
+
+因此中央 ticket 在该隔离探针中比 G8 缩短 `303.049 us`，raw span 下降
+`54.417%`；但它没有随着调用数下降 `98.966%` 而同比加速。中央模式
+`253.851 us` 的 raw span 还包含 `16.535 us` empty 基线、循环控制和计时记账；
+扣除 empty 后为 `237.316 us`，仍只能称为“该探针下单地址竞争协议的净观察
+成本”，不能全部归因成纯硬件 Atomic 串行化。这个探针只比较 owner 仲裁，
+不包含 callback context 生成、descriptor DCCI、TensorMap 或 kernel，也不能
+直接冒充完整调度收益。
+
+全局精确 CAS 也不能因为调用数 `122,880 < 133,120` 就判定优于 G8。它只省掉
+每 task 的 8 次 root CAS，却把 local 层从 8 条地址、每条 12 人，重新合并为
+一条地址、最多 96 人；迟到 worker 对旧 task 的失败 CAS 还会与更后 task 的
+推进共用同一条 line。它是正确性可讨论的独立候选，但当前没有同合同 A5 数据
+证明性能能够打败 G8。
+
+#### 8.6.4 当前 S7 其余直接相关 Atomic：固定项与时序相关项分开
+
+Build owner 表不是完整 kernel 的 Atomic 总表。当前 B256 S7 至少还有以下
+调用数由拓扑直接确定的项目；该表明确不是所有 AtomicSite 的穷举：
+
+| 协议位置 | B256 确定调用数 | 地址并发形状 | 说明 |
+|---|---:|---|---|
+| replay identity seal | 96 次 CAS | 一条 128B-isolated line，最多 96 核在回放尾部汇合 | 一次性一致性封口，不选 Build owner |
+| startup arrival | 96 次 FetchAdd | 一条 startup line，最多 96 核 | 进入正式生命周期的全员到达；startup poll 次数另算 |
+| replay_done arrival | 96 次 FetchAdd | 一条 replay_done line，最多 96 核 | 证明 96 路真实 callback 不再生产新 cell；poll 次数另算 |
+| AIC runtime Execute scan cursor | `ceil(N/Q)+32-1 = 671` 次 FetchAdd | AIC 独占一条 cursor，最多 32 核 | 扫描完整 `[0,N)` runtime cell，不读 Host task-id 表 |
+| AIV runtime Execute scan cursor | `ceil(N/Q)+64-1 = 703` 次 FetchAdd | AIV 独占另一条 cursor，最多 64 核 | 与 AIC 地址隔离；两类合计 1,374 次 |
+| TensorMap insert handoff | `N = 1,280` 次 CAS | 每 task 独立 completion line、唯一 writer | 消费旧值证明唯一发布；空 writer 也推进 |
+| execution cell 生命周期 | `4*E = 4,096` 次 CAS | 1,024 个 task-indexed cell；每个阶段唯一 owner | 每个 executable task 各一次 Build reserve、BUILT publish、Execute claim、DONE publish |
+| task completion vend/flag publish | `2*E = 2,048` 次 Exchange | task-indexed completion control；每 task 唯一 executor | 返回值不参与业务判断，属于 source-issue 发布边界，不混入上行 4 次 cell CAS |
+| execution drain arrival | 96 次 FetchAdd | 16 条分组 line，每条 6 核 | 每 worker 一次；同一次提交本核 DONE 数，root arrival poll 次数另算 |
+
+startup/replay_done poll、runtime cell state Load、TensorMap predecessor ready
+Load、fanin flag Load 和 FinalDrain arrival poll 等属于观察或等待循环：只有
+必要的终态观察存在固定下界，实际物理 Load 次数随 Build/kernel 到达时序变化，
+不能伪造一个固定 B256 总数。SharedOutput reserve/publish、heap、fatal 等操作还会
+随 task 参数、output 数与错误路径变化。完整运行必须以 raw AtomicSite 统计为准；
+等待项应同时报告泳道中的 PollBatch `logical_calls` 和 wait episode，不能把等待
+区间除以 Load 次数冒充单条 Atomic 延迟。
+
+三级 pipeline 不能直接继承旧方案的 `1,376`。若等 `plan_closed` 后才用
+FetchAdd，确实可以得到 `N+W`，却失去 Plan/Build 流水；若要边发布边领取，必须
+用不会越过连续 frontier 的 CAS/reservation 协议，其失败和收口次数尚未确定。
+此外，候选至少还会新增每 task PlanCell 发布、Build acquire、连续
+`planned_frontier` 发布/观察和 `plan_closed`；这些操作究竟合并成几条 control
+line、哪些消费返回值、轮询多少次，必须等 PlanCell ABI 冻结后才能给出精确
+公式。当前文档不以旧 `1,376` 次掩盖尚未设计完成的 Plan 发布成本。
+
+### 8.7 为什么脱离 callback 现场后只有 task id 不够
+
+`task_id` 只表达全局顺序 ordinal，不表达“这个 task 是什么、怎样构建”。任意
+Build owner 至少还需要：
+
+- function id 与目标 engine class；
+- batch、group、实际 block offset 和有效 block 数；
+- runtime shape、view、scalar 和 output create info；
+- INPUT/OUTPUT/INOUT 的逻辑引用；
+- 每个 `SharedOutputRef` 的 producer task id 与 output slot；
+- 由前序 `AcceptTaskOutputs()` 后的 orchestration 状态推导出的完整逻辑参数；
+- writer intent、依赖引用和其他算子通用 Build 元数据。
+
+以一个 PA-G2 batch 为例，真实顺序为：
+
+```text
+0 Alloc
+1 QK(g0)   2 SF(g0)   3 PV(g0)   4 UP(g0)
+5 QK(g1)   6 SF(g1)   7 PV(g1)   8 UP(g1)
+```
+
+中央 ticket 返回 `7` 时，领取者若没有任务描述符和当前 callback 现场，并不能
+由数字 `7` 通用地知道它是 `PV(g1)`，也不知道 group1 的动态 shape、输入引用
+或前序输出。对 PA 用固定公式反推这些信息，只是把预制答案从 Host 搬回 device；
+其他算子还可能有可变 task 数、条件分支或执行结果驱动的后续任务，公共调度器
+更不能假设 `task_id -> callback context` 存在可逆公式。
+
+在真实 callback 内直接让 96 核都调用 `FetchAdd(+1)` 也不成立。所有核此时都
+处于 task N 的现场，但一次竞争会提前取走：
+
+```text
+N, N+1, N+2, ... N+95
+```
+
+只有取得 N 的核拥有匹配现场；其余未来 ticket 已被不在对应 callback 的核消费，
+会形成 missing task。若把全局操作改为
+`CAS(global_cursor, N-1, N)`，则可以只选择当前 task 的一个 owner，不会跳号；
+但这已不是“FetchAdd 返回任意待构建 task”的中央队列，而是全员真实 replay
+现场上的单地址顺序 Claim。它的 B256 调用数约为 `96*1280=122,880`，少于
+G8 Tournament 的 `122,880 local + 10,240 root=133,120`，但把最多 96 核
+竞争重新压回同一地址。A5 已知同地址返回型 Atomic 会随并发显著变慢，因此
+该方案正确性上可作为独立候选，性能不能只按调用数推断。
+
+### 8.8 运行时 TaskPlan -> Build -> Execute 三级 pipeline
+
+若要同时保留“真实动态任务生成”和“低次数中央 Build ticket”，需要在 Build
+之前增加独立的运行时 Plan/Describe 阶段：
+
+```text
+Plan / Describe
+  真实顺序执行 callback
+  生成 RuntimeTaskDesc[N]
+  发布 PLANNED(N)
+        ↓
+Build
+  领取已发布 task id N
+  acquire RuntimeTaskDesc[N]
+  Materialize -> Register -> Fanin -> Build
+  发布 SharedExecCell[N] 为 BUILT
+        ↓
+Execute
+  兼容 engine 领取 BUILT task
+  acquire portable payload
+  检查 fanin -> kernel -> completion -> DONE
+```
+
+这条 pipeline 与旧 Host 计划的根本区别是：`RuntimeTaskDesc` 必须由 device
+真实 callback 根据本轮输入和控制流动态生成，Host 只提供输入并在运行后做独立
+oracle。它也不能只保存 `(batch, kind, group)` 再让 PA adapter 反推答案；要让
+任意 Build worker 仅凭 `task_id` 通用消费，descriptor 必须包含完整不可变的
+逻辑 Build 上下文。
+
+Plan 阶段不必提前 Materialize 实际 output 地址。它可以像当前 loser replay
+一样，以 `(producer_task_id, output_slot)` 保存 `SharedOutputRef`；真正的
+TensorDesc 仍由 producer Build owner Materialize 并发布，consumer 在 Fanin
+阶段按既有协议解析。这使 Plan 可以在前序 kernel 尚未执行时继续向前，但若某个
+算子的后续 task 生成本身依赖 kernel 实际结果，Plan pipeline 必须在该位置等待，
+不能伪造控制流。
+
+#### 8.8.1 RuntimeTaskDesc 的最小通用合同
+
+第一版 descriptor 至少要覆盖：
+
+```text
+task identity:
+  task_id / function_id / engine class
+
+logical args:
+  tensor tag / SharedOutputRef 或普通 tensor identity
+  dynamic shape / view / scalar / create info
+
+dependency and writer metadata:
+  producer references / output slots / writer intent
+
+generic build payload:
+  callback 已经解析完成、Build 所需且不含 planner-private pointer 的不可变字段
+```
+
+若保存的是完整 `TaskArgs` 或等价序列化 frame，容量与 DCCI 行数可能较大；若做
+紧凑 descriptor，就必须证明它对所有算子足够，不能依赖 PA task-kind 特例。这个
+ABI 是该候选的第一项门槛，不能先写中央 ticket 再补上下文。
+
+callback continuation 本身仍由 Plan producer 持有并用于产生 N+1；它不应被
+误塞进 N 的 Build descriptor。只有未来要迁移 Plan owner 时，才需要另建一套
+可跨核发布的 continuation ABI；这与 Build worker 消费 `RuntimeTaskDesc[N]`
+是两个独立问题。
+
+#### 8.8.2 A5 发布与取得顺序
+
+A5 Scalar 间没有 cache coherence，PlanCell 必须把 ordinary payload 与 atomic
+control 分离：
+
+```text
+Plan producer:
+  ordinary store 完整 RuntimeTaskDesc[N]
+  DCCI clean-out payload lines
+  DSB
+  atomic publish PLANNED(N)
+
+Build consumer:
+  atomic acquire PLANNED(N)
+  DCCI invalidate payload lines
+  DSB
+  ordinary load RuntimeTaskDesc[N]
+```
+
+atomic-only line 不做 payload DCCI；descriptor 一旦发布即不可变。第一版按
+task id 使用 fresh cell，不做 ring 复用、generation、ABA 或容量反压，先缩小
+正确性证明面。
+
+#### 8.8.3 Build ticket 不能越过 Plan 发布前沿
+
+这里的 `plan_published` 必须表示 **从 0 开始、无缺口的连续已发布前缀**，
+不能只是所有已写 descriptor 的最大 task id。如果 Plan 只发布到 task 10，
+96 个 Build worker 直接连续 FetchAdd，可能把
+task 11..106 全部领走后等待。若 Plan producer 也来自这批动态 worker，所有
+可运行核被未来 ticket 占住会造成活性问题。首版有两种可验证合同：
+
+1. 一个明确的逻辑 Plan producer 持续推进，Build 允许领取未来 task 后等待；
+2. 维护 `plan_published` 前沿，只有 `build_next < plan_published` 时才以 CAS
+   领取，否则 worker 优先 Execute 或帮助 Plan。
+
+第一种最容易闭合功能，但会固定一条 Plan 串行生产链；第二种调度更灵活，代价是
+Build Claim 不再是单纯 FetchAdd。无论采用哪种，Plan 的生产封口都必须与
+Build/Execute drain 分开表达：
+
+```text
+plan_closed
+&& all planned tasks built or terminal
+&& all executable cells DONE
+&& all owner-local tokens IDLE
+```
+
+#### 8.8.4 TensorMap 顺序没有因此消失
+
+三级 pipeline 只改变 task context 的生产和 Build owner 的分配，不改变 shared
+TensorMap 的强合同。Build task 可以乱序取得并完成 Materialize，但 Register
+仍必须遵守：
+
+```text
+completion[N-1]
+-> publish metadata(N)
+-> completion[N]
+```
+
+Plan 的 `PLANNED`、Build payload 的 `BUILT`、TensorMap insert completion 和
+kernel completion 是四种不同状态，不能复用一个 counter 或布尔值。
+
+#### 8.8.5 预期成本与裁决口径
+
+S7 当前 B256 Build 仲裁为：
+
+```text
+96N 份 callback replay
++ 122,880 次 local CAS
++ 10,240 次 root CAS
+```
+
+三级候选理论上替换为：
+
+```text
+N 份真实 callback replay
++ N 份 RuntimeTaskDesc publish/acquire DCCI
++ 约 N+workers 次中央 Build ticket
+```
+
+它可能显著减少 replay 和返回型 Atomic，但会新增 GM descriptor 容量、DCache
+miss、DCCI，以及一条逻辑串行 Plan 生产链。最终性能应由同一 real-compute
+workload、startup 起点到 FinalDrain 结束的 trace-free A/B 裁决；不能拿旧 Host
+预制计划 `0.82 ms` 直接当目标收益，也不能只比较 Atomic 次数。
+
+当前代码尚未实现三级 pipeline。本节只是下一架构候选的完整合同；实现顺序应为：
+
+1. CPU 证明动态 callback 生成的 descriptor 与现有真实 replay 指纹等价；
+2. A5 独立验证多 cacheline PlanCell 的 publish/acquire；
+3. 单 Plan producer + fresh cell 闭合 B1/G0/G2/混合与 INOUT；
+4. 接入中央 Build ticket，但保持严格 TensorMap completion；
+5. 最后再做 Plan/Build/Execute overlap 和性能评估。
+
 ## 9. 容量、背压和活性
 
 ### 9.1 当前 private slot 容量不能直接沿用
@@ -1101,27 +1614,26 @@ GM task list:
   ...
 
 Executor local admission:
-  token[0..3]: IDLE -> WAITING_BUILT -> Binding -> WAITING_FANIN
+  token[0..3]: IDLE -> Binding -> WAITING_FANIN
                    -> ENGINE_INFLIGHT -> COMPLETING -> IDLE
 
-任一 token ready : 优先 Execute，不领取新 task/Build ticket
-存在 IDLE token  : 从本角色 Execute cursor 唯一领取一个 task，立即检查 cell
-四个 token 均占用且未 ready : 不再领取 Execute ticket，可以完成一个 Build ticket
+任一 token ready : 优先 Execute
+至少两个 IDLE token : 从本角色 runtime cursor 最多领取两个连续 task id
+四个 token 均占用且未 ready : 只继续检查 owner-local fanin，不再领取
 ```
 
-- 未领取 task 仍位于 host 发布的 AIC/AIV immutable task-id 表；cell 可处于
-  `EMPTY/BUILDING/BUILT`；
+- 未领取 task 只位于 task-indexed cell 空间；没有 Host 发布的 AIC/AIV
+  immutable task-id 表；
 - executor 至少有两个 IDLE token 时才允许对本角色 cursor 发射一次返回型
   `FetchAdd(+2)`；尾批可以只返回一个 task；
-- ticket 内每项立即占用独立 token；cell 尚未 `BUILT` 时保持 `WAITING_BUILT`，
-  不读取 payload；
+- `replay_done` 后才开放 cursor；因此严格插入已完成且 cell 仍为
+  `EMPTY` 表示 metadata-only，不占用 token；异常 `BUILDING` 不能被解释成等待中的正常任务；
 - 看到 `BUILT` 后才发射 Claim CAS；CAS 失败是唯一领取合同冲突，必须终止，
   不存在普通 loser；
 - CAS 成功后立即 acquire/bind 到具体 token，并马上执行第一次 fanin 检查；
 - 未 ready task 保持 `CLAIMED`，由该 token 保存 ready prefix；不回退状态；
 - 较早 token 未 ready 且仍有空闲 token 时，允许继续领取后续 task；
-- 每个新 token 取得后都必须立即检查；任一 ready 时先执行 ready token；任一
-  新 token 仍等待 Build 时，本边界不再取得下一批；
+- 每个新 token 取得后都必须立即检查；任一 ready 时先执行 ready token；
 - CAS 成功后该核对 task 负责到 `DONE`，fatal 路径继续 fail-closed；
 - 四个 token 都未 ready 时仍允许本核完成 Build 工作，但每次回到调度点必须
   先复核全部 token，不能连续 Build 而饿死已经 ready 的已领取 task。
@@ -1153,22 +1665,23 @@ PA 只是第一个算子，设计不得固化以下现状：
 | 层次 | 允许知道的信息 | 不允许知道的信息 |
 | ---- | -------------- | ---------------- |
 | 公共调度协议 | task-id、是否需要 engine、engine class、Build/Execute owner、fanin、completion | `TaskKind`、batch 形状、UP/INOUT 数量 |
-| A5 后端策略 | 32 AIC + 64 AIV 物理拓扑、两条角色 Execute ticket、16 组完成归约 | Alloc/QK/SF/PV/UP 的业务含义 |
+| A5 后端策略 | 32 AIC + 64 AIV 物理拓扑、两条角色 runtime scan cursor、16 组完成归约 | Alloc/QK/SF/PV/UP 的业务含义 |
 | 算子适配层 | 随机访问构参、function 路由、payload shape、输出与 INOUT 规则 | 不得让公共 scanner 反向解析这些信息 |
 
-当前 `exec_route` 是公共执行器唯一消费的任务路由，显式编码“是否执行 +
-engine class”。PA 的 `batch/encoded_meta` 只由 Build adapter 解码，并在发布
-execution cell 前交叉验证两份路由一致。终态完成数同样来自计划显式发布的
-`executable_task_count`，不再由 PA 任务拓扑推导。
+当前 runtime engine class 是公共执行器唯一消费的任务路由。它由
+真实 Submit 的 Build winner 连同 portable payload 发布到 execution cell；
+AIC/AIV scanner 不解码 PA `batch/TaskKind/group`，只检查 cell 的 runtime
+engine class。终态 executable task 数由 device root 扫描 runtime cell 终态动态
+统计，不由 Host 计划显式发布，也不由 PA 任务拓扑推导。
 
 代码边界也按这三层收敛：`shared_exec_protocol.h` 保存算子无关的 execution
 状态、payload 与 route；`a5_exec_policy.h` 只实现当前 A5 单 lane 的
 32/64 worker 角色与 owner eligibility；`pa_exec_adapter.h` 只解释 PA
-function 与参数。A5 placement 不再读取 `kMaxTasks` 或 PA task kind，计划
-容量由 dispatch 解码层独立拒绝。以后接入 Joint、固定 block affinity 或
+function 与参数。A5 scanner 不读 PA task kind，runtime task-count 上限在真实
+replay 和 cell 访问边界处 fail-closed。以后接入 Joint、固定 block affinity 或
 multicore task 时，应替换/扩展后端 placement，而不是向 PA adapter 增加分支。
 
-首版可以在 standalone PA 上缩小验证范围，但协议字段和失败检查必须为通用算子留出明确扩展点。角色 Execute ticket、双 token 和 no-reclaim 都是必须显式选择的调度/生命周期能力，不是 PA 身份带来的默认事实。PA adapter 特例不能进入通用 shared execution runtime。
+首版可以在 standalone PA 上缩小验证范围，但协议字段和失败检查必须为通用算子留出明确扩展点。角色 runtime scan cursor、四 token 和 no-reclaim 都是必须显式选择的调度/生命周期能力，不是 PA 身份带来的默认事实。PA adapter 特例不能进入通用 shared execution runtime。
 
 迁移时不能整份复制 `pa_scheduler_core.h`或 `pa_model.h`。前者同时
 包含 PA replay/adapter 与通用 scanner 原型，后者仍有 batch/meta、
@@ -1222,12 +1735,12 @@ PA task kind 特判冒充支持。
 15. completion vend 来自 task 的构建/分配上下文，不来自错误 executor heap cursor；
 16. task completion 只发布一次；
 17. task-indexed 首版在整轮 kernel 内不复用 cell；
-18. 当前正式配置中，每个 executor 最多持有四个已领取 task；一次 Execute ticket 最多取得两个连续 ordinal，空闲 token 少于两个时不得取得下一批；
-19. Execute ticket owner 看到 `BUILT` 后必须完成 Claim、payload acquire/bind 并立即做第一次 fanin 检查，不能把首次检查推迟到下一轮调度；
-20. 较早 token 未 ready 时允许在四槽上限内继续领取，但新批任一 token 首次观察仍为 `WAITING_BUILT` 时必须结束本次边界的继续取票；任一 owner-local token ready 时，Execute 必须优先于新 Claim 和新 Build；
-21. 未被空闲 executor 领取的 task 保持在 immutable 角色表和 task-indexed cell 中，不因某个忙核而移入无界私有队列；
+18. 当前正式配置中，每个 executor 最多持有四个已领取 task；一次 runtime scan ticket 最多取得两个连续 task id，空闲 token 少于两个时不得取得下一批；
+19. `replay_done` 未封口前不得发射 runtime scan ticket；封口后严格插入已完成且仍为 `EMPTY` 的 cell 才能解释为 metadata-only task；
+20. runtime scan owner 看到角色匹配的 `BUILT` 后必须完成 Claim、payload acquire/bind 并立即做第一次 fanin 检查，不能把首次检查推迟到下一轮调度；任一 owner-local token ready 时必须优先 Execute；
+21. 未被 executor 领取的 task 只保持在 task-indexed cell 中，由 AIC/AIV runtime cursor 扫描；不存在 Host immutable 角色表，也不因某个忙核而移入无界私有队列；
 22. 正常路径先发布 completion 和 cell `DONE`，然后才把对应 execution token 恢复为 `IDLE`；
-23. FinalDrain 同时证明 builder 停止生产、所有可执行 cell 全部 DONE、每核四个 execution token 均为 `IDLE`、engine 无 in-flight；每个 worker 只向所属 arrival group 到达一次，并在同一次 FetchAdd 中携带本核已成功发布 DONE 的完成数；非 root 到达后可以结束，固定 root 只有看到 16 组各 6 个到达且完成数合计等于计划发布的 `executable_task_count` 后才允许最后结束；
+23. FinalDrain 同时证明 `replay_done` 已封口、AIC/AIV runtime cursor 到达终端、每核四个 execution token 均为 `IDLE`、engine 无 in-flight；每个 worker 只向所属 arrival group 到达一次，并在同一次 FetchAdd 中携带本核已成功发布 DONE 的完成数；非 root 到达后可以结束，固定 root 看到 16 组各 6 个到达后，从 runtime cell 终态动态统计 executable task，并与完成数合计精确相等；不读 Host `executable_task_count`；
 24. 后续 reuse 版额外证明慢 reader 不会把旧 generation 当新任务；
 25. AIC/AIV function 路由严格匹配；
 26. fatal 路径不会执行半构建或已取消 payload；
@@ -1236,6 +1749,11 @@ PA task kind 特判冒充支持。
 29. CPU 模型通过不代替 A5 DCCI/atomic 同构门槛。
 
 ## 13. 建议的验证顺序
+
+> 本章 S0–S6 是跨核 payload、K2 与旧中央计划版本的历史演进记录。
+> 其 Host plan、Build ticket、K2/角色表和 `WAITING_BUILT` 表述不属于 S7
+> 当前正式合同。当前状态以第 0、5.8、6.1–6.3、15 章和更新记录中的
+> S7 条目为准；下文不批量改写，以便保留候选的证据和否决原因。
 
 ### 贯穿 S0–S6 的观测门槛（不编号）
 
@@ -1544,7 +2062,7 @@ cell 同地址竞争，而是用 AIC/AIV 两条中央 ticket 唯一发放 task�
    clean-out、原子发布，consumer 继续遵守原子 acquire、DCCI invalidate、普通读。
 8. `replay_done` 是生产封口：在全部 worker 到达前，不能把暂时没有
    `BUILT` 解释成非执行 task，也不能关闭 FinalDrain。
-9. 第一版在生产封口后开放 Execute。AIC/AIV 各用一条中央 cursor 扫描完整
+9. 第一版在生产封口后开放 Execute。AIC/AIV 各用一条 runtime scan cursor 扫描完整
    task-id 区间，并按 runtime cell 的 engine class 筛选。
 10. 严格插入完成且 cell 仍为 `EMPTY` 才能认定为 metadata-only；匹配角色
     的 `BUILT` cell 由唯一 task-id 扫描 owner绑定 token并 CAS 到
@@ -1555,10 +2073,13 @@ cell 同地址竞争，而是用 AIC/AIV 两条中央 ticket 唯一发放 task�
     executable cell 为 `DONE`，并使实际完成数与终态扫描得到的
     executable 数一致。
 13. task-indexed cell 本轮不复用，不引入 generation、ABA 或回收。
-14. 第一版不宣称保留旧中央计划版本约 `0.82 ms` 的性能；功能闭合后再以
-    动态 role queue 恢复 Build/Execute overlap。
+14. 第一版不宣称保留旧中央计划版本约 `0.82 ms` 的性能；功能已闭合，
+    下一阶段可以用动态 role queue 恢复 Build/Execute overlap。
 15. 动态 queue 的任何后续版本都必须由真实 Submit winner发布 per-entry
     ready，不能由 Host、固定 PA 公式或单 device planner生成。
+16. 若后续采用中央 Build ticket，必须先由真实 callback 动态发布完整
+    `RuntimeTaskDesc`，使 ticket 返回值只承担唯一分配，不再承担任务语义恢复；
+    `Plan/Build/Execute` 三阶段的发布、封口和 drain 必须分别证明。
 
 本合同把三个问题明确拆开：
 
@@ -1573,8 +2094,8 @@ cell 同地址竞争，而是用 AIC/AIV 两条中央 ticket 唯一发放 task�
 
 ## 16. 尚未决定的问题
 
-1. 全 Scalar replay 恢复后，逐 task Tournament 的真实 A5 成本与 Build
-   分布是否仍能接受？
+1. 下一步是先隔离比较“全局精确 CAS cursor”和“运行时 TaskPlan + 中央 Build
+   ticket”，还是直接以三级 pipeline 为主线？两者都不得恢复 Host/PA 预制答案；
 2. 最终版 executor 是直接 dispatch shared payload，还是复制 active prefix 到紧凑 token？当前直接保存稳定 shared payload 地址，不再复制 active payload；
 3. portable payload 的最小通用 ABI 是什么，怎样兼容真实 function address 和 joint task？
 4. 更通用的 heap 协议中 completion vend 应如何表达？首版已决定在 Materialize reservation 成功后冻结。
@@ -1592,6 +2113,76 @@ cell 同地址竞争，而是用 AIC/AIV 两条中央 ticket 唯一发放 task�
 12. shared execution payload 是否能复用生产 RingSlot ABI，还是需要独立中间 ABI？
 
 ## 17. 更新记录
+
+### 2026-08-10：明确中央 ticket 的上下文前提与三级 pipeline 候选
+
+本轮首先澄清了“两阶段/三阶段”的计数口径：旧方案并非系统逻辑上没有 Plan，
+而是把 Plan 放在 Host launch 前完成，因此 A5 kernel 内只有 Build/Execute；
+三级候选则把真实 Plan 变成 device 正式生产阶段，纳入 startup 到 FinalDrain，
+并新增 `PLANNED`、连续发布前沿和独立封口。当前 S7 又不同于二者：它让 96 核
+各自真实 replay，在 callback 现场用 Tournament 选择 Build owner，尚未生成可供
+中央 ticket 消费的 runtime descriptor。
+
+复核旧预制版本后确认：中央 `next_task.FetchAdd(+1)` 之所以不需要 per-task
+Tournament，是因为 Host task 表与 PA 随机访问 helper 已经把 ordinal 变成可构建
+现场。单独的 task id 只表示顺序，无法通用恢复 kind、batch/group、动态 shape、
+SharedOutputRef、writer intent 和 callback continuation。
+
+若 96 个真实 replay actor 在 task N 现场直接调用 FetchAdd，它们会提前消费
+N..N+95；若改成 `CAS(global_cursor,N-1,N)`，可以正确选出当前 task owner，
+但会恢复 96 核同地址返回型 Atomic 热点，需作为独立候选实测。
+
+另一条更完整的候选是增加运行时 `TaskPlan -> Build -> Execute` 三级 pipeline：
+由 device 真实 callback 单次生成完整 immutable `RuntimeTaskDesc`，按 A5
+ordinary payload 的 DCCI+DSB+Atomic 合同发布；Build ticket 只领取已经发布的
+descriptor，随后沿用严格 TensorMap completion 与现有 portable execution cell；
+Execute 继续按 engine class 唯一消费。该候选可将 96N replay/Tournament 换成
+N 份真实 replay与 descriptor GM 交接，但会引入 Plan 串行生产、容量和 DCache/
+DCCI 成本。当前仅完成设计收敛，尚无实现或性能结论。
+
+### 2026-08-10：S7 无预制计划基线完成 CPU/CCEC/A5 闭合
+
+设计合同已从“决定恢复真实 replay”落到正式实现：
+
+1. 96 个 Scalar 各自从 runtime `batches/context_lens` 走真实 callback
+   回放，不读 Host task identity/writer/engine 表，也不在 device 另建
+   一份固定 PA `FullPaTaskPlan`。
+2. 每个真实 Submit 用 per-task 两级 CAS Tournament 产生唯一 Build
+   owner；Build owner 与 Execute owner 仍完全解耦。
+3. 每个 task 无条件遵守 `completion[N-1] -> metadata(N) ->
+   completion[N]`，空 writer 也推进，不再依赖 Host writer bitset。
+4. 每核把实际 batch/context length 与 Submit 身份混入 replay identity；
+   首个 `context_lens` 读取前每核执行活动区域 invalidate + DSB，不假设
+   A5 Scalar 间 cache coherence。
+5. 96 核先用 identity seal 对照 `(task_count, identity_hash)`，再以
+   `replay_done` 封口生产。之后 AIC/AIV 各自扫描完整 runtime cell
+   空间，engine class 由 Build winner 实际发布的 cell 决定。
+6. FinalDrain 不读 Host executable count；root 从 runtime cell 终态动态统计
+   executable task，并与分组 completion 合计对照。
+
+后续可达性审计删除了 Host Populate/编码链、device 中央 Build ticket、
+random-access PA 构参、dispatch route 解码和 split `Dispatched=true` 分支。
+旧两块计划状态共 `53,120 B`，也已收缩为 replay seal/AIC cursor/AIV
+cursor 三个独立 `128 B` 槽，共 `384 B`；shared ABI generation 升为
+16。AtomicSite 42 仅留 append-only 历史编号且正式路径零调用，site 57
+的当前名称为 `SharedReplayIdentitySeal`。
+
+验证证据：
+
+- CPU 严格构建以及 B1/G0/mixed/B256 业务终态 PASS；
+- A5 B1 full-swimlane PASS，输出为
+  `outputs/pa_scheduler_cross_core_shared_swimlane_20260810_122943_1569038/ccec/`；
+- A5 B256 full-swimlane PASS，输出为
+  `outputs/pa_scheduler_cross_core_shared_swimlane_20260810_123026_1569635/ccec/`；
+- B256 full-swimlane lifecycle 为 `2.902810 ms`；修正 task0 不得覆盖
+  startup increment 前起点后，同合同 perf-clock 为 `2.443455 ms`。
+
+该数据是无预制计划合同的新基线。旧约 `0.82 ms` 版本不包含 96 核
+真实 callback replay、per-task Tournament 和逐 task 严格插入的完整成本，
+两者不等价，不做直接回退百分比。旧版 Build owner 由全局
+`next_task.FetchAdd(+1)` 唯一取得 Host 表 ordinal，因此本来就不需要
+per-task Tournament；这是其“已给出 task 答案后分发”与 S7 “真实
+Submit 时仲裁”的本质区别。
 
 ### 2026-08-10：否决预制 PA TaskPlan，恢复真实全 Scalar replay
 
@@ -1645,7 +2236,7 @@ A5 尚未运行；不宣称通用动态池，也不用 CPU 耗时推导 A5 性�
   增加只为 host 观察服务的 DCCI/DSB。
 - `Validate()` 现在要求 runner 显式声明 raw token 观察权威性：CPU coherent
   路径继续严格断言，CCEC 只呈现 `RESET/NON_FINAL`。完整证据和泳道路径记录在
-  [PA调度器分离版实现过程](cross_core_ordinary/PA调度器分离版实现过程.md)。
+  [PA调度器分离版实现过程](PA调度器分离版实现过程.md)。
 
 ### 2026-08-02：S3a 泳道暴露全核扫描热点，修正 S3b 发现合同
 
@@ -1686,7 +2277,7 @@ A5 尚未运行；不宣称通用动态池，也不用 CPU 耗时推导 A5 性�
 
 - `cross_core_ordinary` 当时形成独立 portable payload、task-indexed cell、每 executor 单 token 和 global fatal 首版；单 token 已在 2026-08-03 的 S6 设计中被两个 token 取代；
 - packed state 增加 task id；删除无独立生产语义的 `output_task_id`，header 高 32 位改为强制零保留位；
-- CPU 确定性交错、100 次重复、ASan/UBSan、TSan 已通过，详细证据见 [PA调度器分离版实现过程](cross_core_ordinary/PA调度器分离版实现过程.md)；
+- CPU 确定性交错、100 次重复、ASan/UBSan、TSan 已通过，详细证据见 [PA调度器分离版实现过程](PA调度器分离版实现过程.md)；
 - AIC/AIV CCEC 编译及 Claim CAS 返回依赖、DCCI/DSB 顺序的自动 IR 门槛已通过；A5 最小探针完成 100 × 32 case，全量覆盖四种跨核方向、四种 payload 大小和两种 acquire 路径，详细证据见实现过程文档；
 - fresh task-indexed cell 上 minimal 返回依赖路径已经闭合，默认不增加前置 DSB；该结论不外推到未来 generation/ring reuse，也不代替完整 PA 验证。
 
@@ -1937,7 +2528,7 @@ CPU、CCEC、A5 B256 full-swimlane 和 trace-free 十轮已全部通过；完整
 进一步降至 `2.519 ms`，因此该低频最终观察已纳入当前设计合同。
 
 逐阶段代码、泳道与性能数字继续记录在
-[PA调度器分离版实现过程](cross_core_ordinary/PA调度器分离版实现过程.md)，本文只保存
+[PA调度器分离版实现过程](PA调度器分离版实现过程.md)，本文只保存
 采用后的架构合同和仍待验证的设计边界。
 
 ### 2026-08-05：已否决的 Register 等待 Execute 检查点
@@ -1985,7 +2576,7 @@ trace-free 端到端从同窗 `996.663 us` 回退到 `2985.751 us`。同步 kern
 因此这一节只保留为已验证反例，不是现行架构合同。生产实现、专用 placement
 和 split finish dispatcher 依赖均撤回；完整证据见
 `test_record/2026-8-6/register_wait_exec_k16_rejected.json` 与
-[Register Wait Execute Checkpoint 方案](cross_core_ordinary/PA_Register_Wait_Execute_Checkpoint_Design_Proposal.md)。
+[Register Wait Execute Checkpoint 方案](PA_Register_Wait_Execute_Checkpoint_Design_Proposal.md)。
 
 ### 2026-08-06：已否决的 Register 后 Execute Opportunity
 
@@ -2005,7 +2596,7 @@ continuation 校验和四 token 扫描。机会点还会在同步执行旧 task 
 Build 内增加 Register-wait 或 Register-after 两类 Execute 检查点。只有未来
 出现能明确减少 FinalDrain、或能避免“每 Build 固定付费”的新触发证据时，才
 重新打开这一设计空间。完整数据和泳道见
-[Build Phase-Aware Execute Opportunity](cross_core_ordinary/PA_Build_Phase_Aware_Execute_Opportunity_Proposal.md)
+[Build Phase-Aware Execute Opportunity](PA_Build_Phase_Aware_Execute_Opportunity_Proposal.md)
 及 `test_record/2026-8-6/build_phase_opportunity_rejected/`。
 
 ### 2026-08-06：用释放上界约束后续优化顺序

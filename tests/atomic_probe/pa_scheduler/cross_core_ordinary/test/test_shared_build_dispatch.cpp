@@ -504,7 +504,7 @@ bool ReplayIdentitySealRejectsContextDivergence(
     SchedulerState &state
 ) {
     state.fatal.value = 0;
-    state.build_dispatch.next_task.value = -1;
+    state.replay_identity_seal.line.value = -1;
     const std::array<int32_t, 1> context_one = {1};
     const std::array<int32_t, 1> context_full_group = {8192};
     uint32_t one_task_count = 0;
@@ -539,7 +539,7 @@ bool ReplayIdentitySealRejectsContextDivergence(
         one_identity != full_identity &&
         first_ok && same_ok && mismatch_rejected &&
         static_cast<uint64_t>(
-            state.build_dispatch.next_task.value
+            state.replay_identity_seal.line.value
         ) == expected_packed &&
         state.fatal.value != 0;
     std::printf(

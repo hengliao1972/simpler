@@ -57,10 +57,10 @@ constexpr uint32_t kExecDispatchGlobalContextIndex = 49;
 // 最新三槽泳道显示 96/96 worker 均达到容量上限，三槽占满时间每核中位
 // 672.945 us；扩容只改变 owner-local 前视深度，不改共享发布或插入合同。
 constexpr uint32_t kExecTokensPerWorker = 4;
-// Execute 发放按固定两项领取：一次返回型 Atomic 取得一段互不重叠的
-// immutable plan ordinal，随后把这两项分别绑定到 owner-local token。
-// 该批次只依赖通用执行计划和 token 容量，不解释算子 task kind/DAG。
-// 两项而不是四项，避免一个尚未 BUILT 的整段一次占满全部前视槽。
+// replay_done 封口后，AIC/AIV 各自用一条返回型 Atomic 按固定两项扫描
+// runtime task-id/cell 区间，再把匹配本 engine 的 BUILT task 绑定到
+// owner-local token。扫描不读取 Host task-id 表，也不解释算子 kind/DAG。
+// 两项而不是四项，避免一次扫描占满全部前视槽。
 constexpr uint32_t kExecTicketBatchSize = 2;
 static_assert(
     kExecTicketBatchSize > 0 &&

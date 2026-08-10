@@ -4185,9 +4185,9 @@ PA_DEVICE SharedExecTicketResult TakeSharedExecTicket(
     const cross_core::ExecEngineClass engine =
         CrossCoreEngineForRole(role);
     if (engine == cross_core::ExecEngineClass::Aic) {
-        cursor = &state->exec_dispatch.aic_next.value;
+        cursor = &state->exec_scan_cursors.aic_next.value;
     } else if (engine == cross_core::ExecEngineClass::Aiv) {
-        cursor = &state->exec_dispatch.aiv_next.value;
+        cursor = &state->exec_scan_cursors.aiv_next.value;
     } else {
         return SharedExecTicketResult{
             SharedExecTicketStatus::Invalid,
@@ -4364,9 +4364,9 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
         );
         return false;
     }
-    // scheduler fatal 由领取新 Build ticket 前的调度边界统一检查。
-    // 本 helper 接收已经取得的合法 task，并只对本 task 的 Build 结果负责；
-    // 不在 WinnerBuild 内再次读取同一全局停止线。
+    // scheduler fatal 由真实 callback 进入 Claim/Build 前的调度边界统一
+    // 检查。本 helper 接收 Tournament 已经选出的合法 task，并只对本
+    // task 的 Build 结果负责；不在 WinnerBuild 内重复读取全局停止线。
 
     cross_core::ExecPayloadSpec spec{};
     cross_core::PaExecPayloadSource source{};
@@ -5779,16 +5779,18 @@ PA_DEVICE bool SubmitCallbackTask(
     );
 #endif
 #if PA_BUILD_PERF_CLOCK
-    // dist_submit_begin/BeginCallbackSubmit 已建立本次 task_id；首个
-    // Submit 的 EfDrain 前只读一次性能时钟，不为其余 Submit 递增
-    // 另一份观察计数。
-    const uint64_t submit_begin = task_id == 0 ? Ops::PerfClockNow() : 0;
+    // perf-clock 的权威起点已经在 startup increment 前读取并保存，不能
+    // 在 task 0 再读一次、也不能用首个 Submit 覆盖完整周期起点。
+    // trace-free 构建的 Submit/EfDrain 局部边界固定为零。
+    const uint64_t submit_begin = 0;
 #elif PA_BUILD_SUBMIT_PMU
     const uint64_t submit_begin = task_id == 0 ? Ops::Now() : 0;
 #else
     const uint64_t submit_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
 #endif
+#if !PA_BUILD_PERF_CLOCK
     if (task_id == 0) stats.result.submit_begin = submit_begin;
+#endif
 
     const uint64_t efdrain_begin = submit_begin;
     BeginSubmitPmuPhase<SubmitPmuPhase::EfDrain, Ops>(pmu_context);
@@ -6010,8 +6012,8 @@ PA_DEVICE bool SealSharedReplayIdentity(
     const int64_t desired = static_cast<int64_t>(packed);
     const int64_t observed = TraceAtomicCompareExchange<Ops>(
         stats.trace, stats.result, -1,
-        AtomicSite::SharedReplayPlanSeal,
-        &state->build_dispatch.next_task.value,
+        AtomicSite::SharedReplayIdentitySeal,
+        &state->replay_identity_seal.line.value,
         static_cast<int64_t>(-1), desired,
         /*result_used=*/true
     );

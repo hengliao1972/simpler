@@ -2,11 +2,15 @@
 
 ## 0. 结论先行
 
-当前 cross-core 调度器已经解决了“一个 task 只能等待两个预定执行候选核”的
-早期负载不均问题，也已经做到：每次领取新 Build ticket 之前，优先推进本核
-已有的 Execute token。
+本文主体记录的是旧中央 Build ticket 阶段为提前执行 AIC task 所做的探索。
+当前 S7 已删除该 ticket 和 Host Execute task-id 表，96 个 Scalar 先完整回放
+真实 callback 并完成 Build，等 `replay_done == 96` 后才由 AIC/AIV runtime
+cursor 扫描 task-indexed cell。因此，“每次领取新 Build ticket 前推进
+Execute token”不再是现行路径，旧泳道与失败候选只能作为历史证据。
 
-但这仍不足以保证 AIC task 尽早执行。当前真正尚未解决的问题是：
+S7 的当前限制更加明确：Build 与 Execute 尚未 overlap，AIC task 会有意等到
+真实 replay 封口后才开始执行。若后续用 winner 动态发布的通用 role queue
+恢复 overlap，仍需面对本文识别出的非抢占边界：
 
 > Execute owner 一旦进入另一个 task 的 Build，就必须连续完成该 Build 的
 > Materialize、严格 Register、Fanin 和 WinnerBuild，期间没有新的调度点。
@@ -59,7 +63,7 @@ Build owner 与 Execute owner 完全解耦，但允许恰好是同一个核。�
 `BUILT` 后，owner 才执行 Claim、payload acquire、fanin 检查和 kernel。
 
 这套模型的正确性边界记录在
-[shared构建执行分离.md](../shared构建执行分离.md)，主要实现位于
+[shared构建执行分离.md](shared构建执行分离.md)，主要实现位于
 [pa_scheduler_core.h](common/pa_scheduler_core.h) 和
 [pa_shared_submit_path.h](common/pa_shared_submit_path.h)。
 

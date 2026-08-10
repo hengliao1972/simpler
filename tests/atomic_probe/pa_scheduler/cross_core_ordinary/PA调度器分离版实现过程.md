@@ -7332,7 +7332,9 @@ oracle；`InitializeState` 不把其中任何 task、writer 或 Execute 路由�
   `semantic_status=PASS`。
 
 CPU 只证明协议与业务结果，不能模拟 A5 无 cache coherence、DCCI 时延或同地址
-Atomic 竞争性能。本阶段尚未运行 CCEC/A5，不能宣称真机正确性或性能收益。
+Atomic 竞争性能。在 S7.3 这个 CPU 门槛完成时尚未运行
+CCEC/A5；后续真机证据统一记录在 S7.6，不把后续结论倒写成
+CPU 阶段已经证明的内容。
 
 ### S7.4 删除不可达的预制调度代码
 
@@ -7351,3 +7353,89 @@ Atomic 竞争性能。本阶段尚未运行 CCEC/A5，不能宣称真机正确�
 把不可达代码删除与 CCEC 搬运边界变化混在一起。清理后 CPU 全量严格构建、
 B1、mixed context 与 B256 完整入口继续通过；下一小步再把两块死表收敛为一条
 replay seal cache line 和两条 AIC/AIV scan cursor cache line。
+
+### S7.5 收缩无预制计划的调度状态 ABI
+
+可达性清理后，旧状态尾部仍为已删除的调度协议保留了
+`53,120 B`：
+
+| 旧状态 | 大小 | 原有内容 | S7 判定 |
+| -------- | ---: | -------- | ------- |
+| `SharedBuildDispatchState` | `18,112 B` | Host task identity、writer bitset/计数、中央 Build cursor | 全部不再是设备调度输入 |
+| `SharedExecDispatchState` | `35,008 B` | Host AIC/AIV task-id 表、两条 Execute cursor | 仅两条 runtime scan cursor 仍有业务意义 |
+
+正式布局改为三个彼此独立的 A5 `128 B` Atomic 冲突单元：
+
+```text
+SharedReplayIdentitySealState  128 B
+└─ replay_identity_seal.line       : (identity_hash, task_count)
+
+SharedExecScanCursorState      256 B
+├─ exec_scan_cursors.aic_next      : AIC 扫描 [0, task_count)
+└─ exec_scan_cursors.aiv_next      : AIV 扫描 [0, task_count)
+```
+
+每个槽的前 `64 B` 是 `AtomicLine`，后 `64 B` 是隔离 padding/canary；
+三条返回型 Atomic 不共用 `128 B` 冲突单元，也不对这些行执行
+DCCI。新调度尾状态合计 `384 B`，相比旧表减少 `52,736 B`。
+
+尺寸变化后的静态合同是：
+
+- `kCrossCoreExecStateBytes = 19,441,088`;
+- non-split `sizeof(SchedulerState) = 1,059,046,656`;
+- split `sizeof(SchedulerState) = 1,059,052,800`;
+- shared build identity ABI generation 从 15 升到 **16**，Host/runtime/
+  finish 不允许混用 generation 15 产物。
+
+AtomicSite 57 保持 append-only 数值不变，但名称由容易误解成
+“封存预制计划”的 `SharedReplayPlanSeal` 改为
+`SharedReplayIdentitySeal`。AtomicSite 42 `SharedBuildDispatchTicket` 仅作为
+历史 raw ABI 编号保留，正式路径必须精确为零调用。Host 初始化与
+终态校验也改为只检查 seal、两条终端 cursor 和隔离 canary，不再
+搬运或校验任何设备预制 task 表。
+
+### S7.6 CPU、CCEC 与 A5 B1/B256 闭合
+
+本阶段将“业务正确性”、“观测结构正确性”与“性能数值”分开取证：
+
+- CPU 严格构建继续以 `-Wall -Wextra -Werror` 通过；B1、G0、mixed
+  `0,1,8192,8193` 与 B256 入口全部 `semantic_status=PASS`；
+  converter 门槛与 Atomic/DCCI 覆盖门槛同时通过。
+- A5 B1 full-swimlane 业务终态与泳道 analyzer 均 PASS，96 个
+  Scalar 每核完整回放 5 个 Submit；输出保存在
+  `outputs/pa_scheduler_cross_core_shared_swimlane_20260810_122943_1569038/ccec/`。
+- A5 B256 full-swimlane 业务终态与 analyzer 均 PASS，96 个
+  Scalar 每核回放 1,280 个 Submit，无 trace drop；输出保存在
+  `outputs/pa_scheduler_cross_core_shared_swimlane_20260810_123026_1569635/ccec/`。
+- B256 full-swimlane 从最早 startup 起点到最后 FinalDrain 结束的
+  lifecycle 为 **`2.902810 ms`**。随后修正 perf-clock task0 不得再次读取
+  时钟并覆盖 startup increment 前起点，干净重编后的同合同 perf-clock 为
+  **`2.443455 ms`**，且 96 核各自精确读取两个生命周期边界，共
+  `192/192` 次。两种构建只用于量化当前真实回放基线和泳道观测代价，
+  不把不同 ELF 的区间直接归因到某一业务阶段。
+
+泳道证据还精确要求：96 次 runtime replay identity seal、旧
+Build ticket site 42 零次、AIC/AIV runtime scan cursor 到达各自终端以及
+三个 `128 B` 隔离 canary 保持零。因此，本轮 A5 通过不只是
+kernel 结果对了，也动态证明真机没有偷走已删除的预制 Build 发放链。
+
+### S7.7 与旧 `0.82 ms` 数据的可比性边界
+
+旧 cross-core 约 `0.82 ms` 数据使用 Host 预制 task identity/writer 集合/
+Execute 角色表，中央 Build ticket 从已给定的 task 表中分发工作。它没有
+支付 96 个 Scalar 独立 callback 回放、每 task Tournament 和逐 task 严格
+`N-1 -> N` TensorMap 插入的完整成本。因此：
+
+其 Build owner 分配机制是一条全局 `next_task` 对中央 cursor 执行
+返回型 `FetchAdd(+1)`：取得 ordinal 的 Scalar 直接解码 Host 表中该项
+identity 并成为它的唯一 Build owner。“每个 ordinal 只被 FetchAdd 返回一次”
+替代了“96 个 Scalar 在同一次真实 Submit 上选出 winner”，所以旧路径
+本来就不需要 per-task Tournament。这正是它少支付的调度成本，也是不能与
+当前真实 replay 基线等价比较的根本原因。
+
+- `2.443455 ms` 是修正起点覆盖后的无预制计划真机 perf-clock 基线；
+- `2.902810 ms` 是同一新合同的 full-swimlane lifecycle；
+- 两者都不能与旧 `0.82 ms` 做“同实现回退了多少”的百分比对照。
+
+旧数据只能回答“在 task 答案已经预制时，跨核 payload 与 Execute 机制可以
+达到什么数量级”；新数据才是后续优化真实 Submit 调度的合法比较起点。

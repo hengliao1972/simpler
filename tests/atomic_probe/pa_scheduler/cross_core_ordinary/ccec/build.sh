@@ -210,26 +210,15 @@ COMMON_FLAGS=(
 # 精确尺寸预留；runtime object、单 role section 与最终双 role 布局都必须
 # 使用同一数值，不能靠多留一条未说明的 cache line 掩盖 ABI 漂移。
 SPLIT_STATE_STORAGE_BYTES=1728
-# 中央 ticket 之后不再为五种 task 人为保留五份 replay 尾部。CCEC 会按
-# role/观察构建合并相同尾部。五种 kind 是否完整覆盖由 dispatch switch 和
-# CPU 动态协议测试证明；这里精确锁定当前每种产物的真实代码形状，防止 finish 被
-# 内联/删除，又不把 CCEC 对等尾部的有益合并误判成覆盖缺失。
-# execution plan header 在 worker 入口校验后，shared startup 允许 Build
-# 先行并在全员到达后开放 Execute。FinalDrain 的 fatal 轮询相位按 worker
-# 错开、Execute admission 首次观察延后到 Build 边界后，CCEC 当前保留
-# perf-clock AIC/AIV 各三处等价 Finish 尾部；
-# readelf 逐条确认 relocation
-# 只指向本角色唯一 finish。任务种类覆盖继续由 dispatch、CPU 动态协议
-# 门槛和 A5 finish_calls 精确终态共同证明，不能把精确值放宽成范围。
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=3
-SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=3
-# full-swimlane AIC/AIV 当前分别生成三个等价 finish 出口。readelf
-# 逐条确认这些 relocation 都只
-# 指向本角色唯一 finish 符号；任务覆盖继续由 dispatch、CPU 动态协议门槛
-# 和 A5 finish_calls 精确终态共同证明。这里按实际机器码冻结为 3/3，
-# 不放宽成范围判断。
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=3
-SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=3
+# 真实 replay 直接按 Alloc/QK/SF/PV/UP 五个 callback 调用点构造任务，
+# 不再经过中央 dispatch switch。CCEC 因而为五种 TaskKind 各保留一处
+# noinline finish relocation；readelf 必须精确观察到 5 条且全部指向本角色
+# 唯一 finish 符号。CPU 动态门槛和 A5 finish_calls 继续证明每 task 只有
+# winner 跨 TU，不能把这个精确值放宽成范围。
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIC=5
+SPLIT_FINISH_CALL_SITES_PERF_CLOCK_AIV=5
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIC=5
+SPLIT_FINISH_CALL_SITES_SWIMLANE_AIV=5
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
     -mllvm "-cce-block-local-reserve-size=$SPLIT_STATE_STORAGE_BYTES"

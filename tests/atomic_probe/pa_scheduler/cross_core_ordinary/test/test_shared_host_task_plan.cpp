@@ -11,6 +11,7 @@
 
 #include "winner_workload_host.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -20,12 +21,36 @@ namespace {
 using namespace pa_scheduler;
 using namespace pa_scheduler::host;
 
+static_assert(
+    sizeof(SharedReplayIdentitySealState) == 128 &&
+        alignof(SharedReplayIdentitySealState) == 64 &&
+        offsetof(SharedReplayIdentitySealState, line) == 0,
+    "replay identity seal must occupy one isolated A5 atomic slot"
+);
+static_assert(
+    sizeof(SharedExecScanCursorState) == 256 &&
+        alignof(SharedExecScanCursorState) == 64 &&
+        offsetof(SharedExecScanCursorState, aic_next) == 0 &&
+        offsetof(SharedExecScanCursorState, aiv_next) == 128,
+    "AIC/AIV scan cursors must occupy distinct A5 atomic slots"
+);
+
 bool Check(bool condition, const char *label) {
     std::printf(
         "[HOST_PLAN_TEST] %-56s %s\n",
         label, condition ? "PASS" : "FAIL"
     );
     return condition;
+}
+
+template <std::size_t Size>
+bool BytesAreZero(const uint8_t (&bytes)[Size]) {
+    for (const uint8_t byte : bytes) {
+        if (byte != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool SetContextsAndBuild(
@@ -688,33 +713,29 @@ int main() {
         initialized_mixed_ok,
         "InitializeState writes the exact shared CLI context vector"
     );
-    bool dispatch_state_empty =
-        state->build_dispatch.next_task.value == -1 &&
-        state->exec_dispatch.aic_next.value == 0 &&
-        state->exec_dispatch.aiv_next.value == 0 &&
-        state->build_dispatch.task_count == 0 &&
-        state->build_dispatch.batch_count == 0 &&
-        state->build_dispatch.executable_task_count == 0 &&
-        state->build_dispatch.metadata_writer_count == 0 &&
-        state->build_dispatch.ordinary_metadata_writer_count == 0 &&
-        state->build_dispatch.symbol_metadata_writer_count == 0 &&
-        state->exec_dispatch.aic_task_count == 0 &&
-        state->exec_dispatch.aiv_task_count == 0;
-    for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
-        const SharedBuildDispatchTaskIdentity &identity =
-            state->build_dispatch.tasks[task_id];
-        dispatch_state_empty &= identity.batch == 0 &&
-            identity.encoded_meta == 0 &&
-            identity.exec_route == 0;
-    }
-    for (uint32_t word = 0;
-         word < kSharedMetadataWriterWordCount; ++word) {
-        dispatch_state_empty &=
-            state->build_dispatch.metadata_writer_bits[word] == 0;
-    }
     ok &= Check(
-        dispatch_state_empty,
-        "InitializeState leaves Host task identities, writer bits, and Execute task-id tables empty"
+        state->replay_identity_seal.line.value == -1 &&
+            state->exec_scan_cursors.aic_next.value == 0 &&
+            state->exec_scan_cursors.aiv_next.value == 0,
+        "InitializeState establishes the replay seal and scan cursor sentinels"
+    );
+    ok &= Check(
+        BytesAreZero(
+            state->replay_identity_seal.isolation_padding
+        ),
+        "replay identity seal isolation padding remains a zero canary"
+    );
+    ok &= Check(
+        BytesAreZero(
+            state->exec_scan_cursors.aic_isolation_padding
+        ),
+        "AIC scan cursor isolation padding remains a zero canary"
+    );
+    ok &= Check(
+        BytesAreZero(
+            state->exec_scan_cursors.aiv_isolation_padding
+        ),
+        "AIV scan cursor isolation padding remains a zero canary"
     );
 
     ok &= Check(

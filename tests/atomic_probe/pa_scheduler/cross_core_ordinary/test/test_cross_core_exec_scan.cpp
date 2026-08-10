@@ -383,15 +383,6 @@ void TestBothRolesScanWholeTaskRange() {
     Check(state != nullptr, kTest, "state mapping");
     if (state == nullptr) return;
 
-    // 故意发布错误的 Host 表头和 task-id 表：新 ticket 合同只接受
-    // runtime task_count 和两类中央游标，不能再读取这些旧答案。
-    state->build_dispatch.task_count = 1;
-    state->build_dispatch.executable_task_count = 1;
-    state->exec_dispatch.aic_task_count = 1;
-    state->exec_dispatch.aiv_task_count = 1;
-    state->exec_dispatch.aic_task_ids[0] = 99;
-    state->exec_dispatch.aiv_task_ids[0] = 77;
-
     std::array<LocalStats, 6> stats{};
     const std::array<uint32_t, 3> aic_workers{0, 7, 31};
     const std::array<uint32_t, 3> aiv_workers{32, 47, 95};
@@ -435,8 +426,10 @@ void TestBothRolesScanWholeTaskRange() {
             stats[3 + index].exec_dispatch_exhausted ==
                 (index == 2 ? 1U : 0U);
     }
-    exact &= state->exec_dispatch.aic_next.value == 6 &&
-        state->exec_dispatch.aiv_next.value == 6 &&
+    exact &= state->exec_scan_cursors.aic_next.value ==
+            ExecTicketTerminalCursor(5, 1) &&
+        state->exec_scan_cursors.aiv_next.value ==
+            ExecTicketTerminalCursor(5, 1) &&
         NoFatal(*state);
     Check(
         exact, kTest,
@@ -470,11 +463,63 @@ void TestZeroTaskRange() {
             aic.task_count == 0 && aiv.task_count == 0 &&
             aic_stats.exec_dispatch_exhausted == 1 &&
             aiv_stats.exec_dispatch_exhausted == 1 &&
-            state->exec_dispatch.aic_next.value == 2 &&
-            state->exec_dispatch.aiv_next.value == 2 &&
+            state->exec_scan_cursors.aic_next.value ==
+                ExecTicketTerminalCursor(0, 1) &&
+            state->exec_scan_cursors.aiv_next.value ==
+                ExecTicketTerminalCursor(0, 1) &&
             NoFatal(*state),
         kTest,
         "zero task closes each role with one terminal ticket"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestAllWorkersReachExactTerminalCursors() {
+    constexpr const char *kTest =
+        "all-workers-reach-exact-terminal-cursors";
+    constexpr uint32_t kTaskCount = 5;
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+
+    const auto drain_role = [&](
+        CoreRole role, uint32_t first_worker,
+        uint32_t worker_count
+    ) {
+        bool exact = true;
+        for (uint32_t offset = 0; offset < worker_count; ++offset) {
+            const uint32_t worker_id = first_worker + offset;
+            LocalStats stats{};
+            InitLocalStats(stats, worker_id, role);
+            uint32_t calls = 0;
+            while (stats.exec_dispatch_exhausted == 0 &&
+                   calls <= kTaskCount + 1U) {
+                const SharedExecTicketResult ticket =
+                    TakeSharedExecTicket<ExecScanTestOps>(
+                        state, worker_id, role,
+                        kTaskCount, stats
+                    );
+                exact &= ticket.status !=
+                    SharedExecTicketStatus::Invalid;
+                ++calls;
+            }
+            exact &= stats.exec_dispatch_exhausted == 1;
+        }
+        return exact;
+    };
+
+    const bool exact =
+        drain_role(CoreRole::Aic, 0, kAicWorkers) &&
+        drain_role(CoreRole::Aiv, kAicWorkers, kAivWorkers) &&
+        state->exec_scan_cursors.aic_next.value ==
+            ExecTicketTerminalCursor(kTaskCount, kAicWorkers) &&
+        state->exec_scan_cursors.aiv_next.value ==
+            ExecTicketTerminalCursor(kTaskCount, kAivWorkers) &&
+        NoFatal(*state);
+    Check(
+        exact, kTest,
+        "all AIC/AIV workers close their runtime scan at exact cursors"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -549,7 +594,8 @@ void TestRuntimeCellRoutesAndConsumesOnce() {
             up_after_aic.valid &&
             up_after_aic.phase == ExecPhase::Built &&
             aic_stats.exec_dispatch_exhausted == 1 &&
-            state->exec_dispatch.aic_next.value == 6 &&
+            state->exec_scan_cursors.aic_next.value ==
+                ExecTicketTerminalCursor(5, 1) &&
             NoFatal(*state),
         kTest,
         "AIC consumes matching cells and skips Empty/AIV cells"
@@ -567,7 +613,8 @@ void TestRuntimeCellRoutesAndConsumesOnce() {
             ExecScanTestOps::executed_tasks[2] == 2 &&
             ExecScanTestOps::executed_tasks[3] == 4 &&
             aiv_stats.exec_dispatch_exhausted == 1 &&
-            state->exec_dispatch.aiv_next.value == 6 &&
+            state->exec_scan_cursors.aiv_next.value ==
+                ExecTicketTerminalCursor(5, 1) &&
             NoFatal(*state),
         kTest,
         "AIV consumes matching cells and skips Empty/AIC cells"
@@ -655,9 +702,8 @@ void TestDrainDerivesExecutableCountFromTerminalCells() {
 
     SetTerminalCells(*state, /*task_count=*/5);
     SetDrainArrivals(*state, /*completed_tasks=*/2);
-    // 故意写入矛盾的旧 Host 摘要；root 必须从 runtime terminal cells
-    // 动态得到两个 executable task，而不是相信该字段。
-    state->build_dispatch.executable_task_count = 99;
+    // root 只从 runtime terminal cells 动态得到两个 executable task，
+    // 不再存在 Host 可写的 executable-task 摘要。
     WorkerState &root = PrepareWorker(
         *state, 0, CoreRole::Aic
     );
@@ -672,7 +718,7 @@ void TestDrainDerivesExecutableCountFromTerminalCells() {
     Check(
         closure_ok && arrived && closed && NoFatal(*state),
         kTest,
-        "two DONE cells close despite contradictory Host executable count"
+        "two DONE cells close from the runtime terminal-cell count"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -717,6 +763,7 @@ void TestDrainCompletionMismatchFailsClosed() {
 int main() {
     TestBothRolesScanWholeTaskRange();
     TestZeroTaskRange();
+    TestAllWorkersReachExactTerminalCursors();
     TestRuntimeCellRoutesAndConsumesOnce();
     TestClosedBuildingCellFailsClosed();
     TestDrainDerivesExecutableCountFromTerminalCells();

@@ -181,7 +181,7 @@ ATOMIC_SITE_NAMES = {
     54: "shared_exec_drain_release_poll",
     55: "shared_exec_drain_arrival_poll",
     56: "shared_exec_dispatch_ticket",
-    57: "shared_replay_plan_seal",
+    57: "shared_replay_identity_seal",
 }
 ATOMIC_OP_NAMES = {
     0: "load",
@@ -274,7 +274,7 @@ POLL_BATCH_SITE_OP_IDS = {
     55: 0,
 }
 SHARED_REGISTER_ATOMIC_SITE_IDS = {19, 20}
-SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 57))
+SCHEMA_V5_SHARED_ATOMIC_SITE_IDS = set(range(19, 58))
 SHARED_INSERT_TURN_POLL_SITE_ID = 19
 SHARED_INSERT_TURN_HANDOFF_SITE_ID = 20
 SHARED_OUTPUT_PUBLISHED_POLL_SITE_IDS = {23, 24}
@@ -907,10 +907,10 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     auxiliary == SHARED_INSERT_TURN_HANDOFF_SITE_ID
                     and submit_topology == "all_worker_replay"
                 ):
-                    # Scalar cross-core 的稀疏 metadata-writer 链只由真实
-                    # writer 用非返回型 FetchAdd 推进；same-core 则用返回型
-                    # CAS 发布每 task 的 insert completion。稳定 site 编号
-                    # 相同，但操作与返回值语义由拓扑决定。
+                    # Scalar cross-core 的全员真实 replay 让每个 task（包括
+                    # 空 writer）用返回型 CAS 发布独立 insert completion。
+                    # 旧稀疏 writer FetchAdd 已退出正式协议；稳定 site 编号
+                    # 保持不变，schema-v5 按当前拓扑要求 CAS/return-ready。
                     expected_atomic_op = 4
                     expected_result_used = True
                 if (

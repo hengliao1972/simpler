@@ -33,8 +33,8 @@ using pa_scheduler::host::SharedSparseTraceValidator;
 using pa_scheduler::host::ValidateTraceHeader;
 
 static_assert(
-    static_cast<uint32_t>(AtomicSite::SharedReplayPlanSeal) == 57U,
-    "SharedReplayPlanSeal is an append-only raw ABI site"
+    static_cast<uint32_t>(AtomicSite::SharedReplayIdentitySeal) == 57U,
+    "SharedReplayIdentitySeal is an append-only raw ABI site"
 );
 
 int g_failures = 0;
@@ -174,16 +174,16 @@ void TestNewAtomicSchemas() {
     );
 
     const TraceRecord seal = MakeReturnReadyCas(
-        AtomicSite::SharedReplayPlanSeal, -1, 200
+        AtomicSite::SharedReplayIdentitySeal, -1, 200
     );
     Check(
-        IsReturnReadyCas(seal, AtomicSite::SharedReplayPlanSeal),
+        IsReturnReadyCas(seal, AtomicSite::SharedReplayIdentitySeal),
         "site 57 replay identity seal is a return-ready CAS"
     );
     bad = seal;
     bad.flags &= ~pa_scheduler::kAtomicResultUsed;
     Check(
-        !IsReturnReadyCas(bad, AtomicSite::SharedReplayPlanSeal),
+        !IsReturnReadyCas(bad, AtomicSite::SharedReplayIdentitySeal),
         "replay identity seal must consume the CAS observation"
     );
     bad = seal;
@@ -191,7 +191,7 @@ void TestNewAtomicSchemas() {
         (bad.flags & ~pa_scheduler::kAtomicOpMask) |
         static_cast<uint32_t>(AtomicOp::FetchAdd);
     Check(
-        !IsReturnReadyCas(bad, AtomicSite::SharedReplayPlanSeal),
+        !IsReturnReadyCas(bad, AtomicSite::SharedReplayIdentitySeal),
         "replay identity seal rejects a central-ticket FetchAdd shape"
     );
 }
@@ -288,7 +288,7 @@ bool ValidateAllWorkerReplay(
                 return false;
             }
             if (!IsReturnReadyCas(
-                    record, AtomicSite::SharedReplayPlanSeal
+                    record, AtomicSite::SharedReplayIdentitySeal
                 ) || record.task_id != -1) {
                 return false;
             }
@@ -406,7 +406,7 @@ std::vector<WorkerReplay> MakeValidReplay(uint32_t total_tasks) {
         }
         replay.replay_atomics.push_back(
             MakeReturnReadyCas(
-                AtomicSite::SharedReplayPlanSeal, -1,
+                AtomicSite::SharedReplayIdentitySeal, -1,
                 1000U + static_cast<uint64_t>(worker) * 10000U +
                     static_cast<uint64_t>(total_tasks) * 100U
             )

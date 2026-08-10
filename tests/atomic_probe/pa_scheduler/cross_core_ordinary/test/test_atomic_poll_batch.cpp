@@ -28,7 +28,7 @@ using pa_scheduler::AtomicPollRegionBegin;
 using pa_scheduler::AtomicPollRegionEnd;
 using pa_scheduler::AtomicSite;
 using pa_scheduler::AccumulateAtomicPollCall;
-using pa_scheduler::CaptureAtomicFetchAddIssue;
+using pa_scheduler::CaptureAtomicCompareExchange;
 using pa_scheduler::TraceAtomicLoad;
 using pa_scheduler::TraceAtomicPollBatchMask;
 using pa_scheduler::TraceAtomicPollBatchIndex;
@@ -446,35 +446,36 @@ void TestAggregateInsertTurnPollBatch() {
     );
 }
 
-void TestInsertTurnHandoffFetchAdd() {
+void TestInsertTurnHandoffCompareExchange() {
     Fixture fixture;
-    volatile int64_t token = 7;
+    volatile int64_t token = 6;
     uint64_t trace_begin = 0;
     uint64_t trace_end = 0;
     TestOps::now = 5000;
-    CaptureAtomicFetchAddIssue<ReturnReadyTestOps>(
-        fixture.trace, &token, 1,
-        trace_begin, trace_end
-    );
+    const int64_t observed =
+        CaptureAtomicCompareExchange<ReturnReadyTestOps>(
+            fixture.trace, &token, 6, 7,
+            trace_begin, trace_end
+        );
     Expect(
-        token == 8,
-        "handoff FetchAdd 没有把目标 token 精确推进一位"
+        observed == 6 && token == 7,
+        "handoff CAS 没有消费合法旧值并发布 task id"
     );
     Expect(
         fixture.trace.record_count == 0 &&
             fixture.result.atomic_trace_calls == 0,
-        "FetchAdd 捕获阶段不得提前写 raw 或更新 logical counter"
+        "CAS 捕获阶段不得提前写 raw 或更新 logical counter"
     );
     WriteAtomicTrace<ReturnReadyTestOps>(
         fixture.trace, fixture.result, 7,
         AtomicSite::SharedInsertTurnHandoff,
-        AtomicOp::FetchAdd,
-        trace_begin, trace_end, false, false
+        AtomicOp::CompareExchange,
+        trace_begin, trace_end, true, true
     );
     Expect(
         fixture.trace.record_count == 1 &&
             fixture.result.atomic_trace_calls == 1,
-        "父/detail 端点固定后，handoff FetchAdd 必须恰好写一条 direct atomic"
+        "父/detail 端点固定后，handoff CAS 必须恰好写一条 direct atomic"
     );
     const TraceRecord &record = fixture.records[0];
     Expect(
@@ -483,22 +484,22 @@ void TestInsertTurnHandoffFetchAdd() {
                 static_cast<uint32_t>(
                     AtomicSite::SharedInsertTurnHandoff
                 ),
-        "handoff FetchAdd 没有保留 task/site 身份"
+        "handoff CAS 没有保留 task/site 身份"
     );
     Expect(
         (record.flags & kAtomicOpMask) ==
                 static_cast<uint32_t>(
-                    AtomicOp::FetchAdd
+                    AtomicOp::CompareExchange
                 ) &&
-            (record.flags & kAtomicResultUsed) == 0 &&
-            (record.flags & kAtomicReturnReady) == 0 &&
+            (record.flags & kAtomicResultUsed) != 0 &&
+            (record.flags & kAtomicReturnReady) != 0 &&
             (record.flags & kAtomicPollBatch) == 0,
-        "handoff FetchAdd 的 op/result/return-ready/direct 标志不正确"
+        "handoff CAS 的 op/result/return-ready/direct 标志不正确"
     );
     Expect(
         trace_end == record.end_cycle &&
             record.end_cycle >= record.start_cycle,
-        "handoff FetchAdd 记录没有使用捕获的 source-issue 边界"
+        "handoff CAS 记录没有使用捕获的 return-ready 边界"
     );
 }
 
@@ -510,7 +511,7 @@ int main() {
     TestNonAllowlistedSiteStaysDirect();
     TestRawSiteIdNeverBecomesTheEnableMaskBit();
     TestAggregateInsertTurnPollBatch();
-    TestInsertTurnHandoffFetchAdd();
+    TestInsertTurnHandoffCompareExchange();
     if (g_failures != 0) {
         std::fprintf(stderr, "[FAIL] atomic PollBatch self-test failures=%d\n", g_failures);
         return EXIT_FAILURE;

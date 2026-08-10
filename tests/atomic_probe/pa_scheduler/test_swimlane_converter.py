@@ -2224,6 +2224,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                 [0, 0, 0, 1, -1, "Atomic", 158, 159, 0x54, 51],
                 [0, 0, 0, -1, -1, "Atomic", 385, 386, 0x50, 55],
                 [0, 0, 0, -1, -1, "Atomic", 386, 387, 0x01, 53],
+                [0, 0, 0, -1, -1, "Atomic", 387, 388, 0x54, 57],
                 [0, 0, 0, 1, -1, "Atomic", 193, 194, 0x54, 46],
                 [0, 0, 0, 1, -1, "Dcci", 193, 194, 0xA0D, 11],
                 [0, 0, 0, 1, -1, "Atomic", 194, 195, 0x54, 47],
@@ -2292,6 +2293,11 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
         self.assertIn(
             "atomic.return_ready.shared_exec_built_publish."
             "compare_exchange#1",
+            names,
+        )
+        self.assertIn(
+            "atomic.return_ready.shared_replay_identity_seal."
+            "compare_exchange#-1",
             names,
         )
         self.assertIn(

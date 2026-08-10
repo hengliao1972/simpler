@@ -838,7 +838,7 @@ execution（in-core QK/SF/PV/UP …：Cube / Vector / MTE 主导）
 本方案是相对 Claim 拓扑的**正交下一阶段**：不改「谁赢」的合同，
 改「何时用本核 scalar 做 Claim」。
 
-> 与 `shared构建执行分离.md` 刻意不引入 engine coroutine 的边界
+> 与 `cross_core_ordinary/shared构建执行分离.md` 刻意不引入 engine coroutine 的边界
 > 不冲突：那份文档排除的是把跨核发布 / owner 仲裁 / 回收与另一套
 > 调度混做；本章讨论的是**同核、协作式、仅交错「已在跑的
 > in-core」与「本核下一轮 Claim」**，且默认不改变跨核 publication

@@ -826,12 +826,12 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     std::memset(state->exec_cells, 0, sizeof(state->exec_cells));
     std::memset(state->exec_tokens, 0, sizeof(state->exec_tokens));
     std::memset(
-        &state->build_dispatch, 0,
-        sizeof(state->build_dispatch)
+        &state->replay_identity_seal, 0,
+        sizeof(state->replay_identity_seal)
     );
     std::memset(
-        &state->exec_dispatch, 0,
-        sizeof(state->exec_dispatch)
+        &state->exec_scan_cursors, 0,
+        sizeof(state->exec_scan_cursors)
     );
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         for (uint32_t token_slot = 0;
@@ -884,11 +884,12 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     // Host 只初始化空的调度状态。task identity、metadata writer 分类和
     // AIC/AIV task-id 序列都由设备真实 replay/Build 结果决定；Host plan
     // 仅可在运行后作为独立 oracle，绝不能写回 device 调度输入。
-    // next_task 的旧 central-ticket 语义已废弃；-1 是 replay identity
-    // seal 的未发布值，首个完成真实 replay 的 Scalar 用 CAS 写入摘要。
-    state->build_dispatch.next_task.value = -1;
-    state->exec_dispatch.aic_next.value = 0;
-    state->exec_dispatch.aiv_next.value = 0;
+    // -1 是 replay identity seal 的未发布值；首个完成真实 replay 的
+    // Scalar 用 CAS 写入摘要。两条 Execute cursor 从 task 0 开始扫描
+    // runtime exec cell，不存在 Host task-id 表。
+    state->replay_identity_seal.line.value = -1;
+    state->exec_scan_cursors.aic_next.value = 0;
+    state->exec_scan_cursors.aiv_next.value = 0;
 #endif
     for (uint32_t shard = 0; shard < kCursorShards; ++shard) {
         // -1 表示尚无 task 被 claim；task 0 的 atomicMax 因而也能正常判定唯一 winner。
@@ -1107,14 +1108,10 @@ inline constexpr size_t CrossCoreExecStateBytes() {
     return kCrossCoreExecStateBytes;
 }
 static_assert(
-    // S6.63 两 token 删除废弃私有 payload 后为 19347648B；
-    // 双中央 Execute ticket 追加 35008B。S6.69 三 token 正式配置再追加
-    // 96 * sizeof(ExecutionToken) = 55296B。S6.71 四 token 再追加
-    // 96 * sizeof(ExecutionToken) = 55296B。未保留无稳定收益的双 Execute
-    // cursor 128B 空槽，因此 task-indexed payload 与其 DCCI 发布边界之外
-    // 只增加一个 owner-local token。稀疏 metadata-writer 计划再追加
-    // 69 个 uint64 word 和 24B 行尾对齐，共 576B。
-    CrossCoreExecStateBytes() == 19493824,
+    // 任务 cell、每核四 token 与 drain 状态保持原布局；旧 Host Build/
+    // Execute 预制表已删除，只保留三条彼此隔离的 128B 原子槽：replay
+    // identity seal、AIC scan cursor、AIV scan cursor。
+    CrossCoreExecStateBytes() == 19441088,
     "cross-core execution state transfer size changed"
 );
 static_assert(
@@ -1370,7 +1367,7 @@ inline const char *AtomicSiteName(uint32_t site) {
         "SharedExecDrainReleasePoll",
         "SharedExecDrainArrivalPoll",
         "SharedExecDispatchTicket",
-        "SharedReplayPlanSeal",
+        "SharedReplayIdentitySeal",
     };
     static_assert(
         sizeof(names) / sizeof(names[0]) ==
@@ -3108,13 +3105,20 @@ inline bool AnalyzeSwimlaneRecords(
         const uint64_t root_events =
             atomic_durations[0][kClaimRootSite].size() +
             atomic_durations[1][kClaimRootSite].size();
-        constexpr uint32_t kReplayPlanSealSite =
+        constexpr uint32_t kReplayIdentitySealSite =
             static_cast<uint32_t>(
-                AtomicSite::SharedReplayPlanSeal
+                AtomicSite::SharedReplayIdentitySeal
             );
-        const uint64_t replay_plan_seal_events =
-            atomic_durations[0][kReplayPlanSealSite].size() +
-            atomic_durations[1][kReplayPlanSealSite].size();
+        const uint64_t replay_identity_seal_events =
+            atomic_durations[0][kReplayIdentitySealSite].size() +
+            atomic_durations[1][kReplayIdentitySealSite].size();
+        constexpr uint32_t kLegacyBuildTicketSite =
+            static_cast<uint32_t>(
+                AtomicSite::SharedBuildDispatchTicket
+            );
+        const uint64_t legacy_build_ticket_events =
+            atomic_durations[0][kLegacyBuildTicketSite].size() +
+            atomic_durations[1][kLegacyBuildTicketSite].size();
         constexpr uint32_t kExecTicketSite =
             static_cast<uint32_t>(
                 AtomicSite::SharedExecDispatchTicket
@@ -3149,7 +3153,8 @@ inline bool AnalyzeSwimlaneRecords(
             ) * shared_plan.total_tasks;
         if (local_events != expected_local_events ||
             root_events != expected_root_events ||
-            replay_plan_seal_events != kWorkers ||
+            replay_identity_seal_events != kWorkers ||
+            legacy_build_ticket_events != 0 ||
             aic_exec_ticket_events !=
                 expected_aic_exec_ticket_events ||
             aiv_exec_ticket_events !=
@@ -3160,7 +3165,8 @@ inline bool AnalyzeSwimlaneRecords(
                 "shared PA atomic closure failed: "
                 "claim_local_aic=%llu claim_local_aiv=%llu "
                 "claim_local=%llu/%llu claim_root=%llu/%llu "
-                "replay_plan_seals=%llu/%u "
+                "replay_identity_seals=%llu/%u "
+                "legacy_build_tickets=%llu/0 "
                 "exec_tickets_aic=%llu/%llu "
                 "exec_tickets_aiv=%llu/%llu "
                 "drain_release_publishes=%llu/0\n",
@@ -3170,8 +3176,11 @@ inline bool AnalyzeSwimlaneRecords(
                 static_cast<unsigned long long>(expected_local_events),
                 static_cast<unsigned long long>(root_events),
                 static_cast<unsigned long long>(expected_root_events),
-                static_cast<unsigned long long>(replay_plan_seal_events),
+                static_cast<unsigned long long>(replay_identity_seal_events),
                 kWorkers,
+                static_cast<unsigned long long>(
+                    legacy_build_ticket_events
+                ),
                 static_cast<unsigned long long>(
                     aic_exec_ticket_events
                 ),
@@ -3199,9 +3208,9 @@ inline bool AnalyzeSwimlaneRecords(
         );
         std::printf(
             "[TRACE_ATOMIC_CLOSURE] "
-            "site=SharedReplayPlanSeal "
+            "site=SharedReplayIdentitySeal "
             "compare_exchange=%llu workers=%u\n",
-            static_cast<unsigned long long>(replay_plan_seal_events),
+            static_cast<unsigned long long>(replay_identity_seal_events),
             kWorkers
         );
         std::printf(
@@ -4732,6 +4741,16 @@ inline bool PerfClockObserverFieldsAreZero(const WorkerResult &result) {
 }
 #endif
 
+template <size_t N>
+inline bool ByteCanaryIsZero(const uint8_t (&bytes)[N]) {
+    for (size_t index = 0; index < N; ++index) {
+        if (bytes[index] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline Metrics Validate(
     const SchedulerState &state, uint32_t run, double host_us,
     const TraceHeader *trace_header,
@@ -4808,14 +4827,37 @@ inline Metrics Validate(
     const uint64_t expected_submits =
         static_cast<uint64_t>(kWorkers) * task_count;
     const uint64_t expected_claims = expected_submits;
-    const uint64_t shared_replay_plan_seal =
+    const uint64_t shared_replay_identity_seal =
         static_cast<uint64_t>(
-            state.build_dispatch.next_task.value
+            state.replay_identity_seal.line.value
         );
-    const bool shared_replay_plan_seal_ok =
-        state.build_dispatch.next_task.value != -1 &&
-        static_cast<uint32_t>(shared_replay_plan_seal) ==
+    const bool shared_replay_identity_seal_ok =
+        state.replay_identity_seal.line.value != -1 &&
+        static_cast<uint32_t>(shared_replay_identity_seal) ==
             task_count;
+    const bool shared_exec_scan_cursors_ok =
+        state.exec_scan_cursors.aic_next.value ==
+            static_cast<int64_t>(
+                cross_core::ExecTicketTerminalCursor(
+                    task_count, kAicWorkers
+                )
+            ) &&
+        state.exec_scan_cursors.aiv_next.value ==
+            static_cast<int64_t>(
+                cross_core::ExecTicketTerminalCursor(
+                    task_count, kAivWorkers
+                )
+            );
+    const bool shared_scheduler_atomic_padding_ok =
+        ByteCanaryIsZero(
+            state.replay_identity_seal.isolation_padding
+        ) &&
+        ByteCanaryIsZero(
+            state.exec_scan_cursors.aic_isolation_padding
+        ) &&
+        ByteCanaryIsZero(
+            state.exec_scan_cursors.aiv_isolation_padding
+        );
 
     // S5b 的 host oracle 直接检查 task-indexed cell，不依赖新增的
     // WorkerResult 计数：Alloc 不产生执行包；其余 task 必须 DONE，并由
@@ -5783,14 +5825,24 @@ inline Metrics Validate(
     );
 #if PTO_FDWIC_SHARED_MAP
     Expect(
-        shared_replay_plan_seal_ok,
+        shared_replay_identity_seal_ok,
         "all workers agree on one runtime replay identity seal and task count",
         &metrics
     );
     std::printf(
         "[REPLAY_SEAL] task_count=%u identity_hash=%08x\n",
-        static_cast<uint32_t>(shared_replay_plan_seal),
-        static_cast<uint32_t>(shared_replay_plan_seal >> 32U)
+        static_cast<uint32_t>(shared_replay_identity_seal),
+        static_cast<uint32_t>(shared_replay_identity_seal >> 32U)
+    );
+    Expect(
+        shared_exec_scan_cursors_ok,
+        "AIC/AIV runtime scanners reach their exact terminal cursors",
+        &metrics
+    );
+    Expect(
+        shared_scheduler_atomic_padding_ok,
+        "replay seal and Execute cursor isolation padding stays zero",
+        &metrics
     );
     Expect(
         claim_attempts_by_role[0] ==

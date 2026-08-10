@@ -1229,7 +1229,7 @@ bool ClaimAndInsertEvidenceMatches(
         state, task_count, expected_seal
     );
     exact &= static_cast<uint64_t>(
-        state.build_dispatch.next_task.value
+        state.replay_identity_seal.line.value
     ) == expected_seal;
     return exact &&
            OrderedSubmitTestOps::bad_completion_publish.load(
