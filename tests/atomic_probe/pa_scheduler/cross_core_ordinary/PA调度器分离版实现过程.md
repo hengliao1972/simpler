@@ -7333,3 +7333,21 @@ oracle；`InitializeState` 不把其中任何 task、writer 或 Execute 路由�
 
 CPU 只证明协议与业务结果，不能模拟 A5 无 cache coherence、DCCI 时延或同地址
 Atomic 竞争性能。本阶段尚未运行 CCEC/A5，不能宣称真机正确性或性能收益。
+
+### S7.4 删除不可达的预制调度代码
+
+在 S7.1–S7.3 的正式路径和 CPU 证据稳定后，先做不改变状态布局的可达性清理：
+
+- Host 删除 task identity、metadata-writer bitset、AIC/AIV task-id 表的编码与
+  Populate 链；`BuildSharedHostTaskPlan` 只保留 heap admission 和运行后独立
+  oracle；
+- device 删除中央 Build ticket/status/watchdog、dispatch identity/route 解码、
+  random-access PA 参数重建和 `Dispatched=true` split-finish 分支；
+- split finish 只剩“所有 actor 完整 replay、winner 跨 TU”的唯一合同；
+- AtomicSite 42 作为 append-only 历史 ABI 继续保留，但正式代码零调用，trace
+  门槛明确拒绝它重新出现。
+
+本小步没有缩减 `SharedBuildDispatchState/SharedExecDispatchState` 的旧布局，避免
+把不可达代码删除与 CCEC 搬运边界变化混在一起。清理后 CPU 全量严格构建、
+B1、mixed context 与 B256 完整入口继续通过；下一小步再把两块死表收敛为一条
+replay seal cache line 和两条 AIC/AIV scan cursor cache line。

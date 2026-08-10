@@ -536,7 +536,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
     // 两类发布。
     if (state == nullptr || !context.won || context.task_id < 0 ||
         context.task_id >= static_cast<int32_t>(kMaxTasks) ||
-        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic 组合入口只供隔离测试；正式 dispatched 路径在领取新 Build ticket 前统一观察 scheduler fatal，已取得的合法工作单元允许闭合
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic 组合入口只供隔离测试；正式 replay 路径在 Submit 边界观察 scheduler fatal，已取得的合法 task 允许闭合
         Ops::Load(&state->fatal.value) != 0 ||
         !PublishSharedTaskOutputs<Ops>(
             state->shared_map, context,
@@ -859,8 +859,7 @@ PA_DEVICE bool WaitForPreparedSharedWriterOutputs(
     return true;
 }
 
-template <typename Ops, bool Profile, bool Dispatched,
-          typename PmuContext>
+template <typename Ops, bool Profile, typename PmuContext>
 PA_DEVICE bool FinishSharedWinnerSubmitBody(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     const TaskArgs &args, SubmitContext &context, LocalStats &stats,
@@ -1327,12 +1326,6 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         ProfilePhase::ReplayTail, build_begin, build_end
     );
 
-    if constexpr (Dispatched) {
-        return CloseSharedDispatchedSubmit<Ops, Profile>(
-            state, stats, ticket.task_id, kind,
-            ticket.submit_begin
-        );
-    }
     return CloseSharedCallbackSubmit<Ops, Profile>(
         state, stats, ticket, task_meta, kind
     );
