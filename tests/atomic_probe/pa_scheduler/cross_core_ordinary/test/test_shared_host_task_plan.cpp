@@ -28,94 +28,6 @@ bool Check(bool condition, const char *label) {
     return condition;
 }
 
-bool CheckGenericFunctionStripedExecPlan(SchedulerState *state) {
-    if (state == nullptr) {
-        return false;
-    }
-    const std::vector<SharedHostExecPlanEntry> entries{
-        {9, 20, cross_core::ExecEngineClass::Aic},
-        {4, 10, cross_core::ExecEngineClass::Aic},
-        {8, 3, cross_core::ExecEngineClass::Aiv},
-        {7, 20, cross_core::ExecEngineClass::Aic},
-        {6, 5, cross_core::ExecEngineClass::Aiv},
-        {2, 10, cross_core::ExecEngineClass::Aic},
-        {1, 3, cross_core::ExecEngineClass::Aiv},
-        {12, 10, cross_core::ExecEngineClass::Aic},
-    };
-    std::string error;
-    bool ok = PopulateFunctionStripedSharedExecPlan(
-        state, entries, &error
-    );
-    const uint32_t expected_aic[] = {4, 9, 2, 7, 12};
-    const uint32_t expected_aiv[] = {8, 6, 1};
-    ok &= error.empty() &&
-        state->exec_dispatch.aic_task_count == 5 &&
-        state->exec_dispatch.aiv_task_count == 3;
-    for (uint32_t index = 0; index < 5; ++index) {
-        ok &= state->exec_dispatch.aic_task_ids[index] ==
-            expected_aic[index];
-    }
-    for (uint32_t index = 0; index < 3; ++index) {
-        ok &= state->exec_dispatch.aiv_task_ids[index] ==
-            expected_aiv[index];
-    }
-
-    std::vector<SharedHostExecPlanEntry> duplicate = entries;
-    duplicate.push_back(
-        {4, 30, cross_core::ExecEngineClass::Aiv}
-    );
-    std::string duplicate_error;
-    ok &= !PopulateFunctionStripedSharedExecPlan(
-              state, duplicate, &duplicate_error
-          ) &&
-        !duplicate_error.empty() &&
-        state->exec_dispatch.aic_task_count == 0 &&
-        state->exec_dispatch.aiv_task_count == 0;
-
-    std::vector<SharedHostExecPlanEntry> invalid_engine{
-        {0, 1, cross_core::ExecEngineClass::Joint},
-    };
-    std::string engine_error;
-    ok &= !PopulateFunctionStripedSharedExecPlan(
-              state, invalid_engine, &engine_error
-          ) &&
-        !engine_error.empty() &&
-        state->exec_dispatch.aic_task_count == 0 &&
-        state->exec_dispatch.aiv_task_count == 0;
-    return ok;
-}
-
-bool DecodeMetadataWriterPlanHost(
-    const SharedBuildDispatchState &dispatch, uint32_t task_id,
-    bool &publishes_metadata, int32_t &previous_metadata_writer
-) {
-    publishes_metadata = false;
-    previous_metadata_writer = -1;
-    if (dispatch.task_count == 0 ||
-        dispatch.task_count > kMaxTasks ||
-        task_id >= dispatch.task_count) {
-        return false;
-    }
-    const uint32_t word_index = task_id / 64U;
-    const uint32_t bit_index = task_id % 64U;
-    const uint64_t word =
-        dispatch.metadata_writer_bits[word_index];
-    publishes_metadata =
-        ((word >> bit_index) & uint64_t{1}) != 0;
-    for (int32_t candidate =
-             static_cast<int32_t>(task_id) - 1;
-         candidate >= 0; --candidate) {
-        if (((dispatch.metadata_writer_bits[
-                  static_cast<uint32_t>(candidate) / 64U
-              ] >> (static_cast<uint32_t>(candidate) % 64U)) &
-             uint64_t{1}) != 0) {
-            previous_metadata_writer = candidate;
-            break;
-        }
-    }
-    return true;
-}
-
 bool SetContextsAndBuild(
     SchedulerState *state, const int32_t *contexts,
     uint32_t batches, SharedHostTaskPlan *plan
@@ -776,142 +688,34 @@ int main() {
         initialized_mixed_ok,
         "InitializeState writes the exact shared CLI context vector"
     );
-    uint32_t expected_metadata_writers = 0;
-    uint32_t expected_ordinary_metadata_writers = 0;
-    uint32_t expected_symbol_metadata_writers = 0;
-    for (const SharedHostPlannedTask &task : mixed.tasks) {
-        expected_metadata_writers +=
-            task.publishes_metadata ? 1U : 0U;
-        expected_ordinary_metadata_writers +=
-            task.publishes_ordinary_metadata ? 1U : 0U;
-        expected_symbol_metadata_writers +=
-            task.publishes_symbol_metadata ? 1U : 0U;
-    }
-    bool dispatch_plan_ok =
-        state->build_dispatch.next_task.value == 0 &&
+    bool dispatch_state_empty =
+        state->build_dispatch.next_task.value == -1 &&
         state->exec_dispatch.aic_next.value == 0 &&
         state->exec_dispatch.aiv_next.value == 0 &&
-        state->build_dispatch.task_count == mixed.total_tasks &&
-        state->build_dispatch.batch_count == mixed.batch_count &&
-        state->build_dispatch.executable_task_count ==
-            mixed.total_tasks - mixed.tasks_by_kind[
-                static_cast<uint32_t>(TaskKind::Alloc)
-            ] &&
-        state->build_dispatch.metadata_writer_count ==
-            expected_metadata_writers &&
-        state->build_dispatch.ordinary_metadata_writer_count ==
-            expected_ordinary_metadata_writers &&
-        state->build_dispatch.symbol_metadata_writer_count ==
-            expected_symbol_metadata_writers;
-    uint32_t expected_aic_tasks = 0;
-    uint32_t expected_aiv_tasks = 0;
-    int32_t expected_previous_metadata_writer = -1;
-    for (uint32_t task_id = 0;
-         task_id < mixed.total_tasks; ++task_id) {
+        state->build_dispatch.task_count == 0 &&
+        state->build_dispatch.batch_count == 0 &&
+        state->build_dispatch.executable_task_count == 0 &&
+        state->build_dispatch.metadata_writer_count == 0 &&
+        state->build_dispatch.ordinary_metadata_writer_count == 0 &&
+        state->build_dispatch.symbol_metadata_writer_count == 0 &&
+        state->exec_dispatch.aic_task_count == 0 &&
+        state->exec_dispatch.aiv_task_count == 0;
+    for (uint32_t task_id = 0; task_id < kMaxTasks; ++task_id) {
         const SharedBuildDispatchTaskIdentity &identity =
             state->build_dispatch.tasks[task_id];
-        dispatch_plan_ok &=
-            identity.batch == mixed.tasks[task_id].batch &&
-            identity.encoded_meta ==
-                EncodeSharedHostDispatchMeta(
-                    mixed.tasks[task_id], mixed.total_tasks
-                ) &&
-            identity.exec_route ==
-                EncodeSharedHostExecRoute(
-                    mixed.tasks[task_id].kind
-                ) &&
-            !mixed.tasks[task_id]
-                 .publishes_ordinary_metadata &&
-            mixed.tasks[task_id]
-                 .publishes_symbol_metadata ==
-                mixed.tasks[task_id].publishes_metadata &&
-            mixed.tasks[task_id]
-                 .requires_metadata_prefix ==
-                mixed.tasks[task_id].publishes_metadata;
-        bool publishes_metadata = false;
-        int32_t previous_metadata_writer = INT32_MIN;
-        dispatch_plan_ok &= DecodeMetadataWriterPlanHost(
-            state->build_dispatch, task_id,
-            publishes_metadata,
-            previous_metadata_writer
-        );
-        dispatch_plan_ok &=
-            publishes_metadata ==
-                mixed.tasks[task_id].publishes_metadata &&
-            previous_metadata_writer ==
-                expected_previous_metadata_writer;
-        if (mixed.tasks[task_id].publishes_metadata) {
-            expected_previous_metadata_writer =
-                static_cast<int32_t>(task_id);
-        }
-        bool executable = false;
-        cross_core::ExecEngineClass engine =
-            cross_core::ExecEngineClass::None;
-        dispatch_plan_ok &=
-            cross_core::DecodeExecDispatchRoute(
-                identity.exec_route, executable, engine
-            );
-        if (executable &&
-            engine == cross_core::ExecEngineClass::Aic) {
-            dispatch_plan_ok &=
-                state->exec_dispatch
-                    .aic_task_ids[expected_aic_tasks++] ==
-                task_id;
-        } else if (executable &&
-                   engine == cross_core::ExecEngineClass::Aiv) {
-            dispatch_plan_ok &=
-                state->exec_dispatch
-                    .aiv_task_ids[expected_aiv_tasks++] ==
-                task_id;
-        }
-    }
-    dispatch_plan_ok &=
-        state->exec_dispatch.aic_task_count ==
-            expected_aic_tasks &&
-        state->exec_dispatch.aiv_task_count ==
-            expected_aiv_tasks &&
-        expected_aic_tasks + expected_aiv_tasks ==
-            state->build_dispatch.executable_task_count;
-    for (uint32_t task_id = mixed.total_tasks;
-         task_id < kMaxTasks; ++task_id) {
-        const SharedBuildDispatchTaskIdentity &identity =
-            state->build_dispatch.tasks[task_id];
-        dispatch_plan_ok &= identity.batch == 0 &&
+        dispatch_state_empty &= identity.batch == 0 &&
             identity.encoded_meta == 0 &&
             identity.exec_route == 0;
     }
-    for (uint32_t word =
-             (mixed.total_tasks + 63U) / 64U;
+    for (uint32_t word = 0;
          word < kSharedMetadataWriterWordCount; ++word) {
-        dispatch_plan_ok &=
+        dispatch_state_empty &=
             state->build_dispatch.metadata_writer_bits[word] == 0;
     }
     ok &= Check(
-        dispatch_plan_ok,
-        "InitializeState publishes compact immutable task identities and a generic metadata-writer plan"
+        dispatch_state_empty,
+        "InitializeState leaves Host task identities, writer bits, and Execute task-id tables empty"
     );
-
-    SharedHostTaskPlan malformed_dispatch = mixed;
-    malformed_dispatch.tasks[1].task_id = 2;
-    std::string malformed_dispatch_error;
-    ok &= Check(
-        !PopulateSharedBuildDispatchPlan(
-            state.get(), malformed_dispatch,
-            &malformed_dispatch_error
-        ) &&
-            !malformed_dispatch_error.empty() &&
-            state->build_dispatch.task_count == 0 &&
-            state->exec_dispatch.aic_task_count == 0 &&
-            state->exec_dispatch.aiv_task_count == 0,
-        "dispatch-plan publication rejects a non-contiguous task identity"
-    );
-    InitializeState(state.get(), mixed_options);
-
-    ok &= Check(
-        CheckGenericFunctionStripedExecPlan(state.get()),
-        "generic Execute plan stripes function ids and rejects malformed entries"
-    );
-    InitializeState(state.get(), mixed_options);
 
     ok &= Check(
         CheckCli(),

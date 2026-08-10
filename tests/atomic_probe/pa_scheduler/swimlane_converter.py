@@ -181,6 +181,7 @@ ATOMIC_SITE_NAMES = {
     54: "shared_exec_drain_release_poll",
     55: "shared_exec_drain_arrival_poll",
     56: "shared_exec_dispatch_ticket",
+    57: "shared_replay_plan_seal",
 }
 ATOMIC_OP_NAMES = {
     0: "load",
@@ -215,7 +216,7 @@ ATOMIC_SITE_OP_IDS = {
     17: 2,
     18: 2,
     19: 0,
-    20: 2,
+    20: 4,
     21: 0,
     22: 0,
     23: 0,
@@ -252,10 +253,11 @@ ATOMIC_SITE_OP_IDS = {
     54: 0,
     55: 0,
     56: 2,
+    57: 4,
 }
 # 这些发布型调用不消费 atomic 返回的旧值；其余 standalone site 的
 # 返回值都参与协议判断。v3 输入必须与源码语义完全一致。
-ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13, 20, 39, 49, 53}
+ATOMIC_RESULT_UNUSED_SITE_IDS = {0, 3, 6, 7, 13, 39, 49, 53}
 # common/private 的六类等待 Load 与 shared Register insert-turn Load 可以
 # 合并；frontier 扫描和 Claim 即使调用很多次也必须继续保留逐调用记录。
 POLL_BATCH_SITE_OP_IDS = {
@@ -1604,15 +1606,10 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         1 if task_key[1] in handoff_task_set else 0
                     )
                     if len(handoffs) != expected_handoff_count:
-                        handoff_op = (
-                            "CompareExchange"
-                            if submit_topology == "all_worker_replay"
-                            else "FetchAdd"
-                        )
                         raise ValueError(
                             "shared schema-v5 level4 requires exactly one "
                             "SharedInsertTurnHandoff direct "
-                            f"{handoff_op} per "
+                            "CompareExchange per "
                             "required insert completion and none otherwise at "
                             f"{task_key}: count={len(handoffs)} "
                             f"expected={expected_handoff_count}"

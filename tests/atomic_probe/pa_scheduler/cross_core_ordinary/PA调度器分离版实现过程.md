@@ -7254,3 +7254,71 @@ orchestration”的目标，还会新增不可比较的单核瓶颈。该过程�
 6. 正确性基线稳定后，再用由 Build winner 动态发布且带 per-entry ready 的
    role queue 恢复 Build/Execute overlap；不得重新引入 Host 或单 planner
    答案。
+
+### S7.1 设备正式路径改为全员真实回放
+
+第一阶段已经按上述合同落地，正式 `RunScheduler` 不再读取 Host task identity、
+metadata-writer bitset、AIC/AIV task-id 表，也不再领取中央 Build ticket。当前
+生产路径为：
+
+1. 96 个 Scalar 都从运行时 `batches/context_lens` 初始化自己的
+   `PaOrchestrationState`；
+2. 每核按真实 callback 顺序回放 Alloc，以及每个实际 block group 的
+   QK/SF/PV/UP；
+3. 每次 Submit 都参加已有的 per-task 两级 CAS Tournament，产生一个且仅一个
+   Build owner，其余 95 个 actor 走轻 loser；
+4. Build winner 发布 task-indexed immutable execution payload；
+5. 每个 task（包括没有 metadata writer 的 task）严格等待
+   `completion[N-1]`，完成本 task 的 TensorMap side effect 后用返回型 CAS 发布
+   `completion[N]`；
+6. 每核回放结束后先封存相同的 `(task_count, replay identity hash)`，再发布
+   `replay_done`；96 核全部到达后才允许把 `EMPTY` exec cell 解释为
+   metadata-only task；
+7. AIC/AIV 各自用一条运行时 cursor 扫描完整 `[0, task_count)`，实际 engine
+   由 Build winner 发布的 exec cell 决定，匹配角色的 worker 才竞争 Execute
+   owner；最后由 execution drain 闭合全部 cell、token 与 kernel completion。
+
+这里的 TensorMap 严格顺序与 Build/Execute owner 是三条彼此独立的合同：Claim
+只决定谁 Build；per-task completion 只决定 metadata side effect 的提交顺序；
+exec cell 只决定谁 Execute。任何一条都不能拿另一条的 owner 或 cursor 作为
+隐含前提。
+
+### S7.2 去掉设备侧重复 FullPaTaskPlan
+
+首版全员回放虽然没有共享/Host dispatch，但仍在每核栈上调用
+`BuildSharedPaBatchPlan`，再用 `SharedPaPlannedTaskAt` 重算 group、kind 与末任务
+标记。它不会选 owner，却仍是与真实 callback 并行存在的第二份 PA 公式，容易
+再次演化成预制答案，因此没有保留在正式路径。
+
+正式路径现在直接使用真实 orchestration 状态：
+
+- `BeginPaBatchForCallback` 从 GM `context_lens` 得到 `current_blocks`；
+- `while (block_offset < current_blocks)` 决定真实 group 数；
+- `PreparePaBlockGroup` 建立 `current_block_offset/current_nblocks`；
+- callback 入口直接由上述现场推导 group index、是否还有后继 group、是否为
+  全局末次 Submit，并把这份实际身份写入 replay seal；
+- G0 由 `current_blocks == 0` 自然只产生 Alloc，不需要计划特判。
+
+`BuildSharedHostTaskPlan` 暂时只保留为运行前 heap 容量准入和运行后独立结果
+oracle；`InitializeState` 不把其中任何 task、writer 或 Execute 路由写入设备
+状态。后续清理旧 ABI 时会继续删除零值搬运的死表，但不能把 Host oracle 与
+设备运行输入重新合并。
+
+### S7.3 CPU 正确性证据
+
+本阶段 CPU 严格编译与完整门槛已经闭合：
+
+- `-Wall -Wextra -Werror` 全量构建通过；
+- G0、G1、G2、G4 与 mixed context 的 96 份 replay 参数指纹一致；
+- 延迟 worker0 直到其他 95 核完成全部 replay，所有 task 仍各有唯一 Build
+  winner，证明没有单 planner 依赖；
+- B256 协议预算为 1,280 个逻辑 task、122,880 次 Submit/Claim、122,880 次
+  local Tournament CAS 和 10,240 次 root CAS；
+- ordered-submit 门槛覆盖空 writer 严格 completion、SharedOutputRef/INOUT
+  writer chain、Build owner 95 / Execute owner 0 的确定性跨核转移，以及
+  FinalDrain 全闭合；
+- CPU 主程序的 B1、G0、mixed `0,1,8192,8193` 和 B256 均
+  `semantic_status=PASS`。
+
+CPU 只证明协议与业务结果，不能模拟 A5 无 cache coherence、DCCI 时延或同地址
+Atomic 竞争性能。本阶段尚未运行 CCEC/A5，不能宣称真机正确性或性能收益。

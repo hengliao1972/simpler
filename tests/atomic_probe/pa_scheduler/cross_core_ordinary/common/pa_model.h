@@ -792,8 +792,8 @@ enum class AtomicSite : uint32_t {
     // 都参与胜负判断，必须按 return-ready 边界观察。
     SharedClaimTournamentLocal = 40,
     SharedClaimTournamentRoot = 41,
-    // shared Build 中央发放器的单调 ticket。FetchAdd 返回旧值直接决定
-    // 本核取得的 task id；超过 task_count 的返回值表示该 worker 完成退场。
+    // 旧 central Build ticket 编号作为 append-only raw ABI 保留；新的
+    // 全员 replay 正式入口不再发射该站点。
     SharedBuildDispatchTicket = 42,
     // cross-core execution package 的共享协议原语。原先这些调用直接落到
     // Ops，导致 WinnerBuild、EfDrain/FinalDrain 中存在无法解释的大段空白；
@@ -816,7 +816,11 @@ enum class AtomicSite : uint32_t {
     // AIC/AIV 各自中央 Execute 发放器的返回型 ticket。两种角色使用
     // 不同 cache line，但共享同一个语义站点；role 由泳道归属区分。
     SharedExecDispatchTicket = 56,
-    Count = 57,
+    // 96 个 Scalar 完成真实 replay 后，用同一条 CAS seal 对照本核实际
+    // 回放得到的 task_count 与顺序身份摘要。它只做一致性封口，不发布
+    // task 身份，也不参与 Build owner 决策。
+    SharedReplayPlanSeal = 57,
+    Count = 58,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -902,7 +906,6 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedHeapVendAdvance:
         case AtomicSite::SharedBuildDispatchTicket:
         case AtomicSite::SharedExecDispatchTicket:
-        case AtomicSite::SharedInsertTurnHandoff:
         case AtomicSite::SharedExecDrainArrive:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
@@ -916,6 +919,8 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedMetadataLastWriterCommit:
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
+        case AtomicSite::SharedInsertTurnHandoff:
+        case AtomicSite::SharedReplayPlanSeal:
         case AtomicSite::SharedExecFatalSet:
         case AtomicSite::SharedExecBuildReserve:
         case AtomicSite::SharedExecBuiltPublish:
@@ -947,7 +952,6 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedOutputRollbackExchange:
         case AtomicSite::SharedExecCompletionVendPublish:
         case AtomicSite::SharedExecDrainReleasePublish:
-        case AtomicSite::SharedInsertTurnHandoff:
             return false;
         case AtomicSite::StartupPoll:
         case AtomicSite::FatalPoll:
@@ -984,6 +988,8 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedMapAppendTailExchange:
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
+        case AtomicSite::SharedInsertTurnHandoff:
+        case AtomicSite::SharedReplayPlanSeal:
         case AtomicSite::SharedBuildDispatchTicket:
         case AtomicSite::SharedExecDispatchTicket:
         case AtomicSite::SharedExecFatalLoad:

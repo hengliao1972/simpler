@@ -130,6 +130,7 @@ PA_DEVICE AtomicOp TraceAtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedMetadataLastWriterCommit:
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
+        case AtomicSite::SharedReplayPlanSeal:
         case AtomicSite::SharedExecFatalSet:
         case AtomicSite::SharedExecBuildReserve:
         case AtomicSite::SharedExecBuiltPublish:

@@ -9,6 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -16,23 +18,13 @@
 
 namespace {
 
-using pa_scheduler::TaskKind;
-using pa_scheduler::TracePhase;
-using pa_scheduler::TraceHeader;
-using pa_scheduler::TraceRecord;
-using pa_scheduler::SharedSubmitClaimTraceRecord;
 using pa_scheduler::AtomicOp;
 using pa_scheduler::AtomicSite;
-using pa_scheduler::kAtomicOpMask;
-using pa_scheduler::kAtomicPollBatch;
-using pa_scheduler::kAtomicPollCountShift;
-using pa_scheduler::kAtomicResultUsed;
-using pa_scheduler::kAtomicReturnReady;
-using pa_scheduler::kTraceRecordSizeBytes;
-using pa_scheduler::kTraceRecordsPerCore;
-using pa_scheduler::kTraceSubmitClaimBytesPerCore;
-using pa_scheduler::kTraceSubmitClaimRecordSizeBytes;
-using pa_scheduler::kTraceWorkerBytes;
+using pa_scheduler::SharedSubmitClaimTraceRecord;
+using pa_scheduler::TaskKind;
+using pa_scheduler::TraceHeader;
+using pa_scheduler::TracePhase;
+using pa_scheduler::TraceRecord;
 using pa_scheduler::host::AtomicRecordSchemaValid;
 using pa_scheduler::host::ExpandSharedTraceRecords;
 using pa_scheduler::host::InitializeTraceHeader;
@@ -40,11 +32,18 @@ using pa_scheduler::host::SharedHostTaskPlan;
 using pa_scheduler::host::SharedSparseTraceValidator;
 using pa_scheduler::host::ValidateTraceHeader;
 
+static_assert(
+    static_cast<uint32_t>(AtomicSite::SharedReplayPlanSeal) == 57U,
+    "SharedReplayPlanSeal is an append-only raw ABI site"
+);
+
 int g_failures = 0;
 
 void Check(bool condition, const char *message) {
-    if (condition) return;
-    std::fprintf(stderr, "[FAIL] shared sparse trace: %s\n", message);
+    if (condition) {
+        return;
+    }
+    std::fprintf(stderr, "[FAIL] all-worker replay trace: %s\n", message);
     ++g_failures;
 }
 
@@ -54,94 +53,176 @@ TraceRecord MakeRecord(
     uint32_t auxiliary = 0
 ) {
     TraceRecord record{};
-    record.phase = static_cast<int32_t>(phase);
+    record.phase = static_cast<uint16_t>(phase);
     record.task_id = task_id;
     record.function_id = function_id;
     record.start_cycle = begin;
     record.end_cycle = end;
     record.flags = flags;
-    record.auxiliary = auxiliary;
+    record.auxiliary = static_cast<uint16_t>(auxiliary);
     return record;
 }
 
-bool SameRecord(const TraceRecord &left, const TraceRecord &right) {
-    return left.start_cycle == right.start_cycle &&
-           left.end_cycle == right.end_cycle &&
-           left.task_id == right.task_id &&
-           left.function_id == right.function_id &&
-           left.flags == right.flags &&
-           left.phase == right.phase &&
-           left.auxiliary == right.auxiliary;
+uint32_t ReturnReadyCasFlags() {
+    return static_cast<uint32_t>(AtomicOp::CompareExchange) |
+           pa_scheduler::kAtomicResultUsed |
+           pa_scheduler::kAtomicReturnReady;
+}
+
+TraceRecord MakeReturnReadyCas(
+    AtomicSite site, int32_t task_id, uint64_t begin
+) {
+    return MakeRecord(
+        TracePhase::Atomic, task_id, -1, begin, begin + 3U,
+        ReturnReadyCasFlags(), static_cast<uint32_t>(site)
+    );
+}
+
+bool IsReturnReadyCas(
+    const TraceRecord &record, AtomicSite expected_site
+) {
+    return record.phase == static_cast<uint16_t>(TracePhase::Atomic) &&
+           record.auxiliary == static_cast<uint16_t>(expected_site) &&
+           (record.flags & pa_scheduler::kAtomicOpMask) ==
+               static_cast<uint32_t>(AtomicOp::CompareExchange) &&
+           (record.flags & pa_scheduler::kAtomicResultUsed) != 0 &&
+           (record.flags & pa_scheduler::kAtomicReturnReady) != 0 &&
+           (record.flags & pa_scheduler::kAtomicPollBatch) == 0 &&
+           AtomicRecordSchemaValid(record, true);
 }
 
 void TestTraceBinaryLayoutAndHeaderGate() {
     Check(
-        sizeof(TraceRecord) == 32 &&
-            alignof(TraceRecord) == 32 &&
-            kTraceRecordSizeBytes == 32,
-        "device trace record must remain a 32-byte half-cache-line"
-    );
-    Check(
-        offsetof(TraceHeader, cores) == 64 &&
-            sizeof(TraceHeader) == 6976,
-        "record-size field must not move or grow the header core array"
-    );
-    constexpr size_t partition_bytes =
-        static_cast<size_t>(kTraceRecordsPerCore) *
-        sizeof(TraceRecord);
-    Check(
-        sizeof(TraceHeader) % 64 == 0 &&
-            partition_bytes % 64 == 0,
-        "header and every worker record partition must start on a cache line"
-    );
-    Check(
-        (0U % 64U) + sizeof(TraceRecord) <= 64U &&
-            (32U % 64U) + sizeof(TraceRecord) <= 64U &&
-            0U / 64U == 32U / 64U &&
-            64U / 64U != 32U / 64U,
-        "two trace records must fit exactly in one cache line"
+        sizeof(TraceRecord) == 32 && alignof(TraceRecord) == 32 &&
+            pa_scheduler::kTraceRecordSizeBytes == 32,
+        "generic trace record remains one 32-byte half cache line"
     );
     Check(
         sizeof(SharedSubmitClaimTraceRecord) == 32 &&
             alignof(SharedSubmitClaimTraceRecord) == 32 &&
-            kTraceSubmitClaimRecordSizeBytes == 32,
-        "shared Submit/Claim record must remain 32-byte aligned"
+            pa_scheduler::kTraceSubmitClaimRecordSizeBytes == 32,
+        "Submit/Claim compact record remains one 32-byte half cache line"
     );
     Check(
-        kTraceSubmitClaimBytesPerCore ==
+        offsetof(TraceHeader, cores) == 64 &&
+            sizeof(TraceHeader) == 6976,
+        "trace header ABI remains stable"
+    );
+    Check(
+        pa_scheduler::kTraceSubmitClaimBytesPerCore ==
                 static_cast<size_t>(pa_scheduler::kMaxTasks) *
                     sizeof(SharedSubmitClaimTraceRecord) &&
-            kTraceSubmitClaimBytesPerCore +
-                    static_cast<size_t>(kTraceRecordsPerCore) *
-                        sizeof(TraceRecord) ==
-                kTraceWorkerBytes &&
-            kTraceWorkerBytes == (1U << 20),
-        "shared compact and generic regions must exactly fill one 1 MiB worker partition"
-    );
-    Check(
-        pa_scheduler::TraceSubmitClaimOffset(0) % 64U == 0 &&
-            pa_scheduler::TraceRecordsOffset(0) % 64U == 0 &&
-            pa_scheduler::TraceRecordsOffset(0) -
-                    pa_scheduler::TraceSubmitClaimOffset(0) ==
-                kTraceSubmitClaimBytesPerCore &&
-            pa_scheduler::TraceWorkerOffset(1) -
-                    pa_scheduler::TraceWorkerOffset(0) ==
-                kTraceWorkerBytes,
-        "shared compact and generic worker regions must keep cache-line isolation"
+            pa_scheduler::kTraceSubmitClaimBytesPerCore +
+                    static_cast<size_t>(
+                        pa_scheduler::kTraceRecordsPerCore
+                    ) * sizeof(TraceRecord) ==
+                pa_scheduler::kTraceWorkerBytes &&
+            pa_scheduler::kTraceWorkerBytes == (1U << 20),
+        "compact and generic regions exactly fill one worker partition"
     );
 
     TraceHeader header{};
     InitializeTraceHeader(&header);
     Check(
-        header.record_size_bytes == 32 &&
-            ValidateTraceHeader(header, "trace ABI self-test"),
-        "initialized header must publish and accept a 32-byte raw ABI"
+        header.record_size_bytes == sizeof(TraceRecord) &&
+            ValidateTraceHeader(header, "all-worker trace ABI"),
+        "initialized trace header accepts the current ABI"
     );
     header.record_size_bytes = 64;
     Check(
-        !ValidateTraceHeader(header, "trace ABI negative self-test"),
-        "header validation must reject the old 64-byte record ABI"
+        !ValidateTraceHeader(header, "all-worker trace ABI negative"),
+        "trace header rejects the obsolete 64-byte record ABI"
     );
+}
+
+void TestNewAtomicSchemas() {
+    const TraceRecord handoff = MakeReturnReadyCas(
+        AtomicSite::SharedInsertTurnHandoff, 3, 100
+    );
+    Check(
+        IsReturnReadyCas(
+            handoff, AtomicSite::SharedInsertTurnHandoff
+        ),
+        "insert completion handoff is a task-indexed return-ready CAS"
+    );
+
+    TraceRecord bad = handoff;
+    bad.flags =
+        (bad.flags & ~pa_scheduler::kAtomicOpMask) |
+        static_cast<uint32_t>(AtomicOp::FetchAdd);
+    Check(
+        !IsReturnReadyCas(
+            bad, AtomicSite::SharedInsertTurnHandoff
+        ),
+        "insert completion handoff rejects the old FetchAdd schema"
+    );
+    bad = handoff;
+    bad.flags &= ~pa_scheduler::kAtomicReturnReady;
+    Check(
+        !IsReturnReadyCas(
+            bad, AtomicSite::SharedInsertTurnHandoff
+        ),
+        "insert completion handoff must include the CAS return boundary"
+    );
+    bad = handoff;
+    bad.task_id = -1;
+    Check(
+        !IsReturnReadyCas(
+            bad, AtomicSite::SharedInsertTurnHandoff
+        ),
+        "insert completion handoff must retain its task identity"
+    );
+
+    const TraceRecord seal = MakeReturnReadyCas(
+        AtomicSite::SharedReplayPlanSeal, -1, 200
+    );
+    Check(
+        IsReturnReadyCas(seal, AtomicSite::SharedReplayPlanSeal),
+        "site 57 replay identity seal is a return-ready CAS"
+    );
+    bad = seal;
+    bad.flags &= ~pa_scheduler::kAtomicResultUsed;
+    Check(
+        !IsReturnReadyCas(bad, AtomicSite::SharedReplayPlanSeal),
+        "replay identity seal must consume the CAS observation"
+    );
+    bad = seal;
+    bad.flags =
+        (bad.flags & ~pa_scheduler::kAtomicOpMask) |
+        static_cast<uint32_t>(AtomicOp::FetchAdd);
+    Check(
+        !IsReturnReadyCas(bad, AtomicSite::SharedReplayPlanSeal),
+        "replay identity seal rejects a central-ticket FetchAdd shape"
+    );
+}
+
+struct ReplayEntry {
+    uint32_t task_id = 0;
+    SharedSubmitClaimTraceRecord endpoints{};
+    std::vector<TraceRecord> winner_children;
+    std::vector<TraceRecord> control_atomics;
+};
+
+struct WorkerReplay {
+    std::vector<ReplayEntry> tasks;
+    std::vector<TraceRecord> replay_atomics;
+};
+
+TaskKind KindForTask(uint32_t task_id) {
+    return static_cast<TaskKind>(
+        task_id % pa_scheduler::kTasksPerBatch
+    );
+}
+
+SharedHostTaskPlan MakeTraceOraclePlan(uint32_t total_tasks) {
+    SharedHostTaskPlan plan;
+    plan.total_tasks = total_tasks;
+    plan.tasks.resize(total_tasks);
+    for (uint32_t task_id = 0; task_id < total_tasks; ++task_id) {
+        plan.tasks[task_id].task_id = task_id;
+        plan.tasks[task_id].kind = KindForTask(task_id);
+    }
+    return plan;
 }
 
 int32_t FunctionId(TaskKind kind) {
@@ -150,1254 +231,436 @@ int32_t FunctionId(TaskKind kind) {
         : static_cast<int32_t>(static_cast<uint32_t>(kind) - 1U);
 }
 
-uint32_t IsAlloc(TaskKind kind) {
-    return kind == TaskKind::Alloc ? 1U : 0U;
+bool EndpointWinner(const SharedSubmitClaimTraceRecord &record) {
+    return (record.claim_end_and_winner &
+            pa_scheduler::kSharedClaimWinnerBit) != 0;
 }
 
-struct CompactTraceWindow {
-    uint64_t submit_begin;
-    uint64_t submit_end;
-    uint64_t claim_begin;
-    uint64_t claim_end;
-};
-
-CompactTraceWindow WindowForTask(
-    uint64_t base_cycle, uint32_t task_id
+uint64_t EndpointClaimEnd(
+    const SharedSubmitClaimTraceRecord &record
 ) {
-    const uint64_t task_base =
-        base_cycle + static_cast<uint64_t>(task_id) * 100U;
-    return CompactTraceWindow{
-        task_base + 10U,
-        task_base + 60U,
-        task_base + 20U,
-        task_base + 25U,
-    };
+    return record.claim_end_and_winner &
+           ~pa_scheduler::kSharedClaimWinnerBit;
 }
 
-SharedSubmitClaimTraceRecord MakeCompactRecord(
-    const CompactTraceWindow &window, bool winner
+bool CompactEndpointsValid(
+    const SharedSubmitClaimTraceRecord &record
 ) {
-    return SharedSubmitClaimTraceRecord{
-        window.claim_begin,
-        window.claim_end |
-            (winner
-                 ? pa_scheduler::kSharedClaimWinnerBit
-                 : 0ULL),
-        window.submit_begin,
-        window.submit_end,
-    };
+    const uint64_t claim_end = EndpointClaimEnd(record);
+    return record.submit_begin != 0 && record.claim_begin != 0 &&
+           (record.submit_begin &
+            pa_scheduler::kSharedClaimWinnerBit) == 0 &&
+           (record.claim_begin &
+            pa_scheduler::kSharedClaimWinnerBit) == 0 &&
+           (record.submit_end &
+            pa_scheduler::kSharedClaimWinnerBit) == 0 &&
+           record.submit_begin <= record.claim_begin &&
+           record.claim_begin <= claim_end &&
+           claim_end <= record.submit_end;
 }
 
-SharedHostTaskPlan MakeCompactTracePlan() {
-    constexpr TaskKind kinds[] = {
-        TaskKind::Alloc,
-        TaskKind::Qk,
-        TaskKind::Sf,
-        TaskKind::Pv,
-        TaskKind::Up,
-    };
-    SharedHostTaskPlan plan;
-    plan.total_tasks =
-        static_cast<uint32_t>(
-            sizeof(kinds) / sizeof(kinds[0])
-        );
-    plan.tasks.resize(plan.total_tasks);
-    for (uint32_t task_id = 0;
-         task_id < plan.total_tasks; ++task_id) {
-        plan.tasks[task_id].task_id = task_id;
-        plan.tasks[task_id].kind = kinds[task_id];
+// 历史文件名沿用 sparse_trace，但新门槛刻意不调用旧
+// SharedSparseTraceValidator/ExpandSharedTraceRecords：二者当前仍允许逐核
+// 空槽和 task-id 跳号，并用 global_task_coverage 拒绝第二个 worker 的同一
+// task。这里直接验证设备 raw 的新合同，避免测试继续替 central owner 背书。
+bool ValidateAllWorkerReplay(
+    const std::vector<WorkerReplay> &workers,
+    uint32_t total_tasks
+) {
+    if (workers.size() != pa_scheduler::kWorkers || total_tasks == 0) {
+        return false;
     }
-    return plan;
+
+    std::vector<uint32_t> winner_count(total_tasks, 0);
+    std::vector<uint32_t> handoff_count(total_tasks, 0);
+    for (uint32_t worker = 0; worker < workers.size(); ++worker) {
+        const WorkerReplay &replay = workers[worker];
+        if (replay.tasks.size() != total_tasks) {
+            return false;
+        }
+
+        uint32_t seal_count = 0;
+        for (const TraceRecord &record : replay.replay_atomics) {
+            if (record.auxiliary ==
+                static_cast<uint16_t>(
+                    AtomicSite::SharedBuildDispatchTicket
+                )) {
+                return false;
+            }
+            if (!IsReturnReadyCas(
+                    record, AtomicSite::SharedReplayPlanSeal
+                ) || record.task_id != -1) {
+                return false;
+            }
+            ++seal_count;
+        }
+        if (seal_count != 1) {
+            return false;
+        }
+
+        for (uint32_t expected_task_id = 0;
+             expected_task_id < total_tasks; ++expected_task_id) {
+            const ReplayEntry &entry = replay.tasks[expected_task_id];
+            // 每核真实 replay 必须是完整 0..N-1 序列。raw 本身按 task_id
+            // 定址，显式 identity 再锁住生成侧不得跳号或重复覆盖。
+            if (entry.task_id != expected_task_id ||
+                !CompactEndpointsValid(entry.endpoints)) {
+                return false;
+            }
+
+            const bool winner = EndpointWinner(entry.endpoints);
+            winner_count[expected_task_id] += winner ? 1U : 0U;
+            const TaskKind kind = KindForTask(expected_task_id);
+            const TracePhase expected_tail = kind == TaskKind::Alloc
+                ? TracePhase::AllocComplete
+                : TracePhase::WinnerBuild;
+            if (entry.winner_children.size() != (winner ? 1U : 0U)) {
+                return false;
+            }
+            for (const TraceRecord &child : entry.winner_children) {
+                if (child.phase != static_cast<uint16_t>(expected_tail) ||
+                    child.task_id !=
+                        static_cast<int32_t>(expected_task_id) ||
+                    child.function_id != FunctionId(kind) ||
+                    child.flags != 0 || child.auxiliary != 0 ||
+                    child.start_cycle < entry.endpoints.claim_begin ||
+                    child.end_cycle < child.start_cycle ||
+                    child.end_cycle > entry.endpoints.submit_end) {
+                    return false;
+                }
+            }
+
+            for (const TraceRecord &atomic : entry.control_atomics) {
+                if (!IsReturnReadyCas(
+                        atomic,
+                        AtomicSite::SharedInsertTurnHandoff
+                    ) || atomic.task_id !=
+                            static_cast<int32_t>(expected_task_id) ||
+                    atomic.start_cycle <
+                        entry.endpoints.claim_begin ||
+                    atomic.end_cycle > entry.endpoints.submit_end) {
+                    return false;
+                }
+                ++handoff_count[expected_task_id];
+            }
+            // 只有 Build winner 推进严格插入完成字；loser 不产生任何
+            // winner 子区间，也不得发布 completion。
+            if (entry.control_atomics.size() != (winner ? 1U : 0U)) {
+                return false;
+            }
+        }
+    }
+
+    for (uint32_t task_id = 0; task_id < total_tasks; ++task_id) {
+        if (winner_count[task_id] != 1 || handoff_count[task_id] != 1) {
+            return false;
+        }
+    }
+    return true;
 }
 
-void TestSharedCompactReconstruction() {
-    // central-ticket 下每个 worker 只保存自己取得的 task 槽；其余
-    // task-indexed 槽保持全零。这里让一个 AIV 稀疏拥有 task 0/3，
-    // 验证导出只展开这两个 winner，同时保留全局覆盖位供外层闭合。
-    constexpr uint32_t worker = 32;
-    constexpr uint64_t base_cycle = 5000;
-    const SharedHostTaskPlan plan = MakeCompactTracePlan();
-    constexpr bool owned[] = {
-        true, false, false, true, false,
-    };
-    std::vector<SharedSubmitClaimTraceRecord> compact(
-        plan.total_tasks
-    );
-    std::vector<TraceRecord> generic;
-    for (uint32_t task_id = 0;
-         task_id < plan.total_tasks; ++task_id) {
-        const CompactTraceWindow window =
-            WindowForTask(base_cycle, task_id);
-        if (owned[task_id]) {
-            compact[task_id] = MakeCompactRecord(window, true);
-            generic.push_back(
-                MakeRecord(
-                    TracePhase::Atomic,
-                    static_cast<int32_t>(task_id), -1,
-                    window.claim_begin + 1U,
-                    window.claim_begin + 2U,
-                    static_cast<uint32_t>(
-                        AtomicOp::FetchMax
-                    ) |
-                        kAtomicResultUsed |
-                        kAtomicReturnReady,
-                    static_cast<uint32_t>(
-                        AtomicSite::ClaimMax
+std::vector<WorkerReplay> MakeValidReplay(uint32_t total_tasks) {
+    std::vector<WorkerReplay> workers(pa_scheduler::kWorkers);
+    for (uint32_t worker = 0; worker < pa_scheduler::kWorkers; ++worker) {
+        WorkerReplay &replay = workers[worker];
+        replay.tasks.reserve(total_tasks);
+        for (uint32_t task_id = 0; task_id < total_tasks; ++task_id) {
+            // 不把 winner 固定到单个 central worker；五类 task 的 owner
+            // 分散在完整 Scalar population 中。
+            const uint32_t owner =
+                (task_id * 17U + 3U) % pa_scheduler::kWorkers;
+            const bool winner = worker == owner;
+            const uint64_t base =
+                1000U + static_cast<uint64_t>(worker) * 10000U +
+                static_cast<uint64_t>(task_id) * 100U;
+            ReplayEntry entry{};
+            entry.task_id = task_id;
+            entry.endpoints = SharedSubmitClaimTraceRecord{
+                base + 20U,
+                (base + 28U) |
+                    (winner
+                         ? pa_scheduler::kSharedClaimWinnerBit
+                         : 0ULL),
+                base + 10U,
+                base + 80U,
+            };
+            if (winner) {
+                const TaskKind kind = KindForTask(task_id);
+                entry.winner_children.push_back(
+                    MakeRecord(
+                        kind == TaskKind::Alloc
+                            ? TracePhase::AllocComplete
+                            : TracePhase::WinnerBuild,
+                        static_cast<int32_t>(task_id),
+                        FunctionId(kind), base + 50U, base + 65U
                     )
-                )
-            );
+                );
+                entry.control_atomics.push_back(
+                    MakeReturnReadyCas(
+                        AtomicSite::SharedInsertTurnHandoff,
+                        static_cast<int32_t>(task_id), base + 40U
+                    )
+                );
+            }
+            replay.tasks.push_back(entry);
+        }
+        replay.replay_atomics.push_back(
+            MakeReturnReadyCas(
+                AtomicSite::SharedReplayPlanSeal, -1,
+                1000U + static_cast<uint64_t>(worker) * 10000U +
+                    static_cast<uint64_t>(total_tasks) * 100U
+            )
+        );
+    }
+    return workers;
+}
+
+void TestAcceptsCompleteAllWorkerReplay() {
+    constexpr uint32_t kTasks = 10;
+    const std::vector<WorkerReplay> workers = MakeValidReplay(kTasks);
+    Check(
+        ValidateAllWorkerReplay(workers, kTasks),
+        "96 workers replay every task while each task has one Build winner"
+    );
+
+    uint64_t compact_records = 0;
+    uint64_t winner_children = 0;
+    for (const WorkerReplay &worker : workers) {
+        compact_records += worker.tasks.size();
+        for (const ReplayEntry &entry : worker.tasks) {
+            winner_children += entry.winner_children.size();
         }
     }
-
-    std::vector<TraceRecord> logical;
-    std::vector<uint8_t> coverage(plan.total_tasks, 0);
-    constexpr uint32_t expected_submits = 2;
     Check(
-        ExpandSharedTraceRecords(
-            worker, generic.data(),
-            static_cast<uint32_t>(generic.size()),
-            compact.data(), plan, expected_submits,
-            coverage.data(), &logical
-        ),
-        "sparse four-endpoint records and generic atomic rows reconstruct"
-    );
-    Check(
-        logical.size() ==
-            generic.size() + 2U * expected_submits,
-        "reconstruction preserves generic rows and adds owned Claim/Submit"
-    );
-    if (logical.size() !=
-        generic.size() + 2U * expected_submits) {
-        return;
-    }
-    Check(
-        coverage[0] == 1 && coverage[3] == 1 &&
-            coverage[1] == 0 && coverage[2] == 0 &&
-            coverage[4] == 0,
-        "sparse expansion marks only this worker's owned tasks"
+        compact_records ==
+                static_cast<uint64_t>(pa_scheduler::kWorkers) * kTasks &&
+            winner_children == kTasks,
+        "compact record population is workers*tasks, not one sparse owner per task"
     );
 
-    size_t index = 0;
-    for (uint32_t task_id = 0;
-         task_id < plan.total_tasks; ++task_id) {
-        if (!owned[task_id]) {
-            continue;
+    // 生产导出 API 也必须逐核展开全部 N 个 Claim/Submit，而不是仅展开
+    // winner 的稀疏槽。Host plan 在这里仅给泳道补 task kind/function_id，
+    // 不承担 owner 或 dispatch 输入。
+    const SharedHostTaskPlan plan = MakeTraceOraclePlan(kTasks);
+    TraceRecord unused_generic{};
+    bool all_expanded = true;
+    for (uint32_t worker = 0; worker < workers.size(); ++worker) {
+        std::vector<SharedSubmitClaimTraceRecord> compact;
+        compact.reserve(kTasks);
+        for (const ReplayEntry &entry : workers[worker].tasks) {
+            compact.push_back(entry.endpoints);
         }
-        Check(
-            logical[index].phase ==
-                    static_cast<uint16_t>(TracePhase::Atomic) &&
-                logical[index].task_id ==
-                    static_cast<int32_t>(task_id) &&
-                logical[index].auxiliary ==
-                    static_cast<uint16_t>(AtomicSite::ClaimMax) &&
-                AtomicRecordSchemaValid(logical[index], true),
-            "generic atomic row remains exact in sparse merge order"
-        );
-        ++index;
-        const TraceRecord &claim = logical[index++];
-        const TraceRecord &submit = logical[index++];
-        const CompactTraceWindow window =
-            WindowForTask(base_cycle, task_id);
-        Check(
-            claim.phase ==
-                    static_cast<uint16_t>(TracePhase::Claim) &&
-                claim.start_cycle == window.claim_begin &&
-                claim.end_cycle == window.claim_end &&
-                claim.flags ==
-                    (pa_scheduler::kClaimWon |
-                     pa_scheduler::kClaimAttempted),
-            "owned Claim reconstructs absolute winner endpoints"
-        );
-        Check(
-            submit.phase ==
-                    static_cast<uint16_t>(
-                        TracePhase::Submit
-                    ) &&
-                submit.start_cycle == window.submit_begin &&
-                submit.end_cycle == window.submit_end &&
-                submit.flags == pa_scheduler::kClaimWon,
-            "owned Submit reconstructs absolute winner endpoints"
-        );
-    }
-}
-
-void TestSharedCompactStageOnlyReconstruction() {
-    constexpr uint32_t worker = 0;
-    constexpr uint64_t base_cycle = 6000;
-    const SharedHostTaskPlan plan = MakeCompactTracePlan();
-    std::vector<SharedSubmitClaimTraceRecord> compact(
-        plan.total_tasks
-    );
-    compact[1] = MakeCompactRecord(
-        WindowForTask(base_cycle, 1), true
-    );
-    compact[4] = MakeCompactRecord(
-        WindowForTask(base_cycle, 4), true
-    );
-    TraceRecord unused_generic{};
-    std::vector<TraceRecord> logical;
-    std::vector<uint8_t> coverage(plan.total_tasks, 0);
-    Check(
-        ExpandSharedTraceRecords(
-            worker, &unused_generic, 0,
-            compact.data(), plan, 2,
-            coverage.data(), &logical
-        ) &&
-            logical.size() == 4 &&
-            coverage[1] == 1 && coverage[4] == 1,
-        "sparse stage-only records expand owned Claim/Submit without Atomic"
-    );
-}
-
-void TestSharedCompactGenericMergeOrder() {
-    constexpr uint32_t worker = 0;
-    constexpr uint64_t base_cycle = 7000;
-    const SharedHostTaskPlan plan = MakeCompactTracePlan();
-    std::vector<SharedSubmitClaimTraceRecord> compact(
-        plan.total_tasks
-    );
-    compact[0] = MakeCompactRecord(
-        WindowForTask(base_cycle, 0), true
-    );
-    const CompactTraceWindow task0 =
-        WindowForTask(base_cycle, 0);
-    std::vector<TraceRecord> generic{
-        MakeRecord(
-            TracePhase::Atomic, 0, -1,
-            task0.claim_begin + 1U,
-            task0.claim_begin + 2U,
-            static_cast<uint32_t>(AtomicOp::FetchMax) |
-                kAtomicResultUsed | kAtomicReturnReady,
-            static_cast<uint32_t>(AtomicSite::ClaimMax)
-        ),
-        MakeRecord(
-            TracePhase::RingBp, 0, 9,
-            task0.claim_end + 1U,
-            task0.claim_end + 2U
-        ),
-    };
-    std::vector<TraceRecord> logical;
-    std::vector<uint8_t> coverage(plan.total_tasks, 0);
-    Check(
-        ExpandSharedTraceRecords(
-            worker, generic.data(),
-            static_cast<uint32_t>(generic.size()),
-            compact.data(), plan, 1,
-            coverage.data(), &logical
-        ) &&
-            logical.size() ==
-                generic.size() + 2U &&
-            SameRecord(logical[0], generic[0]) &&
-            logical[1].phase ==
-                static_cast<uint16_t>(TracePhase::Claim) &&
-            SameRecord(logical[2], generic[1]) &&
-            logical[3].phase ==
-                static_cast<uint16_t>(TracePhase::Submit),
-        "generic rows merge stably around one sparse owned Submit"
-    );
-}
-
-void TestRejectsBadSharedCompactRecords() {
-    constexpr uint32_t worker = 0;
-    constexpr uint64_t base_cycle = 8000;
-    const SharedHostTaskPlan plan = MakeCompactTracePlan();
-    std::vector<SharedSubmitClaimTraceRecord> valid(
-        plan.total_tasks
-    );
-    for (uint32_t task_id = 0;
-         task_id < plan.total_tasks; ++task_id) {
-        valid[task_id] = MakeCompactRecord(
-            WindowForTask(base_cycle, task_id), true
-        );
-    }
-    TraceRecord unused_generic{};
-    auto rejected_for_worker = [&](
-        uint32_t candidate_worker,
-        const std::vector<SharedSubmitClaimTraceRecord> &records
-    ) {
         std::vector<TraceRecord> logical;
-        std::vector<uint8_t> coverage(plan.total_tasks, 0);
-        return !ExpandSharedTraceRecords(
-            candidate_worker, &unused_generic, 0,
-            records.data(), plan, plan.total_tasks,
-            coverage.data(), &logical
+        const bool expanded = ExpandSharedTraceRecords(
+            worker, &unused_generic, 0, compact.data(), plan,
+            &logical
         );
-    };
-    auto rejected = [&rejected_for_worker, worker](
-        const std::vector<SharedSubmitClaimTraceRecord> &records
-    ) {
-        return rejected_for_worker(worker, records);
-    };
-
+        bool exact_sequence = expanded && logical.size() == 2U * kTasks;
+        for (uint32_t task_id = 0;
+             exact_sequence && task_id < kTasks; ++task_id) {
+            const TraceRecord &claim = logical[2U * task_id];
+            const TraceRecord &submit = logical[2U * task_id + 1U];
+            const bool winner =
+                EndpointWinner(compact[task_id]);
+            exact_sequence &=
+                claim.phase ==
+                    static_cast<uint16_t>(TracePhase::Claim) &&
+                submit.phase ==
+                    static_cast<uint16_t>(TracePhase::Submit) &&
+                claim.task_id == static_cast<int32_t>(task_id) &&
+                submit.task_id == static_cast<int32_t>(task_id) &&
+                claim.flags ==
+                    (pa_scheduler::kClaimAttempted |
+                     (winner ? pa_scheduler::kClaimWon : 0U)) &&
+                submit.flags ==
+                    (winner ? pa_scheduler::kClaimWon : 0U);
+        }
+        // worker 0 在这组分散 owner 中恰好没有 winner，可直接让生产
+        // validator 闭合完整 loser replay，证明它不再接受 task-id 跳号。
+        if (exact_sequence && worker == 0) {
+            SharedSparseTraceValidator validator(&plan);
+            for (const TraceRecord &record : logical) {
+                exact_sequence &= validator.Observe(record);
+            }
+            exact_sequence &= validator.Closed() &&
+                validator.ClaimCount() == kTasks &&
+                validator.SubmitCount() == kTasks &&
+                validator.WinnerCount() == 0;
+        }
+        if (!exact_sequence) {
+            all_expanded = false;
+            break;
+        }
+    }
     Check(
-        !rejected(valid),
-        "one Scalar may own sparse Build tasks for both engine roles"
-    );
-
-    std::vector<SharedSubmitClaimTraceRecord> bad = valid;
-    bad[0].submit_begin = 0;
-    Check(rejected(bad), "missing Submit.begin is rejected");
-
-    bad = valid;
-    bad[0].claim_end_and_winner =
-        bad[0].submit_end + 1U;
-    Check(rejected(bad), "Claim outside Submit is rejected");
-
-    Check(
-        rejected_for_worker(pa_scheduler::kWorkers, valid),
-        "owner outside the 96-Scalar population is rejected"
-    );
-
-    bad = valid;
-    bad[1].claim_end_and_winner &=
-        ~pa_scheduler::kSharedClaimWinnerBit;
-    Check(
-        rejected(bad),
-        "central-ticket endpoint without winner ownership is rejected"
-    );
-
-    bad = valid;
-    bad[0].submit_end |=
-        pa_scheduler::kSharedClaimWinnerBit;
-    Check(
-        rejected(bad),
-        "winner marker is forbidden in Submit endpoints"
-    );
-
-    std::vector<TraceRecord> forbidden{
-        MakeRecord(
-            TracePhase::Claim, 0, -1,
-            base_cycle + 21U, base_cycle + 22U,
-            pa_scheduler::kClaimAttempted, 1
-        ),
-    };
-    std::vector<TraceRecord> logical;
-    std::vector<uint8_t> coverage(plan.total_tasks, 0);
-    Check(
-        !ExpandSharedTraceRecords(
-            worker, forbidden.data(), 1,
-            valid.data(), plan, plan.total_tasks,
-            coverage.data(), &logical
-        ),
-        "generic stream cannot duplicate dedicated Claim rows"
-    );
-
-    coverage.assign(plan.total_tasks, 0);
-    Check(
-        ExpandSharedTraceRecords(
-            worker, &unused_generic, 0,
-            valid.data(), plan, plan.total_tasks,
-            coverage.data(), &logical
-        ) &&
-            !ExpandSharedTraceRecords(
-                worker, &unused_generic, 0,
-                valid.data(), plan, plan.total_tasks,
-                coverage.data(), &logical
-            ),
-        "global task coverage rejects a second owner for any task"
+        all_expanded,
+        "host expansion reconstructs every worker's complete replay"
     );
 }
 
-struct TaskTraceBuilder {
-    SharedSparseTraceValidator &validator;
-    uint64_t tick = 10;
-    uint64_t current_submit_begin = 0;
-    uint64_t current_claim_begin = 0;
-    uint64_t last_efdrain_begin = 0;
-    uint64_t last_efdrain_end = 0;
+void TestRejectsReplayCoverageDrift() {
+    constexpr uint32_t kTasks = 5;
+    const std::vector<WorkerReplay> valid = MakeValidReplay(kTasks);
 
-    bool Begin(uint32_t task_id, TaskKind kind, bool winner, bool attempted = true) {
-        current_submit_begin = tick;
-        current_claim_begin = tick + 2;
-        const uint32_t flags =
-            (winner ? pa_scheduler::kClaimWon : 0U) |
-            (attempted ? pa_scheduler::kClaimAttempted : 0U);
-        const bool ok = validator.Observe(
-            MakeRecord(
-                TracePhase::Claim, static_cast<int32_t>(task_id),
-                winner ? FunctionId(kind) : -1,
-                current_claim_begin, current_claim_begin + 1,
-                flags, IsAlloc(kind)
-            )
-        );
-        tick = current_claim_begin + 1;
-        return ok;
-    }
+    std::vector<WorkerReplay> bad = valid;
+    bad[7].tasks.erase(bad[7].tasks.begin() + 2);
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "one worker cannot omit a replayed task"
+    );
 
-    bool FinishWinner(uint32_t task_id, TaskKind kind) {
-        const int32_t function_id = FunctionId(kind);
-        const uint64_t materialize_begin = tick + 2;
-        bool ok = validator.Observe(
-            MakeRecord(
-                TracePhase::Materialize, static_cast<int32_t>(task_id),
-                function_id, materialize_begin, materialize_begin + 3,
-                0, IsAlloc(kind)
-            )
-        );
-        ok &= validator.Observe(
-            MakeRecord(
-                TracePhase::SharedMaterializePublishTaskOutputs,
-                static_cast<int32_t>(task_id), function_id,
-                materialize_begin + 1, materialize_begin + 3
-            )
-        );
-        ok &= validator.Observe(
-            MakeRecord(
-                TracePhase::SharedMaterializePublishTaskOutputsCopy,
-                static_cast<int32_t>(task_id), function_id,
-                materialize_begin + 1, materialize_begin + 2
-            )
-        );
-        ok &= validator.Observe(
-            MakeRecord(
-                TracePhase::SharedMaterializePublishTaskOutputsFlush,
-                static_cast<int32_t>(task_id), function_id,
-                materialize_begin + 2, materialize_begin + 3
-            )
-        );
-        uint64_t previous_end = materialize_begin + 3;
-        ok &= validator.Observe(
-            MakeRecord(
-                TracePhase::Register, static_cast<int32_t>(task_id),
-                function_id, previous_end, previous_end + 3, 0, 0
-            )
-        );
-        ok &= validator.Observe(
-            MakeRecord(
-                TracePhase::SharedRegisterPublishMetadata,
-                static_cast<int32_t>(task_id), function_id,
-                previous_end + 1, previous_end + 2
-            )
-        );
-        previous_end += 3;
-        if (kind != TaskKind::Alloc) {
-            ok &= validator.Observe(
-                MakeRecord(
-                    TracePhase::Fanin, static_cast<int32_t>(task_id),
-                    function_id, previous_end, previous_end + 2, 0, 3
-                )
-            );
-            previous_end += 2;
-        }
-        ok &= validator.Observe(
+    bad = valid;
+    bad[7].tasks[2].task_id = 1;
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "one worker cannot duplicate an earlier task identity"
+    );
+
+    bad = valid;
+    bad[7].tasks[2].task_id = 3;
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "one worker cannot skip ahead in task-id order"
+    );
+
+    bad = valid;
+    bad[7].tasks[2].endpoints = {};
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "an all-zero compact slot is no longer a legal sparse hole"
+    );
+}
+
+void TestRejectsWinnerAndInsertCompletionDrift() {
+    constexpr uint32_t kTasks = 5;
+    const std::vector<WorkerReplay> valid = MakeValidReplay(kTasks);
+    constexpr uint32_t task_id = 2;
+    const uint32_t owner =
+        (task_id * 17U + 3U) % pa_scheduler::kWorkers;
+    const uint32_t loser = (owner + 1U) % pa_scheduler::kWorkers;
+
+    std::vector<WorkerReplay> bad = valid;
+    bad[loser].tasks[task_id].winner_children.push_back(
+        bad[owner].tasks[task_id].winner_children.front()
+    );
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "loser cannot carry a winner-only business interval"
+    );
+
+    bad = valid;
+    bad[owner].tasks[task_id].winner_children.clear();
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "the unique winner must retain its winner-only business interval"
+    );
+
+    bad = valid;
+    bad[loser].tasks[task_id].endpoints.claim_end_and_winner |=
+        pa_scheduler::kSharedClaimWinnerBit;
+    {
+        ReplayEntry &second_winner = bad[loser].tasks[task_id];
+        const TaskKind kind = KindForTask(task_id);
+        const uint64_t claim_begin =
+            second_winner.endpoints.claim_begin;
+        second_winner.winner_children.push_back(
             MakeRecord(
                 kind == TaskKind::Alloc
                     ? TracePhase::AllocComplete
                     : TracePhase::WinnerBuild,
-                static_cast<int32_t>(task_id), function_id,
-                previous_end, previous_end + 4
+                static_cast<int32_t>(task_id), FunctionId(kind),
+                claim_begin + 20U, claim_begin + 30U
             )
         );
-        previous_end += 4;
-        ok &= validator.Observe(
-            MakeRecord(
-                TracePhase::Submit, static_cast<int32_t>(task_id),
-                function_id, current_submit_begin, previous_end + 1,
-                pa_scheduler::kClaimWon, IsAlloc(kind)
+        second_winner.control_atomics.push_back(
+            MakeReturnReadyCas(
+                AtomicSite::SharedInsertTurnHandoff,
+                static_cast<int32_t>(task_id), claim_begin + 10U
             )
         );
-        last_efdrain_begin = current_submit_begin;
-        last_efdrain_end = current_claim_begin;
-        tick = previous_end + 1;
-        return ok;
     }
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "a task cannot have two global Build winners"
+    );
 
-    bool FinishLoser(uint32_t task_id, TaskKind kind) {
-        // loser 的 Submit 父区间只覆盖轻量返回；它不等待、不读取
-        // TensorMap，也不会产生任何 winner-only 子 span。
-        const bool ok = validator.Observe(
-            MakeRecord(
-                TracePhase::Submit, static_cast<int32_t>(task_id), -1,
-                current_submit_begin, tick + 1, 0, IsAlloc(kind)
+    bad = valid;
+    bad[owner].tasks[task_id].endpoints.claim_end_and_winner &=
+        ~pa_scheduler::kSharedClaimWinnerBit;
+    bad[owner].tasks[task_id].winner_children.clear();
+    bad[owner].tasks[task_id].control_atomics.clear();
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "a task cannot finish replay without a Build winner"
+    );
+
+    bad = valid;
+    bad[owner].tasks[task_id].control_atomics.clear();
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "every task must advance the strict insert completion chain once"
+    );
+
+    bad = valid;
+    bad[owner].tasks[task_id].control_atomics.push_back(
+        bad[owner].tasks[task_id].control_atomics.front()
+    );
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "a task cannot publish insert completion twice"
+    );
+
+    bad = valid;
+    bad[owner].tasks[task_id].control_atomics.front().flags &=
+        ~pa_scheduler::kAtomicReturnReady;
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "insert completion CAS must keep its return-ready boundary"
+    );
+}
+
+void TestRejectsReplaySealAndCentralTicketDrift() {
+    constexpr uint32_t kTasks = 5;
+    const std::vector<WorkerReplay> valid = MakeValidReplay(kTasks);
+
+    std::vector<WorkerReplay> bad = valid;
+    bad[11].replay_atomics.clear();
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "every worker must seal the replayed identity/count once"
+    );
+
+    bad = valid;
+    bad[11].replay_atomics.push_back(
+        bad[11].replay_atomics.front()
+    );
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "one worker cannot publish two replay seals"
+    );
+
+    bad = valid;
+    bad[11].replay_atomics.front().flags &=
+        ~pa_scheduler::kAtomicReturnReady;
+    Check(
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "replay seal must expose the return-ready CAS observation"
+    );
+
+    bad = valid;
+    bad[11].replay_atomics.push_back(
+        MakeRecord(
+            TracePhase::Atomic, -1, -1, 500, 501,
+            static_cast<uint32_t>(AtomicOp::FetchAdd) |
+                pa_scheduler::kAtomicResultUsed,
+            static_cast<uint32_t>(
+                AtomicSite::SharedBuildDispatchTicket
             )
-        );
-        last_efdrain_begin = current_submit_begin;
-        last_efdrain_end = current_claim_begin;
-        ++tick;
-        return ok;
-    }
-};
-
-bool OpenAllocWinnerMaterialize(
-    SharedSparseTraceValidator &validator,
-    uint64_t materialize_begin = 15,
-    uint64_t materialize_end = 18
-) {
-    return validator.Observe(
-               MakeRecord(
-                   TracePhase::Claim, 0, -1, 12, 13,
-                   pa_scheduler::kClaimWon |
-                       pa_scheduler::kClaimAttempted,
-                   1
-               )
-           ) &&
-           validator.Observe(
-               MakeRecord(
-                   TracePhase::Materialize, 0, -1,
-                   materialize_begin, materialize_end, 0, 1
-               )
-           );
-}
-
-// outputs 包络内固定 copy → flush 两层；copy.end 必须等于 flush.start。
-bool ObserveSharedMaterializeOutputNest(
-    SharedSparseTraceValidator &validator,
-    int32_t task_id,
-    int32_t function_id,
-    uint64_t outputs_begin,
-    uint64_t outputs_end,
-    uint64_t copy_end
-) {
-    return validator.Observe(
-               MakeRecord(
-                   TracePhase::SharedMaterializePublishTaskOutputs,
-                   task_id, function_id, outputs_begin, outputs_end
-               )
-           ) &&
-           validator.Observe(
-               MakeRecord(
-                   TracePhase::SharedMaterializePublishTaskOutputsCopy,
-                   task_id, function_id, outputs_begin, copy_end
-               )
-           ) &&
-           validator.Observe(
-               MakeRecord(
-                   TracePhase::SharedMaterializePublishTaskOutputsFlush,
-                   task_id, function_id, copy_end, outputs_end
-               )
-           );
-}
-
-bool OpenAllocWinnerRegister(
-    SharedSparseTraceValidator &validator,
-    uint64_t register_begin = 18,
-    uint64_t register_end = 24
-) {
-    return OpenAllocWinnerMaterialize(
-               validator, 15, register_begin
-           ) &&
-           ObserveSharedMaterializeOutputNest(
-               validator, 0, -1, 16, register_begin, 17
-           ) &&
-           validator.Observe(
-               MakeRecord(
-                   TracePhase::Register, 0, -1,
-                   register_begin, register_end
-               )
-           );
-}
-
-void TestAcceptsSparseWinnerAndLoserFlow() {
-    SharedSparseTraceValidator validator;
-    TaskTraceBuilder trace{validator};
-    Check(
-        trace.Begin(0, TaskKind::Alloc, true) &&
-            trace.FinishWinner(0, TaskKind::Alloc),
-        "Alloc winner closes with Materialize/Register/AllocComplete/Submit"
-    );
-    Check(
-        trace.Begin(1, TaskKind::Qk, false) &&
-            trace.FinishLoser(1, TaskKind::Qk),
-        "attempted QK loser keeps only its Claim/Submit pair"
-    );
-    Check(
-        trace.Begin(2, TaskKind::Sf, false, false) &&
-            trace.FinishLoser(2, TaskKind::Sf),
-        "role-not-attempted SF loser also keeps only its Claim/Submit pair"
-    );
-    Check(
-        trace.Begin(3, TaskKind::Pv, true) &&
-            trace.FinishWinner(3, TaskKind::Pv),
-        "ordinary winner includes exactly one Fanin and WinnerBuild"
-    );
-    Check(
-        trace.Begin(4, TaskKind::Up, false) &&
-            trace.FinishLoser(4, TaskKind::Up),
-        "the final logical task may close through the loser parent"
-    );
-    Check(validator.Closed(), "mixed sparse flow is fully closed");
-    Check(
-        validator.EfDrainCount() == 5 &&
-            validator.LastEfDrainBegin() == trace.last_efdrain_begin &&
-            validator.LastEfDrainEnd() == trace.last_efdrain_end &&
-            validator.ClaimCount() == 5 &&
-            validator.WinnerCount() == 2 &&
-            validator.MaterializeCount() == 2 &&
-            validator.FaninCount() == 1 &&
-            validator.RegisterCount() == 2 &&
-            validator.RegisterMetadataCount() == 2 &&
-            validator.MaterializeTaskOutputsCount() == 2 &&
-            validator.WinnerTailCount() == 2 &&
-            validator.SubmitCount() == 5,
-        "sparse flow derives every EfDrain boundary and counts only winner children"
-    );
-}
-
-void TestSparseTaskOrderAndBoundaries() {
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::EfDrain, 0, -1, 10, 12)
-            ),
-            "shared sparse raw rejects an explicit EfDrain record"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            validator.Observe(
-                MakeRecord(TracePhase::Claim, 1, -1, 12, 13)
-            ),
-            "a sparse worker may begin from a nonzero owned task"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::Claim, 0, -1, 13, 12)
-            ),
-            "Claim rejects an inverted time boundary"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        TaskTraceBuilder trace{validator};
-        Check(
-            trace.Begin(0, TaskKind::Alloc, false) &&
-                trace.FinishLoser(0, TaskKind::Alloc),
-            "task 0 establishes the sparse ordering test"
-        );
-        Check(
-            trace.Begin(2, TaskKind::Sf, false) &&
-                trace.FinishLoser(2, TaskKind::Sf),
-            "a worker may skip tasks owned by other Scalars"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::Claim, 1, -1, 30, 31)
-            ),
-            "per-worker sparse task ids must remain strictly increasing"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            validator.Observe(
-                MakeRecord(
-                    TracePhase::Claim, 0, -1, 12, 13,
-                    pa_scheduler::kClaimAttempted, 1
-                )
-            ),
-            "valid Claim opens the derived-EfDrain inversion test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(
-                    TracePhase::Submit, 0, -1, 13, 14, 0, 1
-                )
-            ),
-            "Submit.start cannot be later than Claim.start"
-        );
-    }
-}
-
-void TestRejectsMissingSubmit() {
-    {
-        SharedSparseTraceValidator validator;
-        TaskTraceBuilder trace{validator};
-        Check(
-            trace.Begin(0, TaskKind::Alloc, false),
-            "loser Claim opens the missing-Submit test"
-        );
-        Check(
-            !validator.Closed() &&
-                !validator.Observe(
-                    MakeRecord(
-                        TracePhase::Claim, 1, -1, 20, 21,
-                        pa_scheduler::kClaimAttempted, 0
-                    )
-                ),
-            "loser must close Submit before the next task Claim"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerRegister(validator) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::SharedRegisterPublishMetadata,
-                        0, -1, 20, 22
-                    )
-                ) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::AllocComplete, 0, -1, 24, 28
-                    )
-                ),
-            "winner reaches the state that only permits Submit"
-        );
-        Check(
-            !validator.Closed() &&
-                !validator.Observe(
-                    MakeRecord(TracePhase::Claim, 1, -1, 30, 31)
-                ),
-            "winner must close Submit before the next task Claim"
-        );
-    }
-}
-
-void TestRejectsEveryLoserOnlyForbiddenPhase() {
-    constexpr TracePhase forbidden[] = {
-        TracePhase::Materialize,
-        TracePhase::PrepareMap,
-        TracePhase::Fanin,
-        TracePhase::Register,
-        TracePhase::SharedRegisterPublishMetadata,
-        TracePhase::SharedMaterializePublishTaskOutputs,
-        TracePhase::SharedMaterializePublishTaskOutputsCopy,
-        TracePhase::SharedMaterializePublishTaskOutputsFlush,
-        TracePhase::WinnerBuild,
-        TracePhase::AllocComplete,
-    };
-    for (TracePhase phase : forbidden) {
-        SharedSparseTraceValidator validator;
-        TaskTraceBuilder trace{validator};
-        Check(
-            trace.Begin(0, TaskKind::Alloc, false),
-            "loser prefix is accepted before a forbidden phase"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(phase, 0, -1, 13, 14)
-            ),
-            "loser rejects every winner-only phase"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        TaskTraceBuilder trace{validator};
-        Check(
-            trace.Begin(0, TaskKind::Alloc, false) &&
-                trace.FinishLoser(0, TaskKind::Alloc),
-            "loser closes through exactly one Submit parent"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::Submit, 0, -1, 10, 15, 0, 1)
-            ),
-            "duplicate loser Submit is rejected"
-        );
-    }
-}
-
-void TestRejectsPrepareMapForWinnerAndOutsideSubmit() {
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::PrepareMap, -1, -1, 1, 1)
-            ),
-            "shared rejects PrepareMap even outside a task flow"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        TaskTraceBuilder trace{validator};
-        Check(
-            trace.Begin(0, TaskKind::Alloc, true),
-            "Alloc winner opens the PrepareMap rejection test"
-        );
-        Check(
-            validator.Observe(
-                MakeRecord(
-                    TracePhase::Materialize, 0, -1, 15, 18, 0, 1
-                )
-            ),
-            "winner Materialize is accepted before the forbidden marker"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::PrepareMap, 0, -1, 18, 18)
-            ),
-            "shared winner cannot carry a zero-duration PrepareMap marker"
-        );
-    }
-}
-
-void TestRejectsWinnerShapeDrift() {
-    {
-        SharedSparseTraceValidator validator;
-        TaskTraceBuilder trace{validator};
-        Check(
-            trace.Begin(0, TaskKind::Alloc, true),
-            "Alloc winner opens the Fanin rejection test"
-        );
-        Check(
-            validator.Observe(
-                MakeRecord(
-                    TracePhase::Materialize, 0, -1, 15, 18, 0, 1
-                )
-            ),
-            "Alloc Materialize is accepted"
-        );
-        Check(
-            ObserveSharedMaterializeOutputNest(
-                validator, 0, -1, 16, 18, 17
-            ) &&
-                validator.Observe(
-                MakeRecord(
-                    TracePhase::Register, 0, -1, 18, 20
-                )
-            ) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::SharedRegisterPublishMetadata,
-                        0, -1, 19, 19
-                    )
-                ),
-            "Alloc Register details are accepted before the tail"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::Fanin, 0, -1, 20, 21)
-            ),
-            "Alloc winner cannot emit Fanin"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        TaskTraceBuilder trace{validator};
-        Check(
-            trace.Begin(0, TaskKind::Alloc, false) &&
-                trace.FinishLoser(0, TaskKind::Alloc) &&
-                trace.Begin(1, TaskKind::Qk, true),
-            "ordinary winner opens the missing-Fanin test"
-        );
-        Check(
-            validator.Observe(
-                MakeRecord(
-                    TracePhase::Materialize, 1, 0, 18, 21
-                )
-            ),
-            "ordinary Materialize is accepted"
-        );
-        Check(
-            ObserveSharedMaterializeOutputNest(
-                validator, 1, 0, 19, 21, 20
-            ) &&
-                validator.Observe(
-                MakeRecord(TracePhase::Register, 1, 0, 21, 24, 0, 1)
-            ) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::SharedRegisterPublishMetadata,
-                        1, 0, 22, 23
-                    )
-                ),
-            "ordinary Register details precede Fanin"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::WinnerBuild, 1, 0, 24, 25)
-            ),
-            "ordinary winner cannot skip Fanin after Register"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        TaskTraceBuilder trace{validator};
-        Check(
-            trace.Begin(0, TaskKind::Alloc, true),
-            "Alloc winner opens the wrong-tail test"
-        );
-        Check(
-            validator.Observe(
-                MakeRecord(
-                    TracePhase::Materialize, 0, -1, 15, 18, 0, 1
-                )
-            ) &&
-                ObserveSharedMaterializeOutputNest(
-                    validator, 0, -1, 16, 18, 17
-                ) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::Register, 0, -1, 18, 20
-                    )
-                ) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::SharedRegisterPublishMetadata,
-                        0, -1, 19, 19
-                    )
-                ),
-            "Alloc winner reaches its tail"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::WinnerBuild, 0, -1, 20, 24)
-            ),
-            "Alloc winner requires AllocComplete rather than WinnerBuild"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        TaskTraceBuilder trace{validator};
-        Check(
-            trace.Begin(0, TaskKind::Alloc, true),
-            "incomplete winner opens the closure test"
-        );
-        Check(
-            !validator.Closed(),
-            "winner cannot close before all winner-only phases and Submit"
-        );
-    }
-}
-
-void TestMaterializeOutputDetailContract() {
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerMaterialize(validator),
-            "Materialize parent opens the missing-output test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::Register, 0, -1, 18, 24)
-            ),
-            "winner cannot enter Register before output publication closes"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerMaterialize(validator) &&
-                ObserveSharedMaterializeOutputNest(
-                    validator, 0, -1, 16, 18, 17
-                ),
-            "one output nest contained by Materialize is accepted"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(
-                    TracePhase::SharedMaterializePublishTaskOutputs,
-                    0, -1, 16, 18
-                )
-            ),
-            "duplicate Materialize output detail is rejected"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerMaterialize(validator) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::SharedMaterializePublishTaskOutputs,
-                        0, -1, 16, 18
-                    )
-                ),
-            "output parent opens the missing-copy test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::Register, 0, -1, 18, 24)
-            ),
-            "winner cannot omit output copy detail"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerMaterialize(validator) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::SharedMaterializePublishTaskOutputs,
-                        0, -1, 16, 18
-                    )
-                ) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::SharedMaterializePublishTaskOutputsCopy,
-                        0, -1, 16, 17
-                    )
-                ),
-            "copy detail opens the missing-flush test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::Register, 0, -1, 18, 24)
-            ),
-            "winner cannot omit output flush detail"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerMaterialize(validator) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::SharedMaterializePublishTaskOutputs,
-                        0, -1, 16, 18
-                    )
-                ) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::SharedMaterializePublishTaskOutputsCopy,
-                        0, -1, 16, 17
-                    )
-                ),
-            "copy detail opens the flush-adjacency test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(
-                    TracePhase::SharedMaterializePublishTaskOutputsFlush,
-                    0, -1, 18, 18
-                )
-            ),
-            "flush must start exactly at copy end"
-        );
-    }
-    for (int variant = 0; variant < 4; ++variant) {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerMaterialize(validator),
-            "Materialize opens output containment/identity test"
-        );
-        TraceRecord output = MakeRecord(
-            TracePhase::SharedMaterializePublishTaskOutputs,
-            0, -1, 16, 18
-        );
-        if (variant == 0) output.start_cycle = 14;
-        if (variant == 1) output.task_id = 1;
-        if (variant == 2) output.function_id = 0;
-        if (variant == 3) {
-            output.flags = 1;
-            output.auxiliary = 1;
-        }
-        Check(
-            !validator.Observe(output),
-            "Materialize output detail rejects bad boundary, identity, or payload"
-        );
-    }
-}
-
-void TestRegisterMetadataDetailContract() {
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerRegister(validator),
-            "Register parent opens the missing-detail test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(TracePhase::AllocComplete, 0, -1, 24, 28)
-            ) &&
-                !validator.Closed(),
-            "winner cannot omit its Register metadata detail"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerRegister(validator) &&
-                validator.Observe(
-                    MakeRecord(
-                        TracePhase::SharedRegisterPublishMetadata,
-                        0, -1, 20, 22
-                    )
-                ),
-            "one contained Register metadata detail is accepted"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(
-                    TracePhase::SharedRegisterPublishMetadata,
-                    0, -1, 20, 22
-                )
-            ),
-            "duplicate Register metadata detail is rejected"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerRegister(validator),
-            "Register parent opens the early-boundary test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(
-                    TracePhase::SharedRegisterPublishMetadata,
-                    0, -1, 17, 20
-                )
-            ),
-            "Register metadata cannot begin before its parent"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerRegister(validator),
-            "Register parent opens the late-boundary test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(
-                    TracePhase::SharedRegisterPublishMetadata,
-                    0, -1, 20, 25
-                )
-            ),
-            "Register metadata cannot end after its parent"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerRegister(validator),
-            "Register parent opens the wrong-task test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(
-                    TracePhase::SharedRegisterPublishMetadata,
-                    1, -1, 20, 22
-                )
-            ),
-            "Register metadata must keep the parent task identity"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerRegister(validator),
-            "Register parent opens the wrong-function test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(
-                    TracePhase::SharedRegisterPublishMetadata,
-                    0, 0, 20, 22
-                )
-            ),
-            "Register metadata must keep the parent function identity"
-        );
-    }
-    {
-        SharedSparseTraceValidator validator;
-        Check(
-            OpenAllocWinnerRegister(validator),
-            "Register parent opens the payload-shape test"
-        );
-        Check(
-            !validator.Observe(
-                MakeRecord(
-                    TracePhase::SharedRegisterPublishMetadata,
-                    0, -1, 20, 22, 1, 1
-                )
-            ),
-            "Register metadata detail requires zero flags and auxiliary"
-        );
-    }
-}
-
-void TestSharedInsertTurnAtomicSchema() {
-    TraceRecord poll = MakeRecord(
-        TracePhase::Atomic, -1, -1, 100, 200,
-        static_cast<uint32_t>(AtomicOp::Load) |
-            kAtomicResultUsed | kAtomicPollBatch |
-            kAtomicReturnReady |
-            (17U << kAtomicPollCountShift),
-        static_cast<uint32_t>(
-            AtomicSite::SharedInsertTurnPoll
         )
     );
     Check(
-        AtomicRecordSchemaValid(poll, true),
-        "shared insert-turn aggregate PollBatch schema is accepted"
-    );
-    TraceRecord direct_poll = poll;
-    direct_poll.flags =
-        static_cast<uint32_t>(AtomicOp::Load) |
-        kAtomicResultUsed | kAtomicReturnReady;
-    direct_poll.task_id = 3;
-    Check(
-        !AtomicRecordSchemaValid(direct_poll, true),
-        "shared insert-turn poll cannot masquerade as a direct Load"
-    );
-
-    TraceRecord handoff = MakeRecord(
-        TracePhase::Atomic, 3, -1, 200, 230,
-        static_cast<uint32_t>(
-            AtomicOp::FetchAdd
-        ),
-        static_cast<uint32_t>(
-            AtomicSite::SharedInsertTurnHandoff
-        )
-    );
-    Check(
-        AtomicRecordSchemaValid(handoff, true),
-        "shared insert-turn handoff FetchAdd schema is accepted"
-    );
-    TraceRecord anonymous_handoff = handoff;
-    anonymous_handoff.task_id = -1;
-    Check(
-        !AtomicRecordSchemaValid(anonymous_handoff, true),
-        "handoff FetchAdd requires its shared winner task identity"
-    );
-    TraceRecord wrong_handoff_op = handoff;
-    wrong_handoff_op.flags =
-        (wrong_handoff_op.flags & ~kAtomicOpMask) |
-        static_cast<uint32_t>(AtomicOp::Exchange);
-    Check(
-        !AtomicRecordSchemaValid(wrong_handoff_op, true),
-        "handoff site rejects a non-FetchAdd atomic op"
-    );
-}
-
-void TestPlanClosesAllLogicalTasks() {
-    // SchedulerState 保留真实 DistGlobal 约 1 GiB ABI，不能放在线程栈上。
-    // 静态零初始化只映射本用例实际触碰的 config/context_lens 页面。
-    static pa_scheduler::SchedulerState state{};
-    state.config.batches = 2;
-    state.context_lens[0] = 0;
-    state.context_lens[1] = 0;
-    pa_scheduler::host::SharedHostTaskPlan plan;
-    Check(
-        pa_scheduler::host::BuildSharedHostTaskPlan(state, &plan),
-        "two-batch zero-context host plan is valid"
-    );
-    Check(
-        plan.total_tasks == 2 &&
-            plan.TaskAt(0)->kind == TaskKind::Alloc &&
-            plan.TaskAt(1)->kind == TaskKind::Alloc,
-        "authoritative plan contains one Alloc per empty batch"
-    );
-
-    SharedSparseTraceValidator validator(
-        &plan, plan.total_tasks
-    );
-    TaskTraceBuilder trace{validator};
-    Check(
-        trace.Begin(0, TaskKind::Alloc, true) &&
-            trace.FinishWinner(0, TaskKind::Alloc),
-        "first planned Alloc winner closes"
-    );
-    Check(
-        !validator.Closed(),
-        "plan-aware validator rejects a truncated sparse ownership set"
-    );
-    Check(
-        trace.Begin(1, TaskKind::Alloc, true) &&
-            trace.FinishWinner(1, TaskKind::Alloc),
-        "second sparse owned Alloc winner closes through its Submit parent"
-    );
-    Check(
-        validator.Closed(),
-        "plan-aware validator closes only after every logical task"
+        !ValidateAllWorkerReplay(bad, kTasks),
+        "all-worker replay rejects the retired central Build ticket"
     );
 }
 
@@ -1405,26 +668,18 @@ void TestPlanClosesAllLogicalTasks() {
 
 int main() {
     TestTraceBinaryLayoutAndHeaderGate();
-    TestSharedCompactReconstruction();
-    TestSharedCompactStageOnlyReconstruction();
-    TestSharedCompactGenericMergeOrder();
-    TestRejectsBadSharedCompactRecords();
-    TestAcceptsSparseWinnerAndLoserFlow();
-    TestSparseTaskOrderAndBoundaries();
-    TestRejectsMissingSubmit();
-    TestRejectsEveryLoserOnlyForbiddenPhase();
-    TestRejectsPrepareMapForWinnerAndOutsideSubmit();
-    TestRejectsWinnerShapeDrift();
-    TestMaterializeOutputDetailContract();
-    TestRegisterMetadataDetailContract();
-    TestSharedInsertTurnAtomicSchema();
-    TestPlanClosesAllLogicalTasks();
+    TestNewAtomicSchemas();
+    TestAcceptsCompleteAllWorkerReplay();
+    TestRejectsReplayCoverageDrift();
+    TestRejectsWinnerAndInsertCompletionDrift();
+    TestRejectsReplaySealAndCentralTicketDrift();
     if (g_failures != 0) {
         std::fprintf(
-            stderr, "[FAIL] shared sparse trace tests: %d\n", g_failures
+            stderr, "[FAIL] all-worker replay trace tests: %d\n",
+            g_failures
         );
         return 1;
     }
-    std::printf("[PASS] shared sparse trace tests\n");
+    std::printf("[PASS] all-worker replay trace tests\n");
     return 0;
 }

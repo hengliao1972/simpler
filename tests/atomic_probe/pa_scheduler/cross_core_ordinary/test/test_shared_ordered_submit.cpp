@@ -33,29 +33,12 @@ namespace {
 
 using namespace pa_scheduler;
 
-enum class OrderedSubmitHookMode : uint32_t {
-    None = 0,
-    BuildOverlap = 1,
-    ExecutionOverlap = 2,
-    RemoteFatalAfterBuild = 3,
-};
-
 struct OrderedSubmitTestOps {
     static constexpr bool kAtomicReturnReadyObserved = false;
     static inline thread_local CompeteFirstSplitRuntimeState runtime{};
 
     static inline SchedulerState *observed_state = nullptr;
-    static inline OrderedSubmitHookMode hook_mode =
-        OrderedSubmitHookMode::None;
     static inline std::atomic<uint64_t> shared_map_accesses{0};
-    static inline std::atomic<uint32_t> task4_insert_hook_calls{0};
-    static inline std::atomic<uint32_t> task8_build_hook_calls{0};
-    static inline std::atomic<uint32_t> independent_insert_hook_calls{0};
-    static inline std::atomic<bool> task4_waiting_after_insert{false};
-    static inline std::atomic<bool> task8_built{false};
-    static inline std::atomic<bool> task8_built_before_task4_completion{false};
-    static inline std::atomic<bool> task6_executed_before_task4_build{false};
-    static inline std::atomic<bool> hook_timed_out{false};
     static inline std::atomic<uint32_t>
         claim_attempts_by_task[kMaxTasks]{};
     static inline std::atomic<uint32_t>
@@ -67,6 +50,10 @@ struct OrderedSubmitTestOps {
     static inline std::atomic<uint32_t>
         completion_publish_by_task[kMaxTasks]{};
     static inline std::atomic<uint32_t>
+        insert_hooks_by_task[kMaxTasks]{};
+    static inline std::atomic<uint32_t>
+        build_hooks_by_task[kMaxTasks]{};
+    static inline std::atomic<uint32_t>
         bad_completion_publish{0};
     static inline std::atomic<uint32_t>
         legacy_turn_atomic_accesses{0};
@@ -74,21 +61,10 @@ struct OrderedSubmitTestOps {
         bound_dispatch_calls{0};
     static inline std::atomic<uint32_t>
         bad_bound_dispatch_calls{0};
-    static inline std::atomic<uint32_t>
-        remote_fatal_injections{0};
 
     static void ResetHooks() {
         observed_state = nullptr;
-        hook_mode = OrderedSubmitHookMode::None;
         shared_map_accesses.store(0, std::memory_order_relaxed);
-        task4_insert_hook_calls.store(0, std::memory_order_relaxed);
-        task8_build_hook_calls.store(0, std::memory_order_relaxed);
-        independent_insert_hook_calls.store(0, std::memory_order_relaxed);
-        task4_waiting_after_insert.store(false, std::memory_order_relaxed);
-        task8_built.store(false, std::memory_order_relaxed);
-        task8_built_before_task4_completion.store(false, std::memory_order_relaxed);
-        task6_executed_before_task4_build.store(false, std::memory_order_relaxed);
-        hook_timed_out.store(false, std::memory_order_relaxed);
         for (uint32_t task = 0; task < kMaxTasks; ++task) {
             claim_attempts_by_task[task].store(
                 0, std::memory_order_relaxed
@@ -105,6 +81,12 @@ struct OrderedSubmitTestOps {
             completion_publish_by_task[task].store(
                 0, std::memory_order_relaxed
             );
+            insert_hooks_by_task[task].store(
+                0, std::memory_order_relaxed
+            );
+            build_hooks_by_task[task].store(
+                0, std::memory_order_relaxed
+            );
         }
         bad_completion_publish.store(
             0, std::memory_order_relaxed
@@ -116,9 +98,6 @@ struct OrderedSubmitTestOps {
             0, std::memory_order_relaxed
         );
         bad_bound_dispatch_calls.store(
-            0, std::memory_order_relaxed
-        );
-        remote_fatal_injections.store(
             0, std::memory_order_relaxed
         );
     }
@@ -258,7 +237,7 @@ struct OrderedSubmitTestOps {
             completion_atomic_writes_by_task[task].fetch_add(
                 1, std::memory_order_relaxed
             );
-            if (expected != -1 ||
+            if (expected != SharedInsertCompletionInitialValue(task) ||
                 desired != completion_task) {
                 bad_completion_publish.fetch_add(
                     1, std::memory_order_relaxed
@@ -276,7 +255,10 @@ struct OrderedSubmitTestOps {
             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
         );
         if (completion_task >= 0 &&
-            observed == expected && expected == -1 &&
+            observed == expected &&
+            expected == SharedInsertCompletionInitialValue(
+                static_cast<uint32_t>(completion_task)
+            ) &&
             desired == completion_task) {
             completion_publish_by_task[
                 static_cast<uint32_t>(completion_task)
@@ -530,84 +512,23 @@ struct OrderedSubmitTestOps {
     }
 
     static void AfterSharedTaskInsert(
-        SchedulerState *state, WorkerState &, uint32_t task_id
+        SchedulerState *, WorkerState &, uint32_t task_id
     ) {
-        constexpr uint32_t kPausedUp = 4;
-        if (hook_mode == OrderedSubmitHookMode::BuildOverlap) {
-            if (task_id != kPausedUp) {
-                return;
-            }
-            task4_insert_hook_calls.fetch_add(1, std::memory_order_relaxed);
-            task4_waiting_after_insert.store(true, std::memory_order_release);
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while (!task8_built.load(std::memory_order_acquire)) {
-                if (state->fatal.value != 0 ||
-                    std::chrono::steady_clock::now() >= deadline) {
-                    hook_timed_out.store(true, std::memory_order_relaxed);
-                    break;
-                }
-                std::this_thread::yield();
-            }
-            return;
+        if (task_id < kMaxTasks) {
+            insert_hooks_by_task[task_id].fetch_add(
+                1, std::memory_order_relaxed
+            );
         }
-
-        // B2/G1 中 batch0 UP=task4，batch1 QK=task6。task4 发布插入
-        // 前沿后暂停在 fanin/Build 之前；task6 只依赖 batch1 Alloc，
-        // 因此它的 completion flag 必须能在 task4 仍为 0 时变成 1。
-        constexpr uint32_t kPausedBatch0Up = 4;
-        constexpr uint32_t kIndependentBatch1Qk = 6;
-        if (hook_mode != OrderedSubmitHookMode::ExecutionOverlap ||
-            task_id != kPausedBatch0Up) {
-            return;
-        }
-        independent_insert_hook_calls.fetch_add(
-            1, std::memory_order_relaxed
-        );
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (Load(&state->tasks[kIndependentBatch1Qk].flag) == 0) {
-            if (state->fatal.value != 0 ||
-                std::chrono::steady_clock::now() >= deadline) {
-                hook_timed_out.store(true, std::memory_order_relaxed);
-                return;
-            }
-            std::this_thread::yield();
-        }
-        task6_executed_before_task4_build.store(
-            Load(&state->tasks[kPausedBatch0Up].flag) == 0,
-            std::memory_order_release
-        );
     }
 
     static void AfterSharedTaskBuild(
-        SchedulerState *state, WorkerState &, uint32_t task_id, TaskKind kind
+        SchedulerState *, WorkerState &, uint32_t task_id, TaskKind
     ) {
-        constexpr uint32_t kRemoteFatalTask = 32;
-        if (hook_mode == OrderedSubmitHookMode::RemoteFatalAfterBuild) {
-            if (task_id == kRemoteFatalTask) {
-                remote_fatal_injections.fetch_add(
-                    1, std::memory_order_relaxed
-                );
-                // 模拟其他子系统在一个合法 Build 工作单元结束后广播首错。
-                // 这里只设置 scheduler fatal，不能伪造 execution reason。
-                __atomic_store_n(
-                    &state->fatal.value, int32_t{1}, __ATOMIC_RELEASE
-                );
-            }
-            return;
+        if (task_id < kMaxTasks) {
+            build_hooks_by_task[task_id].fetch_add(
+                1, std::memory_order_relaxed
+            );
         }
-        constexpr uint32_t kPausedUp = 4;
-        constexpr uint32_t kFollowingUp = 8;
-        if (task_id != kFollowingUp || kind != TaskKind::Up) {
-            return;
-        }
-        task8_build_hook_calls.fetch_add(1, std::memory_order_relaxed);
-        const bool overlap =
-            task4_waiting_after_insert.load(std::memory_order_acquire) &&
-            Load(&state->tasks[kPausedUp].flag) == 0;
-        task8_built_before_task4_completion.store(overlap, std::memory_order_release);
-        task8_built.store(true, std::memory_order_release);
     }
 };
 
@@ -664,11 +585,19 @@ bool LegacyTurnsMatch(
     return true;
 }
 
-bool PortableBuildEvidenceMatches(
-    const SchedulerState &state, uint32_t task_count
+bool RuntimeExecEvidenceMatches(
+    SchedulerState &state, uint32_t task_count,
+    uint32_t &cross_owner_tasks
 ) {
+    uint32_t first_bad_task = task_count;
+    if (!ValidateCrossCoreExecTerminalCells<OrderedSubmitTestOps>(
+            &state, task_count, first_bad_task
+        )) {
+        return false;
+    }
     uint32_t planned_tasks = 0;
-    uint32_t portable_kernel_tasks = 0;
+    uint32_t kernel_tasks = 0;
+    cross_owner_tasks = 0;
     bool exact = true;
     for (uint32_t batch = 0;
          batch < state.config.batches; ++batch) {
@@ -689,6 +618,7 @@ bool PortableBuildEvidenceMatches(
             }
             const uint32_t task_id = plan.batch_start + offset;
             if (task.kind == TaskKind::Alloc) {
+                exact &= state.exec_cells[task_id].control.state == 0;
                 continue;
             }
             const cross_core::DecodedExecState decoded =
@@ -707,156 +637,140 @@ bool PortableBuildEvidenceMatches(
                 decoded.task_id == task_id &&
                 decoded.build_owner < kWorkers &&
                 execute_on_kernel_role;
-            ++portable_kernel_tasks;
+            const cross_core::ExecPayloadHeader header =
+                cross_core::DecodeExecPayloadHeader(
+                    state.exec_cells[task_id].payload
+                );
+            exact &= header.task_id == task_id &&
+                header.function_id ==
+                    static_cast<uint32_t>(FunctionId(task.kind));
+            cross_owner_tasks +=
+                decoded.build_owner != decoded.execute_owner ? 1U : 0U;
+            ++kernel_tasks;
         }
         planned_tasks += plan.task_count;
     }
-    uint32_t expected_executable_tasks = 0;
-    for (uint32_t task_id = 0; task_id < task_count; ++task_id) {
-        SharedExecDispatchRoute route{};
-        if (!DecodeSharedExecDispatchRoute(
-                state.build_dispatch, task_id, route
-            )) {
-            return false;
-        }
-        expected_executable_tasks += route.executable ? 1U : 0U;
-    }
     return exact && planned_tasks == task_count &&
-        portable_kernel_tasks == expected_executable_tasks &&
-        expected_executable_tasks ==
-            state.build_dispatch.executable_task_count;
+        kernel_tasks == task_count - state.config.batches;
 }
 
-bool RunB256BuildTicketBudgetContractTest() {
+bool RunB256FullReplayBudgetContractTest() {
     constexpr uint64_t kBatches = 256;
     constexpr uint64_t kTasksPerBatch = 5;
     constexpr uint64_t kTasks = kBatches * kTasksPerBatch;
-    // 每个逻辑 task 只取得一次有效 ticket；每个 worker 退出循环时还会
-    // 取得一次越界 ticket。这里锁定 production 路径的精确调用预算，避免
-    // 后续误把旧 96 份 replay / 两级 Claim Tournament 接回热路径。
-    constexpr uint64_t kValidTickets = kTasks;
-    constexpr uint64_t kTerminalTickets = kWorkers;
-    constexpr uint64_t kPhysicalFetchAdds =
-        kValidTickets + kTerminalTickets;
-    constexpr uint64_t kLegacyPhysicalCas = 133120U;
+    // 每个 Scalar 都独立回放全部 task；每个 task 的 96 个候选各做一次
+    // local CAS，八个 local winner 再各做一次 root CAS。这个静态预算只
+    // 锁定真实 replay/Tournament 拓扑，不依赖 Host dispatch 答案。
+    constexpr uint64_t kLogicalSubmits = kTasks * kWorkers;
+    constexpr uint64_t kLocalClaimCas = kLogicalSubmits;
+    constexpr uint64_t kRootClaimCas =
+        kTasks * kSharedClaimTournamentMaxGroups;
     const bool ok =
-        kValidTickets == 1280U &&
-        kTerminalTickets == 96U &&
-        kPhysicalFetchAdds == 1376U &&
-        kPhysicalFetchAdds < kLegacyPhysicalCas;
+        kTasks == 1280U &&
+        kLogicalSubmits == 122880U &&
+        kLocalClaimCas == 122880U &&
+        kRootClaimCas == 10240U;
     std::printf(
-        "[ORDERED_SUBMIT] b256_build_ticket_budget=%s "
-        "valid=%llu terminal=%llu physical=%llu legacy_claim_cas=%llu\n",
+        "[ORDERED_SUBMIT] b256_full_replay_budget=%s "
+        "tasks=%llu submits=%llu local_cas=%llu root_cas=%llu\n",
         ok ? "PASS" : "FAIL",
-        static_cast<unsigned long long>(kValidTickets),
-        static_cast<unsigned long long>(kTerminalTickets),
-        static_cast<unsigned long long>(kPhysicalFetchAdds),
-        static_cast<unsigned long long>(kLegacyPhysicalCas)
+        static_cast<unsigned long long>(kTasks),
+        static_cast<unsigned long long>(kLogicalSubmits),
+        static_cast<unsigned long long>(kLocalClaimCas),
+        static_cast<unsigned long long>(kRootClaimCas)
     );
     return ok;
 }
 
-bool RunSharedBuildFatalPollCadenceTest() {
-    // RunScheduler 在进入中央 ticket 循环前已经立即观察一次 fatal。
-    // 循环内只需锁定“每 16 个成功 Build 一次”的边界：0 不能重复读，
-    // 16/32 必须读，其余位置不读。这样远端错误传播最多多做 15 个 task。
-    bool exact = true;
-    for (uint64_t completed = 0; completed <= 48U; ++completed) {
-        const bool expected =
-            completed == 16U || completed == 32U || completed == 48U;
-        exact &= SharedBuildFatalPollDue(completed) == expected;
+bool RunReplayTopologyContractTest() {
+    const bool ok =
+        kSharedAllocClaimParticipants == kWorkers &&
+        kSharedClaimTournamentMaxGroups == 8U &&
+        kSharedAllocClaimTournamentGroups ==
+            kSharedClaimTournamentMaxGroups &&
+        kSharedKernelClaimTournamentGroups ==
+            kSharedClaimTournamentMaxGroups;
+    std::printf(
+        "[ORDERED_SUBMIT] replay_topology=%s "
+        "workers=%u groups=%u\n",
+        ok ? "PASS" : "FAIL",
+        kWorkers, kSharedClaimTournamentMaxGroups
+    );
+    return ok;
+}
+
+struct OwnerTransferPayloadSource {
+    uint64_t TensorWord(uint32_t, uint32_t) const {
+        return 0;
     }
-    const bool ok =
-        exact && (kSharedBuildFatalPollPeriod - 1U) == 15U;
-    std::printf(
-        "[ORDERED_SUBMIT] build_fatal_poll_cadence=%s "
-        "period=%llu max_extra_tasks=%llu\n",
-        ok ? "PASS" : "FAIL",
-        static_cast<unsigned long long>(
-            kSharedBuildFatalPollPeriod
-        ),
-        static_cast<unsigned long long>(
-            kSharedBuildFatalPollPeriod - 1U
-        )
-    );
-    return ok;
-}
 
-enum class InvalidImmutablePlanSummary : uint32_t {
-    MetadataWriter = 0,
-    ExecuteRoleCount = 1,
+    uint64_t TensorReference(uint32_t) const {
+        return 0;
+    }
+
+    uint64_t Scalar(uint32_t) const {
+        return 0;
+    }
+
+    int32_t Fanin(uint32_t) const {
+        return 0;
+    }
 };
 
-bool RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
-    InvalidImmutablePlanSummary invalid_summary
-) {
-    SchedulerState *state = MapSchedulerState();
-    if (state == nullptr) {
-        return false;
-    }
-    pa_scheduler::host::Options options;
-    options.batches = 1;
-    options.runs = 1;
-    options.trace_enabled = false;
-    options.shared_context_lens = {8192};
-    options.final_barrier_shape = FinalBarrierShape::TwoLevel16;
-    pa_scheduler::host::InitializeState(state, options);
-    pa_scheduler::host::ConfigureTrace(state, options, nullptr);
-
-    // Build/Execute dispatch header 都是 host 在 launch 前发布、device 只读
-    // 的算子通用计划。无论破坏 writer union 还是 engine role 总数，所有
-    // worker 都必须在领取第一张 ticket 前终止；正式热路随后才可以复用
-    // 这份入口证明，不在每次 progress 中重复读取同一摘要。
-    const char *summary_name = nullptr;
-    if (invalid_summary == InvalidImmutablePlanSummary::MetadataWriter) {
-        state->build_dispatch.metadata_writer_count =
-            state->build_dispatch.task_count + 1U;
-        summary_name = "metadata";
-    } else {
-        state->exec_dispatch.aic_task_count =
-            state->build_dispatch.task_count + 1U;
-        summary_name = "execute-role";
-    }
-
-    std::vector<std::thread> workers;
-    workers.reserve(kWorkers);
-    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
-        const CoreRole role =
-            worker_id < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
-        workers.emplace_back([state, worker_id, role]() {
-            RunScheduler<OrderedSubmitTestOps>(state, worker_id, role);
-        });
-    }
-    for (std::thread &worker : workers) {
-        worker.join();
-    }
-
-    uint64_t completed_submits = 0;
-    bool all_workers_returned = true;
-    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
-        completed_submits += state->results[worker_id].submits;
-        all_workers_returned &=
-            state->results[worker_id].worker_id == worker_id &&
-            state->results[worker_id].finish_cycle != 0;
-    }
+bool RunBuildExecuteOwnerIndependenceTest() {
+    constexpr uint32_t kTaskId = 3;
+    constexpr uint32_t kBuildOwner = kWorkers - 1U;
+    constexpr uint32_t kExecuteOwner = 0;
+    cross_core::SharedExecCell cell{};
+    cross_core::SharedExecFatalControl fatal{};
+    cross_core::ExecutionToken token{};
+    cross_core::ResetExecutionToken(token);
+    const OwnerTransferPayloadSource source{};
+    const cross_core::ExecPayloadSpec spec{
+        kTaskId,
+        /*function_address=*/0,
+        /*output_reference=*/4096,
+        static_cast<uint32_t>(FunctionId(TaskKind::Qk)),
+        /*tensor_count=*/4,
+        /*scalar_count=*/2,
+        /*fanin_count=*/0,
+        cross_core::ExecEngineClass::Aic,
+        /*flags=*/0,
+        /*multicore_group_id=*/0,
+        /*multicore_rank=*/0,
+        /*multicore_size=*/1,
+        /*tensor_reference_mask=*/0,
+    };
+    const cross_core::ExecBuildResult built =
+        cross_core::BuildAndPublishExecPayload<
+            OrderedSubmitTestOps
+        >(cell, kBuildOwner, spec, source, fatal);
+    const cross_core::ExecClaimResult claimed =
+        cross_core::ClaimAndBindExecPayload<
+            OrderedSubmitTestOps
+        >(
+            cell, kTaskId, kExecuteOwner,
+            cross_core::ExecEngineClass::Aic,
+            token, fatal
+        );
+    const cross_core::DecodedExecState state =
+        cross_core::DecodeExecState(cell.control.state);
     const bool ok =
-        state->fatal.value == 1 &&
-        state->build_dispatch.next_task.value == 0 &&
-        state->exec_dispatch.aic_next.value == 0 &&
-        state->exec_dispatch.aiv_next.value == 0 &&
-        completed_submits == 0 && all_workers_returned;
+        built == cross_core::ExecBuildResult::Published &&
+        claimed == cross_core::ExecClaimResult::Claimed &&
+        state.valid &&
+        state.phase == cross_core::ExecPhase::Claimed &&
+        state.build_owner == kBuildOwner &&
+        state.execute_owner == kExecuteOwner &&
+        token.control.build_owner == kBuildOwner &&
+        token.control.execute_owner == kExecuteOwner &&
+        fatal.state == 0;
     std::printf(
-        "[ORDERED_SUBMIT] invalid_%s_summary_pre_dispatch=%s "
-        "cursor=%lld submits=%llu all_workers_returned=%u\n",
-        summary_name,
+        "[ORDERED_SUBMIT] build_execute_owner_independence=%s "
+        "build_owner=%u execute_owner=%u\n",
         ok ? "PASS" : "FAIL",
-        static_cast<long long>(
-            state->build_dispatch.next_task.value
-        ),
-        static_cast<unsigned long long>(completed_submits),
-        all_workers_returned ? 1U : 0U
+        state.build_owner, state.execute_owner
     );
-    (void)munmap(state, sizeof(SchedulerState));
     return ok;
 }
 
@@ -974,7 +888,60 @@ bool RunSplitReplayTaskIdPrefixTest() {
     return ok;
 }
 
-bool DispatchAndInsertEvidenceMatches(
+uint32_t ExpectedClaimAttempts(TaskKind kind) {
+    return kind < TaskKind::Count ? kWorkers : 0U;
+}
+
+uint32_t ExpectedClaimGroups(TaskKind kind) {
+    return kind < TaskKind::Count
+        ? kSharedClaimTournamentMaxGroups : 0U;
+}
+
+bool ExpectedReplaySeal(
+    const SchedulerState &state, uint32_t task_count,
+    uint64_t &expected_seal
+) {
+    uint32_t task_id = 0;
+    uint32_t identity_hash = kSharedReplayIdentityHashSeed;
+    for (uint32_t batch = 0;
+         batch < state.config.batches; ++batch) {
+        SharedPaBatchPlan plan{};
+        if (!BuildSharedPaBatchPlan(
+                static_cast<uint64_t>(state.context_lens[batch]),
+                task_id, plan
+            )) {
+            return false;
+        }
+        for (uint32_t offset = 0;
+             offset < plan.task_count; ++offset) {
+            SharedPaPlannedTask task{};
+            if (!SharedPaPlannedTaskAt(plan, offset, task)) {
+                return false;
+            }
+            const uint32_t current = plan.batch_start + offset;
+            const bool is_last =
+                task.is_last_in_batch &&
+                batch + 1U == state.config.batches;
+            const uint8_t meta = EncodeSharedPaTaskMeta(
+                task.kind, task.group_index,
+                task.has_following_group, is_last
+            );
+            if (meta == 0) {
+                return false;
+            }
+            RecordSharedReplayIdentity(
+                identity_hash, current, batch, meta
+            );
+        }
+        task_id += plan.task_count;
+    }
+    expected_seal =
+        (static_cast<uint64_t>(identity_hash) << 32U) |
+        static_cast<uint64_t>(task_count);
+    return task_id == task_count;
+}
+
+bool ClaimAndInsertEvidenceMatches(
     const SchedulerState &state, uint32_t task_count
 ) {
     uint32_t planned_tasks = 0;
@@ -999,59 +966,56 @@ bool DispatchAndInsertEvidenceMatches(
             );
             const uint32_t task_id =
                 plan.batch_start + offset;
-            // 生产路径已经由中央 ticket 唯一发放；旧 Claim Tournament
-            // 不应再有任何逐 task CAS 证据。
             exact &= OrderedSubmitTestOps::
                     claim_attempts_by_task[task_id].load(
                         std::memory_order_relaxed
-                    ) == 0;
+                    ) == ExpectedClaimAttempts(task.kind);
             exact &= OrderedSubmitTestOps::
                     claim_wins_by_task[task_id].load(
                         std::memory_order_relaxed
-                    ) == 0;
+                    ) == 1;
             const SharedClaimTournamentTask &tournament =
                 state.claim_tournament[task_id];
-            const bool publishes_metadata =
-                ((state.build_dispatch.metadata_writer_bits[
-                      task_id / 64U
-                  ] >> (task_id % 64U)) & uint64_t{1}) != 0;
-            // PA host plan 在这个生产组合中只标记 UP；
-            // 通用 device 热路只消费 immutable bit，不解码 kind。
-            exact &= publishes_metadata ==
-                (task.kind == TaskKind::Up);
-            exact &= tournament.root.owner.value == -1;
+            exact &= tournament.root.owner.value ==
+                static_cast<int64_t>(task_id);
+            const uint32_t groups =
+                ExpectedClaimGroups(task.kind);
             for (uint32_t group = 0;
                  group < kSharedClaimTournamentMaxGroups;
                  ++group) {
                 exact &= tournament.local[group].owner.value ==
-                    -1;
+                    (group < groups
+                         ? static_cast<int64_t>(task_id)
+                         : -1);
             }
             exact &=
                 tournament.root.insert_completion.value ==
-                (publishes_metadata
-                     ? static_cast<int64_t>(task_id)
-                     : SharedInsertCompletionInitialValue(task_id));
+                static_cast<int64_t>(task_id);
             exact &= state.tasks[task_id].deps_prepared ==
                 SharedInsertCompletionInitialValue(task_id);
             exact &=
                 OrderedSubmitTestOps::
                     completion_atomic_writes_by_task[task_id]
-                        .load(std::memory_order_relaxed) ==
-                    (publishes_metadata ? 1U : 0U);
+                        .load(std::memory_order_relaxed) == 1;
             exact &=
                 OrderedSubmitTestOps::
                     completion_publish_by_task[task_id]
-                        .load(std::memory_order_relaxed) ==
-                    (publishes_metadata ? 1U : 0U);
+                        .load(std::memory_order_relaxed) == 1;
             const uint32_t completion_loads =
                 OrderedSubmitTestOps::
                     completion_loads_by_cell[task_id]
                         .load(std::memory_order_relaxed);
-            exact &=
-                (publishes_metadata &&
-                 task_id + 1U < task_count)
-                    ? completion_loads != 0
-                    : completion_loads == 0;
+            exact &= task_id + 1U < task_count
+                ? completion_loads != 0
+                : completion_loads == 0;
+            exact &= OrderedSubmitTestOps::
+                    insert_hooks_by_task[task_id].load(
+                        std::memory_order_relaxed
+                    ) == 1;
+            exact &= OrderedSubmitTestOps::
+                    build_hooks_by_task[task_id].load(
+                        std::memory_order_relaxed
+                    ) == 1;
         }
         planned_tasks += plan.task_count;
     }
@@ -1082,6 +1046,14 @@ bool DispatchAndInsertEvidenceMatches(
             OrderedSubmitTestOps::
                 completion_loads_by_cell[task].load(
                     std::memory_order_relaxed
+                ) == 0 &&
+            OrderedSubmitTestOps::
+                insert_hooks_by_task[task].load(
+                    std::memory_order_relaxed
+                ) == 0 &&
+            OrderedSubmitTestOps::
+                build_hooks_by_task[task].load(
+                    std::memory_order_relaxed
                 ) == 0;
     }
     uint64_t submits = 0;
@@ -1090,23 +1062,36 @@ bool DispatchAndInsertEvidenceMatches(
     uint64_t task_id_sum = 0;
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         const WorkerResult &result = state.results[worker];
-        exact &= result.claim_attempts == result.submits + 1U;
-        exact &= result.claim_wins == result.submits;
+        exact &= result.submits == task_count;
+        exact &= result.claim_attempts == task_count;
         exact &= state.workers[worker].local_index ==
-            static_cast<int32_t>(result.submits);
+            static_cast<int32_t>(task_count);
+        exact &= result.compete_first_split_finish_calls ==
+            result.claim_wins;
+        exact &= result.compete_first_split_task_id_sum ==
+            static_cast<uint64_t>(task_count) *
+                (task_count - 1U) / 2U;
+        exact &= result.compete_first_split_protocol_errors == 0;
         submits += result.submits;
         attempts += result.claim_attempts;
         wins += result.claim_wins;
         task_id_sum += result.compete_first_split_task_id_sum;
     }
-    exact &= submits == task_count;
+    exact &= submits ==
+        static_cast<uint64_t>(kWorkers) * task_count;
     exact &= wins == task_count;
     exact &= attempts ==
-        static_cast<uint64_t>(task_count) + kWorkers;
+        static_cast<uint64_t>(kWorkers) * task_count;
     exact &= task_id_sum ==
-        static_cast<uint64_t>(task_count) * (task_count - 1U) / 2U;
-    exact &= state.build_dispatch.next_task.value ==
-        static_cast<int64_t>(task_count + kWorkers);
+        static_cast<uint64_t>(kWorkers) * task_count *
+            (task_count - 1U) / 2U;
+    uint64_t expected_seal = 0;
+    exact &= ExpectedReplaySeal(
+        state, task_count, expected_seal
+    );
+    exact &= static_cast<uint64_t>(
+        state.build_dispatch.next_task.value
+    ) == expected_seal;
     return exact &&
            OrderedSubmitTestOps::bad_completion_publish.load(
                std::memory_order_relaxed
@@ -1667,7 +1652,7 @@ bool RunPaUpWriterShapeContractTest() {
     return ok;
 }
 
-bool RunInsertReleaseBeforeBuildTest() {
+bool RunMultiGroupReplayClosureTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
         return false;
@@ -1683,8 +1668,6 @@ bool RunInsertReleaseBeforeBuildTest() {
     const LegacyTurnSnapshot legacy =
         SeedLegacyTurns(*state);
     OrderedSubmitTestOps::ResetHooks();
-    OrderedSubmitTestOps::hook_mode =
-        OrderedSubmitHookMode::BuildOverlap;
     OrderedSubmitTestOps::observed_state = state;
 
     std::vector<std::thread> workers;
@@ -1708,10 +1691,10 @@ bool RunInsertReleaseBeforeBuildTest() {
         const WorkerResult &result = state->results[worker_id];
         worker_results_ok &=
             result.worker_id == worker_id &&
-            result.claim_wins == result.submits &&
-            result.claim_attempts == result.submits + 1U &&
+            result.submits == kTaskCount &&
+            result.claim_attempts == kTaskCount &&
             state->workers[worker_id].local_index ==
-                static_cast<int32_t>(result.submits) &&
+                static_cast<int32_t>(kTaskCount) &&
             result.finish_cycle != 0 &&
             result.final_occupied == 0 &&
             result.completion_duplicates == 0;
@@ -1725,16 +1708,10 @@ bool RunInsertReleaseBeforeBuildTest() {
     bool claim_cells_match = true;
     for (uint32_t task = 0; task < kTaskCount; ++task) {
         all_tasks_ready &= state->tasks[task].flag == 1;
-        const bool publishes_metadata =
-            ((state->build_dispatch.metadata_writer_bits[
-                  task / 64U
-              ] >> (task % 64U)) & uint64_t{1}) != 0;
         claim_cells_match &=
             state->claim_tournament[task]
                     .root.insert_completion.value ==
-            (publishes_metadata
-                 ? static_cast<int64_t>(task)
-                 : SharedInsertCompletionInitialValue(task));
+            static_cast<int64_t>(task);
         claim_cells_match &= state->tasks[task].deps_prepared ==
             SharedInsertCompletionInitialValue(task);
     }
@@ -1749,32 +1726,29 @@ bool RunInsertReleaseBeforeBuildTest() {
         state->shared_map.shared_outputs[0]
             .last_writer[2].value == 0;
 
-    const bool overlap =
-        OrderedSubmitTestOps::task8_built_before_task4_completion.load(
-            std::memory_order_acquire
-        );
     const cross_core::DecodedExecFatal exec_fatal =
         cross_core::DecodeExecFatal(state->exec_fatal.state);
+    uint32_t cross_owner_tasks = 0;
+    const bool claim_insert_ok =
+        ClaimAndInsertEvidenceMatches(*state, kTaskCount);
+    const bool runtime_exec_ok =
+        RuntimeExecEvidenceMatches(
+            *state, kTaskCount, cross_owner_tasks
+        );
+    const bool closure_ok =
+        state->replay_done.value ==
+            static_cast<int64_t>(kWorkers) &&
+        pa_scheduler::host::FinalBarrierStateIsZero(
+            state->final_barrier
+        );
     const bool ok =
         state->fatal.value == 0 &&
         LegacyTurnsMatch(*state, legacy) &&
-        DispatchAndInsertEvidenceMatches(
-            *state, kTaskCount
-        ) &&
-        PortableBuildEvidenceMatches(
-            *state, kTaskCount
-        ) &&
-        OrderedSubmitTestOps::task4_insert_hook_calls.load(
-            std::memory_order_relaxed
-        ) == 1 &&
-        OrderedSubmitTestOps::task8_build_hook_calls.load(
-            std::memory_order_relaxed
-        ) == 1 &&
-        !OrderedSubmitTestOps::hook_timed_out.load(
-            std::memory_order_relaxed
-        ) &&
-        overlap && worker_results_ok &&
-        completed_submits == kTaskCount && all_tasks_ready &&
+        claim_insert_ok && runtime_exec_ok &&
+        worker_results_ok &&
+        completed_submits ==
+            static_cast<uint64_t>(kWorkers) * kTaskCount &&
+        all_tasks_ready &&
         claim_cells_match && final_group_writer_ok &&
         OrderedSubmitTestOps::bound_dispatch_calls.load(
             std::memory_order_relaxed
@@ -1784,21 +1758,22 @@ bool RunInsertReleaseBeforeBuildTest() {
         ) == 0 &&
         kernel_counts[0] == 4 && kernel_counts[1] == 4 &&
         kernel_counts[2] == 4 && kernel_counts[3] == 4 &&
-        state->replay_done.value == 0 &&
-        pa_scheduler::host::FinalBarrierStateIsZero(
-            state->final_barrier
-        );
+        closure_ok;
     std::printf(
-        "[ORDERED_SUBMIT] release_before_build=%s "
-        "completed=%u legacy_turn0=%lld overlap=%u "
-        "fatal=%d exec_fatal=%lld/%u/%u/%u "
+        "[ORDERED_SUBMIT] multigroup_replay_closure=%s "
+        "completed=%u legacy_turn0=%lld cross_owner=%u "
+        "evidence=%u/%u closure=%u fatal=%d "
+        "exec_fatal=%lld/%u/%u/%u "
         "kernels=%llu,%llu,%llu,%llu\n",
         ok ? "PASS" : "FAIL",
         kTaskCount,
         static_cast<long long>(
             state->shared_map.committed_tasks.value
         ),
-        overlap ? 1U : 0U,
+        cross_owner_tasks,
+        claim_insert_ok ? 1U : 0U,
+        runtime_exec_ok ? 1U : 0U,
+        closure_ok ? 1U : 0U,
         state->fatal.value,
         static_cast<long long>(state->exec_fatal.state),
         static_cast<uint32_t>(exec_fatal.reason),
@@ -1813,7 +1788,7 @@ bool RunInsertReleaseBeforeBuildTest() {
     return ok;
 }
 
-bool RunIndependentKernelExecutionTest() {
+bool RunCrossBatchDependencyAndExecutionTest() {
     SchedulerState *state = MapSchedulerState();
     if (state == nullptr) {
         return false;
@@ -1829,8 +1804,6 @@ bool RunIndependentKernelExecutionTest() {
     const LegacyTurnSnapshot legacy =
         SeedLegacyTurns(*state);
     OrderedSubmitTestOps::ResetHooks();
-    OrderedSubmitTestOps::hook_mode =
-        OrderedSubmitHookMode::ExecutionOverlap;
     OrderedSubmitTestOps::observed_state = state;
 
     std::vector<std::thread> workers;
@@ -1852,18 +1825,27 @@ bool RunIndependentKernelExecutionTest() {
     uint64_t kernel_counts[4] = {};
     bool worker_results_ok = true;
     uint64_t completed_submits = 0;
+    uint64_t materialized_outputs = 0;
+    uint64_t dependency_signature = 0;
+    uint64_t symbol_input_loads = 0;
+    uint64_t symbol_inout_commits = 0;
     for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
         const WorkerResult &result = state->results[worker_id];
         worker_results_ok &=
             result.worker_id == worker_id &&
-            result.claim_wins == result.submits &&
-            result.claim_attempts == result.submits + 1U &&
+            result.submits == kTaskCount &&
+            result.claim_attempts == kTaskCount &&
             state->workers[worker_id].local_index ==
-                static_cast<int32_t>(result.submits) &&
+                static_cast<int32_t>(kTaskCount) &&
             result.finish_cycle != 0 &&
             result.final_occupied == 0 &&
             result.completion_duplicates == 0;
         completed_submits += result.submits;
+        materialized_outputs += result.materialized_outputs;
+        dependency_signature ^= result.dependency_signature;
+        symbol_input_loads += result.shared_symbol_input_loads;
+        symbol_inout_commits +=
+            result.shared_symbol_inout_commits;
         for (uint32_t kind = 0; kind < 4; ++kind) {
             kernel_counts[kind] += result.kernel_counts[kind];
         }
@@ -1872,29 +1854,57 @@ bool RunIndependentKernelExecutionTest() {
     for (uint32_t task = 0; task < kTaskCount; ++task) {
         all_tasks_ready &= state->tasks[task].flag == 1;
     }
-    const bool execution_overlap =
-        OrderedSubmitTestOps::task6_executed_before_task4_build.load(
-            std::memory_order_acquire
-        );
     const cross_core::DecodedExecFatal exec_fatal =
         cross_core::DecodeExecFatal(state->exec_fatal.state);
+    const uint64_t expected_dependency_signature =
+        DependencyEdgeSignature(2, 1) ^
+        DependencyEdgeSignature(3, 2) ^
+        DependencyEdgeSignature(4, 2) ^
+        DependencyEdgeSignature(4, 3) ^
+        DependencyEdgeSignature(4, 0) ^
+        DependencyEdgeSignature(7, 6) ^
+        DependencyEdgeSignature(8, 7) ^
+        DependencyEdgeSignature(9, 7) ^
+        DependencyEdgeSignature(9, 8) ^
+        DependencyEdgeSignature(9, 5);
+    const bool inout_writer_chain_ok =
+        state->shared_map.shared_outputs[0]
+                .last_writer[0].value == 4 &&
+        state->shared_map.shared_outputs[0]
+                .last_writer[1].value == 0 &&
+        state->shared_map.shared_outputs[0]
+                .last_writer[2].value == 0 &&
+        state->shared_map.shared_outputs[5]
+                .last_writer[0].value == 9 &&
+        state->shared_map.shared_outputs[5]
+                .last_writer[1].value == 5 &&
+        state->shared_map.shared_outputs[5]
+                .last_writer[2].value == 5;
+    uint32_t cross_owner_tasks = 0;
+    const bool claim_insert_ok =
+        ClaimAndInsertEvidenceMatches(*state, kTaskCount);
+    const bool runtime_exec_ok =
+        RuntimeExecEvidenceMatches(
+            *state, kTaskCount, cross_owner_tasks
+        );
+    const bool dependency_ok =
+        materialized_outputs == 16 &&
+        dependency_signature == expected_dependency_signature &&
+        symbol_input_loads == 10 &&
+        symbol_inout_commits == 6 && inout_writer_chain_ok;
+    const bool closure_ok =
+        state->replay_done.value ==
+            static_cast<int64_t>(kWorkers) &&
+        pa_scheduler::host::FinalBarrierStateIsZero(
+            state->final_barrier
+        );
     const bool ok =
         state->fatal.value == 0 &&
         LegacyTurnsMatch(*state, legacy) &&
-        DispatchAndInsertEvidenceMatches(
-            *state, kTaskCount
-        ) &&
-        PortableBuildEvidenceMatches(
-            *state, kTaskCount
-        ) &&
-        OrderedSubmitTestOps::independent_insert_hook_calls.load(
-            std::memory_order_relaxed
-        ) == 1 &&
-        !OrderedSubmitTestOps::hook_timed_out.load(
-            std::memory_order_relaxed
-        ) &&
-        execution_overlap && worker_results_ok &&
-        completed_submits == kTaskCount &&
+        claim_insert_ok && runtime_exec_ok &&
+        worker_results_ok &&
+        completed_submits ==
+            static_cast<uint64_t>(kWorkers) * kTaskCount &&
         all_tasks_ready &&
         OrderedSubmitTestOps::bound_dispatch_calls.load(
             std::memory_order_relaxed
@@ -1904,15 +1914,13 @@ bool RunIndependentKernelExecutionTest() {
         ) == 0 &&
         kernel_counts[0] == 2 && kernel_counts[1] == 2 &&
         kernel_counts[2] == 2 && kernel_counts[3] == 2 &&
-        state->replay_done.value == 0 &&
-        pa_scheduler::host::FinalBarrierStateIsZero(
-            state->final_barrier
-        );
+        dependency_ok && closure_ok;
     std::printf(
-        "[ORDERED_SUBMIT] independent_kernel_overlap=%s "
+        "[ORDERED_SUBMIT] cross_batch_dependency_execution=%s "
         "completed=%u legacy_turn0=%lld "
-        "fatal=%d overlap=%u hooks=%u hook_timeout=%u "
-        "workers=%u ready=%u submits=%llu dispatch=%u/%u "
+        "fatal=%d cross_owner=%u evidence=%u/%u dependency=%u "
+        "closure=%u workers=%u ready=%u "
+        "submits=%llu dispatch=%u/%u "
         "exec_fatal=%lld/%u/%u/%u "
         "kernels=%llu,%llu,%llu,%llu\n",
         ok ? "PASS" : "FAIL",
@@ -1921,13 +1929,11 @@ bool RunIndependentKernelExecutionTest() {
             state->shared_map.committed_tasks.value
         ),
         state->fatal.value,
-        execution_overlap ? 1U : 0U,
-        OrderedSubmitTestOps::independent_insert_hook_calls.load(
-            std::memory_order_relaxed
-        ),
-        OrderedSubmitTestOps::hook_timed_out.load(
-            std::memory_order_relaxed
-        ) ? 1U : 0U,
+        cross_owner_tasks,
+        claim_insert_ok ? 1U : 0U,
+        runtime_exec_ok ? 1U : 0U,
+        dependency_ok ? 1U : 0U,
+        closure_ok ? 1U : 0U,
         worker_results_ok ? 1U : 0U,
         all_tasks_ready ? 1U : 0U,
         static_cast<unsigned long long>(completed_submits),
@@ -1950,93 +1956,17 @@ bool RunIndependentKernelExecutionTest() {
     return ok;
 }
 
-bool RunRemoteFatalCadenceClosureTest() {
-    SchedulerState *state = MapSchedulerState();
-    if (state == nullptr) {
-        return false;
-    }
-    pa_scheduler::host::Options options;
-    options.batches = 64;
-    options.runs = 1;
-    options.trace_enabled = false;
-    options.shared_context_lens = {8192};
-    options.final_barrier_shape = FinalBarrierShape::TwoLevel16;
-    pa_scheduler::host::InitializeState(state, options);
-    pa_scheduler::host::ConfigureTrace(state, options, nullptr);
-    OrderedSubmitTestOps::ResetHooks();
-    OrderedSubmitTestOps::hook_mode =
-        OrderedSubmitHookMode::RemoteFatalAfterBuild;
-    OrderedSubmitTestOps::observed_state = state;
-
-    std::vector<std::thread> workers;
-    workers.reserve(kWorkers);
-    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
-        const CoreRole role =
-            worker_id < kAicWorkers ? CoreRole::Aic : CoreRole::Aiv;
-        workers.emplace_back([state, worker_id, role]() {
-            RunScheduler<OrderedSubmitTestOps>(
-                state, worker_id, role
-            );
-        });
-    }
-    for (std::thread &worker : workers) {
-        worker.join();
-    }
-
-    bool all_workers_returned = true;
-    uint64_t total_attempts = 0;
-    for (uint32_t worker_id = 0; worker_id < kWorkers; ++worker_id) {
-        const WorkerResult &result = state->results[worker_id];
-        all_workers_returned &=
-            result.worker_id == worker_id && result.finish_cycle != 0;
-        total_attempts += result.claim_attempts;
-    }
-    constexpr uint32_t kTaskCount = 64U * kTasksPerBatch;
-    const cross_core::DecodedExecFatal exec_fatal =
-        cross_core::DecodeExecFatal(state->exec_fatal.state);
-    const bool ok =
-        OrderedSubmitTestOps::remote_fatal_injections.load(
-            std::memory_order_relaxed
-        ) == 1U &&
-        state->fatal.value == 1 &&
-        exec_fatal.reason == cross_core::ExecFatalReason::None &&
-        all_workers_returned &&
-        total_attempts <=
-            static_cast<uint64_t>(kTaskCount + kWorkers) &&
-        state->build_dispatch.next_task.value <=
-            static_cast<int64_t>(kTaskCount + kWorkers);
-    std::printf(
-        "[ORDERED_SUBMIT] remote_fatal_cadence_closure=%s "
-        "injections=%u attempts=%llu cursor=%lld\n",
-        ok ? "PASS" : "FAIL",
-        OrderedSubmitTestOps::remote_fatal_injections.load(
-            std::memory_order_relaxed
-        ),
-        static_cast<unsigned long long>(total_attempts),
-        static_cast<long long>(state->build_dispatch.next_task.value)
-    );
-    OrderedSubmitTestOps::observed_state = nullptr;
-    (void)munmap(state, sizeof(SchedulerState));
-    return ok;
-}
-
 }  // namespace
 
 int main() {
     const bool claim_accounting_ok =
         RunLocalClaimAttemptAccountingTest();
-    const bool build_ticket_budget_ok =
-        RunB256BuildTicketBudgetContractTest();
-    const bool build_fatal_poll_cadence_ok =
-        RunSharedBuildFatalPollCadenceTest();
-    const bool invalid_metadata_summary_ok =
-        RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
-            InvalidImmutablePlanSummary::MetadataWriter
-        );
-    const bool invalid_exec_summary_ok =
-        RunInvalidImmutablePlanSummaryRejectedBeforeBuildTest(
-            InvalidImmutablePlanSummary::ExecuteRoleCount
-        );
+    const bool full_replay_budget_ok =
+        RunB256FullReplayBudgetContractTest();
+    const bool replay_topology_ok =
+        RunReplayTopologyContractTest();
+    const bool owner_independence_ok =
+        RunBuildExecuteOwnerIndependenceTest();
     const bool task_id_prefix_ok =
         RunSplitReplayTaskIdPrefixTest();
     const bool loser_ok = RunLoserZeroTensorMapAccessTest();
@@ -2048,29 +1978,25 @@ int main() {
         RunOpportunisticEfDrainBackoffTest();
     const bool pa_up_shape_ok =
         RunPaUpWriterShapeContractTest();
-    const bool overlap_ok = RunInsertReleaseBeforeBuildTest();
-    const bool execution_ok =
-        RunIndependentKernelExecutionTest();
-    const bool remote_fatal_ok =
-        RunRemoteFatalCadenceClosureTest();
-    if (!claim_accounting_ok || !build_ticket_budget_ok ||
-        !build_fatal_poll_cadence_ok ||
-        !invalid_metadata_summary_ok ||
-        !invalid_exec_summary_ok ||
+    const bool multigroup_ok =
+        RunMultiGroupReplayClosureTest();
+    const bool cross_batch_ok =
+        RunCrossBatchDependencyAndExecutionTest();
+    if (!claim_accounting_ok || !full_replay_budget_ok ||
+        !replay_topology_ok || !owner_independence_ok ||
         !task_id_prefix_ok || !loser_ok ||
         !output_prepare_ok ||
         !fanin_compaction_ok || !efdrain_skip_ok ||
-        !pa_up_shape_ok ||
-        !overlap_ok || !execution_ok || !remote_fatal_ok) {
+        !pa_up_shape_ok || !multigroup_ok || !cross_batch_ok) {
         std::fprintf(
             stderr, "[FAIL] shared ordered-insert Submit tests\n"
         );
         return 1;
     }
     std::printf(
-        "[PASS] central Build tickets assign every logical task once; "
-        "strict TensorMap insertion and independent role-ticket execution close; "
-        "all 96 Scalar workers remain eligible builders\n"
+        "[PASS] all 96 Scalar workers replay every Submit; per-task "
+        "Tournament elects one Build owner; every task advances strict "
+        "TensorMap completion; replay_done then closes independent Execute\n"
     );
     return 0;
 }

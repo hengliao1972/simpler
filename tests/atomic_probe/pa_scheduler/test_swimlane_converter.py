@@ -470,8 +470,9 @@ def _v5_shared_register_atomic_capture(
                 ]
             )
         if task_id in (0, 4):
-            # central-ticket 只有真实 writer 才用不消费返回值的 FetchAdd
-            # 推进稀疏 writer completion；空 writer task 不参与该链。
+            # 旧 central-ticket fixture 仍只为真实 writer 构造完成记录，
+            # 但 site20 的稳定原语已统一成消费返回值的 CAS。
+            handoff_flags = 0x14 | (0x40 if dependency_applied else 0)
             capture_rows.append(
                 [
                     0,
@@ -482,7 +483,7 @@ def _v5_shared_register_atomic_capture(
                     "Atomic",
                     base + 34,
                     base + 40,
-                    0x02,
+                    handoff_flags,
                     20,
                 ]
             )
@@ -1919,8 +1920,8 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             for event in events
             if event.get("name")
             == (
-                "atomic.source_issue.shared_insert_completion_publish."
-                "fetch_add#0"
+                "atomic.return_ready.shared_insert_completion_publish."
+                "compare_exchange#0"
             )
         )
         register = next(
@@ -2606,7 +2607,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             ),
             "handoff_without_task": (
                 20,
-                [0, 0, 0, -1, -1, "Atomic", 134, 140, 0x02, 20],
+                [0, 0, 0, -1, -1, "Atomic", 134, 140, 0x54, 20],
             ),
         }
         for label, (site_id, replacement) in cases.items():
@@ -2639,10 +2640,10 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             ("missing_poll", "SharedInsertTurnPoll PollBatch"),
             ("duplicate_poll", "SharedInsertTurnPoll PollBatch"),
             ("poll_boundary", "SharedInsertTurnPoll PollBatch"),
-            ("missing_handoff", "SharedInsertTurnHandoff direct FetchAdd"),
-            ("duplicate_handoff", "SharedInsertTurnHandoff direct FetchAdd"),
+            ("missing_handoff", "SharedInsertTurnHandoff direct CompareExchange"),
+            ("duplicate_handoff", "SharedInsertTurnHandoff direct CompareExchange"),
             ("handoff_boundary", "identity or boundary"),
-            ("handoff_task", "SharedInsertTurnHandoff direct FetchAdd"),
+            ("handoff_task", "SharedInsertTurnHandoff direct CompareExchange"),
         )
         for label, expected in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
@@ -2706,7 +2707,7 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
             names,
         )
         self.assertIn(
-            "atomic.source_issue.shared_insert_completion_publish.fetch_add#0",
+            "atomic.source_issue.shared_insert_completion_publish.compare_exchange#0",
             names,
         )
 

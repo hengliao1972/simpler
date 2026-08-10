@@ -2205,7 +2205,7 @@ void TestOrderedPublishRejectsFullBucketAtomically(
     );
 }
 
-void TestCorruptCompletionIsRejectedByNextOwner(
+void TestCorruptCompletionIsRejectedByPublisher(
     SchedulerState &state
 ) {
     ResetProtocolState(state);
@@ -2244,33 +2244,25 @@ void TestCorruptCompletionIsRejectedByNextOwner(
         "completion failure test prepares a mixed writer delta"
     );
 
-    // 非返回型完成发布不在当前 owner 上等待旧值；人为破坏当前字后，
-    // FetchAdd 会保留异常终值，下一 owner 必须据此 fail-closed。
+    // 人为破坏当前 completion 后，发布者的返回型 CAS
+    // 必须原地 fail-closed；不再把错误延迟到下一 owner。
     InsertCompletion(state, 1) = 77;
     const uint32_t bucket = TensorMapHash(ordinary.buffer_addr);
     Check(
-        PublishSharedTaskWriterDelta<WriterIntentTestOps>(
+        !PublishSharedTaskWriterDelta<WriterIntentTestOps>(
             &state, context, delta, stats
         ),
-        "single-writer completion publication issues without consuming old value"
+        "single-writer completion CAS rejects an unexpected old value"
     );
-    LocalStats next_stats{};
-    int64_t ready_observed = INT64_MIN;
-    uint64_t load_count = 0;
-    const bool next_ready =
-        WaitForSharedTaskInsertTurn<WriterIntentTestOps>(
-            &state, 2, next_stats, ready_observed,
-            load_count
-        );
     Check(
-        !next_ready && state.fatal.value == 1 &&
-            InsertCompletion(state, 1) == 78 &&
+        state.fatal.value == 1 &&
+            InsertCompletion(state, 1) == 77 &&
             state.shared_map.buckets[bucket].tail.value == 1 &&
             symbol.last_writer[0].value == 1 &&
             state.shared_map.writer_history[1].count == 1 &&
-            stats.result.map_inserts == 1 &&
-            stats.result.shared_symbol_inout_commits == 1,
-        "next owner rejects corrupt completion while preserving terminal metadata evidence"
+            stats.result.map_inserts == 0 &&
+            stats.result.shared_symbol_inout_commits == 0,
+        "publisher rejects corrupt completion while preserving terminal metadata evidence"
     );
 }
 
@@ -2397,7 +2389,7 @@ int main() {
     TestManualWriterNeedsNoGate(*state);
     const bool fatal_clean = state->fatal.value == 0;
     Check(fatal_clean, "all positive paths leave fatal clear");
-    TestCorruptCompletionIsRejectedByNextOwner(*state);
+    TestCorruptCompletionIsRejectedByPublisher(*state);
     TestOrderedPublishRejectsFullBucketAtomically(*state);
     TestOutOfOrderSymbolWriterFailsClosed(*state);
     TestMultiSymbolConflictKeepsTerminalPrefix(*state);
