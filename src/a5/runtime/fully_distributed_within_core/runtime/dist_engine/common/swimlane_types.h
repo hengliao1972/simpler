@@ -594,6 +594,36 @@ static_assert(offsetof(FdwicSwimlaneCoreState, dcci_calls) == 32, "DCCI counters
 static_assert(offsetof(FdwicSwimlaneCoreState, dcci_records) == 40, "DCCI counter layout changed");
 #endif
 
+// simt-builder-clock 复用 header 的前 64 个 core cacheline，但把每一行
+// 解释成一个 (builder_rank, warp) 的独占聚合记录。六个时间段均由 leader
+// 在寄存器中累计；退出时只发布这一个 cacheline，不产生逐 task 记录。
+constexpr uint32_t kFdwicSimtBuilderClockMagic = 0x5342434CU;  // "SBCL"
+constexpr uint32_t kFdwicSimtBuilderClockPublished = 1U;
+constexpr uint32_t kFdwicSimtBuilderClockWarpsPerBuilder = 4U;
+
+struct FdwicSimtBuilderClockLeaderData {
+    uint64_t request_acquire_cycles;
+    uint64_t resolve_reference_cycles;
+    uint64_t materialize_cycles;
+    uint64_t publish_metadata_cycles;
+    uint64_t lookup_fanin_cycles;
+    uint64_t publish_exec_cycles;
+    uint32_t magic;
+    uint16_t builder_rank;
+    uint16_t warp;
+    uint32_t task_count;
+    uint32_t status;
+} __attribute__((aligned(64)));
+
+static_assert(
+    sizeof(FdwicSimtBuilderClockLeaderData) == sizeof(FdwicSwimlaneCoreState),
+    "SIMT Builder clock record must reuse exactly one core-state cacheline"
+);
+static_assert(
+    offsetof(FdwicSimtBuilderClockLeaderData, magic) == 48,
+    "SIMT Builder clock identity must occupy the seventh 64-bit word"
+);
+
 struct FdwicSwimlaneHeader {
     uint32_t magic;
     uint32_t version;

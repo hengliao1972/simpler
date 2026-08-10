@@ -92,6 +92,13 @@ DIST_API_ATTR PTO_DEVICE_FUNC uint32_t dist_perf_clock_kernel_profile_marker() {
 #endif
 #endif
 
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+// 仅用于证明最终 AICore ELF 确实携带独立 Builder 分段观察器。
+DIST_API_ATTR PTO_DEVICE_FUNC uint32_t dist_simt_builder_clock_profile_marker() {
+    return kFdwicSimtBuilderClockMagic;
+}
+#endif
+
 #if PTO_FDWIC_SUBMIT_PMU
 DIST_API_ATTR PTO_DEVICE_FUNC void dist_submit_pmu_expect_submits(uint32_t expected_submits) {
     fdwic_submit_pmu_expect_submits(expected_submits);

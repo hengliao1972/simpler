@@ -19,6 +19,7 @@ namespace {
 
 constexpr uint32_t kDistSimtBuilderThreads = 128;
 constexpr uint32_t kDistSimtBuilderWarps = kDistSimtBuilderThreads / 32U;
+static_assert(kDistSimtBuilderWarps == kFdwicSimtBuilderClockWarpsPerBuilder);
 constexpr int64_t kDistSimtBuilderReset = 0;
 // Use the bounded-wait scale proven by standalone G0. The outer A5 AICPU has a
 // three-second execution threshold, so 30G cycles would let that timeout hide
@@ -70,6 +71,18 @@ struct DistSimtRequestView {
     uint32_t references_ready;
 };
 
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+struct DistSimtBuilderClockLocal {
+    uint64_t request_acquire_cycles;
+    uint64_t resolve_reference_cycles;
+    uint64_t materialize_cycles;
+    uint64_t publish_metadata_cycles;
+    uint64_t lookup_fanin_cycles;
+    uint64_t publish_exec_cycles;
+    uint32_t task_count;
+};
+#endif
+
 DIST_SIMT_CALLEE uint64_t dist_simt_atomic_load(__gm__ uint64_t *address) {
     return asc_atomic_add(address, static_cast<uint64_t>(0U));
 }
@@ -77,6 +90,31 @@ DIST_SIMT_CALLEE uint64_t dist_simt_atomic_load(__gm__ uint64_t *address) {
 DIST_SIMT_CALLEE uint64_t dist_simt_atomic_cas(__gm__ uint64_t *address, uint64_t expected, uint64_t desired) {
     return asc_atomic_cas(address, expected, desired);
 }
+
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+DIST_SIMT_CALLEE bool dist_simt_publish_builder_clock(
+    __gm__ FdwicSimtBuilderClockLeaderData *record, const DistSimtBuilderClockLocal &profile, uint32_t builder_rank,
+    uint32_t warp
+) {
+    if (record == nullptr || builder_rank > UINT16_MAX || warp > UINT16_MAX) return false;
+    __gm__ uint64_t *words = reinterpret_cast<__gm__ uint64_t *>(record);
+    const uint64_t identity = static_cast<uint64_t>(kFdwicSimtBuilderClockMagic) |
+                              (static_cast<uint64_t>(builder_rank) << 32U) |
+                              (static_cast<uint64_t>(warp) << 48U);
+    const uint64_t closure = static_cast<uint64_t>(profile.task_count) |
+                             (static_cast<uint64_t>(kFdwicSimtBuilderClockPublished) << 32U);
+    // 每个 leader 独占一条 64B atomic-only 记录。八次 CAS 只在该 leader
+    // 完成全部 task 后执行，因此不会进入任一业务阶段的累计时间，也不会
+    // 与其他 leader 争用同一地址。
+    return dist_simt_atomic_cas(words + 0, 0, profile.request_acquire_cycles) == 0 &&
+           dist_simt_atomic_cas(words + 1, 0, profile.resolve_reference_cycles) == 0 &&
+           dist_simt_atomic_cas(words + 2, 0, profile.materialize_cycles) == 0 &&
+           dist_simt_atomic_cas(words + 3, 0, profile.publish_metadata_cycles) == 0 &&
+           dist_simt_atomic_cas(words + 4, 0, profile.lookup_fanin_cycles) == 0 &&
+           dist_simt_atomic_cas(words + 5, 0, profile.publish_exec_cycles) == 0 &&
+           dist_simt_atomic_cas(words + 6, 0, identity) == 0 && dist_simt_atomic_cas(words + 7, 0, closure) == 0;
+}
+#endif
 
 DIST_SIMT_CALLEE void dist_simt_store(__gm__ uint64_t *address, uint64_t value) { *address = value; }
 
@@ -663,11 +701,30 @@ DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
 DIST_SIMT_CALLEE bool dist_simt_prepare_dag_and_fanin(
     __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata, const DistSimtRequestView &request, uint32_t history,
     int32_t fanin[], uint32_t *fanin_count, __gm__ uint64_t *fatal
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    , DistSimtBuilderClockLocal *profile
+#endif
 ) {
-    if (!dist_simt_publish_dag_metadata(metadata, request)) return false;
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    const uint64_t metadata_begin = clock();
+#endif
+    const bool metadata_published = dist_simt_publish_dag_metadata(metadata, request);
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    profile->publish_metadata_cycles += clock() - metadata_begin;
+#endif
+    if (!metadata_published) return false;
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    const uint64_t lookup_begin = clock();
+#endif
     *fanin_count = 0;
     int32_t lookup_producers[fdwic::cross_core::kExecMaxTensors] = {};
-    if (!dist_simt_lookup_dag_fanins(metadata, request, history, fatal, lookup_producers)) return false;
+    const bool lookup_succeeded = dist_simt_lookup_dag_fanins(metadata, request, history, fatal, lookup_producers);
+    if (!lookup_succeeded) {
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+        profile->lookup_fanin_cycles += clock() - lookup_begin;
+#endif
+        return false;
+    }
     for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
         const uint32_t tag = dist_simt_request_tag(request, tensor);
         if (tag == static_cast<uint32_t>(TensorArgType::OUTPUT)) continue;
@@ -699,6 +756,9 @@ DIST_SIMT_CALLEE bool dist_simt_prepare_dag_and_fanin(
             return false;
         }
     }
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    profile->lookup_fanin_cycles += clock() - lookup_begin;
+#endif
     return true;
 }
 
@@ -841,6 +901,9 @@ DIST_SIMT_CALLEE bool dist_simt_build_request(
     __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells,
     __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata, __gm__ uint8_t *heap_base, uint64_t heap_size,
     uint32_t history, DistSimtRequestView request, uint32_t build_owner
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    , DistSimtBuilderClockLocal *profile
+#endif
 ) {
     __gm__ uint64_t *fatal =
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->runtime.fatal.state));
@@ -851,13 +914,25 @@ DIST_SIMT_CALLEE bool dist_simt_build_request(
     __gm__ uint64_t *heap_cursor =
         reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&state->runtime.heap_cursor.state));
     __gm__ fdwic::cross_core::CrossCoreOutputCell<Tensor> *outputs = &state->runtime.outputs[request.task_id];
-    if (!dist_simt_resolve_request_references(state->runtime.outputs, &request, fatal)) return false;
-    if (!dist_simt_materialize_outputs(
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    const uint64_t resolve_begin = clock();
+#endif
+    const bool references_resolved = dist_simt_resolve_request_references(state->runtime.outputs, &request, fatal);
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    profile->resolve_reference_cycles += clock() - resolve_begin;
+#endif
+    if (!references_resolved) return false;
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    const uint64_t materialize_begin = clock();
+#endif
+    const bool materialized = dist_simt_materialize_outputs(
             outputs, heap_cursor, heap_base, heap_size, request, build_owner, output_bytes, &output_count, &heap_begin,
             &heap_end
-        )) {
-        return false;
-    }
+        );
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    profile->materialize_cycles += clock() - materialize_begin;
+#endif
+    if (!materialized) return false;
     (void)heap_begin;
 
     int32_t fanin[fdwic::cross_core::kExecMaxFanin] = {};
@@ -870,17 +945,34 @@ DIST_SIMT_CALLEE bool dist_simt_build_request(
         return false;
     }
 #else
-    if (!dist_simt_prepare_dag_and_fanin(metadata, request, history, fanin, &fanin_count, fatal)) return false;
+    if (!dist_simt_prepare_dag_and_fanin(
+            metadata, request, history, fanin, &fanin_count, fatal
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+            , profile
 #endif
-    return dist_simt_publish_exec(
+        )) {
+        return false;
+    }
+#endif
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    const uint64_t publish_exec_begin = clock();
+#endif
+    const bool exec_published = dist_simt_publish_exec(
         &state->runtime.tasks[request.task_id], task_cells, outputs, request, fanin, fanin_count, output_count,
         heap_end, build_owner
     );
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    profile->publish_exec_cycles += clock() - publish_exec_begin;
+#endif
+    return exec_published;
 }
 
 static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSimtCrossCoreBuild(
     __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
     uint64_t heap_size, uint32_t history, uint32_t builder_rank, uint32_t builder_count, uint32_t builder_owner
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    , uint64_t profile_base_address
+#endif
 ) {
     const uint32_t thread = static_cast<uint32_t>(threadIdx.x);
     const uint32_t warp = thread / 32U;
@@ -910,6 +1002,12 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
         kFdwicCrossCoreTaskCapacity * sizeof(fdwic::cross_core::SimtBuildRequestCell)
     );
 #endif
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    __gm__ auto *profile_header = reinterpret_cast<__gm__ FdwicSwimlaneHeader *>(profile_base_address);
+    __gm__ auto *profile_records = reinterpret_cast<__gm__ FdwicSimtBuilderClockLeaderData *>(
+        &profile_header->cores[0]
+    );
+#endif
     const bool topology_valid = builder_count != 0 && builder_rank < builder_count;
     if (thread == 0) {
         // Match the standalone multi-builder rendezvous: each VF contributes
@@ -917,13 +1015,20 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
         // AIV0 has launched. This prevents a fast low-rank VF from running far
         // ahead of a delayed builder that owns an interleaved task stream.
         const uint64_t observed = asc_atomic_add(started, static_cast<uint64_t>(1U));
-        if (!topology_valid || observed >= builder_count) {
+        if (!topology_valid || observed >= builder_count
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+            || profile_base_address == 0 || builder_count * kDistSimtBuilderWarps > 108U
+#endif
+        ) {
             dist_simt_publish_fatal(fatal, UINT32_MAX, builder_owner);
         } else {
             asc_threadfence();
         }
     }
     if (active) {
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+        DistSimtBuilderClockLocal profile{};
+#endif
         const uint64_t start_begin = clock();
         while (topology_valid && dist_simt_atomic_load(started) < builder_count &&
                clock() - start_begin <= kDistSimtBuilderPollBudget && !dist_simt_fatal_observed(fatal)) {}
@@ -971,6 +1076,9 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
                 if (count != UINT64_MAX && task_id >= count) break;
                 if (dist_simt_fatal_observed(fatal)) break;
             }
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+            profile.request_acquire_cycles += clock() - wait_begin;
+#endif
             if (!acquired) {
                 const uint64_t count = dist_simt_atomic_load(sealed);
                 if (!dist_simt_fatal_observed(fatal) && count != UINT64_MAX && task_id >= count) break;
@@ -979,12 +1087,24 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
             }
             if (!dist_simt_build_request(
                     state, task_cells, metadata, heap_base, heap_size, history, request, builder_owner
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+                    , &profile
+#endif
                 )) {
                 dist_simt_publish_fatal(fatal, task_id, builder_owner);
                 break;
             }
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+            ++profile.task_count;
+#endif
             task_id += total_leaders;
         }
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+        const uint32_t profile_index = builder_rank * kDistSimtBuilderWarps + warp;
+        if (!dist_simt_publish_builder_clock(&profile_records[profile_index], profile, builder_rank, warp)) {
+            dist_simt_publish_fatal(fatal, UINT32_MAX, builder_owner);
+        }
+#endif
         const uint64_t prior_finished = asc_atomic_add(finished, static_cast<uint64_t>(1U));
         if (prior_finished >= total_leaders) dist_simt_publish_fatal(fatal, UINT32_MAX, builder_owner);
     }
@@ -1000,10 +1120,18 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(kDistSimtBuilderThreads) void DistSim
 extern "C" PTO_DEVICE_FUNC void fdwic_simt_cross_core_run_builder(
     __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
     uint64_t heap_size, uint32_t history, uint32_t builder_rank, uint32_t builder_count, uint32_t builder_owner
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    , uint64_t profile_base_address
+#endif
 );
 #endif
 
-PTO_DEVICE_FUNC bool dist_simt_cross_core_launch_builder(__gm__ DistCore *self) {
+PTO_DEVICE_FUNC bool dist_simt_cross_core_launch_builder(
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    __gm__ Runtime *runtime,
+#endif
+    __gm__ DistCore *self
+) {
 #if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
 #if PTO_FDWIC_SCHEDULER_MODE == 3
     __gm__ DistSimtCrossCoreBuilderState &state = g_dist.simt_cross_core_ordinary;
@@ -1031,6 +1159,9 @@ PTO_DEVICE_FUNC bool dist_simt_cross_core_launch_builder(__gm__ DistCore *self) 
     fdwic_simt_cross_core_run_builder(
         &state, &g_dist.tasks[0], heap_base_address, static_cast<uint64_t>(g_dist.heap_size),
         static_cast<uint32_t>(g_dist.H), builder_rank, builder_count, builder_owner
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+        , runtime == nullptr ? 0U : runtime->dist.swimlane_base
+#endif
     );
 #else
     (void)self;

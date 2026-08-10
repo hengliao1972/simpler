@@ -154,6 +154,15 @@ def test_fdwic_profile_partitions_compile_cache(monkeypatch):
     assert _fdwic_profile() == "perf-clock-kernel"
     assert _profiled_cache_key(base) == (*base, "private", "same_core", "perf-clock-kernel")
 
+    monkeypatch.setenv("PTO_FDWIC_TENSORMAP_MODE", "shared")
+    monkeypatch.setenv("PTO_FDWIC_SCHEDULER_MODE", "simt_cross_core_dag")
+    monkeypatch.setenv("PTO_FDWIC_PROFILE", "simt-builder-clock")
+    assert _fdwic_profile() == "simt-builder-clock"
+    assert _profiled_cache_key(base) == (*base, "shared", "simt_cross_core_dag", "simt-builder-clock")
+
+    monkeypatch.setenv("PTO_FDWIC_TENSORMAP_MODE", "private")
+    monkeypatch.setenv("PTO_FDWIC_SCHEDULER_MODE", "same_core")
+
     monkeypatch.setenv("PTO_FDWIC_PROFILE", "submit-pmu-none")
     assert _fdwic_profile() == "submit-pmu-none"
     assert _profiled_cache_key(base) == (*base, "private", "same_core", "submit-pmu-none")
@@ -266,6 +275,10 @@ def test_fdwic_evidence_profiles_have_isolated_compile_definitions():
     assert _fdwic_compile_definitions("perf-clock-kernel") == [
         "PTO_FDWIC_PERF_CLOCK=1",
         "PTO_FDWIC_PERF_CLOCK_KERNEL=1",
+        "PTO_FDWIC_TRACE_ENABLED=0",
+    ]
+    assert _fdwic_compile_definitions("simt-builder-clock") == [
+        "PTO_FDWIC_SIMT_BUILDER_CLOCK=1",
         "PTO_FDWIC_TRACE_ENABLED=0",
     ]
     assert _fdwic_compile_definitions("submit-pmu-none") == [
@@ -658,6 +671,29 @@ def test_perf_clock_kernel_elf_gate_rejects_plain_perf_clock_image(monkeypatch, 
         _assert_fdwic_perf_clock_elf(tmp_path / "aicore_kernel.o", "perf-clock-kernel")
 
 
+def test_simt_builder_clock_elf_gate_requires_isolated_marker(monkeypatch, tmp_path):
+    symbol_table = "37412: 0000000000001ba0 8 FUNC WEAK DEFAULT 1 dist_simt_builder_clock_profile_marker\n"
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    _assert_fdwic_perf_clock_elf(tmp_path / "aicore_kernel.o", "simt-builder-clock")
+
+
+def test_simt_builder_clock_elf_gate_rejects_plain_perf_clock_image(monkeypatch, tmp_path):
+    symbol_table = "37410: 0000000000001b54 68 FUNC WEAK DEFAULT 1 _Z30dist_perf_clock_expect_submitsj\n"
+    monkeypatch.setattr(
+        _scene_test_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=symbol_table, stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match="missing defined perf-clock marker"):
+        _assert_fdwic_perf_clock_elf(tmp_path / "aicore_kernel.o", "simt-builder-clock")
+
+
 def _write_perf_clock_artifact(tmp_path: Path, profile: str) -> Path:
     is_kernel = profile == "perf-clock-kernel"
     output_name = "fdwic_perf_clock_kernel_summary.json" if is_kernel else "fdwic_perf_clock_summary.json"
@@ -738,6 +774,55 @@ def _write_perf_clock_artifact(tmp_path: Path, profile: str) -> Path:
             "aiv": {"min_ticks": 100, "max_ticks": 100},
         }
     artifact = tmp_path / output_name
+    artifact.write_text(json.dumps(payload))
+    return artifact
+
+
+def _write_simt_builder_clock_artifact(tmp_path: Path) -> Path:
+    builder_cores = fdwic_simt_builder_count("simt_cross_core_dag", 32)
+    warps_per_builder = 4
+    leader_count = builder_cores * warps_per_builder
+    stage_fields = {
+        "request_acquire": "request_acquire_cycles",
+        "resolve_reference": "resolve_reference_cycles",
+        "materialize": "materialize_cycles",
+        "publish_metadata": "publish_metadata_cycles",
+        "lookup_fanin": "lookup_fanin_cycles",
+        "publish_exec": "publish_exec_cycles",
+    }
+    stage_totals = dict.fromkeys(stage_fields, 0)
+    leaders = []
+    for leader_id in range(leader_count):
+        rank, warp = divmod(leader_id, warps_per_builder)
+        leader = {
+            "leader_id": leader_id,
+            "builder_rank": rank,
+            "warp": warp,
+            "task_count": 20,
+        }
+        for stage_index, (stage, field) in enumerate(stage_fields.items(), start=1):
+            cycles = (leader_id + 1) * stage_index
+            leader[field] = cycles
+            stage_totals[stage] += cycles
+        leaders.append(leader)
+    measured_total = sum(stage_totals.values())
+    payload = {
+        "schema": "fdwic-simt-builder-clock-v1",
+        "mode": "simt-builder-clock",
+        "scheduler_mode": "simt_cross_core_dag",
+        "scheduler_mode_id": FDWIC_SCHEDULER_MODE_IDS["simt_cross_core_dag"],
+        "boundary": "persistent_builder_leader_local_stage_aggregate",
+        "counter_domain": "aiv_scalar_clock_cycles",
+        "calibrated_cycles_per_ns": 1.649731,
+        "builder_cores": builder_cores,
+        "warps_per_builder": warps_per_builder,
+        "leader_count": leader_count,
+        "task_count": sum(leader["task_count"] for leader in leaders),
+        "measured_core_cycles_sum": measured_total,
+        "stages": {stage: {"cycles_sum": total} for stage, total in stage_totals.items()},
+        "leaders": leaders,
+    }
+    artifact = tmp_path / "fdwic_simt_builder_clock_summary.json"
     artifact.write_text(json.dumps(payload))
     return artifact
 
@@ -851,6 +936,24 @@ def test_perf_clock_case_artifact_contract_accepts_exact_closure(tmp_path, profi
     artifact = _write_perf_clock_artifact(tmp_path, profile)
 
     assert _validate_case_fdwic_perf_clock("Case", tmp_path, profile) == artifact
+
+
+def test_simt_builder_clock_artifact_accepts_exact_leader_and_cycle_closure(monkeypatch, tmp_path):
+    monkeypatch.setenv("PTO_FDWIC_SCHEDULER_MODE", "simt_cross_core_dag")
+    artifact = _write_simt_builder_clock_artifact(tmp_path)
+
+    assert _validate_case_fdwic_perf_clock("Case", tmp_path, "simt-builder-clock") == artifact
+
+
+def test_simt_builder_clock_artifact_rejects_broken_stage_closure(monkeypatch, tmp_path):
+    monkeypatch.setenv("PTO_FDWIC_SCHEDULER_MODE", "simt_cross_core_dag")
+    artifact = _write_simt_builder_clock_artifact(tmp_path)
+    payload = json.loads(artifact.read_text())
+    payload["leaders"][0]["lookup_fanin_cycles"] += 1
+    artifact.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="lookup_fanin cycle closure failed"):
+        _validate_case_fdwic_perf_clock("Case", tmp_path, "simt-builder-clock")
 
 
 @pytest.mark.parametrize(
@@ -1447,6 +1550,30 @@ def test_perf_clock_kernel_profile_publishes_environment(monkeypatch):
     _configure_fdwic_profile(_FakePytestConfig(**{"--fdwic-profile": "perf-clock-kernel"}))
 
     assert _fdwic_profile() == "perf-clock-kernel"
+
+
+def test_simt_builder_clock_profile_requires_and_publishes_dag_scheduler(monkeypatch):
+    monkeypatch.delenv("PTO_FDWIC_PROFILE", raising=False)
+
+    _configure_fdwic_profile(
+        _FakePytestConfig(
+            **{
+                "--fdwic-profile": "simt-builder-clock",
+                "--fdwic-scheduler-mode": "simt_cross_core_dag",
+            }
+        )
+    )
+    assert _fdwic_profile() == "simt-builder-clock"
+
+    with pytest.raises(pytest.UsageError, match="requires --fdwic-scheduler-mode simt_cross_core_dag"):
+        _configure_fdwic_profile(
+            _FakePytestConfig(
+                **{
+                    "--fdwic-profile": "simt-builder-clock",
+                    "--fdwic-scheduler-mode": "cross_core_dag",
+                }
+            )
+        )
 
 
 def test_shared_tensormap_mode_publishes_environment(monkeypatch):

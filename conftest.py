@@ -176,6 +176,7 @@ def pytest_addoption(parser):
             "none",
             "perf-clock",
             "perf-clock-kernel",
+            "simt-builder-clock",
             "submit-pmu-none",
             "submit-pmu-arg-build",
             "submit-pmu-empty-bracket",
@@ -194,6 +195,7 @@ def pytest_addoption(parser):
         help="Select a private fully_distributed_within_core evidence build. "
         "perf-clock keeps only the first/last Submit device clock per core; "
         "perf-clock-kernel additionally aggregates linked-kernel time/calls inside that per-core window; "
+        "simt-builder-clock aggregates six Builder stages once per persistent warp leader; "
         "submit-pmu-none keeps one full Submit-sequence scalar/I-cache PMU window per core; "
         "submit-pmu-arg-build attributes the Claim-to-Materialize eager-build interval; "
         "submit-pmu-empty-bracket calibrates the adjacent begin/end observer cost at Claim.end; "
@@ -503,6 +505,7 @@ def _configure_fdwic_profile(config):
     if fdwic_profile not in {
         "perf-clock",
         "perf-clock-kernel",
+        "simt-builder-clock",
         "submit-pmu-none",
         "submit-pmu-arg-build",
         "submit-pmu-empty-bracket",
@@ -528,6 +531,12 @@ def _configure_fdwic_profile(config):
         raise pytest.UsageError(f"--fdwic-profile {fdwic_profile} only supports runtime fully_distributed_within_core")
     if level not in {None, 2}:
         raise pytest.UsageError(f"--fdwic-profile {fdwic_profile} only supports SceneTest level 2")
+    if (
+        fdwic_profile == "simt-builder-clock"
+        and config.getoption("--fdwic-scheduler-mode", default=FDWIC_SCHEDULER_MODE_SAME_CORE)
+        != "simt_cross_core_dag"
+    ):
+        raise pytest.UsageError("--fdwic-profile simt-builder-clock requires --fdwic-scheduler-mode simt_cross_core_dag")
     if config.getoption("--rounds", default=1) != 1:
         raise pytest.UsageError(
             f"--fdwic-profile {fdwic_profile} requires --rounds 1 because its per-case artifact is single-run"

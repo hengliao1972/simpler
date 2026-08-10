@@ -1457,3 +1457,93 @@ cache-line 对齐。这样多个 writer 的 clean-out 不会命中相邻 writer 
 2. 修改共享 execution/output/TensorMap/request 协议时，四种模式全部重跑；
 3. PA B256 仍只承担该算子的数值与性能回归，不能替代上述通用门槛；
 4. 本阶段只运行真实 A5，不运行 A5Sim。
+
+## 28. SIMT DAG Builder 的低扰动聚合观测
+
+### 28.1 为什么不能继续靠端到端时间猜 Builder
+
+第 23 章已经把 mode4 从约 8 ms 降到约 3.2 ms，但端到端口径无法区分
+request 等待、输出引用解析、Materialize、metadata 发布、fanin 查询和
+execution payload 发布。逐 task 泳道又会额外写大量 GM 记录，尤其会改变
+SIMT leader 的寄存器、I-cache 和 D-cache 行为，不能拿诊断 ELF 的绝对时间
+直接评价候选。
+
+新增隔离构建 `--fdwic-profile simt-builder-clock`，合同如下：
+
+1. 只允许 `shared + simt_cross_core_dag + A5`，与普通泳道、atomic 泳道、
+   perf-clock 和 Submit-PMU 互斥；
+2. 16 个 AIV0 Builder 上的 4 个 persistent warp leader 各自只在本地累计，
+   共 64 份记录；
+3. 每个 leader 完成全部任务后，才把六个 64 位累计值、身份和 task 数发布到
+   自己独占的一条 64 B atomic-only cache line；不写逐 task 记录，也不存在
+   leader 间同地址竞争；
+4. host 和 Python 同时校验 64 个 `(builder_rank, warp)`、task 总数、六阶段
+   求和和 final ELF marker，任何缺行、重复身份、零时段或聚合不闭合都失败；
+5. `clock()` 是 AIV Scalar cycle，不是 1 GHz SYS_CNT。JSON 明确写出
+   `counter_domain=aiv_scalar_clock_cycles`，按本机受控校准
+   `1.649731 cycles/ns` 仅换算等效时间。
+
+六个互斥父阶段为：
+
+- `request_acquire`：取得并解码 immutable build request；
+- `resolve_reference`：等待并解析跨 task fresh-output 引用；
+- `materialize`：分配输出并发布 descriptor；
+- `publish_metadata`：发布本 task 的 DAG writer metadata；
+- `lookup_fanin`：查询 metadata、合并 descriptor owner 与显式依赖；
+- `publish_exec`：发布 immutable execution payload 和 Built 状态。
+
+这些值是 **64 个 leader 的 core-cycle 累加**，不是墙钟时间；只适合在同一诊断
+ELF 中看阶段构成，不能与 `perf-clock` 的端到端时间相减。
+
+### 28.2 真实 A5 首轮结果
+
+PA Case1 B256 完整通过数值 golden，64/64 leader 和 1280/1280 task 闭合。
+一次代表性结果为：
+
+| Builder 阶段 | cycles 总和 | cycles/task | 六阶段占比 |
+| ------------ | ----------: | ----------: | ---------: |
+| request acquire | 9,344,489 | 7,300 | 3.00% |
+| resolve reference | 75,078,249 | 58,655 | 24.09% |
+| materialize | 20,711,348 | 16,181 | 6.65% |
+| publish metadata | 7,063,639 | 5,518 | 2.27% |
+| lookup fanin | 183,857,495 | 143,639 | 58.99% |
+| publish exec | 15,625,729 | 12,208 | 5.01% |
+
+`lookup_fanin + resolve_reference` 合计约 **83.98%**，后续 mode4 优化应先审计
+这两段里的返回型 control 读取次数和不可变数据重复解析。相同源码的普通
+`perf-clock` 单次为 **3.289 ms**，与本轮前五次中位数 **3.243 ms** 同量级；
+诊断宏在普通构建中被编译期去除。
+
+### 28.3 已撤回的两类候选
+
+1. **提前发布 DAG metadata**：把 metadata 发布移到 Materialize 前的配对
+   五次测试，候选中位数 3.419 ms，原顺序中位数 3.243 ms，回退约 5.42%。
+   它虽缩短后继 metadata 等待，却把 GM/DCCI 竞争提前并扰乱现有流水，代码
+   已完整撤回。
+2. **一次记录全部 control 子指标**：曾把 leader 本地累计从六个 64 位阶段
+   扩展到父段、两个 control 子段和三类 load 次数。该诊断 ELF 连续两次在
+   发布首条记录前触发 AICPU/AICore 超时；恢复六个 64 位累计后立即完成全部
+   1280 task。现有证据只能说明局部状态膨胀与超时确定相关，不能武断归因为
+   某一个寄存器或 spill 机制。该实现已撤回；后续细分必须采用互斥窄变体，
+   不能把所有计数同时压进一个 VF。
+
+### 28.4 已否决：用 builtin 替换 reference-mask 手写计数
+
+`dist_simt_request_tensor_word_offset()` 会在多个 Builder 阶段反复统计当前
+Tensor 之前的 output-reference 位数。仓库 A5 AICore 路径已有
+`__builtin_popcount` 的正式用法，因此验证了用 builtin 替换逐位循环的等价
+候选。
+
+候选的单次 `simt-builder-clock` 六阶段合计由 311,680,949 降到
+307,245,781 cycles，约下降 1.42%，而且六个阶段均同向下降。但普通
+`perf-clock` 的同窗口独立进程结果为：
+
+```text
+builtin：3.364 / 3.423 / 3.232 / 3.330 / 3.218 ms，median = 3.330 ms
+原循环：3.377 / 3.308 / 3.332 / 3.286 / 3.247 ms，median = 3.308 ms
+```
+
+候选中位数反而回退约 0.65%，两组范围高度重叠。这里说明两个口径不能互相
+替代：Builder leader 的累计 Scalar cycle 下降，不代表 startup 到 FinalDrain
+墙钟一定下降；它还可能改变 Builder/Execute 到达和共享资源竞争。该候选没有
+达到端到端保留条件，代码已恢复为原循环，只保留本记录。

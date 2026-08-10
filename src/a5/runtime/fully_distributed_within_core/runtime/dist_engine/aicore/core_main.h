@@ -76,7 +76,14 @@ DIST_API_ATTR PTO_DEVICE_FUNC void DIST_CORE_MAIN_ENTRY(__gm__ Runtime *runtime,
     // and AIV1 Scalars to publish requests and execute tasks. A builder Scalar
     // never replays while its resident VF is active.
     const bool simt_builder_worker = dist_simt_cross_core_is_builder_worker(self);
-    if (!fdwic_trace_is_fatal()) (void)dist_simt_cross_core_launch_builder(self);
+    if (!fdwic_trace_is_fatal()) {
+        (void)dist_simt_cross_core_launch_builder(
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+            runtime,
+#endif
+            self
+        );
+    }
     // Request slots are reset before the run and each task is published once.
     // The publisher therefore has no requirement to start the consumer first.
     // Non-builder Scalars replay Submit immediately; a request may precede its

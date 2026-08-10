@@ -33,6 +33,9 @@ namespace {
 
 constexpr uint32_t kFdwicSwimlaneMaxLevel = kFdwicAtomicSwimlaneLevel;
 constexpr int32_t kFdwicSwimlanePhaseCount = static_cast<int32_t>(FdwicSwimlanePhase::Count);
+// A5 本机受控 cold/warm 同窗校准值。Builder VF 只运行在 AIV Scalar，
+// 其 clock() 返回 Scalar cycle，不是 1 GHz SYS_CNT tick。
+constexpr double kFdwicAivScalarCyclesPerNs = 1.649731;
 
 struct TraceSummary {
     uint64_t records = 0;
@@ -1334,7 +1337,10 @@ std::string output_path(const Runtime *runtime) {
 std::string perf_clock_output_path_from_prefix(const std::string &prefix) {
     const char *mode = std::getenv("PTO_FDWIC_PROFILE");
     const bool kernel = mode != nullptr && std::strcmp(mode, "perf-clock-kernel") == 0;
-    const char *name = kernel ? "fdwic_perf_clock_kernel_summary.json" : "fdwic_perf_clock_summary.json";
+    const bool simt_builder = mode != nullptr && std::strcmp(mode, "simt-builder-clock") == 0;
+    const char *name = simt_builder ? "fdwic_simt_builder_clock_summary.json" :
+                       kernel       ? "fdwic_perf_clock_kernel_summary.json" :
+                                      "fdwic_perf_clock_summary.json";
     if (!prefix.empty() && prefix.back() == '/') return prefix + name;
     return prefix + "/" + name;
 }
@@ -1344,9 +1350,15 @@ bool perf_clock_kernel_requested() {
     return mode != nullptr && std::strcmp(mode, "perf-clock-kernel") == 0;
 }
 
+bool simt_builder_clock_requested() {
+    const char *mode = std::getenv("PTO_FDWIC_PROFILE");
+    return mode != nullptr && std::strcmp(mode, "simt-builder-clock") == 0;
+}
+
 bool perf_clock_requested() {
     const char *mode = std::getenv("PTO_FDWIC_PROFILE");
-    return mode != nullptr && (std::strcmp(mode, "perf-clock") == 0 || std::strcmp(mode, "perf-clock-kernel") == 0);
+    return mode != nullptr && (std::strcmp(mode, "perf-clock") == 0 || std::strcmp(mode, "perf-clock-kernel") == 0 ||
+                               std::strcmp(mode, "simt-builder-clock") == 0);
 }
 
 struct PerfClockGroupAggregate {
@@ -1400,6 +1412,143 @@ bool remove_output_if_present(const std::string &path) {
     if (std::remove(path.c_str()) == 0 || errno == ENOENT) return true;
     LOG_ERROR("cannot remove stale fdwic swimlane output %s: %s", path.c_str(), std::strerror(errno));
     return false;
+}
+
+int export_simt_builder_clock(Runtime *runtime, const FdwicSwimlaneHeader *header) {
+    constexpr uint32_t kExpectedAic = 32U;
+    constexpr uint32_t kStageCount = 6U;
+    const auto scheduler_mode = static_cast<FdwicSchedulerMode>(runtime->fdwic_build_identity.scheduler_mode);
+    const uint32_t builder_count = expected_simt_builder_workers(scheduler_mode, kExpectedAic);
+    const uint32_t leader_count = builder_count * kFdwicSimtBuilderClockWarpsPerBuilder;
+    const bool header_valid = scheduler_mode == FdwicSchedulerMode::SimtCrossCoreDag &&
+                              header->magic == kFdwicSwimlaneMagic && header->version == kFdwicSwimlaneVersion &&
+                              header->num_cores == leader_count && header->records_per_core == 0 &&
+                              header->freq_hz == PLATFORM_PROF_SYS_CNT_FREQ && runtime->worker_count == 96 &&
+                              runtime->fdwic_swimlane_bytes_ == sizeof(FdwicSwimlaneHeader) &&
+                              runtime->fdwic_swimlane_num_cores_ == leader_count &&
+                              runtime->dist.swimlane_level == 0 && runtime->dist.swimlane_records_per_core == 0 &&
+                              runtime->dist.swimlane_base == runtime->fdwic_swimlane_dev_base_ && leader_count != 0 &&
+                              leader_count <= 108U;
+    if (!header_valid) {
+        LOG_ERROR(
+            "fdwic simt-builder-clock header/topology closure failed: scheduler=%u leaders=%u/%u records=%u "
+            "freq=%llu bytes=%llu",
+            runtime->fdwic_build_identity.scheduler_mode, header->num_cores, leader_count, header->records_per_core,
+            static_cast<unsigned long long>(header->freq_hz),
+            static_cast<unsigned long long>(runtime->fdwic_swimlane_bytes_)
+        );
+        return -1;
+    }
+
+    const auto *leaders = reinterpret_cast<const FdwicSimtBuilderClockLeaderData *>(&header->cores[0]);
+    uint64_t stage_totals[kStageCount] = {};
+    uint64_t task_total = 0;
+    for (uint32_t index = 0; index < leader_count; ++index) {
+        const FdwicSimtBuilderClockLeaderData &leader = leaders[index];
+        const uint32_t expected_rank = index / kFdwicSimtBuilderClockWarpsPerBuilder;
+        const uint32_t expected_warp = index % kFdwicSimtBuilderClockWarpsPerBuilder;
+        const bool identity_valid = leader.magic == kFdwicSimtBuilderClockMagic &&
+                                    leader.status == kFdwicSimtBuilderClockPublished &&
+                                    leader.builder_rank == expected_rank && leader.warp == expected_warp;
+        const bool task_time_valid =
+            leader.task_count == 0 ||
+            (leader.request_acquire_cycles != 0 && leader.resolve_reference_cycles != 0 &&
+             leader.materialize_cycles != 0 && leader.publish_metadata_cycles != 0 &&
+             leader.lookup_fanin_cycles != 0 && leader.publish_exec_cycles != 0);
+        if (!identity_valid || !task_time_valid) {
+            LOG_ERROR(
+                "fdwic simt-builder-clock leader %u failed closure: magic=0x%08x rank=%u/%u warp=%u/%u "
+                "tasks=%u status=%u",
+                index, leader.magic, static_cast<uint32_t>(leader.builder_rank), expected_rank,
+                static_cast<uint32_t>(leader.warp), expected_warp, leader.task_count, leader.status
+            );
+            return -1;
+        }
+        stage_totals[0] += leader.request_acquire_cycles;
+        stage_totals[1] += leader.resolve_reference_cycles;
+        stage_totals[2] += leader.materialize_cycles;
+        stage_totals[3] += leader.publish_metadata_cycles;
+        stage_totals[4] += leader.lookup_fanin_cycles;
+        stage_totals[5] += leader.publish_exec_cycles;
+        task_total += leader.task_count;
+    }
+    if (task_total == 0) {
+        LOG_ERROR("fdwic simt-builder-clock observed zero built tasks");
+        return -1;
+    }
+    uint64_t measured_total = 0;
+    for (uint32_t stage = 0; stage < kStageCount; ++stage) measured_total += stage_totals[stage];
+    if (measured_total == 0) {
+        LOG_ERROR("fdwic simt-builder-clock observed zero measured cycles");
+        return -1;
+    }
+
+    static constexpr const char *kStageNames[kStageCount] = {
+        "request_acquire", "resolve_reference", "materialize", "publish_metadata", "lookup_fanin", "publish_exec",
+    };
+    const std::string path = perf_clock_output_path_from_prefix(runtime->fdwic_swimlane_output_prefix_);
+    const std::string temporary_path = path + ".tmp";
+    if (!remove_output_if_present(temporary_path)) return -1;
+    std::ofstream out(temporary_path, std::ios::out | std::ios::trunc);
+    if (!out.is_open()) {
+        LOG_ERROR("cannot open fdwic simt-builder-clock output %s: %s", temporary_path.c_str(), std::strerror(errno));
+        return -1;
+    }
+    out << "{\n";
+    out << "  \"schema\": \"fdwic-simt-builder-clock-v1\",\n";
+    out << "  \"mode\": \"simt-builder-clock\",\n";
+    out << "  \"scheduler_mode\": \"simt_cross_core_dag\",\n";
+    out << "  \"scheduler_mode_id\": " << runtime->fdwic_build_identity.scheduler_mode << ",\n";
+    out << "  \"boundary\": \"persistent_builder_leader_local_stage_aggregate\",\n";
+    out << "  \"counter_domain\": \"aiv_scalar_clock_cycles\",\n";
+    // 保留完整校准精度；ostream 默认六位有效数字会把 1.649731 截成 1.64973。
+    out << "  \"calibrated_cycles_per_ns\": 1.649731,\n";
+    out << "  \"builder_cores\": " << builder_count << ",\n";
+    out << "  \"warps_per_builder\": " << kFdwicSimtBuilderClockWarpsPerBuilder << ",\n";
+    out << "  \"leader_count\": " << leader_count << ",\n";
+    out << "  \"task_count\": " << task_total << ",\n";
+    out << "  \"measured_core_cycles_sum\": " << measured_total << ",\n";
+    out << "  \"measured_core_time_us_sum\": "
+        << static_cast<double>(measured_total) / kFdwicAivScalarCyclesPerNs / 1000.0 << ",\n";
+    out << "  \"stages\": {\n";
+    for (uint32_t stage = 0; stage < kStageCount; ++stage) {
+        out << "    \"" << kStageNames[stage] << "\": {\"cycles_sum\": " << stage_totals[stage]
+            << ", \"cycles_per_task\": " << static_cast<double>(stage_totals[stage]) / task_total
+            << ", \"time_us_sum\": "
+            << static_cast<double>(stage_totals[stage]) / kFdwicAivScalarCyclesPerNs / 1000.0
+            << ", \"measured_share\": " << static_cast<double>(stage_totals[stage]) / measured_total << "}"
+            << (stage + 1U == kStageCount ? "\n" : ",\n");
+    }
+    out << "  },\n";
+    out << "  \"leaders\": [\n";
+    for (uint32_t index = 0; index < leader_count; ++index) {
+        const FdwicSimtBuilderClockLeaderData &leader = leaders[index];
+        out << "    {\"leader_id\": " << index << ", \"builder_rank\": " << leader.builder_rank
+            << ", \"warp\": " << leader.warp << ", \"task_count\": " << leader.task_count
+            << ", \"request_acquire_cycles\": " << leader.request_acquire_cycles
+            << ", \"resolve_reference_cycles\": " << leader.resolve_reference_cycles
+            << ", \"materialize_cycles\": " << leader.materialize_cycles
+            << ", \"publish_metadata_cycles\": " << leader.publish_metadata_cycles
+            << ", \"lookup_fanin_cycles\": " << leader.lookup_fanin_cycles
+            << ", \"publish_exec_cycles\": " << leader.publish_exec_cycles << "}"
+            << (index + 1U == leader_count ? "\n" : ",\n");
+    }
+    out << "  ]\n}\n";
+    out.close();
+    if (!out) {
+        LOG_ERROR("failed while writing fdwic simt-builder-clock output %s", temporary_path.c_str());
+        return -1;
+    }
+    if (std::rename(temporary_path.c_str(), path.c_str()) != 0) {
+        LOG_ERROR("cannot finalize fdwic simt-builder-clock output %s: %s", path.c_str(), std::strerror(errno));
+        return -1;
+    }
+    LOG_INFO_V0(
+        "fdwic simt-builder-clock written to %s: builders=%u leaders=%u tasks=%llu measured_cycles=%llu",
+        path.c_str(), builder_count, leader_count, static_cast<unsigned long long>(task_total),
+        static_cast<unsigned long long>(measured_total)
+    );
+    return 0;
 }
 
 bool should_print_trace_export() {
@@ -1852,6 +2001,7 @@ extern "C" void fdwic_swimlane_host_finalize(Runtime *runtime) {
 extern "C" int fdwic_perf_clock_host_init(Runtime *runtime, int num_cores, const char *output_prefix) {
     if (!perf_clock_requested()) return 0;
     if (runtime == nullptr) return -1;
+    const bool simt_builder_profile = simt_builder_clock_requested();
     const bool storage_empty = runtime->fdwic_swimlane_host_shadow_ == nullptr &&
                                runtime->fdwic_swimlane_dev_allocation_ == 0 && runtime->fdwic_swimlane_dev_base_ == 0 &&
                                runtime->fdwic_swimlane_bytes_ == 0 && runtime->fdwic_swimlane_num_cores_ == 0 &&
@@ -1872,6 +2022,14 @@ extern "C" int fdwic_perf_clock_host_init(Runtime *runtime, int num_cores, const
         LOG_ERROR(
             "fdwic perf-clock requires 96 workers (32 AIC + 64 AIV): num_cores=%d worker_count=%d", num_cores,
             runtime->worker_count
+        );
+        return -1;
+    }
+    if (simt_builder_profile &&
+        runtime->fdwic_build_identity.scheduler_mode != static_cast<uint32_t>(FdwicSchedulerMode::SimtCrossCoreDag)) {
+        LOG_ERROR(
+            "fdwic simt-builder-clock requires simt_cross_core_dag runtime: scheduler_mode=%u",
+            runtime->fdwic_build_identity.scheduler_mode
         );
         return -1;
     }
@@ -1897,7 +2055,10 @@ extern "C" int fdwic_perf_clock_host_init(Runtime *runtime, int num_cores, const
     auto *header = reinterpret_cast<FdwicSwimlaneHeader *>(host_shadow);
     header->magic = kFdwicSwimlaneMagic;
     header->version = kFdwicSwimlaneVersion;
-    header->num_cores = kExpectedCores;
+    const uint32_t simt_builder_clock_leaders =
+        expected_simt_builder_workers(FdwicSchedulerMode::SimtCrossCoreDag, kExpectedAic) *
+        kFdwicSimtBuilderClockWarpsPerBuilder;
+    header->num_cores = simt_builder_profile ? simt_builder_clock_leaders : kExpectedCores;
     header->records_per_core = 0;
     header->freq_hz = PLATFORM_PROF_SYS_CNT_FREQ;
 
@@ -1920,7 +2081,7 @@ extern "C" int fdwic_perf_clock_host_init(Runtime *runtime, int num_cores, const
     runtime->fdwic_swimlane_dev_allocation_ = reinterpret_cast<uint64_t>(dev_allocation);
     runtime->fdwic_swimlane_dev_base_ = dev_base;
     runtime->fdwic_swimlane_bytes_ = bytes;
-    runtime->fdwic_swimlane_num_cores_ = kExpectedCores;
+    runtime->fdwic_swimlane_num_cores_ = header->num_cores;
     runtime->fdwic_swimlane_records_per_core_ = 0;
     std::memcpy(runtime->fdwic_swimlane_output_prefix_, prefix.c_str(), prefix.size() + 1);
     // Reuse the handoff address for the fixed header only. Keeping
@@ -1945,6 +2106,7 @@ extern "C" int fdwic_perf_clock_host_export(Runtime *runtime) {
     }
 
     const auto *header = reinterpret_cast<const FdwicSwimlaneHeader *>(runtime->fdwic_swimlane_host_shadow_);
+    if (simt_builder_clock_requested()) return export_simt_builder_clock(runtime, header);
     constexpr uint32_t kExpectedAic = 32;
     constexpr uint32_t kExpectedAiv = 64;
     constexpr uint32_t kExpectedCores = kExpectedAic + kExpectedAiv;

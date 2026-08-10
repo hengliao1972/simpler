@@ -65,6 +65,7 @@ _FDWIC_PROFILE_ENV = "PTO_FDWIC_PROFILE"
 _FDWIC_PROFILE_NONE = "none"
 _FDWIC_PROFILE_PERF_CLOCK = "perf-clock"
 _FDWIC_PROFILE_PERF_CLOCK_KERNEL = "perf-clock-kernel"
+_FDWIC_PROFILE_SIMT_BUILDER_CLOCK = "simt-builder-clock"
 _FDWIC_PROFILE_SUBMIT_PMU_NONE = "submit-pmu-none"
 _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD = "submit-pmu-arg-build"
 _FDWIC_PROFILE_SUBMIT_PMU_EMPTY_BRACKET = "submit-pmu-empty-bracket"
@@ -83,6 +84,10 @@ _FDWIC_PERF_CLOCK_ARTIFACTS = {
     _FDWIC_PROFILE_PERF_CLOCK_KERNEL: (
         "fdwic_perf_clock_kernel_summary.json",
         "fdwic-perf-clock-kernel-v1",
+    ),
+    _FDWIC_PROFILE_SIMT_BUILDER_CLOCK: (
+        "fdwic_simt_builder_clock_summary.json",
+        "fdwic-simt-builder-clock-v1",
     ),
 }
 _FDWIC_SUBMIT_PMU_PHASE_PROFILES = frozenset(
@@ -213,6 +218,8 @@ def _fdwic_compile_definitions(profile: str) -> list[str] | None:
             "PTO_FDWIC_PERF_CLOCK_KERNEL=1",
             "PTO_FDWIC_TRACE_ENABLED=0",
         ]
+    if profile == _FDWIC_PROFILE_SIMT_BUILDER_CLOCK:
+        return ["PTO_FDWIC_SIMT_BUILDER_CLOCK=1", "PTO_FDWIC_TRACE_ENABLED=0"]
     if profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
         return ["PTO_FDWIC_SUBMIT_PMU=1", "PTO_FDWIC_TRACE_ENABLED=0"]
     if profile == _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD:
@@ -404,7 +411,8 @@ def _assert_fdwic_perf_clock_elf(binary: Path, profile: str = _FDWIC_PROFILE_PER
         raise ValueError(f"Unsupported perf-clock ELF profile {profile!r}")
     symbol_rows = _fdwic_elf_symbol_rows(binary)
 
-    required = ["dist_perf_clock_expect_submits"]
+    builder_clock = profile == _FDWIC_PROFILE_SIMT_BUILDER_CLOCK
+    required = ["dist_simt_builder_clock_profile_marker"] if builder_clock else ["dist_perf_clock_expect_submits"]
     if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL:
         required.append("dist_perf_clock_kernel_profile_marker")
     forbidden = [
@@ -427,8 +435,18 @@ def _assert_fdwic_perf_clock_elf(binary: Path, profile: str = _FDWIC_PROFILE_PER
         "get_fdwic_submit_pmu_reg_base",
         "g_fdwic_submit_pmu_",
     ]
+    if builder_clock:
+        forbidden.extend(("dist_perf_clock_expect_submits", "g_fdwic_perf_clock_"))
     if profile == _FDWIC_PROFILE_PERF_CLOCK:
-        forbidden.extend(("dist_perf_clock_kernel_profile_marker", "g_fdwic_perf_clock_kernel_"))
+        forbidden.extend(
+            (
+                "dist_perf_clock_kernel_profile_marker",
+                "dist_simt_builder_clock_profile_marker",
+                "g_fdwic_perf_clock_kernel_",
+            )
+        )
+    elif profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL:
+        forbidden.append("dist_simt_builder_clock_profile_marker")
     missing = [
         symbol
         for symbol in required
@@ -1624,10 +1642,100 @@ def _render_case_fdwic_submit_pmu(case_label: str, output_prefix: Path, build_id
     return report
 
 
+def _validate_case_fdwic_simt_builder_clock(case_label: str, output_prefix: Path) -> Path:
+    """Validate the low-volume per-leader SIMT DAG Builder aggregate."""
+    output_name, schema = _FDWIC_PERF_CLOCK_ARTIFACTS[_FDWIC_PROFILE_SIMT_BUILDER_CLOCK]
+    artifact = output_prefix / output_name
+    if not artifact.is_file() or artifact.stat().st_size == 0:
+        raise RuntimeError(f"[{case_label}] simt-builder-clock did not publish a non-empty {artifact}")
+    try:
+        payload = json.loads(artifact.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"[{case_label}] {artifact} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"[{case_label}] {artifact} root must be a JSON object")
+
+    scheduler_mode = _fdwic_scheduler_mode()
+    builder_cores = fdwic_simt_builder_count(scheduler_mode, 32)
+    warps_per_builder = 4
+    leader_count = builder_cores * warps_per_builder
+    expected_scalars = {
+        "schema": schema,
+        "mode": _FDWIC_PROFILE_SIMT_BUILDER_CLOCK,
+        "scheduler_mode": "simt_cross_core_dag",
+        "scheduler_mode_id": FDWIC_SCHEDULER_MODE_IDS["simt_cross_core_dag"],
+        "boundary": "persistent_builder_leader_local_stage_aggregate",
+        "counter_domain": "aiv_scalar_clock_cycles",
+        "calibrated_cycles_per_ns": 1.649731,
+        "builder_cores": builder_cores,
+        "warps_per_builder": warps_per_builder,
+        "leader_count": leader_count,
+    }
+    mismatches = [
+        f"{name}={payload.get(name)!r}, expected {expected!r}"
+        for name, expected in expected_scalars.items()
+        if payload.get(name) != expected
+    ]
+    if scheduler_mode != "simt_cross_core_dag" or mismatches:
+        raise RuntimeError(
+            f"[{case_label}] invalid simt-builder-clock artifact contract: "
+            f"scheduler={scheduler_mode!r}; {'; '.join(mismatches)}"
+        )
+
+    leaders = payload.get("leaders")
+    if not isinstance(leaders, list) or len(leaders) != leader_count or not all(
+        isinstance(leader, dict) for leader in leaders
+    ):
+        raise RuntimeError(f"[{case_label}] simt-builder-clock leaders must contain exactly {leader_count} objects")
+    stage_fields = {
+        "request_acquire": "request_acquire_cycles",
+        "resolve_reference": "resolve_reference_cycles",
+        "materialize": "materialize_cycles",
+        "publish_metadata": "publish_metadata_cycles",
+        "lookup_fanin": "lookup_fanin_cycles",
+        "publish_exec": "publish_exec_cycles",
+    }
+    task_total = 0
+    stage_totals = dict.fromkeys(stage_fields, 0)
+    for index, leader in enumerate(leaders):
+        expected_rank, expected_warp = divmod(index, warps_per_builder)
+        if (
+            leader.get("leader_id") != index
+            or leader.get("builder_rank") != expected_rank
+            or leader.get("warp") != expected_warp
+        ):
+            raise RuntimeError(f"[{case_label}] simt-builder-clock leader {index} topology closure failed")
+        tasks = leader.get("task_count")
+        if type(tasks) is not int or tasks < 0:
+            raise RuntimeError(f"[{case_label}] simt-builder-clock leader {index} has invalid task_count")
+        task_total += tasks
+        for stage, field in stage_fields.items():
+            cycles = leader.get(field)
+            if type(cycles) is not int or cycles < 0 or (tasks != 0 and cycles == 0):
+                raise RuntimeError(f"[{case_label}] simt-builder-clock leader {index} has invalid {field}")
+            stage_totals[stage] += cycles
+
+    if task_total <= 0 or payload.get("task_count") != task_total:
+        raise RuntimeError(f"[{case_label}] simt-builder-clock task-count closure failed")
+    stages = payload.get("stages")
+    if not isinstance(stages, dict) or set(stages) != set(stage_fields):
+        raise RuntimeError(f"[{case_label}] simt-builder-clock stage set is incomplete")
+    for stage, total in stage_totals.items():
+        row = stages.get(stage)
+        if not isinstance(row, dict) or row.get("cycles_sum") != total:
+            raise RuntimeError(f"[{case_label}] simt-builder-clock {stage} cycle closure failed")
+    measured_total = sum(stage_totals.values())
+    if measured_total <= 0 or payload.get("measured_core_cycles_sum") != measured_total:
+        raise RuntimeError(f"[{case_label}] simt-builder-clock measured cycle closure failed")
+    return artifact
+
+
 def _validate_case_fdwic_perf_clock(  # noqa: PLR0912, PLR0915 -- fail-closed artifact contract is explicit
     case_label: str, output_prefix: Path, profile: str
 ) -> Path:
     """Validate the exact artifact contract of one successful perf-clock case."""
+    if profile == _FDWIC_PROFILE_SIMT_BUILDER_CLOCK:
+        return _validate_case_fdwic_simt_builder_clock(case_label, output_prefix)
     try:
         output_name, same_core_schema = _FDWIC_PERF_CLOCK_ARTIFACTS[profile]
     except KeyError as exc:

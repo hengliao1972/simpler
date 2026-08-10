@@ -32,6 +32,13 @@
 #define PTO_FDWIC_PERF_CLOCK_KERNEL 0
 #endif
 
+// SIMT DAG Builder 的低扰动分段时钟使用独立 ELF。每个持久 warp leader
+// 只在本地累计，在退出前向独占的 64B 记录发布一次；它不携带普通泳道、
+// atomic 泳道或每 task 记录路径。
+#ifndef PTO_FDWIC_SIMT_BUILDER_CLOCK
+#define PTO_FDWIC_SIMT_BUILDER_CLOCK 0
+#endif
+
 #ifndef PTO_FDWIC_SUBMIT_PMU
 #define PTO_FDWIC_SUBMIT_PMU 0
 #endif
@@ -147,12 +154,25 @@
 #error "PTO_FDWIC_PERF_CLOCK_KERNEL requires PTO_FDWIC_PERF_CLOCK=1"
 #endif
 
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK && PTO_FDWIC_SCHEDULER_MODE != 4
+#error "PTO_FDWIC_SIMT_BUILDER_CLOCK requires simt_cross_core_dag scheduler mode"
+#endif
+
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK && PTO_FDWIC_TRACE_ENABLED
+#error "PTO_FDWIC_SIMT_BUILDER_CLOCK requires PTO_FDWIC_TRACE_ENABLED=0"
+#endif
+
 #if PTO_FDWIC_SUBMIT_PMU && PTO_FDWIC_TRACE_ENABLED
 #error "PTO_FDWIC_SUBMIT_PMU requires PTO_FDWIC_TRACE_ENABLED=0"
 #endif
 
 #if PTO_FDWIC_SUBMIT_PMU && PTO_FDWIC_PERF_CLOCK
 #error "PTO_FDWIC_SUBMIT_PMU and PTO_FDWIC_PERF_CLOCK are mutually exclusive"
+#endif
+
+
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK && (PTO_FDWIC_PERF_CLOCK || PTO_FDWIC_SUBMIT_PMU)
+#error "PTO_FDWIC_SIMT_BUILDER_CLOCK is an isolated profile"
 #endif
 
 #if !PTO_FDWIC_SUBMIT_PMU && PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0

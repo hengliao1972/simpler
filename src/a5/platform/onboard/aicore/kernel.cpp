@@ -14,12 +14,14 @@
 #include "aicore/aicore.h"
 #if defined(PTO_FDWIC_SUBMIT_PMU) && PTO_FDWIC_SUBMIT_PMU
 #include "aicore/fdwic_submit_pmu_state.h"
-#elif !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
+#elif (!defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK) && \
+    (!defined(PTO_FDWIC_SIMT_BUILDER_CLOCK) || !PTO_FDWIC_SIMT_BUILDER_CLOCK)
 #include "aicore/aicore_profiling_state.h"
 #endif
 #include "common/core_type.h"
 #include "common/kernel_args.h"
-#if !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
+#if (!defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK) && \
+    (!defined(PTO_FDWIC_SIMT_BUILDER_CLOCK) || !PTO_FDWIC_SIMT_BUILDER_CLOCK)
 #if !defined(PTO_FDWIC_SUBMIT_PMU) || !PTO_FDWIC_SUBMIT_PMU
 #include "common/l2_swimlane_profiling.h"
 #include "common/pmu_profiling.h"
@@ -53,10 +55,16 @@ class Runtime;
 extern "C" __attribute__((weak)) __aicore__ void fdwic_simt_cross_core_run_builder(
     __gm__ DistSimtCrossCoreBuilderState *state, __gm__ DistTaskCell *task_cells, uint64_t heap_base_address,
     uint64_t heap_size, uint32_t history, uint32_t builder_rank, uint32_t builder_count, uint32_t builder_owner
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+    , uint64_t profile_base_address
+#endif
 ) {
     cce::async_invoke<DistSimtCrossCoreBuild>(
         cce::dim3{kDistSimtBuilderThreads, 1U, 1U}, state, task_cells, heap_base_address, heap_size, history,
         builder_rank, builder_count, builder_owner
+#if PTO_FDWIC_SIMT_BUILDER_CLOCK
+        , profile_base_address
+#endif
     );
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     // Each AIV0 builder Scalar waits only for its own persistent VF. AIC and
@@ -97,7 +105,8 @@ __attribute__((weak)) __aicore__ void set_fdwic_submit_pmu_reg_base(uint64_t reg
     s_fdwic_submit_pmu_reg_base = reg_base;
 }
 __attribute__((weak)) __aicore__ uint64_t get_fdwic_submit_pmu_reg_base() { return s_fdwic_submit_pmu_reg_base; }
-#elif !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
+#elif (!defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK) && \
+    (!defined(PTO_FDWIC_SIMT_BUILDER_CLOCK) || !PTO_FDWIC_SIMT_BUILDER_CLOCK)
 // Per-core profiling state. Populated once by KERNEL_ENTRY from KernelArgs;
 // read by aicore_execute and profiling helpers via the getters below. This
 // mirrors the AICPU-side set_l2_swimlane_enabled / set_pmu_enabled pattern,
@@ -179,7 +188,8 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     // physical register table published by the host.
     __gm__ uint64_t *regs_array = reinterpret_cast<__gm__ uint64_t *>(k_args->regs);
     set_fdwic_submit_pmu_reg_base(regs_array == nullptr ? 0 : regs_array[get_physical_core_id()]);
-#elif !defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK
+#elif (!defined(PTO_FDWIC_PERF_CLOCK) || !PTO_FDWIC_PERF_CLOCK) && \
+    (!defined(PTO_FDWIC_SIMT_BUILDER_CLOCK) || !PTO_FDWIC_SIMT_BUILDER_CLOCK)
     // Publish per-core profiling state into platform-owned slots before the
     // executor runs. AICore reads via get_aicore_*() — never touches Handshake
     // for profiling. The PMU MMIO base is resolved here from
