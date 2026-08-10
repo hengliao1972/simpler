@@ -22,7 +22,7 @@
 | S0 | Plan ABI、动态存储和 AICPU/AICore 发布合同 | 已闭合 |
 | S1 | 真实 AICPU orchestration SO 与 Plan backend | 已闭合，已通过正式 A5 AICPU launch 验证 |
 | S2 | ordinary Scalar Build 端到端 | 已闭合，CPU 与 A5 B1/B256 均已通过 |
-| S3 | ordinary SIMT Build 端到端 | 未开始 |
+| S3 | ordinary SIMT Build 端到端 | 已闭合四 leader CPU 协议与 CCEC Plan-v2 compile gate；A5 完整 Build 尚未实现 |
 | S4 | DAG Scalar Build | 未开始 |
 | S5 | DAG SIMT Build | 未开始 |
 | S6 | 观测闭合后的性能收敛 | 已有首组无泳道样本，尚未收敛 |
@@ -76,10 +76,13 @@ Alloc callback 到达时记录当前 `batch_start`，后续同 batch callback �
 continuation 携带该值。Scalar 从 Plan header 读取它；PA 固定 offset 只在
 adapter 内交叉校验显式 provenance，不能生成 provenance。
 
-另一个仍未闭合项是与生产
-`runtime/dist_engine/common/cross_core_simt_request_protocol.h` 的复用。当前
-standalone 头文件已固定 canonical 4416B payload，但尚未证明两者的
-pack/validate 逻辑已经收敛到同一权威实现。
+生产
+`runtime/dist_engine/common/cross_core_simt_request_protocol.h` 不是待复用的
+Plan wire，而是“AICore replay producer -> VF consumer”的另一套
+request ABI。它的 control stride、tensor slot、OutputRef 和 header
+字段都与 canonical Plan v2 不同。ordinary Scalar/SIMT 只能共享
+`RuntimeTaskPlanCell` ABI v2；另一套 request 只能供 atomic/DCCI、
+VF leader 和 publication 的实现方式参考，不做二次拷贝或强转。
 
 ### 3.2 本轮文档收敛
 
@@ -88,8 +91,8 @@ pack/validate 逻辑已经收敛到同一权威实现。
 - 删除“`RuntimeTaskDesc` 恰好 64B”的错误定性；
 - 明确 64B 是 header，完整通用 payload 上限是 4416B；
 - 明确 PlanCell 是运行期动态外置数组，Host 只提供容量和 GM 地址；
-- 明确后续要复用或提取生产 4416B request payload 的 pack/validate
-  机制，不保留两套漂移 ABI；
+- 明确 canonical Plan v2 是 Scalar/SIMT 唯一 wire ABI；生产
+  SIMT request 布局不兼容，仅复用实现经验，不保留两套 Plan ABI；
 - 将首版时序收敛为 Plan-ahead，先封口完整 Plan，再启动 Build；
 - 明确 Plan 必须来自 AICPU 执行真实 orchestration SO 及 `dist_*`
   Plan backend；
@@ -342,3 +345,84 @@ ordinary Scalar 的功能基线已经成立。下一步按既定顺序实现
 ordinary TensorMap 严格顺序插入语义。完成且比较 ordinary Scalar/SIMT
 后，再依次进入 DAG Scalar 和 DAG SIMT。当前 DAG 目录只是目标布局，
 尚未实现，不得把 ordinary 结果外推成 DAG 证据。
+
+## 7. 2026-08-10：S3 ordinary SIMT 起步
+
+### 7.1 已冻结的首版边界
+
+S3 不复制旧 standalone 的 `FullPaTaskPlan`，也不把 canonical Plan 转成
+生产 `SimtBuildRequestCell`。这两条旧路径分别含固定 PA 公式和不同的
+wire layout，不能作为 AICPU Plan 的真实 consumer。
+
+首版仍是 Plan-ahead：AICPU 先发布并关闭 ABI v2 Plan；block0/AIV0 再
+启动一个 128-thread persistent VF。4 个 warp 仅各自 lane0 参与 Build，
+通过同一 `build_next` 动态领取 task。每个 task 的语义必须来自 PlanCell
+header/payload，代码禁止用 `task_id % 5`、Host task table 或 device 固定
+PA 公式恢复 kind、engine、shape、fanin。
+
+本阶段先选动态 ticket，而不是立即采用 standalone 的静态 residue，原因
+是前者对任意 task 成本分布都成立，并能先隔离“Scalar Build 改为 SIMT
+Build”这一项变化。静态 residue 会消除每 task FetchAdd，已作为后续独立
+性能候选保留；只有在完整 ordinary Build 与 Execute 语义闭合后才做 A/B。
+
+### 7.2 已完成的 CPU 协议门槛
+
+新增：
+
+- `ordinary/simt_build/common/simt_plan_build_protocol.h`；
+- `ordinary/simt_build/test/test_simt_plan_build_protocol.cpp`；
+- `ordinary/simt_build/cpu/build_protocol.sh`。
+
+门槛直接复用公共 `RuntimeTaskPlanCell` ABI v2。builder 外层先
+用 `AttachClosedPlan` 一次性校验 closed/frontier/fatal 并缓存 N；
+4 个 warp leader 随后只用 `TakeAttachedBuildTicket` 动态消费
+closed Plan，每张票只保留必要的 `build_next FetchAdd`。task 的
+function id、adapter data、flags、engine、core/sync、tensor/scalar 和
+explicit dependency 均从 Plan 逐字段验证；没有 PA task 周期公式。
+
+普通与 ASan+UBSan 两种构建均通过以下 task 数：
+
+| N | 预期 build-next 终值 | 结果 |
+| ----: | ----: | ---- |
+| 0 | 4 | PASS |
+| 1 | 5 | PASS |
+| 3 | 7 | PASS |
+| 4 | 8 | PASS |
+| 5 | 9 | PASS |
+| 41 | 45 | PASS |
+| 257 | 261 | PASS |
+| 1280 | 1284 | PASS |
+
+每组均验证：每 task exactly-once、cell N 从真实初值 N-1 以
+CAS 推进到 N、4 个不同 leader 各参与一次且各 arrival 一次、唯一
+last arrival、`build_release=N`。N=41 会刻意延迟 task0，证明后继
+leader 即使已取到高 task 也不能越过 completion 链或提前 release。
+所有等待均同时观察 fatal 并有有界 deadline，不用永久 spin 掩盖
+失败。control 未知位与 payload 非法 engine 两类破坏均经过完整
+leader 消费路径，必须发布 fatal 且保持 release pending。
+
+这只是 CPU 内存模型下的协议门槛，不证明 `async_invoke`、VF
+`__simt_callee__` 调用闭合、A5 SIMT DCCI 或完整 Materialize/TensorMap/
+SharedExecCell。
+
+### 7.3 已完成的 CCEC compile gate
+
+新增 `ordinary/simt_build/ccec_probe/`，直接包含公共
+`RuntimeTaskPlanCell` ABI v2 和四 leader 合同。真实 CCEC 产物已闭合：
+
+- `static __simt_vf__ __aicore__ LAUNCH_BOUND(128)` 与 mixed AIV entry
+  在同一 TU；
+- `async_invoke` 后以 V→S flag/wait 收口；
+- 仅 4 个 warp lane0 用返回型 atomic 观察 Plan control，按
+  `published_lines` 逐行生成 DCCI，再次观察 control 并校验通用
+  header；
+- 最终 ELF 仅一个 GLOBAL AIV entry、一个 LOCAL SIMT entry，
+  metadata 为 `SIMD_SIMT_MIX_VF=4`；
+- CCEC 使用 `-Werror`，bitcode intrinsic、无 relocation/未定义
+  GLOBAL 等静态门槛全部 PASS。
+
+该探针刻意不领取 `build_next`，不执行 Materialize、ordinary
+TensorMap 插入、Fanin 或 Execute。`asc_dcci_single +
+asc_threadfence` 能被编译也不等于已证明 A5 内存模型。下一阶段
+是复用真实 Build body 并闭合 B1 全链路；当前仍不得宣称
+ordinary SIMT 已实现或已有性能收益。

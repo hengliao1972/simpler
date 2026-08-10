@@ -150,13 +150,20 @@ S0 草案位于
 代表支持通用 Build 的完整任务语义。
 
 生产接线时不应再维护第二套并行的 payload 布局和 pack/validate
-逻辑。应对齐或提取复用
-`runtime/dist_engine/common/cross_core_simt_request_protocol.h` 中已有的
-4416B request payload 与序列化机制。AICPU Plan 可保留已验证的 128B
-atomic 隔离 stride，但 payload 容量、Tensor/scalar/explicit-dependency
-表达和校验规则必须只有一个权威来源。现有 SIMT header 中的
-`function_address` 不能被盲目复制进跨 AICPU/AICore ABI；公共 Plan 保存
-logical function id，由 Build 解析本地可执行地址。
+逻辑。现有
+`runtime/dist_engine/common/cross_core_simt_request_protocol.h` 是
+“AICore replay producer -> VF consumer”的另一份 request wire：control
+只有 64B、payload 使用变长 tensor slot、引用被压缩为 1 word，并携带
+AICore `function_address`；它缺少 Plan v2 的 `adapter_data`。因此只能复用
+其中已经验证的 atomic/DCCI、VF leader 和 publication 实现经验，不能把
+canonical Plan 再复制成该 request，也不能把两种 cell 强转互换。
+
+ordinary Scalar 与 ordinary SIMT 都必须直接消费本目录唯一权威的
+`RuntimeTaskPlanCell` ABI v2。公共 Plan 只保存 logical function id；Build
+在 AICore 本地解析可执行地址。SIMT 可达 helper 即使受
+`__simt_callee__` 限制而需要单独实现解码代码，也必须逐字段服从同一
+header/layout/canonical-zero/OutputRef 定义，并由 CPU、CCEC 与 A5 门槛
+交叉锁定，不能形成第二套 wire ABI。
 
 ### 3.1 无指针边界
 
@@ -244,7 +251,68 @@ ordinary Scalar 保留 direct PlannedBuild，不恢复旧 callback split。但 C
 并在每轮入口整体复位。CPU 实现继续使用栈对象。这只是 CCEC
 存储约束，不改变 non-split `WorkerResult` ABI、Plan ticket 协议或调度语义。
 
-### 4.3 尚未实现的公共边界
+### 4.3 ordinary SIMT 首版的精确合同
+
+ordinary SIMT 继续使用完全相同的 AICPU closed Plan 和 Plan-ahead
+生命周期。首版只有一个物理 builder VF：block0/AIV0 调用
+`async_invoke` 启动 128 个 SIMT thread，组成 4 个 warp；每个 warp 只有
+lane0 是 active Build leader。VF 完成后，该 AIV0 Scalar 仍回到普通 AIV
+Execute/FinalDrain，因此 Execute 拓扑保持 32 AIC + 64 AIV，而不是为了
+Build 永久牺牲一个执行核。
+
+首个功能版本让 4 个 leader 共用 `build_next.FetchAdd(1)`：
+
+```text
+AICPU: frontier == closed == N
+  -> 4 个 VF leader 动态领取 [0, N)
+  -> 每 leader 完成当前 task 后才领取下一 task
+  -> 每 leader 首次取得越界 ticket 后报到一次
+  -> build_next == N + 4
+  -> build_workers_done == 4
+  -> completion[N-1] == N-1（N>0）
+  -> 唯一 last leader 发布 build_release == N
+```
+
+该选择不是把 Scalar 的 96 核竞争原样搬进 VF：竞争人口从 96 降到 4，
+不再存在 per-task Tournament。首版保留动态 ticket 的原因是它不依赖
+task 类型和单 task 成本，面对其他算子仍可自动做 leader 负载均衡，并且
+直接复用已经闭合的 closed-Plan 领取/报到/release 协议。正常原子调用数
+为 `N+4` 次 build-next FetchAdd、4 次 arrival FetchAdd 和 1 次 release
+publish。builder 启动前还会一次性读取 closed/frontier/fatal 并缓存
+N；每个 PlanCell 的前后两次 control 观察与严格 TensorMap
+completion 另行计数，不能与 build-next 控制原子混算。
+全局 `build_workers_done==4` 只能证明“报到了四次”，不能单独
+证明“四个不同 leader 各一次”。首版不为此增加第二个 GM
+atomic bitmask；该 exactly-once 身份由固定 lane0 拓扑、每 leader 持久局部
+arrival 状态和一次性退出结构共同证明，CPU 与 CCEC 门槛必须锁定这三点。
+
+静态 residue（leader `L` 处理 `L, L+4, ...`）可完全消除 build-next
+原子，现有 standalone/生产 SIMT 已证明该分工形式可编译运行；但它会把
+负载均衡假设交给 task 序列。它保留为功能闭合后的独立性能候选，必须在
+同一 Plan、同一算子输入下同时验证尾部不均衡、严格插入等待和端到端
+收益，不能在首版中既改变分工又改变 Build 实现而失去可归因性。
+
+每个 SIMT leader 的 task 内部顺序固定为：
+
+```text
+atomic observe PlanCell control
+  -> 精确 invalidate 已发布 payload lines
+  -> 再读 control 并校验 ABI/task/layout/tag/ref/canonical-zero
+  -> 串行链外 Materialize、heap reserve 和 output descriptor 发布
+  -> 等待 completion[N-1]（N=0 跳过）
+  -> 发布 ordinary/symbol writer metadata
+  -> 零 writer task 也发布 completion[N]
+  -> 只查询 producer < N 的 fanin
+  -> 发布 SharedExecCell 或完成 metadata-only task
+```
+
+首版在全部 4 个 leader 完成 Build 后才允许 Execute。这样
+`SharedExecCell::Empty` 仍可在 release 后无歧义地解释为 metadata-only；
+若将来做 Build/Execute overlap，必须先增加“尚未 Build”与
+“metadata-only terminal”的显式区分，不能让 Execute 扫描把暂时 Empty
+静默跳过。
+
+### 4.4 尚未实现的公共边界
 
 下列能力不在首版声明范围内：
 
@@ -269,7 +337,7 @@ PA 首例只能使用已有 symbolic `SharedTaskOutputs/FdwicOutputRef` deferred
 | S0 | 固定 Plan ABI、AICPU/AICore 发布合同和正确性门槛 | 已闭合 |
 | S1 | 接通真实 AICPU orchestration SO 和 Plan backend | 已闭合，正式 A5 owner/dispatcher 已通过 |
 | S2 | ordinary Scalar Build，CPU 后 A5 B1/B256 | 已闭合，Plan-only B1 与 full B1/B256 均通过 |
-| S3 | 在同一 Plan ABI 上替换为 ordinary SIMT Build | 未实现 |
+| S3 | 在同一 Plan ABI 上替换为 ordinary SIMT Build | 已闭合四 leader CPU 协议与 CCEC Plan-v2 compile gate；A5 完整 Build 尚未实现 |
 | S4 | 证明 ordinary 闭合后迁移 DAG Scalar Build | 未实现 |
 | S5 | 在 DAG 上替换为 SIMT Build | 未实现 |
 | S6 | 在正确性与观测闭合后做性能收敛 | ordinary Scalar 已有首组无泳道样本，尚未收敛 |
