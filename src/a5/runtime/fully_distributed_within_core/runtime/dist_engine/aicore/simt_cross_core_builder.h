@@ -631,7 +631,7 @@ DIST_SIMT_CALLEE bool dist_simt_publish_dag_metadata(
 // unmatched query against that candidate before moving to the older task.
 DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
     __gm__ fdwic::cross_core::DagTaskMetadataCell *metadata, const DistSimtRequestView &request, uint32_t history,
-    __gm__ uint64_t *fatal, int32_t producers[]
+    __gm__ uint64_t *fatal, int32_t producers[], int32_t fanin[], uint32_t *fanin_count
 ) {
     uint32_t unresolved = 0;
     uint32_t earliest_owner = UINT32_MAX;
@@ -645,22 +645,30 @@ DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
     for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
         producers[tensor] = -1;
         const uint32_t tag = dist_simt_request_tag(request, tensor);
-        if (tag != static_cast<uint32_t>(TensorArgType::INPUT) && tag != static_cast<uint32_t>(TensorArgType::INOUT)) {
-            continue;
-        }
+        if (tag == static_cast<uint32_t>(TensorArgType::OUTPUT)) continue;
         __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
         if (descriptor == nullptr) return false;
-        const bool manual_dependency = ((descriptor[5] >> 8U) & 0xFFU) != 0;
-        if (!manual_dependency) {
-            if (!dist_simt_tensor_region(
-                    descriptor, &query_address[tensor], &query_lo[tensor], &query_hi[tensor]
-                )) {
+        const uint64_t owner_raw = descriptor[2];
+        if (owner_raw != UINT64_MAX) {
+            const uint32_t owner = static_cast<uint32_t>(owner_raw);
+            if (static_cast<uint32_t>(owner_raw >> 32U) != 0 || owner >= request.task_id ||
+                !dist_simt_add_fanin(fanin, fanin_count, static_cast<int32_t>(owner))) {
                 return false;
             }
-            // creator owner 会在后续 fanin 合并中独立保留。若所有自动
+        }
+        const bool manual_dependency = ((descriptor[5] >> 8U) & 0xFFU) != 0;
+        uint64_t address = 0;
+        uint64_t lo = 0;
+        uint64_t hi = 0;
+        if (!dist_simt_tensor_region(descriptor, &address, &lo, &hi)) return false;
+        if (!manual_dependency && (tag == static_cast<uint32_t>(TensorArgType::INPUT) ||
+                                   tag == static_cast<uint32_t>(TensorArgType::INOUT))) {
+            query_address[tensor] = address;
+            query_lo[tensor] = lo;
+            query_hi[tensor] = hi;
+            // creator owner 已在本次 fanin 合并中独立保留。若所有自动
             // 查询都有 owner，则只需继续寻找 owner 之后的覆盖写者；更早
             // 的 metadata 不可能产生比 creator 更新的依赖。
-            const uint64_t owner_raw = descriptor[2];
             if (owner_raw == UINT64_MAX) {
                 every_query_has_owner = false;
             } else {
@@ -719,7 +727,10 @@ DIST_SIMT_CALLEE bool dist_simt_lookup_dag_fanins(
                 }
             }
         }
-        if (unresolved == 0) return true;
+        if (unresolved == 0) break;
+    }
+    for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
+        if (!dist_simt_add_fanin(fanin, fanin_count, producers[tensor])) return false;
     }
     return true;
 }
@@ -744,35 +755,13 @@ DIST_SIMT_CALLEE bool dist_simt_prepare_dag_and_fanin(
 #endif
     *fanin_count = 0;
     int32_t lookup_producers[fdwic::cross_core::kExecMaxTensors] = {};
-    const bool lookup_succeeded = dist_simt_lookup_dag_fanins(metadata, request, history, fatal, lookup_producers);
+    const bool lookup_succeeded =
+        dist_simt_lookup_dag_fanins(metadata, request, history, fatal, lookup_producers, fanin, fanin_count);
     if (!lookup_succeeded) {
 #if PTO_FDWIC_SIMT_BUILDER_CLOCK
         profile->lookup_fanin_cycles += clock() - lookup_begin;
 #endif
         return false;
-    }
-    for (uint32_t tensor = 0; tensor < request.tensor_count; ++tensor) {
-        const uint32_t tag = dist_simt_request_tag(request, tensor);
-        if (tag == static_cast<uint32_t>(TensorArgType::OUTPUT)) continue;
-        __gm__ uint64_t *descriptor = dist_simt_request_tensor(request, tensor);
-        if (descriptor == nullptr) return false;
-        const uint64_t owner_raw = descriptor[2];
-        if (owner_raw != UINT64_MAX) {
-            const uint32_t producer = static_cast<uint32_t>(owner_raw);
-            if (static_cast<uint32_t>(owner_raw >> 32U) != 0 || producer >= request.task_id ||
-                !dist_simt_add_fanin(fanin, fanin_count, static_cast<int32_t>(producer))) {
-                return false;
-            }
-        }
-        const bool manual_dependency = ((descriptor[5] >> 8U) & 0xFFU) != 0;
-        uint64_t address = 0;
-        uint64_t lo = 0;
-        uint64_t hi = 0;
-        if (!dist_simt_tensor_region(descriptor, &address, &lo, &hi)) return false;
-        if (!manual_dependency && (tag == static_cast<uint32_t>(TensorArgType::INPUT) ||
-                                   tag == static_cast<uint32_t>(TensorArgType::INOUT))) {
-            if (!dist_simt_add_fanin(fanin, fanin_count, lookup_producers[tensor])) return false;
-        }
     }
     for (uint32_t dependency = 0; dependency < request.explicit_dep_count; ++dependency) {
         const uint64_t raw = request.words[request.explicit_dep_word_offset + dependency];

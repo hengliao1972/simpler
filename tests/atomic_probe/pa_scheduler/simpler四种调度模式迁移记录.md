@@ -1660,3 +1660,49 @@ owner 下界：3.04853 / 3.06703 / 2.97376 / 3.03745 / 3.10850 ms
 output 被 AIC 消费、32 fresh output、历史窗口下界和跨来源 fanin 合并，直接
 覆盖 owner 与后续 writer 的关键组合。全部场景数值 golden PASS；未运行
 A5Sim。
+
+## 31. 合并 DAG 查询前后的重复 descriptor 遍历
+
+### 31.1 被重复执行的工作
+
+`dist_simt_lookup_dag_fanins()` 已经为了构造查询区域逐个读取非 OUTPUT
+descriptor、解析 manual 标志并计算 Tensor 区域。函数返回后，调用方又完整
+遍历同一批 descriptor：再次读取 owner/manual 字段、再次计算区域，随后只使用
+owner 和 lookup producer；第二次算出的 `address/lo/hi` 没有任何消费者。
+
+保留实现把 creator owner 的校验与 fanin 合并移入第一次 descriptor 遍历，
+并在同一次遍历中完成所有非 OUTPUT descriptor 的区域合法性检查。历史查询
+仍把 producer 暂存在原有数组，扫描完成后继续按 Tensor 参数顺序加入 fanin；
+显式依赖仍在原位置合并。因此：
+
+- fanin 集合与顺序不变；
+- metadata 发布、history 下界和 writer 扫描顺序不变；
+- manual dependency、OUTPUT_EXISTING 和 NO_DEP 仍执行区域校验；
+- 没有新增共享状态、数组、atomic 或 DCCI；
+- 不依赖 PA task 类型、batch、固定次序或 shape。
+
+### 31.2 真实 A5 性能
+
+相同 `simt-builder-clock` 构建中：
+
+| 指标 | 修改前 | 合并遍历 | 变化 |
+| ---- | -----: | -------: | ---: |
+| `lookup_fanin` | 142,073,320 cycles | 130,172,274 cycles | -8.38% |
+| 六阶段合计 | 272,667,259 cycles | 265,397,007 cycles | -2.67% |
+
+普通 PA B256、startup 到 FinalDrain 五次为：
+
+```text
+修改前：3.04853 / 3.06703 / 2.97376 / 3.03745 / 3.10850 ms
+合并遍历：3.00182 / 2.98338 / 2.99014 / 2.95376 / 2.99278 ms
+中位数：3.04853 -> 2.99014 ms，改善 1.92%
+```
+
+五个候选样本均不超过 `3.002 ms`，与 lookup 分段的下降方向一致。
+
+### 31.3 正确性门槛
+
+受影响的 `simt_cross_core_dag` 第三次完整运行第 27.4 节的 **27/27** 类真实
+A5 非 PA 场景，两个 compact 测试类全部数值 golden PASS。覆盖 owner、manual
+dependency、OUTPUT_EXISTING、NO_DEP、连续 INOUT、32 fresh output、16 fanin
+和跨引擎 output/view；未运行 A5Sim。
