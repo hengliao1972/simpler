@@ -1547,3 +1547,58 @@ builtin：3.364 / 3.423 / 3.232 / 3.330 / 3.218 ms，median = 3.330 ms
 替代：Builder leader 的累计 Scalar cycle 下降，不代表 startup 到 FinalDrain
 墙钟一定下降；它还可能改变 Builder/Execute 到达和共享资源竞争。该候选没有
 达到端到端保留条件，代码已恢复为原循环，只保留本记录。
+
+## 29. SIMT DAG 同 producer 输出引用复用一次 acquire
+
+### 29.1 可复用的发布事实
+
+跨 task fresh-output 引用原先按 Tensor 参数逐项读取 producer output cell 的
+`control`。同一 producer 的多个 output slot 即使在 request 中相邻，也会为
+每个 slot 分别执行返回型 atomic load。该重复读取并不是 descriptor 的必要
+正确性边界：producer 的正式发布合同是先写完该 cell 的全部 descriptor，再
+完成 clean-out/threadfence，最后一次性把 control 发布为 `Published`。因此，
+第一次 acquire 已经证明这个 cell 中所有 slot 的 immutable descriptor 可见。
+
+保留实现只缓存最近一次成功验证的 `(producer, control)`：
+
+1. 下一个引用仍属于同一 producer 时，不再重复读取 control；
+2. producer 改变或之后再次非连续出现时，重新执行原有 atomic acquire；
+3. 每个引用仍独立检查 output slot 上界和 descriptor owner；
+4. 不增加按 Tensor 数量增长的本地数组，只增加一个 task id 和一个 control；
+5. 不读取 PA task kind、batch、固定 task 次序或 Tensor shape。
+
+所以这是一项 publish-once output 协议上的通用优化，不是利用 PA 的固定三组
+producer。PA 中相邻引用只是让这一通用条件实际命中。
+
+### 29.2 分段与端到端证据
+
+相同 `simt-builder-clock` 诊断 ELF 口径下，代表性样本由
+`311,680,949` 降至 `309,666,469` core-cycles，下降约 **0.65%**；其中直接
+受影响的 `resolve_reference` 由 `75,078,249` 降至 `73,263,675` cycles，
+下降约 **2.42%**。其余阶段没有被合并进 Resolve，也没有用诊断总周期代替
+端到端判断。
+
+普通 PA B256、startup 到 FinalDrain 的同窗口五次 `perf-clock` 为：
+
+```text
+原实现：3.37692 / 3.30836 / 3.33199 / 3.28616 / 3.24699 ms
+候选版：3.28370 / 3.25065 / 3.21345 / 3.28525 / 3.27825 ms
+中位数：3.30836 -> 3.27825 ms，改善 0.91%
+```
+
+候选五次上界 `3.28525 ms` 也接近原实现五次中的第二低值
+`3.28616 ms`，端到端与 Resolve 分段同时同向，故保留该项；不把 0.91% 扩大
+解释为消除了整个 output-reference 热点。
+
+### 29.3 非 PA 正确性门槛
+
+受影响的 `simt_cross_core_dag` 重新运行第 27.4 节规定的全部 27 类真实 A5
+门槛并数值 golden PASS：
+
+- 十二类动态调度、容量、跨引擎和 INOUT 场景；
+- 九类宽参数、fresh output、fanin 合并与历史下界场景；
+- 六类 output view、跨引擎 output、fanin ring/fanout 与参数标签场景。
+
+这组门槛覆盖单 task 32 个 fresh output、同一 producer 多 slot、AIV output 被
+AIC 消费、跨来源 fanin 合并和连续 INOUT writer。测试只运行真实 A5，未运行
+A5Sim。

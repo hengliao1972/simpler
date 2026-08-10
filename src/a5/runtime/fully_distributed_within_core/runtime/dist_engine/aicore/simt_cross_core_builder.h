@@ -280,6 +280,12 @@ DIST_SIMT_CALLEE bool dist_simt_resolve_request_references(
 ) {
     request->all_outputs = all_outputs;
     uint32_t unresolved = request->tensor_reference_mask;
+    // 同一 producer 的多个 output slot 在 request 中通常相邻。output cell
+    // 遵循 descriptor 全写完、threadfence、control publish-once 的合同；一次
+    // 成功 acquire 已经证明该 cell 的全部 descriptor 可见。只缓存最近一项，
+    // 不增加按 Tensor 的本地数组，也不跳过每个 slot 的边界和 owner 校验。
+    uint32_t cached_producer = UINT32_MAX;
+    uint64_t cached_control = 0;
     while (unresolved != 0) {
         uint32_t tensor = 0;
         while ((unresolved & (uint32_t{1} << tensor)) == 0)
@@ -297,14 +303,16 @@ DIST_SIMT_CALLEE bool dist_simt_resolve_request_references(
         __gm__ fdwic::cross_core::CrossCoreOutputCell<Tensor> *producer_outputs = &all_outputs[producer];
         __gm__ uint64_t *control =
             reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&producer_outputs->control.state));
-        const uint64_t begin = clock();
-        uint32_t polls = 0;
-        uint64_t raw = 0;
-        while (clock() - begin <= kDistSimtBuilderPollBudget) {
-            raw = dist_simt_atomic_load(control);
-            const uint32_t phase = static_cast<uint32_t>(raw & fdwic::cross_core::kOutputStatePhaseMask);
-            if (phase == static_cast<uint32_t>(fdwic::cross_core::OutputPhase::Published)) break;
-            if (raw != 0 || ((++polls & 1023U) == 0 && dist_simt_fatal_observed(fatal))) return false;
+        uint64_t raw = cached_producer == producer ? cached_control : 0;
+        if (cached_producer != producer) {
+            const uint64_t begin = clock();
+            uint32_t polls = 0;
+            while (clock() - begin <= kDistSimtBuilderPollBudget) {
+                raw = dist_simt_atomic_load(control);
+                const uint32_t phase = static_cast<uint32_t>(raw & fdwic::cross_core::kOutputStatePhaseMask);
+                if (phase == static_cast<uint32_t>(fdwic::cross_core::OutputPhase::Published)) break;
+                if (raw != 0 || ((++polls & 1023U) == 0 && dist_simt_fatal_observed(fatal))) return false;
+            }
         }
         const uint32_t phase = static_cast<uint32_t>(raw & fdwic::cross_core::kOutputStatePhaseMask);
         const uint32_t output_count = static_cast<uint32_t>(
@@ -322,6 +330,8 @@ DIST_SIMT_CALLEE bool dist_simt_resolve_request_references(
             encoded_task != producer || output_slot >= output_count) {
             return false;
         }
+        cached_producer = producer;
+        cached_control = raw;
         __gm__ uint64_t *descriptor = reinterpret_cast<__gm__ uint64_t *>(&producer_outputs->descriptors[output_slot]);
         if (descriptor[2] != producer) return false;
     }
