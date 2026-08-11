@@ -43,6 +43,77 @@ bool CheckAcl(aclError error, const char *label) {
     return false;
 }
 
+aclError InitAclForCompiledRuntimePlanBuildBackend() {
+    if constexpr (
+        pa_scheduler::kCompiledRuntimePlanBuildBackend ==
+        pa_scheduler::RuntimePlanBuildBackend::Simt
+    ) {
+        // ACL 只在进程首次初始化时消费 SIMT/DVG 容量。formal AIV
+        // metadata 的 tag9/tag10 分别要求 8336/8320B，这里按 A5 已验证的
+        // 512B 容量步长向上取整；临时文件只作为同步 aclInit 输入。
+        constexpr char kConfig[] = R"acl({
+  "StackSize": {
+    "simt_stack_size": 8704,
+    "simt_divergence_stack_size": 8704
+  }
+}
+)acl";
+        char path[] = "/tmp/pa_scheduler_simt_acl_XXXXXX";
+        const int fd = mkstemp(path);
+        if (fd < 0) {
+            std::fprintf(
+                stderr,
+                "Cannot create temporary ordinary SIMT ACL config: errno=%d\n",
+                errno
+            );
+            return ACL_ERROR_FAILURE;
+        }
+
+        size_t written = 0;
+        while (written < sizeof(kConfig) - 1U) {
+            const ssize_t result =
+                write(fd, kConfig + written, sizeof(kConfig) - 1U - written);
+            if (result > 0) {
+                written += static_cast<size_t>(result);
+                continue;
+            }
+            if (result < 0 && errno == EINTR) continue;
+            const int write_error = result < 0 ? errno : 0;
+            std::fprintf(
+                stderr,
+                "Cannot write temporary ordinary SIMT ACL config: errno=%d\n",
+                write_error
+            );
+            (void)close(fd);
+            (void)unlink(path);
+            return ACL_ERROR_FAILURE;
+        }
+        if (close(fd) != 0) {
+            const int close_error = errno;
+            std::fprintf(
+                stderr,
+                "Cannot close temporary ordinary SIMT ACL config: errno=%d\n",
+                close_error
+            );
+            (void)unlink(path);
+            return ACL_ERROR_FAILURE;
+        }
+
+        const aclError init_error = aclInit(path);
+        if (unlink(path) != 0) {
+            const int unlink_error = errno;
+            std::fprintf(
+                stderr,
+                "Cannot remove temporary ordinary SIMT ACL config: errno=%d\n",
+                unlink_error
+            );
+        }
+        return init_error;
+    } else {
+        return aclInit(nullptr);
+    }
+}
+
 bool CheckRt(rtError_t error, const char *label) {
     if (error == RT_ERROR_NONE) return true;
     std::fprintf(stderr, "RT error %d: %s\n", static_cast<int>(error), label);
@@ -2162,7 +2233,8 @@ int main(int argc, char **argv) {
 
     // 正常及后处理路径依次完成 ACL 初始化、选卡、stream/ELF/设备区创建、launch/D2H
     // 和尾部清理；初始化、传输或 launch 的早期错误仍按当前实现就地返回。
-    if (!CheckAcl(aclInit(nullptr), "aclInit") || !CheckAcl(aclrtSetDevice(options.device), "aclrtSetDevice")) {
+    if (!CheckAcl(InitAclForCompiledRuntimePlanBuildBackend(), "aclInit") ||
+        !CheckAcl(aclrtSetDevice(options.device), "aclrtSetDevice")) {
         return EXIT_FAILURE;
     }
     aclrtStream stream = nullptr;
@@ -2747,6 +2819,72 @@ int main(int argc, char **argv) {
             execution_ok = false;
             break;
         }
+
+        // SIMT ordinary 的 writer/output 后验必须消费 AICPU 实际发布的
+        // canonical Plan，而不是重新套 Scalar PA 的 grouped-writer 公式。
+        // 这里已位于 AICore sync 和全部权威计时窗之后；D2H 只服务语义
+        // oracle，不会回灌 producer、Build ticket 或 Execute。
+        std::vector<pa_scheduler::aicpu_plan::RuntimeTaskPlanCell>
+            runtime_plan_snapshot_cells;
+        pa_scheduler::host::RuntimePlanHostSnapshot
+            runtime_plan_snapshot{};
+        if (pa_scheduler::host::kHostUsesSimtRuntimePlanBuild) {
+            const int64_t closed =
+                state->runtime_plan_control.closed_task_count.value;
+            const int64_t frontier =
+                state->runtime_plan_control.planned_frontier.value;
+            const bool snapshot_shape_ok =
+                closed >= 0 && closed == frontier &&
+                closed <= static_cast<int64_t>(
+                    state->runtime_plan_storage.capacity
+                ) &&
+                closed == static_cast<int64_t>(
+                    owner_request.result.backend.task_count
+                ) &&
+                closed == static_cast<int64_t>(
+                    launch_plan.total_tasks
+                );
+            if (!snapshot_shape_ok) {
+                std::fprintf(
+                    stderr,
+                    "Runtime Plan snapshot shape mismatch: "
+                    "closed=%lld frontier=%lld capacity=%u owner=%u "
+                    "host_oracle=%u.\n",
+                    static_cast<long long>(closed),
+                    static_cast<long long>(frontier),
+                    state->runtime_plan_storage.capacity,
+                    owner_request.result.backend.task_count,
+                    launch_plan.total_tasks
+                );
+                execution_ok = false;
+                all_passed = false;
+                break;
+            }
+            const uint32_t snapshot_count =
+                static_cast<uint32_t>(closed);
+            runtime_plan_snapshot_cells.resize(snapshot_count);
+            const size_t snapshot_bytes =
+                static_cast<size_t>(snapshot_count) *
+                sizeof(runtime_plan_snapshot_cells[0]);
+            if (snapshot_bytes != 0U &&
+                !CheckAcl(
+                    aclrtMemcpy(
+                        runtime_plan_snapshot_cells.data(),
+                        snapshot_bytes,
+                        runtime_plan_cells_device,
+                        snapshot_bytes,
+                        ACL_MEMCPY_DEVICE_TO_HOST
+                    ),
+                    "aclrtMemcpy(D2H full-run canonical Plan cells)"
+                )) {
+                execution_ok = false;
+                all_passed = false;
+                break;
+            }
+            runtime_plan_snapshot.cells =
+                runtime_plan_snapshot_cells.data();
+            runtime_plan_snapshot.count = snapshot_count;
+        }
 #endif
         if (real_compute &&
             !CheckAcl(
@@ -2826,6 +2964,10 @@ int main(int argc, char **argv) {
             *state, run, host_us,
             options.trace_enabled ? &trace_header : nullptr,
             pa_scheduler::host::RawExecTokenSnapshotAuthority::DiagnosticOnly
+#if PTO_FDWIC_SHARED_MAP
+            , pa_scheduler::host::kHostUsesSimtRuntimePlanBuild
+                  ? &runtime_plan_snapshot : nullptr
+#endif
         );
         all_passed &= metrics.passed;
         const bool workload_passed =

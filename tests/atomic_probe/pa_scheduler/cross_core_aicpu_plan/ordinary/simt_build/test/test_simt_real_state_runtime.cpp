@@ -3,6 +3,7 @@
 #define PTO_FDWIC_SHARED_MAP 1
 #define PTO_FDWIC_TENSORMAP_RING_CAP 128
 #define PTO_FDWIC_SHARED_INSERT_TURN_GROUPS 1
+#define PA_RUNTIME_PLAN_BUILD_BACKEND 1
 #define PA_RUNTIME_PLAN_BUILD_WORKERS 4
 #define PA_BUILD_PERF_CLOCK 1
 #define PA_DEVICE inline
@@ -668,7 +669,7 @@ void TestFreshOutputAndSymbolHistoryOnRealState()
             history.magic == kSharedWriterHistoryMagic &&
             history.writer_task == 2 && history.count == 1U &&
             history.reserved == 0U &&
-            history.entries[0].symbol_key == 0U &&
+            history.entries[0].symbol_key == 1U &&
             history.entries[0].previous_writer == 0,
         "symbol writer history did not publish the future-writer chain"
     );

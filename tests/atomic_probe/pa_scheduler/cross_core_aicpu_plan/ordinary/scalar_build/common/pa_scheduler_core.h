@@ -40,6 +40,59 @@ static_assert(
 );
 #endif
 
+// AIV0 在另一份 SIMT-identity TU 中取得 VF Build 的端点，V->S join 后
+// 才进入本 Scalar scheduler TU。这个 POD 只携带本轮本核的时间窗口，
+// 不进入 SchedulerState/Host ABI。active flag 明确区分合法的 cycle=0 与
+// “未提供外部窗口”；reserved 必须为零，便于以后扩展时 fail closed。
+constexpr uint32_t kRuntimePlanExternalBuildWindowActive = 1U << 0U;
+struct RuntimePlanExternalBuildWindow {
+    uint64_t begin;
+    uint64_t end;
+    uint32_t flags;
+    uint32_t reserved;
+};
+static_assert(
+    sizeof(RuntimePlanExternalBuildWindow) == 24U &&
+        alignof(RuntimePlanExternalBuildWindow) == alignof(uint64_t),
+    "external Runtime Plan Build window ABI changed"
+);
+constexpr RuntimePlanExternalBuildWindow
+    kNoRuntimePlanExternalBuildWindow{0U, 0U, 0U, 0U};
+
+PA_DEVICE bool RuntimePlanExternalBuildWindowActive(
+    const RuntimePlanExternalBuildWindow &window
+) {
+    return window.flags ==
+               kRuntimePlanExternalBuildWindowActive &&
+           window.reserved == 0U &&
+           window.end >= window.begin;
+}
+
+PA_DEVICE bool RuntimePlanExternalBuildWindowValidForWorker(
+    const RuntimePlanExternalBuildWindow &window,
+    uint32_t worker_id, CoreRole role
+) {
+    const bool disabled =
+        window.begin == 0U && window.end == 0U &&
+        window.flags == 0U && window.reserved == 0U;
+    if constexpr (
+        kCompiledRuntimePlanBuildBackend ==
+        RuntimePlanBuildBackend::Scalar
+    ) {
+        (void)worker_id;
+        (void)role;
+        return disabled;
+    } else {
+        // AIV0 是连续 Scalar worker 32；只有它实际拥有外部 VF 窗口。
+        // 其余 95 核必须走无窗口入口，只记录自己真实发生的 Attach/Wait。
+        const bool is_aiv0 =
+            worker_id == kAicWorkers && role == CoreRole::Aiv;
+        return is_aiv0
+            ? RuntimePlanExternalBuildWindowActive(window)
+            : disabled;
+    }
+}
+
 struct LocalStats {
     WorkerResult result;
 #if PTO_FDWIC_SHARED_MAP
@@ -6486,7 +6539,15 @@ PA_DEVICE bool WaitRuntimePlanBuildRelease(
         ++wait_polls;
         // 正常 release 只轮询独占 release line；错误停止线每 256 轮观察
         // 一次，避免全部等待者同时把 Plan/scheduler fatal 变成新热点。
-        if ((wait_polls & 255U) == 0U &&
+        // SIMT continuation 正常应在 VF join 后直接观察到 release；若
+        // builder 在发布 release 前失败，则第一次 pending 就检查 fatal，
+        // 防止 96 个 Scalar 把 failure 误当成正常长 Build 等待。
+        const bool check_fatal =
+            (wait_polls & 255U) == 0U ||
+            (kCompiledRuntimePlanBuildBackend ==
+                 RuntimePlanBuildBackend::Simt &&
+             wait_polls == 1U);
+        if (check_fatal &&
             (TraceAtomicControlLoad<Ops>(
                  stats.trace, stats.result, -1,
                  AtomicSite::RuntimePlanFatalLoad,
@@ -6690,7 +6751,10 @@ PA_DEVICE void PublishResult(PA_GM WorkerResult &destination, const WorkerResult
 }
 
 template <typename Ops, bool Profile>
-PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id, CoreRole role) {
+PA_DEVICE void RunSchedulerImpl(
+    PA_GM SchedulerState *state, uint32_t worker_id, CoreRole role,
+    const RuntimePlanExternalBuildWindow &external_build_window
+) {
     // 一个入口实例只拥有 state->workers[worker_id] 的私有 map/ring/payload；cursor、task cell 和屏障为跨核共享区。
     if (worker_id >= kWorkers) {
         return;
@@ -6710,17 +6774,34 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         startup_dcci_begin, startup_dcci_end
     );
     const bool build_identity_matches =
-        state->config.build_identity_magic == kBuildIdentityMagic &&
-        state->config.build_identity_abi_version == kBuildIdentityAbiVersion &&
-        state->config.tensor_map_mode == static_cast<uint32_t>(kCompiledTensorMapMode) &&
-        state->config.scheduler_state_size == static_cast<uint32_t>(sizeof(SchedulerState)) &&
-        state->pmu_probe.build_variant == kCompiledBuildVariant;
+        RuntimePlanBuildIdentityPreflight(state);
     if (!build_identity_matches) {
         (void)PreAttachAtomicExchange<Ops>(
             &state->fatal.value, static_cast<int32_t>(1)
         );
         return;
     }
+    if (!RuntimePlanExternalBuildWindowValidForWorker(
+            external_build_window, worker_id, role
+        )) {
+        // 外部窗口属于 device entry ABI。错误 owner、漏接 AIV0 continuation
+        // 或把 SIMT 窗口送入 Scalar backend 都必须在解释 worker 私有状态前
+        // fail closed；这条错误不允许伪造成合法 RuntimePlanBuild span。
+        (void)PreAttachAtomicExchange<Ops>(
+            &state->fatal.value, static_cast<int32_t>(1)
+        );
+#if PTO_FDWIC_SHARED_MAP
+        (void)PreAttachAtomicExchange<Ops>(
+            &state->runtime_plan_control.fatal.value,
+            static_cast<int64_t>(1)
+        );
+#endif
+        return;
+    }
+    const bool external_build_window_active =
+        RuntimePlanExternalBuildWindowActive(
+            external_build_window
+        );
     PA_GM WorkerState &worker = state->workers[worker_id];
     worker.role = role;
     worker.core_idx = static_cast<int32_t>(worker_id);
@@ -6839,11 +6920,22 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     // perf-clock 的第一次权威读数从 startup increment 前开始，
     // 与 FinalDrain 后的第二次读数组成完整端到端边界。复用
     // submit_begin 字段避免增加 WorkerResult ABI；该构建不输出
-    // Submit-only 边界。启动 watchdog 仍用独立时钟建立超时起点。
-    stats.result.submit_begin = Ops::PerfClockNow();
+    // Submit-only 边界。SIMT AIV0 的真正业务起点位于 VF launch 前，
+    // continuation 必须沿用 external begin，不能在 Build 完成后重启计时。
+    // 其余 95 核仍从各自 startup increment 前计时。启动 watchdog 继续
+    // 使用独立时钟建立超时起点。
+    stats.result.submit_begin = external_build_window_active
+        ? external_build_window.begin
+        : Ops::PerfClockNow();
     stats.result.startup_barrier_begin = 0;
 #else
-    stats.result.startup_barrier_begin = Ops::Now();
+    // 普通 lifecycle 口径与 perf-clock 一样必须覆盖 AIV0 在另一 TU
+    // 中已经完成的 VF Build。RuntimePlanBuild raw 只是诊断泳道，不能
+    // 替代 WorkerResult 的端到端 lifecycle 起点。
+    stats.result.startup_barrier_begin =
+        external_build_window_active
+            ? external_build_window.begin
+            : Ops::Now();
 #endif
     TraceAtomicFetchAdd<Ops>(
         stats.trace, stats.result, -1, AtomicSite::StartupIncrement,
@@ -6903,8 +6995,17 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     };
     bool runtime_plan_attached = false;
     bool runtime_plan_build_released = false;
-    uint64_t runtime_plan_build_begin = 0;
-    uint64_t runtime_plan_build_end = 0;
+    // AIV0 的 external span 在 scheduler 已经观察到 terminal fatal 时也
+    // 必须保留；因此不能把它的初始化放进 scheduler_entry_ok 分支。
+    // 其他 worker 从零开始，只有真实执行 Attach/Wait 后才获得端点。
+    uint64_t runtime_plan_build_begin =
+        external_build_window_active
+            ? external_build_window.begin
+            : 0U;
+    uint64_t runtime_plan_build_end =
+        external_build_window_active
+            ? external_build_window.end
+            : 0U;
 #endif
     // 复用入口已有的 terminal 读取结果。若本核已经发现启动协议错误，
     // FinalDrain 不得在错相 fatal 观察到来前发放 Execute ticket。
@@ -6922,10 +7023,13 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
         // 不应污染 Submit 取数。
         auto pmu_context = Ops::PmuWindowStart(state, worker_id);
 #if PTO_FDWIC_SHARED_MAP
-        // 父区间必须在 Plan storage acquire 与 closed 轮询之前
-        // 取起点，否则会把 AICPU→Scalar 发布边界丢在父区间外。
-        runtime_plan_build_begin =
-            TraceTimestamp<Ops>(stats.trace, stats.result);
+        // Scalar backend 以及 SIMT 的 95 个普通 continuation 都从真实
+        // Plan storage acquire 前取 Attach/Wait 起点；AIV0 保留 VF launch
+        // 前传入的 external begin，不能在 continuation 中覆盖。
+        if (!external_build_window_active) {
+            runtime_plan_build_begin =
+                TraceTimestamp<Ops>(stats.trace, stats.result);
+        }
         runtime_plan_attached = AttachClosedRuntimePlan<Ops>(
             state, stats, runtime_plan_view, task_count
         );
@@ -6945,39 +7049,55 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 #else
         stats.result.submit_begin = orchestration_begin;
 #endif
-        bool build_ok = runtime_plan_attached;
-        while (build_ok) {
-            const aicpu_plan::BuildReservation reservation =
-                TakeAttachedClosedRuntimePlanBuildTicket<Ops>(
-                    runtime_plan_view, task_count, stats
-                );
-            if (reservation.status ==
-                aicpu_plan::BuildReservationStatus::Reserved) {
-                build_ok = BuildRuntimePlanTask<Ops, Profile>(
-                    state, worker, runtime_plan_view,
-                    reservation.task_id, context, stats,
-                    pmu_context
-                );
-                continue;
-            }
-            if (reservation.status !=
-                aicpu_plan::BuildReservationStatus::Closed) {
-                PublishRuntimePlanConsumerFatal<Ops>(state, stats);
-                build_ok = false;
+        if constexpr (
+            kCompiledRuntimePlanBuildBackend ==
+            RuntimePlanBuildBackend::Scalar
+        ) {
+            bool build_ok = runtime_plan_attached;
+            while (build_ok) {
+                const aicpu_plan::BuildReservation reservation =
+                    TakeAttachedClosedRuntimePlanBuildTicket<Ops>(
+                        runtime_plan_view, task_count, stats
+                    );
+                if (reservation.status ==
+                    aicpu_plan::BuildReservationStatus::Reserved) {
+                    build_ok = BuildRuntimePlanTask<Ops, Profile>(
+                        state, worker, runtime_plan_view,
+                        reservation.task_id, context, stats,
+                        pmu_context
+                    );
+                    continue;
+                }
+                if (reservation.status !=
+                    aicpu_plan::BuildReservationStatus::Closed) {
+                    PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+                    build_ok = false;
+                    break;
+                }
+                // 每个 Scalar 只在首次取得越界 ticket 后报到；last 核验
+                // N+96、最后插入与 96 次唯一 arrival。
+                runtime_plan_build_released =
+                    ArriveAndWaitRuntimePlanBuildRelease<Ops>(
+                        state, runtime_plan_view, task_count, stats
+                    );
+                build_ok = runtime_plan_build_released;
                 break;
             }
-            // 每个 worker 只在首次取得越界 ticket 后报到；该分支恰好
-            // 执行一次。last 核验 N+BuildWorkers 和最后插入；W 次 arrival 的
-            // program-order 合同证明已无 in-flight BUILDING。
+        } else {
+            // 四个 VF leader 已经独占 Take/Build/Arrival。包括 AIV0 在内的
+            // 96 个 Scalar continuation 绝不再消费 ticket 或报到，只把
+            // closed Plan 身份与 release N 交叉校验后进入 Execute。
+            (void)context;
             runtime_plan_build_released =
-                ArriveAndWaitRuntimePlanBuildRelease<Ops>(
+                runtime_plan_attached &&
+                WaitRuntimePlanBuildRelease<Ops>(
                     state, runtime_plan_view, task_count, stats
                 );
-            build_ok = runtime_plan_build_released;
-            break;
         }
-        runtime_plan_build_end =
-            TraceTimestamp<Ops>(stats.trace, stats.result);
+        if (!external_build_window_active) {
+            runtime_plan_build_end =
+                TraceTimestamp<Ops>(stats.trace, stats.result);
+        }
 #if PA_BUILD_PERF_CLOCK
         // 唯一性能终点在 FinalDrain 排空后读取；不保留 Submit-only
         // 性能边界。
@@ -7219,11 +7339,13 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
     }
 #endif
 #if PTO_FDWIC_SHARED_MAP
-    if (runtime_plan_build_begin != 0 &&
+    if ((external_build_window_active ||
+         runtime_plan_build_begin != 0U) &&
         runtime_plan_build_end >= runtime_plan_build_begin) {
-        // 延后写 raw，父区间不包含自身 TraceRecord 的 GM 写入
-        // 开销；起止端点仍精确包住 storage/closed、所有本核
-        // PlannedBuild 和 arrival/release。
+        // Scalar backend 精确包住 storage/closed、PlannedBuild 与
+        // arrival/release；SIMT 的 95 个普通 continuation 只包住自己的
+        // Attach/Wait。AIV0 则使用 VF TU 传入的精确 external begin/end，
+        // 即使 Build 已置 fatal 也不丢失这段证据。
         WriteTrace<false>(
             stats.trace, stats.result, -1, -1,
             TracePhase::RuntimePlanBuild,
@@ -7371,20 +7493,41 @@ PA_DEVICE void RunSchedulerImpl(PA_GM SchedulerState *state, uint32_t worker_id,
 }
 
 template <typename Ops>
-PA_DEVICE void RunScheduler(PA_GM SchedulerState *state, uint32_t worker_id, CoreRole role) {
+PA_DEVICE void RunScheduler(
+    PA_GM SchedulerState *state, uint32_t worker_id, CoreRole role,
+    const RuntimePlanExternalBuildWindow &external_build_window
+) {
     // 两个正式 CCEC 构建都不再携带旧 phase-profile 模板副本：swimlane 用
     // records 表达阶段，submit-pmu 使用独立 PMU 边界。其他后端暂时保留原
     // 运行时入口，保证公共 standalone 的 CPU/AscendC 回归不被 CCEC 构建切分影响。
 #if PA_BUILD_SWIMLANE || PA_BUILD_SUBMIT_PMU || PA_BUILD_PERF_CLOCK
-    RunSchedulerImpl<Ops, false>(state, worker_id, role);
+    RunSchedulerImpl<Ops, false>(
+        state, worker_id, role, external_build_window
+    );
 #else
     // Profile 作为编译期模板参数，只在显式开启时保留阶段累计代码，关闭时不在热路径增加运行时分支。
     if (state->config.profile_phases != 0) {
-        RunSchedulerImpl<Ops, true>(state, worker_id, role);
+        RunSchedulerImpl<Ops, true>(
+            state, worker_id, role, external_build_window
+        );
     } else {
-        RunSchedulerImpl<Ops, false>(state, worker_id, role);
+        RunSchedulerImpl<Ops, false>(
+            state, worker_id, role, external_build_window
+        );
     }
 #endif
+}
+
+template <typename Ops>
+PA_DEVICE void RunScheduler(
+    PA_GM SchedulerState *state, uint32_t worker_id, CoreRole role
+) {
+    // 既有 Scalar 调用点保持源码和机器合同不变。SIMT backend 的正式
+    // AIV0 entry 必须显式使用四参 overload；其余 95 核继续走本入口。
+    RunScheduler<Ops>(
+        state, worker_id, role,
+        kNoRuntimePlanExternalBuildWindow
+    );
 }
 
 }  // namespace pa_scheduler

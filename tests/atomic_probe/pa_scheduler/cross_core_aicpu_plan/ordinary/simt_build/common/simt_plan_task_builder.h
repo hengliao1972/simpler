@@ -171,6 +171,34 @@ PA_DEVICE uint64_t SimtPackU32Pair(uint32_t low, uint32_t high)
            (static_cast<uint64_t>(high) << 32U);
 }
 
+// Shared writer-history key ABI is one-based: zero is permanently reserved
+// as the invalid/unset key.  Keep the narrow SIMT producer and reader on the
+// same encoding used by SharedSymbolHistoryKey/SharedSymbolHistoryReference.
+PA_DEVICE bool SimtEncodeSharedSymbolHistoryKey(
+    uint32_t producer, uint32_t slot, uint32_t &key
+)
+{
+    if (slot >= plan::kMaxRuntimeOutputsPerTask) return false;
+    const uint64_t key64 =
+        static_cast<uint64_t>(producer) *
+            plan::kMaxRuntimeOutputsPerTask +
+        slot + 1U;
+    if (key64 > UINT32_MAX) return false;
+    key = static_cast<uint32_t>(key64);
+    return true;
+}
+
+PA_DEVICE bool SimtDecodeSharedSymbolHistoryKey(
+    uint32_t key, uint32_t &producer, uint32_t &slot
+)
+{
+    if (key == 0U) return false;
+    const uint32_t zero_based_key = key - 1U;
+    producer = zero_based_key / plan::kMaxRuntimeOutputsPerTask;
+    slot = zero_based_key % plan::kMaxRuntimeOutputsPerTask;
+    return true;
+}
+
 PA_DEVICE uint64_t SimtElementSize(uint8_t dtype)
 {
     constexpr uint8_t sizes[kSimtDataTypeCount] = {
@@ -689,13 +717,13 @@ PA_DEVICE bool PrepareWriterDelta(
                     task_id || reference.output_slot < 0) {
                 return false;
             }
-            const uint64_t key64 =
-                static_cast<uint64_t>(
-                    static_cast<uint32_t>(reference.producer_task_id)
-                ) * plan::kMaxRuntimeOutputsPerTask +
-                static_cast<uint32_t>(reference.output_slot);
-            if (key64 > UINT32_MAX) return false;
-            const uint32_t key = static_cast<uint32_t>(key64);
+            uint32_t key = 0U;
+            if (!SimtEncodeSharedSymbolHistoryKey(
+                    static_cast<uint32_t>(reference.producer_task_id),
+                    static_cast<uint32_t>(reference.output_slot), key
+                )) {
+                return false;
+            }
             for (uint32_t previous = 0U;
                  previous < scratch.symbol_count; ++previous) {
                 if (scratch.symbol_keys[previous] == key) return false;
@@ -776,11 +804,11 @@ PA_DEVICE bool PublishWriterMetadataAndCompletion(
         for (uint32_t symbol = 0U;
              symbol < scratch.symbol_count; ++symbol) {
             const uint32_t key = scratch.symbol_keys[symbol];
-            const uint32_t producer =
-                key / plan::kMaxRuntimeOutputsPerTask;
-            const uint32_t slot =
-                key % plan::kMaxRuntimeOutputsPerTask;
-            if (producer >= task_id ||
+            uint32_t producer = 0U;
+            uint32_t slot = 0U;
+            if (!SimtDecodeSharedSymbolHistoryKey(
+                    key, producer, slot
+                ) || producer >= task_id ||
                 Ops::Load(runtime.OutputPublished(producer, slot)) !=
                     static_cast<int64_t>(producer)) {
                 return false;
@@ -825,11 +853,11 @@ PA_DEVICE bool PublishWriterMetadataAndCompletion(
         for (uint32_t symbol = 0U;
              symbol < scratch.symbol_count; ++symbol) {
             const uint32_t key = scratch.symbol_keys[symbol];
-            const uint32_t producer =
-                key / plan::kMaxRuntimeOutputsPerTask;
-            const uint32_t slot =
-                key % plan::kMaxRuntimeOutputsPerTask;
-            if (Ops::CompareExchange(
+            uint32_t producer = 0U;
+            uint32_t slot = 0U;
+            if (!SimtDecodeSharedSymbolHistoryKey(
+                    key, producer, slot
+                ) || Ops::CompareExchange(
                     runtime.OutputLastWriter(producer, slot),
                     scratch.symbol_previous[symbol],
                     static_cast<int64_t>(task_id)
@@ -928,7 +956,9 @@ PA_DEVICE bool ResolveSymbolWriterBefore(
     const uint32_t producer =
         static_cast<uint32_t>(reference.producer_task_id);
     const uint32_t slot = static_cast<uint32_t>(reference.output_slot);
+    uint32_t key = 0U;
     if (producer >= reader_task ||
+        !SimtEncodeSharedSymbolHistoryKey(producer, slot, key) ||
         Ops::Load(runtime.OutputPublished(producer, slot)) !=
             static_cast<int64_t>(producer)) {
         return false;
@@ -936,8 +966,6 @@ PA_DEVICE bool ResolveSymbolWriterBefore(
     int32_t latest = static_cast<int32_t>(
         Ops::Load(runtime.OutputLastWriter(producer, slot))
     );
-    const uint32_t key =
-        producer * plan::kMaxRuntimeOutputsPerTask + slot;
     uint32_t traversed = 0U;
     while (latest >= static_cast<int32_t>(reader_task)) {
         if (latest < 0 ||

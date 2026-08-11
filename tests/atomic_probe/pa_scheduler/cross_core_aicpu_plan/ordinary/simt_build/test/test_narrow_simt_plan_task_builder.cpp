@@ -98,6 +98,31 @@ void Expect(bool condition, const char *message)
     if (!condition) Fail(message);
 }
 
+void TestSharedSymbolHistoryKeyAbi()
+{
+    uint32_t key = 0U;
+    uint32_t producer = UINT32_MAX;
+    uint32_t slot = UINT32_MAX;
+    Expect(simt::SimtEncodeSharedSymbolHistoryKey(0U, 0U, key) &&
+               key == 1U &&
+               simt::SimtDecodeSharedSymbolHistoryKey(
+                   key, producer, slot
+               ) && producer == 0U && slot == 0U,
+           "producer 0 slot 0 did not use one-based history key 1");
+    Expect(simt::SimtEncodeSharedSymbolHistoryKey(7U, 3U, key) &&
+               key == 60U &&
+               simt::SimtDecodeSharedSymbolHistoryKey(
+                   key, producer, slot
+               ) && producer == 7U && slot == 3U,
+           "nonzero shared history key did not round-trip");
+    Expect(!simt::SimtDecodeSharedSymbolHistoryKey(
+               0U, producer, slot
+           ) && !simt::SimtEncodeSharedSymbolHistoryKey(
+               0U, plan::kMaxRuntimeOutputsPerTask, key
+           ),
+           "reserved key 0 or out-of-range output slot was accepted");
+}
+
 bool WaitUntil(
     std::chrono::steady_clock::time_point deadline,
     const std::function<bool()> &predicate
@@ -1255,11 +1280,11 @@ void TestFourLeaderFullBuild()
         runtime_fixture.state->shared_map.writer_history[6];
     Expect(history1.magic == simt::kSimtWriterHistoryMagic &&
                history1.writer_task == 1 && history1.count == 1U &&
-               history1.entries[0].symbol_key == 0U &&
+               history1.entries[0].symbol_key == 1U &&
                history1.entries[0].previous_writer == 0 &&
                history6.magic == simt::kSimtWriterHistoryMagic &&
                history6.writer_task == 6 && history6.count == 1U &&
-               history6.entries[0].symbol_key == 0U &&
+               history6.entries[0].symbol_key == 1U &&
                history6.entries[0].previous_writer == 1,
            "symbol writer history did not preserve its predecessor chain");
 
@@ -1624,6 +1649,7 @@ void TestAllFaninSourcesHonorHeapWindow()
 
 int main()
 {
+    TestSharedSymbolHistoryKeyAbi();
     TestFourLeaderFullBuild();
     TestCorruptPlanFailsBeforeSideEffects();
     TestBrokenPredecessorFailsClosed();

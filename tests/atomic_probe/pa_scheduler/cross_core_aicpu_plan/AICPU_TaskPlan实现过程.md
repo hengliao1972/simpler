@@ -22,17 +22,18 @@
 | S0 | Plan ABI、动态存储和 AICPU/AICore 发布合同 | 已闭合 |
 | S1 | 真实 AICPU orchestration SO 与 Plan backend | 已闭合，已通过正式 A5 AICPU launch 验证 |
 | S2 | ordinary Scalar Build 端到端 | 已闭合，CPU 与 A5 B1/B256 均已通过 |
-| S3 | ordinary SIMT Build 端到端 | 已闭合四 leader 协议、通用 writer、窄完整 Build 的 CPU 与 CCEC machine-code 门槛；正式 runtime/A5 尚未接通 |
+| S3 | ordinary SIMT Build 端到端 | 已正式接通；CPU/CCEC 门槛与 A5 B1/B256 perf-clock 功能全部 PASS |
 | S4 | DAG Scalar Build | 未开始 |
 | S5 | DAG SIMT Build | 未开始 |
-| S6 | 观测闭合后的性能收敛 | 已有首组无泳道样本，尚未收敛 |
+| S6 | 观测闭合后的性能收敛 | Scalar 已有 warm 样本；SIMT 只有冷 run1 功能样本，尚未收敛 |
 
-当前已经闭合 ordinary + Scalar 的第一条完整路径：真实
-AICPU callback 生成 canonical Plan，Plan-ahead 完整封口后，96 个
-Scalar 用中央 ticket 完成 Materialize、ordinary TensorMap 严格顺序
-插入、Fanin 和 Build，最后由 AIC/AIV Execute 与 FinalDrain 收口。
-这证明了功能路径；B1 warm pipeline 已低于 1ms，但 B256 仍明显超过
-1ms，不能把子阶段时间当成已达成整体目标。
+当前 ordinary 的 Scalar Build 和 SIMT Build 两条完整路径都已
+闭合。两者共用真实 AICPU callback 生成的 closed canonical Plan
+v2、ordinary TensorMap 严格插入链和 96 Scalar Execute/FinalDrain。
+SIMT 只把 Build owner 替换为 AIV0 启动的 128-thread VF/四个
+warp leader，不改变 Execute population。功能路径已证明，但
+S3 当前只有冷 run1 功能样本，B256 pipeline 约 71.8ms，离
+1ms 很远，不宣称性能达标。
 
 ## 3. 2026-08-10：S0 协议门槛
 
@@ -338,15 +339,17 @@ physical generic records 为 2165、drop 为 0；converter 与 Plan 专用
 exclusive analyzer 均 PASS。泳道 lifecycle 为 348.119us，只用于归因，
 不能与上述 trace-free 绝对值相减。
 
-## 6. 下一步
+## 6. 当前停止点
 
-ordinary Scalar 的功能基线已经成立。下一步按既定顺序实现
-`ordinary/simt_build`，要求继续消费同一份 canonical Plan，不改变
-ordinary TensorMap 严格顺序插入语义。完成且比较 ordinary Scalar/SIMT
-后，再依次进入 DAG Scalar 和 DAG SIMT。当前 DAG 目录只是目标布局，
-尚未实现，不得把 ordinary 结果外推成 DAG 证据。
+ordinary Scalar 和 ordinary SIMT 的功能基线都已成立。根据
+用户要求，本轮在 ordinary SIMT 正式 A5 B1/B256 功能闭合后
+停止继续功能开发，不进入 DAG Scalar 或 DAG SIMT，也不启动
+新的性能优化轮次。当前
+DAG 目录只是目标布局，没有实现与 A5 证据，不得把
+ordinary 结果外推成 DAG 证据。SIMT 冷 run1 也不是可用于
+性能结论的稳态基线。
 
-## 7. 2026-08-10：S3 ordinary SIMT 起步
+## 7. 2026-08-10—2026-08-11：S3 ordinary SIMT
 
 ### 7.1 已冻结的首版边界
 
@@ -617,9 +620,87 @@ continuation 会再次返回型读取 build release、Plan fatal 和 scheduler f
 `MIX_VF=4`，没有未定义 GLOBAL 或 relocation；动态 ticket、完整 Build、
 四次唯一 arrival、release 以及 fatal/success continuation 都存在于优化 IR。
 
-这一阶段仍然是 production-shape gate，不是正式 mode：它没有修改
+在该阶段结束时，这仍然只是 production-shape gate，不是正式
+mode：它当时没有修改
 `scalar_build` 的 Host、kernel、manifest、`run.sh` 或 Host oracle，也没有
 在 A5 上验证 AICPU->SIMT、leader->AIV0、AIV0->Scalar 的可见性。下一阶段
 必须把 backend hook 接入正式 RunScheduler，并把 Scalar Build 统计口径改成
 SIMT 直接状态 oracle；不能通过伪造 96 个 Scalar 的 submits/wins 来满足旧
-Host 校验。
+Host 校验。这些正式接线已在 7.10 完成。
+
+### 7.10 正式 CCEC mode 与 A5 功能闭合
+
+2026-08-11，`ordinary/simt_build` 已从 production-shape gate 接入
+正式 CCEC Host/kernel/AICPU producer/manifest/`run.sh`。最终路径是：
+
+```text
+AICPU 唯一 producer
+  -> 执行真实 orchestration callback
+  -> 按无缺口 task id 发布 canonical Plan v2
+  -> frontier == closed == N
+
+AIV0 正式入口
+  -> 只读核验 backend/ABI/variant/workers/Plan storage
+  -> async_invoke 128-thread VF
+  -> 4 个 warp lane0 leader 动态领取 N 个 Build task
+  -> build_next == N + 4，arrivals == 4
+  -> N>0 时确认 completion[N-1] == N-1
+  -> 唯一 last leader 发布 build_release == N
+  -> success/fatal 都完成 V->S join
+
+96 Scalar continuation
+  -> 32 AIC + 64 AIV 共同 Execute
+  -> FinalDrain 收口
+```
+
+其他 95 个 Scalar 不冒充 Build worker，只 attach closed Plan 并等待
+四 leader release；AIV0 在 VF join 后作为第 96 个 Scalar 进入同一
+Execute/FinalDrain continuation。因此 Build population 是 4，Execute
+population 始终是 96，不会为 SIMT Build 永久牺牲 AIV0。
+
+Alloc task 保留在 canonical Plan 中：PlanCell 仅携带逻辑 Alloc
+identity（`EngineClass::MetadataOnly`）和 fresh-output `TensorCreateInfo`，
+AICPU 不分配 output heap。真实
+8-shard heap reserve、descriptor 构造和 `SharedOutputCell` publication 都由拿到
+Alloc ticket 的 SIMT Build leader 完成。Alloc 完成 metadata vend/flag 但不发布
+executable kernel；因此“Alloc 在 Plan 中”不等于“Plan 已完成 heap
+Materialize”。
+
+正式 Host 在 AICore sync 和全部权威计时窗结束后，D2H 回读
+AICPU 实际发布的 immutable PlanCell 前缀。writer/output oracle 从
+Plan tensor tag、CreateInfo、inline descriptor 和 OutputRef 通用投影：
+
+- fresh output 数量、大小、descriptor 和 8-shard heap 区间；
+- reference `Inout/OutputExisting` 的 writer history 与最终
+  `last_writer`；
+- non-reference ordinary writer 的 bucket/head/tail/seq/payload；
+- 每 task 严格 insert completion 和未用状态。
+
+这部分校验不从 PA group/kind 公式猜 writer/output。shared writer-history
+key 严格使用 one-based ABI：
+`producer * kSharedOutputMaxPerTask + slot + 1`，其中 0 永久保留为
+invalid/unset；这保证 producer 0/slot 0 的 key 为 1，SIMT writer、reader
+和 Host projection 三方一致。Plan snapshot 是事后 oracle，不是 Host 调度
+输入，也不进入 pipeline 计时。
+
+正式 AIV ELF 最终 metadata 需要 8344B SIMT stack 和 8320B divergence
+stack。Host 的 SIMT backend 不再使用默认 `aclInit(nullptr)`，而是在
+ACL 首次初始化时传入按 512B 容量步长向上取整的
+`simt_stack_size=8704` 和 `simt_divergence_stack_size=8704`，分别覆盖
+8344B/8320B 的最终 metadata 要求。该修复
+只在编译期 SIMT backend 生效，Scalar backend 仍保持原有 ACL 初始化。
+
+首次正式 A5 `perf-clock` 功能运行的 run1 精确结果如下：
+
+| workload | startup→FinalDrain | plan_time | producer_exec | aicore_time | pipeline_e2e | 结果 |
+| ---- | ----: | ----: | ----: | ----: | ----: | ---- |
+| B1 | 489.219us | 6019.780us | 153.927us | 996.086us | 7016.097us | execution/semantic/postprocess PASS |
+| B256 | 62359.163us | 8871.954us | 2959.921us | 62884.823us | 71756.980us | execution/semantic/postprocess PASS |
+
+这两条只是 formal ordinary SIMT 首次冷 run 的功能证据，不是
+多轮 warm 中位数，不能当作稳态性能基线。B1 冷 pipeline 为
+7.016ms；B256 的 AICore device 内主体已达 62.359ms，完整
+pipeline 为 71.757ms，离 1ms 目标很远。本阶段只宣称
+B1/B256 的 execution、semantic 和 postprocess 全部闭合，不宣称
+SIMT 性能达标或优于 Scalar。DAG 没有实现，且已按用户要求
+在此停止继续功能开发，也不开始新的性能优化。

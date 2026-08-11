@@ -134,6 +134,23 @@
 #error "compact generic trace currently supports only the production CAP=128 ABI"
 #endif
 
+// Runtime Plan 的生产者始终是 AICPU；这个开关只选择 closed Plan 之后
+// 由谁执行 Materialize/Register/Fanin/Build。0 保留现有 96 Scalar
+// 中央 ticket 路径，1 表示由 AIV0 启动的四个 SIMT leader 完成 Build，
+// 随后 96 个 Scalar 只附着 Plan、观察 release 并执行 FinalDrain。
+#ifndef PA_RUNTIME_PLAN_BUILD_BACKEND
+#define PA_RUNTIME_PLAN_BUILD_BACKEND 0
+#endif
+
+#if PA_RUNTIME_PLAN_BUILD_BACKEND != 0 && \
+    PA_RUNTIME_PLAN_BUILD_BACKEND != 1
+#error "PA_RUNTIME_PLAN_BUILD_BACKEND must be 0 (Scalar) or 1 (SIMT)"
+#endif
+
+#if PA_RUNTIME_PLAN_BUILD_BACKEND == 1 && !PTO_FDWIC_SHARED_MAP
+#error "the SIMT Runtime Plan Build backend requires shared TensorMap mode"
+#endif
+
 // submit-pmu 与 perf-clock 都不允许把阶段泳道、atomic 包围计时或
 // phase-profile 模板带入最终 ELF。统一谓词避免各 helper 对“无 trace”
 // 的理解逐渐分叉；它不代表 PMU 已开启。
@@ -146,11 +163,25 @@ enum class TensorMapBuildMode : uint32_t {
     Shared = 1,
 };
 
+enum class RuntimePlanBuildBackend : uint32_t {
+    Scalar = 0,
+    Simt = 1,
+};
+
 constexpr TensorMapBuildMode kCompiledTensorMapMode =
     static_cast<TensorMapBuildMode>(PTO_FDWIC_SHARED_MAP);
+constexpr RuntimePlanBuildBackend kCompiledRuntimePlanBuildBackend =
+    static_cast<RuntimePlanBuildBackend>(
+        PA_RUNTIME_PLAN_BUILD_BACKEND
+    );
 constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 constexpr uint32_t kBuildIdentityCompactGenericTraceBit =
     1U << 31U;
+// bit30 尚未被现有 CAP/G/trace 身份占用。Scalar 保持既有 ABI 数值完全
+// 不变；SIMT 必须带上该位，Host、AIV VF 与 Scalar continuation 因而
+// 无法把 W=4 与 W=96 的产物静默混接。
+constexpr uint32_t kBuildIdentityRuntimePlanSimtBit =
+    1U << 30U;
 #if PTO_FDWIC_SHARED_MAP
 constexpr uint32_t kBuildIdentityAbiGeneration = 17;
 #else
@@ -162,7 +193,7 @@ constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 // 拒绝不同 G 的 shared 混件。非默认隔离变体继续把 CAP 编进 ABI。
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiVersion =
+constexpr uint32_t kBuildIdentityAbiBaseVersion =
     (kBuildIdentityAbiGeneration << 8U) |
     static_cast<uint32_t>(
         PTO_FDWIC_SHARED_INSERT_TURN_GROUPS
@@ -171,23 +202,34 @@ constexpr uint32_t kBuildIdentityAbiVersion =
          ? kBuildIdentityCompactGenericTraceBit
          : 0U);
 #else
-constexpr uint32_t kBuildIdentityAbiVersion =
+constexpr uint32_t kBuildIdentityAbiBaseVersion =
     kBuildIdentityAbiGeneration;
 #endif
 #else
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiVersion =
+constexpr uint32_t kBuildIdentityAbiBaseVersion =
     (kBuildIdentityAbiGeneration << 24U) |
     (static_cast<uint32_t>(
          PTO_FDWIC_SHARED_INSERT_TURN_GROUPS
      ) << 16U) |
     static_cast<uint32_t>(PTO_FDWIC_TENSORMAP_RING_CAP);
 #else
-constexpr uint32_t kBuildIdentityAbiVersion =
+constexpr uint32_t kBuildIdentityAbiBaseVersion =
     (kBuildIdentityAbiGeneration << 16U) |
     static_cast<uint32_t>(PTO_FDWIC_TENSORMAP_RING_CAP);
 #endif
 #endif
+static_assert(
+    (kBuildIdentityAbiBaseVersion &
+     kBuildIdentityRuntimePlanSimtBit) == 0U,
+    "existing build identity overlaps the Runtime Plan backend bit"
+);
+constexpr uint32_t kBuildIdentityAbiVersion =
+    kBuildIdentityAbiBaseVersion |
+    (kCompiledRuntimePlanBuildBackend ==
+             RuntimePlanBuildBackend::Simt
+         ? kBuildIdentityRuntimePlanSimtBit
+         : 0U);
 static_assert(
     (kBuildIdentityAbiVersion &
      kBuildIdentityCompactGenericTraceBit) ==
@@ -259,19 +301,27 @@ constexpr uint32_t kAicWorkers = 32;
 constexpr uint32_t kAivWorkers = 64;
 constexpr uint32_t kWorkers = kAicWorkers + kAivWorkers;
 // Runtime Plan 的 Build population 与最终 Execute population 是两个
-// 独立合同。ordinary Scalar 默认由 96 个 Scalar 领取 Build ticket；
-// ordinary SIMT 会在自己的构建中把它设为 4 个 warp leader，但仍由
-// 全部 96 个 Scalar 执行和完成 FinalDrain。这里只参数化通用收口数字，
-// 不改变默认 Scalar 路径。
+// 独立合同。这里不允许任意 W：Scalar backend 固定 W=96，SIMT backend
+// 固定 W=4；Execute 始终由全部 96 个 Scalar 推进。保留旧 workers 宏
+// 只是让现有构建脚本获得明确的编译期交叉校验，不能用它绕过 backend。
 #ifndef PA_RUNTIME_PLAN_BUILD_WORKERS
+#if PA_RUNTIME_PLAN_BUILD_BACKEND == 1
+#define PA_RUNTIME_PLAN_BUILD_WORKERS 4
+#else
 #define PA_RUNTIME_PLAN_BUILD_WORKERS 96
+#endif
 #endif
 constexpr uint32_t kRuntimePlanBuildWorkers =
     static_cast<uint32_t>(PA_RUNTIME_PLAN_BUILD_WORKERS);
+constexpr uint32_t kExpectedRuntimePlanBuildWorkers =
+    kCompiledRuntimePlanBuildBackend ==
+            RuntimePlanBuildBackend::Simt
+        ? 4U
+        : kWorkers;
 static_assert(
-    kRuntimePlanBuildWorkers > 0U &&
-        kRuntimePlanBuildWorkers <= kWorkers,
-    "Runtime Plan Build population must fit the Scalar worker set"
+    kRuntimePlanBuildWorkers ==
+        kExpectedRuntimePlanBuildWorkers,
+    "Runtime Plan Build population disagrees with the compiled backend"
 );
 constexpr uint32_t kRuntimeMaxWorkers = 108;
 constexpr uint32_t kCursorShards = 4;
@@ -2517,6 +2567,43 @@ static_assert(
 #endif
 #endif
 static_assert(sizeof(SchedulerState) <= UINT32_MAX, "SchedulerState size must fit build identity");
+
+// SIMT AIV0 必须在启动 VF、发布 report 或写任一调度 GM 状态之前拒绝
+// Host/device 混件。该 helper 自身严格只读：调用方负责先对连续三条
+// startup 配置线做 acquire/DCCI；失败后的 fatal 发布和 V->S join 仍由
+// 外层入口负责。Scalar RunScheduler 也复用同一谓词，避免两份身份规则
+// 随版本漂移。
+#ifdef PA_DEVICE
+#define PA_RUNTIME_PLAN_PREFLIGHT_INLINE PA_DEVICE
+#else
+#define PA_RUNTIME_PLAN_PREFLIGHT_INLINE inline
+#endif
+#ifdef PA_GM
+#define PA_RUNTIME_PLAN_PREFLIGHT_GM PA_GM
+#else
+#define PA_RUNTIME_PLAN_PREFLIGHT_GM
+#endif
+
+PA_RUNTIME_PLAN_PREFLIGHT_INLINE bool
+RuntimePlanBuildIdentityPreflight(
+    PA_RUNTIME_PLAN_PREFLIGHT_GM const SchedulerState *state
+) {
+    return state != nullptr &&
+           state->config.build_identity_magic ==
+               kBuildIdentityMagic &&
+           state->config.build_identity_abi_version ==
+               kBuildIdentityAbiVersion &&
+           state->config.workers == kWorkers &&
+           state->config.tensor_map_mode ==
+               static_cast<uint32_t>(kCompiledTensorMapMode) &&
+           state->config.scheduler_state_size ==
+               static_cast<uint32_t>(sizeof(SchedulerState)) &&
+           state->pmu_probe.build_variant ==
+               kCompiledBuildVariant;
+}
+
+#undef PA_RUNTIME_PLAN_PREFLIGHT_GM
+#undef PA_RUNTIME_PLAN_PREFLIGHT_INLINE
 
 }  // namespace pa_scheduler
 

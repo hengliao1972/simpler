@@ -19,13 +19,16 @@ canonical TaskPlan；AICore 不再 96 路重放 callback，而是按 task id 领
 - shared TensorMap 仍严格按 task id 完成 `N-1 -> N` 插入；
 - 公共协议不得依赖 PA 的 task 数、TaskKind 排列或 Host 预制答案。
 
-当前 ordinary + Scalar 首版已在 CPU 和 A5 闭合：真实 AICPU
-orchestration callback 生成 canonical Plan，96 个 Scalar 使用中央 ticket
-完成 Build，ordinary TensorMap 仍严格按 task id 插入，随后 AIC/AIV
-执行并由 FinalDrain 收口。当前 B1 warm pipeline 已低于 1ms，但 B256
-仍为多毫秒，所以完整目标尚未达成。ordinary SIMT 已完成四 leader 协议、
-通用 ordinary writer、窄完整 Build 的 CPU 与 CCEC machine-code 门槛，
-正式 runtime/A5 尚未接通；两种 DAG 模式尚未实现。
+当前 ordinary + Scalar 与 ordinary + SIMT 都已在 CPU/CCEC 门槛
+和 A5 正式路径上闭合。两者共用真实 AICPU orchestration
+callback 生成的 closed canonical Plan v2、ordinary TensorMap 严格插入链
+和 32 AIC + 64 AIV Execute/FinalDrain。SIMT 模式由 AIV0 启动
+128-thread VF，四个 warp leader 用动态 ticket 完成 Build；Host 在
+权威计时结束后回读实际 Plan，对 writer/output 做 Plan-driven
+通用投影校验。A5 B1/B256 perf-clock 功能已全部 PASS，但
+目前只有冷 run1 样本，B256 pipeline 约 71.8ms，不是稳态性能
+基线，也不宣称已达成 1ms 目标。两种 DAG 模式均未实现，
+并已按用户要求在 ordinary SIMT 功能闭合后停止继续功能开发。
 
 ### 1.1 目录与两个正交维度
 
@@ -72,8 +75,10 @@ AICPU（唯一 Plan producer）
   发布 closed_task_count == planned_frontier
   结束 AICPU 阶段
 
-AICore Build（首版为 Scalar）
-  从 build_next 领取 N < closed_task_count
+AICore Build（编译期选择 Scalar 或 SIMT backend）
+  Scalar：96 个 worker 从 build_next 领取
+  SIMT：AIV0 启动 128-thread VF，4 个 warp leader 从 build_next 领取
+  两者都只处理 N < closed_task_count
   acquire / invalidate / validate PlanCell[N]
   Materialize
   等待 TensorMap completion[N-1]
@@ -122,8 +127,10 @@ Host 不得为这条路径设置 PlanCell 内容。
 
 当前 A5 owner request 只携带 Plan storage 引用、容量、输入 Tensor
 metadata、`context_lens` 和 scalar。task 数、task kind、task identity 和
-dispatch plan 均不是 Host 输入。Host 可在 Plan 生成后使用独立 PA
-oracle 校验 D2H 结果，但 oracle 不进入 device 调度数据流。
+dispatch plan 均不是 Host 输入。正式 SIMT Host 只在 AICore 完成
+FinalDrain/sync 后回读 immutable Plan snapshot，对 writer/output 做事后
+Plan-driven 投影校验；该 oracle 不进入 device 调度数据流或权威
+计时窗。
 
 ## 3. 公共 Plan ABI 与内存合同
 
@@ -261,6 +268,13 @@ lane0 是 active Build leader。VF 完成后，该 AIV0 Scalar 仍回到普通 A
 Execute/FinalDrain，因此 Execute 拓扑保持 32 AIC + 64 AIV，而不是为了
 Build 永久牺牲一个执行核。
 
+该架构已接入正式 CCEC mode，不再只是 compile probe。唯一
+正式 AIV global entry 中，AIV0 在任何 Build GM side effect 之前做
+backend/ABI/variant/workers/storage 只读 preflight，再启动 VF；其他 AIV
+直接进入 Scalar continuation。success 和 fatal 都必须先做 V->S join，
+随后 AIV0 作为 worker 32 进入第 96 个 Scalar continuation，避免其余
+95 核卡在 startup/release。AIC 继续复用 Scalar AIC 正式入口。
+
 首个功能版本让 4 个 leader 共用 `build_next.FetchAdd(1)`：
 
 ```text
@@ -306,6 +320,13 @@ atomic observe PlanCell control
   -> 只查询 producer < N 的 fanin
   -> 发布 SharedExecCell 或完成 metadata-only task
 ```
+
+Alloc 也是上述动态 ticket 流中的真实 Plan task。AICPU 在 Alloc
+PlanCell 中只发布逻辑 Alloc identity（`EngineClass::MetadataOnly`）和
+fresh-output CreateInfo，不在
+Plan 阶段预分配 heap。真实 8-shard heap reserve、descriptor Materialize、
+`SharedOutputCell` publication 和 metadata vend/flag 都在拿到 Alloc ticket 的
+Build leader 上完成；Alloc 不产生后续 executable kernel。
 
 这里的 Register 不能直接复用当前 ordinary Scalar 的
 `FinishSharedWinnerSubmitBody`。该函数为 PA 首例保留了一个已测快路径：
@@ -375,6 +396,29 @@ writer 侧禁止用 `asc_dcci_single` 代替 clean-out。completion 交棒前的
 并发局部回滚，整轮不得继续 Execute，下一轮必须完整清零 sidecar。该
 fail-stop 合同与正常热路径分开，不能为了错误恢复给每个 task 增加额外原子。
 
+shared writer-history key 是one-based 公共 ABI：
+
+```text
+key = producer_task_id * kSharedOutputMaxPerTask + output_slot + 1
+```
+
+0 永久保留为 invalid/unset，所以 producer 0/slot 0 的合法 key
+是 1，不能使用零基编码把它与空 history 混淆。SIMT writer、
+future-writer reader 回溯和 Host oracle 必须使用同一编解码。
+
+Host 在 AICore FinalDrain/sync 结束后才 D2H 回读 immutable PlanCell
+前缀，以 Plan tensor tag/CreateInfo/descriptor/OutputRef 投影 fresh output、
+ordinary writer、symbol history 和 final writer，再对照真实
+`SharedTensorMapSidecar`。该 writer/output oracle 不读 PA group/kind 公式，
+快照 D2H 也不在 pipeline 计时窗内，更不是 Build/Execute 调度输入。
+
+正式 AIV 最终 metadata 要求 8344B SIMT stack 和 8320B divergence stack。
+SIMT Host 在 ACL 首次初始化时显式配置向 512B 步长取整后的
+`simt_stack_size=8704` 和 `simt_divergence_stack_size=8704`；Scalar
+backend 不使用该配置。8704B 分别覆盖 8344B/8320B 的最终
+metadata 要求。这是正式 SIMT ELF 能在 A5 启动的 runtime
+资源合同，不是 Build 算法参数。
+
 ### 4.4 尚未实现的公共边界
 
 下列能力不在首版声明范围内：
@@ -387,6 +431,8 @@ fail-stop 合同与正常热路径分开，不能为了错误恢复给每个 tas
   orchestration；
 - Submit 返回时必须立即取得 materialized `TaskOutputTensors::get_ref()` 的
   同步输出 API。
+- DAG TensorMap 的 Scalar/SIMT Build。当前只闭合 ordinary，并已按
+  用户要求在 ordinary SIMT 功能验证后停止继续功能开发。
 
 PA 首例只能使用已有 symbolic `SharedTaskOutputs/FdwicOutputRef` deferred
 路径。遇到上述不支持语义时必须 fail-closed，不能伪造 Tensor descriptor。
@@ -400,10 +446,10 @@ PA 首例只能使用已有 symbolic `SharedTaskOutputs/FdwicOutputRef` deferred
 | S0 | 固定 Plan ABI、AICPU/AICore 发布合同和正确性门槛 | 已闭合 |
 | S1 | 接通真实 AICPU orchestration SO 和 Plan backend | 已闭合，正式 A5 owner/dispatcher 已通过 |
 | S2 | ordinary Scalar Build，CPU 后 A5 B1/B256 | 已闭合，Plan-only B1 与 full B1/B256 均通过 |
-| S3 | 在同一 Plan ABI 上替换为 ordinary SIMT Build | 已闭合四 leader、通用 writer、窄完整 Build、真实 SchedulerState 映射和双 TU production-shape gate；正式 RunScheduler/Host/A5 尚未实现 |
+| S3 | 在同一 Plan ABI 上替换为 ordinary SIMT Build | 已正式接通；CPU/CCEC 门槛和 A5 B1/B256 perf-clock 功能全部 PASS |
 | S4 | 证明 ordinary 闭合后迁移 DAG Scalar Build | 未实现 |
 | S5 | 在 DAG 上替换为 SIMT Build | 未实现 |
-| S6 | 在正确性与观测闭合后做性能收敛 | ordinary Scalar 已有首组无泳道样本，尚未收敛 |
+| S6 | 在正确性与观测闭合后做性能收敛 | Scalar 已有 warm 样本；SIMT 只有冷 run1 功能样本，尚未收敛 |
 
 S0 至少需要以下证据：
 
@@ -448,6 +494,17 @@ B1 首轮仍有 6011.888us Plan/6622.200us pipeline 的 Path-A 冷启动，
 callback 成本，也不能把 warm 中位数冒充冷启动。B256 的 warm producer
 本身仍为 2626.289us，完整 pipeline 为 5180.220us，因此小于 1ms 目标
 明确未达成。
-下一步必须先实现 ordinary SIMT，在同一 Plan ABI、ordinary
-TensorMap 语义和 pipeline 口径下与 Scalar 比较；之后才能依次进入
-DAG Scalar/SIMT。
+
+ordinary SIMT 正式 `perf-clock` 的首次冷 run1 功能证据为：
+
+| workload | startup→FinalDrain | plan_time | producer_exec | aicore_time | pipeline_e2e | 结果 |
+| ---- | ----: | ----: | ----: | ----: | ----: | ---- |
+| B1 | 489.219us | 6019.780us | 153.927us | 996.086us | 7016.097us | execution/semantic/postprocess PASS |
+| B256 | 62359.163us | 8871.954us | 2959.921us | 62884.823us | 71756.980us | execution/semantic/postprocess PASS |
+
+这两条不是多轮 warm 中位数，只能证明 formal ordinary SIMT
+B1/B256 的功能、语义和后处理已收口。B256 的
+`startup→FinalDrain` 为 62.359ms，`pipeline_e2e` 为 71.757ms，
+离 1ms 目标很远；在取得多轮热态证据前不宣称 SIMT 性能
+达标或优于 Scalar。当前已按用户要求在 ordinary SIMT 功能
+闭合后停止，DAG Scalar/SIMT 均未实现，也不开始新的性能优化。

@@ -25,6 +25,19 @@
 
 namespace pa_scheduler::host {
 
+// Runtime Plan Build backend 是 pa_model 已验证的编译期合同；Host 直接
+// 使用同一 enum，不另造默认宏或第二份 identity。
+inline constexpr bool kHostUsesSimtRuntimePlanBuild =
+    kCompiledRuntimePlanBuildBackend ==
+    RuntimePlanBuildBackend::Simt;
+inline constexpr uint32_t kHostSimtRuntimePlanBuildLeaders = 4U;
+static_assert(
+    !kHostUsesSimtRuntimePlanBuild ||
+        kRuntimePlanBuildWorkers ==
+            kHostSimtRuntimePlanBuildLeaders,
+    "ordinary SIMT Host oracle requires exactly four Build leaders"
+);
+
 // shared host oracle 与 private 固定五 task 校验必须在预处理阶段彻底分叉。
 // private 的 #else 有意保留基线 token 形状，避免同一翻译单元内的 shared
 // AST 改动触发 GCC IPA/内联漂移，破坏两种 TensorMap 的严格产物可比性。
@@ -1725,9 +1738,12 @@ inline bool DcciRecordSchemaValid(const TraceRecord &record) {
     return call_count == 1 && record.task_id >= 0;
 }
 
-// AICPU Plan-ahead 下没有 96 路 replay、Claim 或 loser。每个 Scalar 只为
-// 自己从中央 ticket 取得并成功 Build 的 task 记录 Materialize、Register、
-// Fanin（非 Alloc）和 WinnerBuild/AllocComplete。每个 Materialize 父区间
+// AICPU Plan-ahead 下没有 96 路 replay、Claim 或 loser。Scalar backend
+// 中，每个 Scalar 只为自己从中央 ticket 取得并成功 Build 的 task 记录
+// Materialize、Register、Fanin（非 Alloc）和 WinnerBuild/AllocComplete；
+// SIMT backend 的 expected_builds 为 0，只要求每个 Scalar 闭合唯一的粗
+// RuntimePlanBuild 父段，不接受任何伪造的 PlannedBuild 子段。每个
+// Scalar Build 的 Materialize 父区间
 // 后依次紧跟
 // fresh-output publish 及其 copy/flush 两层 detail；每个 Register 后只
 // 跟唯一 SharedRegisterPublishMetadata。output detail 严格嵌在
@@ -3825,7 +3841,77 @@ inline bool HostExecOwnerMatchesEngine(
 }
 
 inline bool HostBuildOwnerMatchesS5bPolicy(uint32_t owner) {
-    return owner < kWorkers;
+    // Scalar Build 的 owner 是任意一个 Scalar；SIMT Build 的 owner 字段
+    // 刻意仍写真实 leader 编号 0..3，而不是虚构 96..99 的额外 owner。
+    // Execute owner 继续由下一层按 AIC/AIV engine 独立检查。
+    return owner <
+        (kHostUsesSimtRuntimePlanBuild
+             ? kHostSimtRuntimePlanBuildLeaders
+             : kWorkers);
+}
+
+inline bool HostScalarWorkerBuildOnlyCountersAreZero(
+    const WorkerResult &result
+) {
+    bool zero =
+        result.submits == 0 &&
+        result.claim_attempts == 0 &&
+        result.claim_wins == 0 &&
+        result.heap_guards == 0 &&
+        result.context_reads == 0 &&
+        result.views_created == 0 &&
+        result.dynamic_create_infos == 0 &&
+        result.arg_resets == 0 &&
+        result.tensor_args_added == 0 &&
+        result.scalar_args_added == 0 &&
+        result.materialized_outputs == 0 &&
+        result.map_inserts == 0 &&
+        result.map_lookups == 0 &&
+        result.slot_tensor_copies == 0 &&
+        result.slot_scalar_copies == 0 &&
+        result.fanin_edges == 0 &&
+        result.final_heap_next == 0 &&
+        result.checksum == 0 &&
+        result.dependency_signature == 0 &&
+        result.shared_symbol_input_loads == 0 &&
+        result.shared_symbol_inout_commits == 0;
+    for (uint32_t kind = 0;
+         kind < static_cast<uint32_t>(TaskKind::Count); ++kind) {
+        zero &= result.wins[kind] == 0;
+    }
+    constexpr ProfilePhase kBuildOnlyPhases[] = {
+        ProfilePhase::Materialize,
+        ProfilePhase::PrepareMap,
+        ProfilePhase::Fanin,
+        ProfilePhase::Register,
+        ProfilePhase::Build,
+    };
+    for (ProfilePhase phase : kBuildOnlyPhases) {
+        const uint32_t index = static_cast<uint32_t>(phase);
+        zero &= result.phase_calls[index] == 0;
+        zero &= result.phase_cycles[index] == 0;
+    }
+    return zero;
+}
+
+inline bool HostRuntimePlanControlIsTerminal(
+    const aicpu_plan::RuntimePlanControl &control,
+    uint32_t task_count
+) {
+    return
+        control.planned_frontier.value ==
+            static_cast<int64_t>(task_count) &&
+        control.closed_task_count.value ==
+            static_cast<int64_t>(task_count) &&
+        control.build_next.value ==
+            static_cast<int64_t>(
+                task_count + kRuntimePlanBuildWorkers
+            ) &&
+        control.build_workers_done.value ==
+            static_cast<int64_t>(kRuntimePlanBuildWorkers) &&
+        control.build_release.value ==
+            static_cast<int64_t>(task_count) &&
+        control.fatal.value == 0;
 }
 
 inline bool HostDynamicPaExecuteOwnerIsLegal(
@@ -4492,6 +4578,617 @@ inline SharedOutputValidation ValidateSharedOutputs(
     }
     return validation;
 }
+
+// Full run 在 AICore 完成后才把 immutable canonical PlanCell 回读到 Host。
+// 这份快照只用于事后协议校验，绝不参与 AICPU producer、Build ticket 或
+// Execute 路由。SIMT ordinary writer 必须从这份真实 Plan 的 tensor tag/
+// reference 推导，不能套用 Scalar PA 的 accumulator-group fastpath。
+struct RuntimePlanHostSnapshot {
+    const aicpu_plan::RuntimeTaskPlanCell *cells = nullptr;
+    uint32_t count = 0;
+};
+
+struct RuntimePlanWriterProjection {
+    bool protocol_ok = false;
+    uint32_t first_bad_task = UINT32_MAX;
+    const char *first_bad_reason = "none";
+    uint64_t published_outputs = 0;
+    uint64_t allocation_bytes = 0;
+    std::vector<uint32_t> output_counts;
+    std::vector<uint64_t> task_allocation_bytes;
+    std::vector<TensorDesc> output_descriptors;
+    std::vector<int64_t> final_writers;
+    std::vector<SharedWriterHistoryCell> writer_histories;
+    std::vector<std::vector<SharedRegionValue>> ordinary_by_bucket;
+};
+
+inline bool DecodeRuntimePlanTensorDescHost(
+    const aicpu_plan::RuntimeTaskPlanStorage &payload,
+    uint32_t word_offset, uint32_t consumer_task,
+    TensorDesc *tensor
+) {
+    if (tensor == nullptr ||
+        word_offset > aicpu_plan::kMaxPlanPayloadWords -
+            aicpu_plan::kTensorDescWords) {
+        return false;
+    }
+    const volatile uint64_t *words = &payload.words[word_offset];
+    TensorDesc decoded{};
+    decoded.buffer_addr = words[0];
+    decoded.buffer_size = words[1];
+    decoded.owner_task_id = words[2];
+    decoded.start_offset = words[3];
+    decoded.version = aicpu_plan::DecodeRuntimeWireInt32(
+        static_cast<uint32_t>(words[4])
+    );
+    decoded.ndims = static_cast<uint32_t>(words[4] >> 32U);
+    decoded.dtype = static_cast<DataType>(static_cast<uint8_t>(words[5]));
+    const uint8_t manual_dep = static_cast<uint8_t>(words[5] >> 8U);
+    const uint8_t contiguous = static_cast<uint8_t>(words[5] >> 16U);
+    decoded.manual_dep = manual_dep != 0U;
+    decoded.is_contiguous = contiguous != 0U;
+    decoded.child_memory = static_cast<uint8_t>(words[5] >> 24U);
+    decoded.shapes[0] = static_cast<uint32_t>(words[5] >> 32U);
+    decoded.shapes[1] = static_cast<uint32_t>(words[6]);
+    decoded.shapes[2] = static_cast<uint32_t>(words[6] >> 32U);
+    decoded.shapes[3] = static_cast<uint32_t>(words[7]);
+    decoded.shapes[4] = static_cast<uint32_t>(words[7] >> 32U);
+    decoded.extent_elem_cache = words[8];
+    decoded.strides[0] = static_cast<uint32_t>(words[9]);
+    decoded.strides[1] = static_cast<uint32_t>(words[9] >> 32U);
+    decoded.strides[2] = static_cast<uint32_t>(words[10]);
+    decoded.strides[3] = static_cast<uint32_t>(words[10] >> 32U);
+    decoded.strides[4] = static_cast<uint32_t>(words[11]);
+    const uint64_t owner = decoded.owner_task_id;
+    if (decoded.buffer_addr == 0U || decoded.buffer_size == 0U ||
+        decoded.ndims == 0U || decoded.ndims > kMaxTensorDims ||
+        decoded.dtype >= DataType::Count ||
+        manual_dep > 1U || contiguous > 1U ||
+        (decoded.owner_task_id != kHostInvalidTaskId &&
+         (owner > INT32_MAX || owner >= consumer_task))) {
+        return false;
+    }
+    for (uint32_t dimension = 0; dimension < decoded.ndims; ++dimension) {
+        if (decoded.shapes[dimension] == 0U) return false;
+    }
+    *tensor = decoded;
+    return true;
+}
+
+inline bool DecodeRuntimePlanCreateInfoHost(
+    const aicpu_plan::RuntimeTaskPlanStorage &payload,
+    uint32_t word_offset, uint32_t task_id,
+    TensorDesc *descriptor, uint64_t *aligned_bytes
+) {
+    if (descriptor == nullptr || aligned_bytes == nullptr ||
+        word_offset > aicpu_plan::kMaxPlanPayloadWords -
+            aicpu_plan::kTensorCreateInfoWords) {
+        return false;
+    }
+    const volatile uint64_t *words = &payload.words[word_offset];
+    const uint8_t has_initial = static_cast<uint8_t>(words[1]);
+    const uint64_t reserved = words[2];
+    const uint64_t start_offset = words[3];
+    const int32_t version = aicpu_plan::DecodeRuntimeWireInt32(
+        static_cast<uint32_t>(words[4])
+    );
+    const uint32_t ndims = static_cast<uint32_t>(words[4] >> 32U);
+    const DataType dtype =
+        static_cast<DataType>(static_cast<uint8_t>(words[5]));
+    const uint8_t manual_dep = static_cast<uint8_t>(words[5] >> 8U);
+    const uint8_t contiguous = static_cast<uint8_t>(words[5] >> 16U);
+    const uint8_t child_memory = static_cast<uint8_t>(words[5] >> 24U);
+    const uint32_t shapes[kMaxTensorDims] = {
+        static_cast<uint32_t>(words[5] >> 32U),
+        static_cast<uint32_t>(words[6]),
+        static_cast<uint32_t>(words[6] >> 32U),
+        static_cast<uint32_t>(words[7]),
+        static_cast<uint32_t>(words[7] >> 32U),
+    };
+    if (has_initial != 0U || reserved != 0U || start_offset != 0U ||
+        ndims == 0U || ndims > kMaxTensorDims ||
+        dtype >= DataType::Count || manual_dep > 1U ||
+        contiguous != 1U || child_memory != 0U) {
+        return false;
+    }
+    uint32_t elements = 1U;
+    for (uint32_t dimension = 0U; dimension < ndims; ++dimension) {
+        if (shapes[dimension] == 0U ||
+            elements > UINT32_MAX / shapes[dimension]) {
+            return false;
+        }
+        elements *= shapes[dimension];
+    }
+    const uint64_t element_bytes = HostElementSize(dtype);
+    if (element_bytes == 0U ||
+        static_cast<uint64_t>(elements) > UINT64_MAX / element_bytes) {
+        return false;
+    }
+    const uint64_t raw_bytes =
+        static_cast<uint64_t>(elements) * element_bytes;
+    if (raw_bytes == 0U ||
+        raw_bytes > UINT64_MAX - (kOutputAlignment - 1U)) {
+        return false;
+    }
+    TensorDesc expected{};
+    expected.buffer_size = raw_bytes;
+    expected.owner_task_id = task_id;
+    expected.start_offset = 0U;
+    expected.version = version;
+    expected.ndims = ndims;
+    expected.dtype = dtype;
+    expected.manual_dep = manual_dep != 0U;
+    expected.is_contiguous = true;
+    expected.child_memory = false;
+    uint32_t stride = 1U;
+    for (uint32_t dimension = 0U; dimension < kMaxTensorDims; ++dimension) {
+        expected.shapes[dimension] = shapes[dimension];
+        expected.strides[dimension] = 0U;
+    }
+    for (uint32_t reverse = 0U; reverse < ndims; ++reverse) {
+        const uint32_t dimension = ndims - 1U - reverse;
+        expected.strides[dimension] = stride;
+        if (stride > UINT32_MAX / shapes[dimension]) return false;
+        stride *= shapes[dimension];
+    }
+    expected.extent_elem_cache = stride;
+    *descriptor = expected;
+    *aligned_bytes =
+        (raw_bytes + kOutputAlignment - 1U) &
+        ~(kOutputAlignment - 1U);
+    return true;
+}
+
+inline bool RuntimePlanWriterRegionHost(
+    const TensorDesc &tensor, uint32_t task_id,
+    SharedRegionValue *region
+) {
+    if (region == nullptr || tensor.buffer_addr == 0U ||
+        tensor.ndims == 0U || tensor.ndims > kMaxTensorDims ||
+        tensor.dtype >= DataType::Count) {
+        return false;
+    }
+    uint64_t extent = tensor.extent_elem_cache;
+    if (tensor.is_contiguous) {
+        extent = 1U;
+        for (uint32_t dimension = 0U;
+             dimension < tensor.ndims; ++dimension) {
+            if (tensor.shapes[dimension] == 0U ||
+                extent > UINT64_MAX / tensor.shapes[dimension]) {
+                return false;
+            }
+            extent *= tensor.shapes[dimension];
+        }
+    }
+    const uint64_t element_bytes = HostElementSize(tensor.dtype);
+    if (extent == 0U || element_bytes == 0U ||
+        tensor.start_offset > UINT64_MAX - extent ||
+        tensor.start_offset > UINT64_MAX / element_bytes ||
+        tensor.start_offset + extent > UINT64_MAX / element_bytes) {
+        return false;
+    }
+    *region = SharedRegionValue{
+        tensor.buffer_addr,
+        tensor.start_offset * element_bytes,
+        (tensor.start_offset + extent) * element_bytes,
+        static_cast<int32_t>(task_id),
+        0U,
+    };
+    return region->lo < region->hi;
+}
+
+inline RuntimePlanWriterProjection BuildRuntimePlanWriterProjection(
+    const RuntimePlanHostSnapshot &snapshot, uint32_t task_count
+) {
+    RuntimePlanWriterProjection projection;
+    const auto fail = [&](uint32_t task, const char *reason) {
+        if (projection.first_bad_task == UINT32_MAX) {
+            projection.first_bad_task = task;
+            projection.first_bad_reason = reason;
+        }
+    };
+    if (snapshot.cells == nullptr || snapshot.count != task_count ||
+        task_count > kMaxTasks) {
+        fail(UINT32_MAX, "snapshot shape");
+        return projection;
+    }
+    projection.output_counts.assign(task_count, 0U);
+    projection.task_allocation_bytes.assign(task_count, 0U);
+    projection.output_descriptors.assign(
+        static_cast<size_t>(task_count) * kSharedOutputMaxPerTask,
+        TensorDesc{}
+    );
+    projection.final_writers.assign(
+        static_cast<size_t>(task_count) * kSharedOutputMaxPerTask, -1
+    );
+    projection.writer_histories.assign(
+        task_count, SharedWriterHistoryCell{}
+    );
+    projection.ordinary_by_bucket.resize(kMapBuckets);
+
+    for (uint32_t task_id = 0U; task_id < task_count; ++task_id) {
+        const aicpu_plan::RuntimeTaskPlanCell &cell =
+            snapshot.cells[task_id];
+        const aicpu_plan::DecodedPlanCellControl control =
+            aicpu_plan::DecodePlanCellControl(cell.control.value);
+        aicpu_plan::RuntimeTaskPlanHeader header{};
+        aicpu_plan::RuntimeTaskPlanLayout layout{};
+        if (!control.valid ||
+            control.phase != aicpu_plan::PlanCellPhase::Published ||
+            control.task_id != task_id ||
+            !aicpu_plan::ValidateRuntimeTaskPlanPayload(
+                cell.payload, task_id, control.payload_lines,
+                header, layout
+            ) || header.output_count > kSharedOutputMaxPerTask) {
+            fail(task_id, "canonical PlanCell");
+            return projection;
+        }
+
+        uint32_t output_slot = 0U;
+        uint64_t task_allocation = 0U;
+        SharedWriterHistoryCell &expected_history =
+            projection.writer_histories[task_id];
+        for (uint32_t tensor_index = 0U;
+             tensor_index < header.tensor_count; ++tensor_index) {
+            uint32_t word_offset = 0U;
+            if (!aicpu_plan::RuntimeTaskPlanTensorWordOffset(
+                    header, tensor_index, word_offset
+                )) {
+                fail(task_id, "tensor offset");
+                return projection;
+            }
+            const aicpu_plan::TensorTag tag =
+                static_cast<aicpu_plan::TensorTag>(
+                    header.tensor_tags[tensor_index]
+                );
+            const bool reference =
+                (header.tensor_reference_mask &
+                 (uint32_t{1} << tensor_index)) != 0U;
+            if (tag == aicpu_plan::TensorTag::Output) {
+                if (reference || output_slot >= header.output_count) {
+                    fail(task_id, "output shape");
+                    return projection;
+                }
+                TensorDesc descriptor{};
+                uint64_t aligned_bytes = 0U;
+                if (!DecodeRuntimePlanCreateInfoHost(
+                        cell.payload, word_offset, task_id,
+                        &descriptor, &aligned_bytes
+                    ) || task_allocation > UINT64_MAX - aligned_bytes) {
+                    fail(task_id, "output CreateInfo");
+                    return projection;
+                }
+                projection.output_descriptors[
+                    static_cast<size_t>(task_id) *
+                        kSharedOutputMaxPerTask + output_slot
+                ] = descriptor;
+                projection.final_writers[
+                    static_cast<size_t>(task_id) *
+                        kSharedOutputMaxPerTask + output_slot
+                ] = static_cast<int64_t>(task_id);
+                task_allocation += aligned_bytes;
+                ++output_slot;
+                continue;
+            }
+            if (tag != aicpu_plan::TensorTag::Inout &&
+                tag != aicpu_plan::TensorTag::OutputExisting) {
+                continue;
+            }
+            if (reference) {
+                const aicpu_plan::RuntimeOutputReferenceWire output_ref =
+                    aicpu_plan::DecodeRuntimeOutputReferenceWire(
+                        cell.payload.words[word_offset],
+                        cell.payload.words[word_offset + 1U]
+                    );
+                if (!aicpu_plan::RuntimeOutputReferenceWireValid(
+                        output_ref, task_id
+                    )) {
+                    fail(task_id, "writer output reference");
+                    return projection;
+                }
+                const uint32_t producer = static_cast<uint32_t>(
+                    output_ref.producer_task_id
+                );
+                const uint32_t slot = static_cast<uint32_t>(
+                    output_ref.output_slot
+                );
+                if (producer >= task_count ||
+                    slot >= projection.output_counts[producer] ||
+                    expected_history.count >=
+                        kSharedWriterHistoryMaxPerTask) {
+                    fail(task_id, "writer target");
+                    return projection;
+                }
+                const size_t writer_index =
+                    static_cast<size_t>(producer) *
+                        kSharedOutputMaxPerTask + slot;
+                const int64_t previous =
+                    projection.final_writers[writer_index];
+                if (previous < static_cast<int64_t>(producer) ||
+                    previous >= static_cast<int64_t>(task_id)) {
+                    fail(task_id, "writer predecessor");
+                    return projection;
+                }
+                const uint64_t key64 =
+                    static_cast<uint64_t>(producer) *
+                        kSharedOutputMaxPerTask + slot + 1U;
+                if (key64 > UINT32_MAX) {
+                    fail(task_id, "writer key overflow");
+                    return projection;
+                }
+                const uint32_t key = static_cast<uint32_t>(key64);
+                for (uint32_t previous_index = 0U;
+                     previous_index < expected_history.count;
+                     ++previous_index) {
+                    if (expected_history.entries[previous_index]
+                            .symbol_key == key) {
+                        fail(task_id, "duplicate writer key");
+                        return projection;
+                    }
+                }
+                expected_history.entries[expected_history.count++] =
+                    SharedWriterHistoryRecord{
+                        key, static_cast<int32_t>(previous)
+                    };
+                projection.final_writers[writer_index] =
+                    static_cast<int64_t>(task_id);
+                continue;
+            }
+            TensorDesc tensor{};
+            SharedRegionValue region{};
+            if (!DecodeRuntimePlanTensorDescHost(
+                    cell.payload, word_offset, task_id, &tensor
+                )) {
+                fail(task_id, "inline writer tensor");
+                return projection;
+            }
+            if (tensor.manual_dep) continue;
+            if (!RuntimePlanWriterRegionHost(
+                    tensor, task_id, &region
+                )) {
+                fail(task_id, "ordinary writer region");
+                return projection;
+            }
+            const uint32_t bucket =
+                SharedTensorMapHashHost(region.buffer_addr);
+            if (projection.ordinary_by_bucket[bucket].size() >=
+                    kMapBucketCapacity) {
+                fail(task_id, "ordinary bucket capacity");
+                return projection;
+            }
+            projection.ordinary_by_bucket[bucket].push_back(region);
+        }
+        if (output_slot != header.output_count) {
+            fail(task_id, "output count");
+            return projection;
+        }
+        projection.output_counts[task_id] = output_slot;
+        projection.task_allocation_bytes[task_id] = task_allocation;
+        projection.published_outputs += output_slot;
+        if (projection.allocation_bytes > UINT64_MAX - task_allocation) {
+            fail(task_id, "allocation sum overflow");
+            return projection;
+        }
+        projection.allocation_bytes += task_allocation;
+        if (expected_history.count != 0U) {
+            expected_history.magic = kSharedWriterHistoryMagic;
+            expected_history.writer_task = static_cast<int32_t>(task_id);
+        }
+    }
+    projection.protocol_ok = true;
+    return projection;
+}
+
+inline SharedTensorMapValidation ValidateRuntimePlanSharedTensorMap(
+    const SharedTensorMapSidecar &map,
+    const RuntimePlanWriterProjection &projection
+) {
+    SharedTensorMapValidation validation;
+    validation.protocol_ok = projection.protocol_ok;
+    for (uint32_t lane = 0U;
+         lane < kSharedInsertTurnCapacity; ++lane) {
+        validation.protocol_ok &=
+            SharedInsertTurnValueHost(map, lane) ==
+            SharedExpectedUnusedInsertTurnHost(lane);
+    }
+    validation.protocol_ok &= map.reclaim_upto.value == -1;
+    const SharedRegionPayload zero_payload{};
+    for (uint32_t bucket = 0U; bucket < kMapBuckets; ++bucket) {
+        const std::vector<SharedRegionValue> &expected =
+            projection.ordinary_by_bucket[bucket];
+        validation.protocol_ok &=
+            map.buckets[bucket].head.value == 0 &&
+            map.buckets[bucket].tail.value ==
+                static_cast<int64_t>(expected.size());
+        validation.total_appends += expected.size();
+        validation.physical_entries += expected.size();
+        validation.logical_entries += expected.size();
+        for (uint32_t cursor = 0U;
+             cursor < kMapBucketCapacity; ++cursor) {
+            const uint32_t slot_index =
+                bucket * kMapBucketCapacity +
+                (cursor & kMapBucketSlotMask);
+            const SharedRegionSlot &slot = map.slots[slot_index];
+            if (cursor >= expected.size()) {
+                validation.protocol_ok &=
+                    slot.seq.value == -1 &&
+                    std::memcmp(
+                        &slot.payload, &zero_payload,
+                        sizeof(zero_payload)
+                    ) == 0;
+                continue;
+            }
+            const SharedRegionValue &value = expected[cursor];
+            validation.protocol_ok &=
+                slot.seq.value == static_cast<int64_t>(cursor) &&
+                slot.payload.value.buffer_addr == value.buffer_addr &&
+                slot.payload.value.lo == value.lo &&
+                slot.payload.value.hi == value.hi &&
+                slot.payload.value.producer == value.producer &&
+                slot.payload.value.reserved == 0U;
+            SharedLogicalHashWord(&validation.logical_signature, bucket);
+            SharedLogicalHashWord(
+                &validation.logical_signature, value.buffer_addr
+            );
+            SharedLogicalHashWord(&validation.logical_signature, value.lo);
+            SharedLogicalHashWord(&validation.logical_signature, value.hi);
+            SharedLogicalHashWord(
+                &validation.logical_signature,
+                static_cast<uint32_t>(value.producer)
+            );
+        }
+    }
+    const SharedWriterHistoryCell zero_history{};
+    for (uint32_t task = 0U; task < kMaxTasks; ++task) {
+        const SharedWriterHistoryCell &expected =
+            task < projection.writer_histories.size()
+                ? projection.writer_histories[task]
+                : zero_history;
+        validation.protocol_ok &= std::memcmp(
+            &map.writer_history[task], &expected,
+            sizeof(expected)
+        ) == 0;
+    }
+    for (uint32_t worker = 0U; worker < kWorkers; ++worker) {
+        validation.protocol_ok &= map.reader_done[worker].value == -1;
+    }
+    return validation;
+}
+
+inline SharedOutputValidation ValidateRuntimePlanSharedOutputs(
+    const SharedTensorMapSidecar &map,
+    const RuntimePlanWriterProjection &projection,
+    uint64_t heap_size
+) {
+    SharedOutputValidation validation;
+    const auto record = [&] (
+        bool condition, uint32_t task, uint32_t slot,
+        const char *reason
+    ) {
+        validation.protocol_ok &= condition;
+        if (!condition && validation.first_bad_task == UINT32_MAX) {
+            validation.first_bad_task = task;
+            validation.first_bad_slot = slot;
+            validation.first_bad_reason = reason;
+        }
+        return condition;
+    };
+    record(
+        projection.protocol_ok, projection.first_bad_task,
+        UINT32_MAX, projection.first_bad_reason
+    );
+    const TensorDesc zero_tensor{};
+    const uint64_t shard_span = ExpectedSharedHeapShardSpan(heap_size);
+    std::vector<SharedHeapInterval> intervals[kSharedHeapShards];
+    for (uint32_t task_id = 0U; task_id < kMaxTasks; ++task_id) {
+        const uint32_t expected_count =
+            task_id < projection.output_counts.size()
+                ? projection.output_counts[task_id]
+                : 0U;
+        const uint64_t task_bytes =
+            task_id < projection.task_allocation_bytes.size()
+                ? projection.task_allocation_bytes[task_id]
+                : 0U;
+        const SharedOutputCell &cell = map.shared_outputs[task_id];
+        uint64_t task_base = 0U;
+        if (expected_count != 0U) {
+            const uint32_t shard = task_id % kSharedHeapShards;
+            const uint64_t shard_begin =
+                static_cast<uint64_t>(shard) * shard_span;
+            const uint64_t shard_end = shard_begin + shard_span;
+            const uint64_t address = cell.tensors[0].buffer_addr;
+            const bool address_ok =
+                address >= kSyntheticHeapBase && task_bytes != 0U &&
+                task_bytes <= shard_span;
+            if (address_ok) task_base = address - kSyntheticHeapBase;
+            const bool interval_ok =
+                address_ok && task_base % kOutputAlignment == 0U &&
+                task_base >= shard_begin &&
+                task_base <= shard_end - task_bytes;
+            record(
+                interval_ok, task_id, UINT32_MAX,
+                "runtime Plan task heap interval"
+            );
+            if (interval_ok) {
+                intervals[shard].push_back(
+                    {task_base, task_base + task_bytes, task_id}
+                );
+            }
+        }
+        uint64_t output_offset = 0U;
+        for (uint32_t slot = 0U;
+             slot < kSharedOutputMaxPerTask; ++slot) {
+            if (slot >= expected_count) {
+                record(
+                    cell.published[slot].value == -1,
+                    task_id, slot, "inactive published"
+                );
+                record(
+                    cell.last_writer[slot].value == -1,
+                    task_id, slot, "inactive last_writer"
+                );
+                record(
+                    std::memcmp(
+                        &cell.tensors[slot], &zero_tensor,
+                        sizeof(zero_tensor)
+                    ) == 0,
+                    task_id, slot, "inactive descriptor"
+                );
+                continue;
+            }
+            const size_t index =
+                static_cast<size_t>(task_id) *
+                    kSharedOutputMaxPerTask + slot;
+            record(
+                cell.published[slot].value ==
+                    static_cast<int64_t>(task_id),
+                task_id, slot, "active published"
+            );
+            record(
+                index < projection.final_writers.size() &&
+                    cell.last_writer[slot].value ==
+                        projection.final_writers[index],
+                task_id, slot, "active last_writer"
+            );
+            TensorDesc expected = projection.output_descriptors[index];
+            expected.buffer_addr =
+                kSyntheticHeapBase + task_base + output_offset;
+            record(
+                TensorDescFieldsMatch(cell.tensors[slot], expected),
+                task_id, slot, "active descriptor"
+            );
+            output_offset +=
+                (expected.buffer_size + kOutputAlignment - 1U) &
+                ~(kOutputAlignment - 1U);
+            ++validation.published_outputs;
+        }
+        record(
+            output_offset == task_bytes,
+            task_id, UINT32_MAX, "task allocation bytes"
+        );
+    }
+    for (uint32_t shard = 0U; shard < kSharedHeapShards; ++shard) {
+        std::sort(
+            intervals[shard].begin(), intervals[shard].end(),
+            [](const SharedHeapInterval &left,
+               const SharedHeapInterval &right) {
+                return left.begin < right.begin;
+            }
+        );
+        uint64_t next = static_cast<uint64_t>(shard) * shard_span;
+        for (const SharedHeapInterval &interval : intervals[shard]) {
+            record(
+                interval.begin == next, interval.task_id,
+                UINT32_MAX, "non-contiguous shard interval"
+            );
+            next = interval.end;
+        }
+        validation.shard_bytes[shard] =
+            next - static_cast<uint64_t>(shard) * shard_span;
+        validation.allocated_bytes += validation.shard_bytes[shard];
+    }
+    return validation;
+}
 #endif
 
 struct NormalizedWriterEntry {
@@ -4763,7 +5460,8 @@ inline bool ByteCanaryIsZero(const uint8_t (&bytes)[N]) {
 inline Metrics Validate(
     const SchedulerState &state, uint32_t run, double host_us,
     const TraceHeader *trace_header,
-    RawExecTokenSnapshotAuthority raw_exec_token_snapshot_authority
+    RawExecTokenSnapshotAuthority raw_exec_token_snapshot_authority,
+    const RuntimePlanHostSnapshot *runtime_plan_snapshot = nullptr
 ) {
     Metrics metrics;
     // AICPU 按真实 orchestration callback 顺序产生并关闭唯一
@@ -4820,6 +5518,29 @@ inline Metrics Validate(
         shared_plan_ok ? shared_plan.total_tasks : 0;
     const uint32_t group_count =
         shared_plan_ok ? shared_plan.total_groups : 0;
+    RuntimePlanWriterProjection runtime_plan_writer_projection;
+    if (kHostUsesSimtRuntimePlanBuild &&
+        runtime_plan_snapshot != nullptr) {
+        runtime_plan_writer_projection =
+            BuildRuntimePlanWriterProjection(
+                *runtime_plan_snapshot, task_count
+            );
+    }
+    const bool runtime_plan_writer_projection_ok =
+        !kHostUsesSimtRuntimePlanBuild ||
+        runtime_plan_writer_projection.protocol_ok;
+    if (kHostUsesSimtRuntimePlanBuild &&
+        !runtime_plan_writer_projection_ok) {
+        std::printf(
+            "[RUNTIME_PLAN_PROJECTION_FAILURE] task=%u reason=%s "
+            "snapshot_count=%u expected=%u\n",
+            runtime_plan_writer_projection.first_bad_task,
+            runtime_plan_writer_projection.first_bad_reason,
+            runtime_plan_snapshot == nullptr
+                ? 0U : runtime_plan_snapshot->count,
+            task_count
+        );
+    }
 #else
     const uint32_t task_count = batches * kTasksPerBatch;
 #endif
@@ -4834,10 +5555,13 @@ inline Metrics Validate(
     (void)final_barrier_shape;
 #endif
 #if PTO_FDWIC_SHARED_MAP
-    // Plan-ahead 不再有 96 路 Submit/Claim replay。WorkerResult::submits
-    // 表示本核完成的 PlannedBuild 数，全局严格合计 N；
-    // Claim attempt/win 必须始终为 0。
-    const uint64_t expected_submits = task_count;
+    // Plan-ahead 不再有 96 路 Submit/Claim replay。Scalar backend 的
+    // WorkerResult::submits 表示本核完成的 PlannedBuild 数，全局严格
+    // 合计 N；SIMT backend 的 Build 发生在 VF writer，96 份 Scalar
+    // WorkerResult 的全部 Build-only 字段必须保持 0，不能为了沿用旧 Host
+    // 口径而伪造 N 次 submits/wins/materialize/fanin。
+    const uint64_t expected_submits =
+        kHostUsesSimtRuntimePlanBuild ? 0U : task_count;
     const uint64_t expected_claims = 0;
     const bool shared_replay_state_idle =
         state.replay_identity_seal.line.value == -1 &&
@@ -4848,19 +5572,9 @@ inline Metrics Validate(
         ) &&
         state.runtime_plan_storage.capacity >= task_count;
     const bool shared_runtime_plan_control_ok =
-        state.runtime_plan_control.planned_frontier.value ==
-            static_cast<int64_t>(task_count) &&
-        state.runtime_plan_control.closed_task_count.value ==
-            static_cast<int64_t>(task_count) &&
-        state.runtime_plan_control.build_next.value ==
-            static_cast<int64_t>(
-                task_count + kRuntimePlanBuildWorkers
-            ) &&
-        state.runtime_plan_control.build_workers_done.value ==
-            static_cast<int64_t>(kRuntimePlanBuildWorkers) &&
-        state.runtime_plan_control.build_release.value ==
-            static_cast<int64_t>(task_count) &&
-        state.runtime_plan_control.fatal.value == 0;
+        HostRuntimePlanControlIsTerminal(
+            state.runtime_plan_control, task_count
+        );
     const bool shared_exec_scan_cursors_ok =
         state.exec_scan_cursors.aic_next.value ==
             static_cast<int64_t>(
@@ -4908,11 +5622,12 @@ inline Metrics Validate(
             state.runtime_plan_control.fatal.isolation_padding
         );
 
-    // Plan-ahead 的 host oracle 直接检查 task-indexed exec cell，不依赖新增的
-    // WorkerResult 计数：Alloc 不产生执行包；其余 task 必须 DONE，并由
-    // host 独立检查 Build owner 在 96 核范围，以及 Execute owner 与目标
-    // engine 角色一致。该公式不能调用 device adapter，避免 device/host
-    // 同错后相互放行。
+    // Plan-ahead 的 host oracle 直接检查 task-indexed exec cell，不依赖
+    // WorkerResult 的 Build 计数：Alloc 不产生执行包；其余 task 必须
+    // DONE。Scalar backend 的 Build owner 在 96 核范围，SIMT backend
+    // 则严格限制为四个真实 leader 0..3；Execute owner 始终独立匹配目标
+    // engine。该公式不能调用 device adapter，避免 device/host 同错后
+    // 相互放行。
     bool cross_core_exec_cells_ok = shared_plan_ok;
     bool cross_core_exec_role_owner_ok = shared_plan_ok;
     uint32_t first_bad_exec_task = UINT32_MAX;
@@ -5189,6 +5904,7 @@ inline Metrics Validate(
     uint64_t fanin_ready_loads_by_role[2] = {};
     uint64_t claim_attempts_by_role[2] = {};
     uint64_t submits_by_role[2] = {};
+    bool simt_scalar_build_only_counters_zero = true;
 #endif
     bool frontier_worker_counts_ok = true;
     bool role_kernel_routing_ok = true;
@@ -5220,9 +5936,15 @@ inline Metrics Validate(
         const SharedHostPlannedTask *planned_task =
             shared_plan.TaskAt(task_id);
         const uint64_t output_bytes =
-            planned_task == nullptr
-                ? 0
-                : planned_task->output_bytes;
+            kHostUsesSimtRuntimePlanBuild &&
+                    runtime_plan_writer_projection_ok &&
+                    task_id < runtime_plan_writer_projection
+                                  .task_allocation_bytes.size()
+                ? runtime_plan_writer_projection
+                      .task_allocation_bytes[task_id]
+                : (planned_task == nullptr
+                       ? 0
+                       : planned_task->output_bytes);
 #else
         const uint64_t output_bytes = ExpectedTaskOutputBytes(task_id);
 #endif
@@ -5336,13 +6058,55 @@ inline Metrics Validate(
     const uint64_t expected_map_floor = task_count > kHeapWindow + 1 ? task_count - kHeapWindow - 1 : 0;
 #if PTO_FDWIC_SHARED_MAP
     const SharedTensorMapValidation shared_map_validation =
-        ValidateSharedTensorMap(
-            state.shared_map, shared_plan
-        );
+        kHostUsesSimtRuntimePlanBuild
+            ? ValidateRuntimePlanSharedTensorMap(
+                  state.shared_map,
+                  runtime_plan_writer_projection
+              )
+            : ValidateSharedTensorMap(
+                  state.shared_map, shared_plan
+              );
     const SharedOutputValidation shared_output_validation =
-        ValidateSharedOutputs(
-            state.shared_map, shared_plan, state.heap_size
-        );
+        kHostUsesSimtRuntimePlanBuild
+            ? ValidateRuntimePlanSharedOutputs(
+                  state.shared_map,
+                  runtime_plan_writer_projection,
+                  state.heap_size
+              )
+            : ValidateSharedOutputs(
+                  state.shared_map, shared_plan, state.heap_size
+              );
+    uint64_t runtime_plan_ordinary_appends = 0U;
+    uint64_t runtime_plan_ordinary_signature =
+        1469598103934665603ULL;
+    if (kHostUsesSimtRuntimePlanBuild &&
+        runtime_plan_writer_projection_ok) {
+        for (uint32_t bucket = 0U; bucket < kMapBuckets; ++bucket) {
+            const std::vector<SharedRegionValue> &entries =
+                runtime_plan_writer_projection
+                    .ordinary_by_bucket[bucket];
+            runtime_plan_ordinary_appends += entries.size();
+            for (const SharedRegionValue &entry : entries) {
+                SharedLogicalHashWord(
+                    &runtime_plan_ordinary_signature, bucket
+                );
+                SharedLogicalHashWord(
+                    &runtime_plan_ordinary_signature,
+                    entry.buffer_addr
+                );
+                SharedLogicalHashWord(
+                    &runtime_plan_ordinary_signature, entry.lo
+                );
+                SharedLogicalHashWord(
+                    &runtime_plan_ordinary_signature, entry.hi
+                );
+                SharedLogicalHashWord(
+                    &runtime_plan_ordinary_signature,
+                    static_cast<uint32_t>(entry.producer)
+                );
+            }
+        }
+    }
     const CrossCoreExecPayloadValidation
         cross_core_exec_payload_validation =
             ValidateCrossCoreExecPayloads(
@@ -5439,10 +6203,16 @@ inline Metrics Validate(
         for (uint32_t kind = 0; kind < 5U; ++kind) {
             worker_builds_by_kind += result.wins[kind];
         }
-        worker_shape_ok &= result.submits <= task_count;
+        worker_shape_ok &= kHostUsesSimtRuntimePlanBuild
+            ? result.submits == 0
+            : result.submits <= task_count;
         worker_shape_ok &= result.claim_attempts == 0;
         worker_shape_ok &= result.claim_wins == 0;
         worker_shape_ok &= worker_builds_by_kind == result.submits;
+        if (kHostUsesSimtRuntimePlanBuild) {
+            simt_scalar_build_only_counters_zero &=
+                HostScalarWorkerBuildOnlyCountersAreZero(result);
+        }
         worker_shape_ok &=
             result.max_occupied <=
                 cross_core::kExecTokensPerWorker;
@@ -5601,22 +6371,31 @@ inline Metrics Validate(
         const uint64_t qk_wins = result.wins[static_cast<uint32_t>(TaskKind::Qk)];
         const uint64_t sf_wins = result.wins[static_cast<uint32_t>(TaskKind::Sf)];
         const uint64_t pv_wins = result.wins[static_cast<uint32_t>(TaskKind::Pv)];
-        frontend_worker_counts_ok &=
-            result.context_reads == 0;
-        frontend_worker_counts_ok &=
-            result.views_created == 0;
-        frontend_worker_counts_ok &=
-            result.dynamic_create_infos == 0;
-        frontend_worker_counts_ok &=
-            result.arg_resets == 0;
-        frontend_worker_counts_ok &=
-            result.tensor_args_added == 0;
-        frontend_worker_counts_ok &=
-            result.scalar_args_added == 0;
-        frontend_worker_counts_ok &=
-            result.materialized_outputs ==
-                alloc_wins * 3 + qk_wins + sf_wins * 3 + pv_wins;
-        frontend_worker_counts_ok &= result.map_inserts == 0;
+        if (kHostUsesSimtRuntimePlanBuild) {
+            // VF writer 没有借用 Scalar WorkerResult。这里不仅要求聚合
+            // 为零，还逐 worker 锁死全部 Build-only 字段，防止正负值
+            // 或错误归因在全局汇总时互相抵消。
+            frontend_worker_counts_ok &=
+                HostScalarWorkerBuildOnlyCountersAreZero(result);
+        } else {
+            frontend_worker_counts_ok &=
+                result.context_reads == 0;
+            frontend_worker_counts_ok &=
+                result.views_created == 0;
+            frontend_worker_counts_ok &=
+                result.dynamic_create_infos == 0;
+            frontend_worker_counts_ok &=
+                result.arg_resets == 0;
+            frontend_worker_counts_ok &=
+                result.tensor_args_added == 0;
+            frontend_worker_counts_ok &=
+                result.scalar_args_added == 0;
+            frontend_worker_counts_ok &=
+                result.materialized_outputs ==
+                    alloc_wins * 3 + qk_wins +
+                    sf_wins * 3 + pv_wins;
+            frontend_worker_counts_ok &= result.map_inserts == 0;
+        }
         // shared 的权威进度是 sidecar cursor/vend。worker.heap_next 只保存
         // 该 worker 最近一次获胜时观察到的并发 aggregate prefix；不同
         // winner 的 FetchAdd 顺序不由 task_id 决定，因此不能再拿确定的
@@ -5632,13 +6411,18 @@ inline Metrics Validate(
             qk_wins * 8192ULL +
             sf_wins * 6144ULL +
             pv_wins * 8192ULL;
-        final_worker_state_ok &=
-            result.final_heap_next <= expected_heap_next &&
-            result.final_heap_next >= own_reserved_minimum &&
-            (result.final_heap_next == 0 ||
-             result.final_heap_next % kOutputAlignment == 0) &&
-            (result.submits != 0 || result.final_heap_next == 0) &&
-            (nonzero_output_wins == 0 || result.final_heap_next != 0);
+        if (kHostUsesSimtRuntimePlanBuild) {
+            final_worker_state_ok &= result.final_heap_next == 0;
+        } else {
+            final_worker_state_ok &=
+                result.final_heap_next <= expected_heap_next &&
+                result.final_heap_next >= own_reserved_minimum &&
+                (result.final_heap_next == 0 ||
+                 result.final_heap_next % kOutputAlignment == 0) &&
+                (result.submits != 0 || result.final_heap_next == 0) &&
+                (nonzero_output_wins == 0 ||
+                 result.final_heap_next != 0);
+        }
 #else
         frontend_worker_counts_ok &= result.context_reads == batches;
         frontend_worker_counts_ok &= result.views_created == static_cast<uint64_t>(batches) * 2;
@@ -5753,8 +6537,10 @@ inline Metrics Validate(
             expected_aic_execute_fanin_loads &&
         fanin_ready_loads_by_role[1] ==
             expected_aiv_execute_fanin_loads &&
-        fanin_edges == expected_fanin_edges &&
-        fanin_ready_loads == fanin_edges;
+        fanin_ready_loads == expected_fanin_edges &&
+        (kHostUsesSimtRuntimePlanBuild
+             ? fanin_edges == 0
+             : fanin_edges == expected_fanin_edges);
 #endif
 
     uint32_t ready_flags = 0;
@@ -5857,7 +6643,9 @@ inline Metrics Validate(
     Expect(
         submits == expected_submits,
 #if PTO_FDWIC_SHARED_MAP
-        "96 Scalar central tickets complete every PlannedBuild exactly once",
+        kHostUsesSimtRuntimePlanBuild
+            ? "Scalar WorkerResult does not counterfeit SIMT PlannedBuild ownership"
+            : "96 Scalar central tickets complete every PlannedBuild exactly once",
 #else
         "replay count is workers * tasks",
 #endif
@@ -5879,8 +6667,10 @@ inline Metrics Validate(
         &metrics
     );
     std::printf(
-        "[RUNTIME_PLAN] frontier=%lld closed=%lld build_next=%lld "
-        "workers_done=%lld release=%lld fatal=%lld capacity=%u\n",
+        "[RUNTIME_PLAN] backend=%s frontier=%lld closed=%lld "
+        "build_next=%lld workers_done=%lld release=%lld fatal=%lld "
+        "capacity=%u\n",
+        kHostUsesSimtRuntimePlanBuild ? "simt" : "scalar",
         static_cast<long long>(
             state.runtime_plan_control.planned_frontier.value
         ),
@@ -5908,7 +6698,7 @@ inline Metrics Validate(
     );
     Expect(
         shared_runtime_plan_control_ok,
-        "Runtime Plan closes at N and central Build reaches the configured N+W tickets, W arrivals, and release N",
+        "Runtime Plan closes at N and the selected Build backend reaches exact N+W tickets, W arrivals, and release N",
         &metrics
     );
     Expect(
@@ -5925,10 +6715,19 @@ inline Metrics Validate(
         claim_attempts_by_role[0] == 0 &&
             claim_attempts_by_role[1] == 0 &&
             submits_by_role[0] + submits_by_role[1] ==
-                task_count,
-        "AIC/AIV own all PlannedBuilds without legacy Claim or loser work",
+                expected_submits,
+        kHostUsesSimtRuntimePlanBuild
+            ? "Scalar AIC/AIV publish no SIMT Build ownership or legacy Claim work"
+            : "AIC/AIV own all PlannedBuilds without legacy Claim or loser work",
         &metrics
     );
+    if (kHostUsesSimtRuntimePlanBuild) {
+        Expect(
+            simt_scalar_build_only_counters_zero,
+            "all 96 Scalar WorkerResults leave every SIMT Build-only field zero",
+            &metrics
+        );
+    }
 #endif
 #if PTO_FDWIC_SHARED_MAP
     Expect(
@@ -5953,7 +6752,9 @@ inline Metrics Validate(
     );
     Expect(
         cross_core_exec_role_owner_ok,
-        "Build owner is any Scalar and Execute owner independently matches its engine role",
+        kHostUsesSimtRuntimePlanBuild
+            ? "Build owner is one of SIMT leaders 0..3 and Execute owner independently matches its engine role"
+            : "Build owner is any Scalar and Execute owner independently matches its engine role",
         &metrics
     );
     Expect(
@@ -5995,12 +6796,20 @@ inline Metrics Validate(
         &metrics
     );
     Expect(
-        wins_by_kind[0] == batches &&
-            wins_by_kind[1] == group_count &&
-            wins_by_kind[2] == group_count &&
-            wins_by_kind[3] == group_count &&
-            wins_by_kind[4] == group_count,
-        "shared winners match Alloc + groups*(QK/SF/PV/UP)",
+        kHostUsesSimtRuntimePlanBuild
+            ? wins_by_kind[0] == 0 &&
+                  wins_by_kind[1] == 0 &&
+                  wins_by_kind[2] == 0 &&
+                  wins_by_kind[3] == 0 &&
+                  wins_by_kind[4] == 0
+            : wins_by_kind[0] == batches &&
+                  wins_by_kind[1] == group_count &&
+                  wins_by_kind[2] == group_count &&
+                  wins_by_kind[3] == group_count &&
+                  wins_by_kind[4] == group_count,
+        kHostUsesSimtRuntimePlanBuild
+            ? "Scalar winner buckets remain zero for SIMT Build"
+            : "shared winners match Alloc + groups*(QK/SF/PV/UP)",
         &metrics
     );
     Expect(
@@ -6106,11 +6915,13 @@ inline Metrics Validate(
     );
     Expect(
         shared_runtime_plan_control_ok &&
-            submits == task_count &&
+            submits == expected_submits &&
             shared_insert_completions_ok &&
             cross_core_exec_cells_ok &&
             cross_core_exec_payload_validation.protocol_ok,
-        "every acquired Plan cell decodes and finishes before release, strict insert completion, and runtime execution closure",
+        kHostUsesSimtRuntimePlanBuild
+            ? "SIMT Build reaches strict insert completion and runtime execution closure without Scalar Build counters"
+            : "every acquired Plan cell decodes and finishes before release, strict insert completion, and runtime execution closure",
         &metrics
     );
     Expect(
@@ -6170,8 +6981,10 @@ inline Metrics Validate(
         tensor_args_added == 0 &&
         scalar_args_added == 0 &&
         materialized_outputs ==
-            static_cast<uint64_t>(batches) * 3 +
-            static_cast<uint64_t>(group_count) * 5 &&
+            (kHostUsesSimtRuntimePlanBuild
+                 ? 0
+                 : static_cast<uint64_t>(batches) * 3 +
+                       static_cast<uint64_t>(group_count) * 5) &&
         map_inserts == expected_global_map_inserts;
 #else
         context_reads == static_cast<uint64_t>(kWorkers) * batches &&
@@ -6186,48 +6999,68 @@ inline Metrics Validate(
     Expect(
         global_frontend_counts_ok,
         kCompiledTensorMapMode == TensorMapBuildMode::Shared
-            ? "AICPU owns callback argument construction and Scalar Finish totals are exact"
+            ? (kHostUsesSimtRuntimePlanBuild
+                   ? "AICPU owns callback arguments and Scalar reports no SIMT Finish work"
+                   : "AICPU owns callback argument construction and Scalar Finish totals are exact")
             : "global PA frontend operation totals are exact",
         &metrics
     );
     Expect(
         map_lookups ==
 #if PTO_FDWIC_SHARED_MAP
-            static_cast<uint64_t>(group_count) * 5 &&
+            (kHostUsesSimtRuntimePlanBuild
+                 ? 0
+                 : static_cast<uint64_t>(group_count) * 5) &&
 #else
             static_cast<uint64_t>(batches) * 14 &&
 #endif
 #if PTO_FDWIC_SHARED_MAP
-            slot_tensor_copies ==
-                static_cast<uint64_t>(group_count) * 19 &&
+        slot_tensor_copies ==
+                (kHostUsesSimtRuntimePlanBuild
+                     ? 0
+                     : static_cast<uint64_t>(group_count) * 19) &&
 #else
             slot_tensor_copies == static_cast<uint64_t>(batches) * 19 &&
 #endif
 #if PTO_FDWIC_SHARED_MAP
-            slot_scalar_copies ==
-                static_cast<uint64_t>(group_count) * 9 &&
+        slot_scalar_copies ==
+                (kHostUsesSimtRuntimePlanBuild
+                     ? 0
+                     : static_cast<uint64_t>(group_count) * 9) &&
             fanin_edges ==
-                static_cast<uint64_t>(group_count) * 5,
+                (kHostUsesSimtRuntimePlanBuild
+                     ? 0
+                     : static_cast<uint64_t>(group_count) * 5),
 #else
             slot_scalar_copies == static_cast<uint64_t>(batches) * 9 &&
             fanin_edges == static_cast<uint64_t>(batches) * 5,
 #endif
-        "winner-only TensorMap/symbol, slot-copy, and fanin totals are exact", &metrics
+        kHostUsesSimtRuntimePlanBuild
+            ? "Scalar TensorMap/symbol, slot-copy, and Build-fanin totals remain zero"
+            : "winner-only TensorMap/symbol, slot-copy, and fanin totals are exact",
+        &metrics
     );
     Expect(
         shared_symbol_input_loads ==
 #if PTO_FDWIC_SHARED_MAP
-            static_cast<uint64_t>(group_count) * 5 &&
+            (kHostUsesSimtRuntimePlanBuild
+                 ? 0
+                 : static_cast<uint64_t>(group_count) * 5) &&
 #else
             0 &&
 #endif
         shared_symbol_inout_commits ==
 #if PTO_FDWIC_SHARED_MAP
-            static_cast<uint64_t>(group_count) * 3,
+            (kHostUsesSimtRuntimePlanBuild
+                 ? 0
+                 : static_cast<uint64_t>(group_count) * 3),
 #else
             0,
 #endif
-        "shared symbol INPUT-load / logical INOUT-symbol-commit totals are exact", &metrics
+        kHostUsesSimtRuntimePlanBuild
+            ? "Scalar shared-symbol Build counters remain zero"
+            : "shared symbol INPUT-load / logical INOUT-symbol-commit totals are exact",
+        &metrics
     );
 #if PTO_FDWIC_SHARED_MAP
     std::printf(
@@ -6247,11 +7080,20 @@ inline Metrics Validate(
         ExpectedPaDependencySignature(batches);
 #endif
     Expect(
-        dependency_signature == expected_dependency_signature,
+        dependency_signature ==
 #if PTO_FDWIC_SHARED_MAP
-        kCompiledTensorMapMode == TensorMapBuildMode::Private
-            ? "fanin dependency-edge signature matches fixed private PA"
-            : "fanin dependency-edge signature matches shared group chain",
+            (kHostUsesSimtRuntimePlanBuild
+                 ? 0
+                 : expected_dependency_signature),
+#else
+            expected_dependency_signature,
+#endif
+#if PTO_FDWIC_SHARED_MAP
+        kHostUsesSimtRuntimePlanBuild
+            ? "Scalar dependency signature remains zero for SIMT Build"
+            : (kCompiledTensorMapMode == TensorMapBuildMode::Private
+                   ? "fanin dependency-edge signature matches fixed private PA"
+                   : "fanin dependency-edge signature matches shared group chain"),
 #else
         "fanin dependency-edge signature matches PA Case1",
 #endif
@@ -6299,18 +7141,31 @@ inline Metrics Validate(
     );
     Expect(
         shared_map_validation.protocol_ok &&
-            shared_map_validation.total_appends == 0 &&
-            shared_map_validation.physical_entries == 0 &&
-            shared_map_validation.logical_entries == 0 &&
-            shared_map_validation.logical_signature == 1469598103934665603ULL,
-        "shared strict per-task completion, empty ordinary ring, and writer history are exact",
+            shared_map_validation.total_appends ==
+                (kHostUsesSimtRuntimePlanBuild
+                     ? runtime_plan_ordinary_appends : 0U) &&
+            shared_map_validation.physical_entries ==
+                (kHostUsesSimtRuntimePlanBuild
+                     ? runtime_plan_ordinary_appends : 0U) &&
+            shared_map_validation.logical_entries ==
+                (kHostUsesSimtRuntimePlanBuild
+                     ? runtime_plan_ordinary_appends : 0U) &&
+            shared_map_validation.logical_signature ==
+                (kHostUsesSimtRuntimePlanBuild
+                     ? runtime_plan_ordinary_signature
+                     : 1469598103934665603ULL),
+        kHostUsesSimtRuntimePlanBuild
+            ? "shared strict completion, Plan-derived ordinary ring, and writer history are exact"
+            : "shared strict per-task completion, empty ordinary ring, and writer history are exact",
         &metrics
     );
     Expect(
         shared_output_heap_layout_ok &&
             shared_output_validation.published_outputs ==
-                static_cast<uint64_t>(batches) * 3 +
-                static_cast<uint64_t>(group_count) * 5,
+                (kHostUsesSimtRuntimePlanBuild
+                     ? runtime_plan_writer_projection.published_outputs
+                     : static_cast<uint64_t>(batches) * 3 +
+                           static_cast<uint64_t>(group_count) * 5),
         "shared fresh-output descriptors form exact non-overlapping shard coverage",
         &metrics
     );
@@ -6321,6 +7176,44 @@ inline Metrics Validate(
         "shared symbol projection matches canonical normalized writer signature",
         &metrics
     );
+    if (kHostUsesSimtRuntimePlanBuild) {
+        // SIMT writer 不向 Scalar WorkerResult 回填 Build 统计，因此 Build
+        // 正确性只由真实共享状态闭合：Plan 的 N/N+4/4/release、逐 task
+        // insert completion、fresh output/heap/map、TaskCell completion、
+        // Exec payload/owner/terminal 以及全局 drain 缺一不可。
+        const bool simt_direct_state_oracle_ok =
+            shared_plan_ok &&
+            runtime_plan_writer_projection_ok &&
+            shared_replay_state_idle &&
+            shared_runtime_plan_storage_ok &&
+            shared_runtime_plan_control_ok &&
+            shared_exec_scan_cursors_ok &&
+            shared_scheduler_atomic_padding_ok &&
+            shared_insert_completions_ok &&
+            legacy_task_completion_canary_ok &&
+            shared_heap_state_ok &&
+            shared_map_validation.protocol_ok &&
+            shared_output_validation.protocol_ok &&
+            shared_output_heap_layout_ok &&
+            shared_normalized_writer_signature ==
+                expected_normalized_writer_signature &&
+            duplicates == 0 &&
+            ready_flags == task_count &&
+            vend_values_ok &&
+            vend_progress_bounds_ok &&
+            cross_core_exec_cells_ok &&
+            cross_core_exec_role_owner_ok &&
+            cross_core_exec_payload_validation.protocol_ok &&
+            cross_core_exec_terminal_snapshot_ok &&
+            cross_core_exec_drain_ok &&
+            cross_core_exec_fatal_clear &&
+            state.fatal.value == 0;
+        Expect(
+            simt_direct_state_oracle_ok,
+            "SIMT Build direct-state oracle closes Plan, publication, payload, completion, and drain",
+            &metrics
+        );
+    }
     std::printf(
         "[TENSORMAP] mode=shared insert_order=per_task_128b_completion "
         "completed_insert_tasks=%u legacy_turns=[%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld] "
@@ -6576,12 +7469,16 @@ inline Metrics Validate(
             }
         }
 #if PTO_FDWIC_SHARED_MAP
-        // generic 物理区内：每 batch 的 Alloc Build 有 7 条；每 group
-        // 的四个普通 Build 子区间有 32 条，四个实际 kernel 的
-        // Kernel/Commit 有 8 条，合计 40 条。
+        // Scalar backend 的 generic 物理区内：每 batch Alloc Build 7 条，
+        // 每 group 四个普通 Build 子区间 32 条，四个实际 kernel 的
+        // Kernel/Commit 8 条。SIMT backend 第一版只把每个 Scalar 的粗
+        // RuntimePlanBuild 父段放进本 TraceHeader；VF writer 的子段绝不
+        // 伪造成 96 路 PlannedBuild，因而这里只剩每 group 8 条 Execute。
         const uint64_t expected_shared_extra_records =
-            7ULL * static_cast<uint64_t>(batches) +
-            40ULL * static_cast<uint64_t>(group_count);
+            kHostUsesSimtRuntimePlanBuild
+                ? 8ULL * static_cast<uint64_t>(group_count)
+                : 7ULL * static_cast<uint64_t>(batches) +
+                      40ULL * static_cast<uint64_t>(group_count);
         const uint64_t physical_expected_trace_records =
             expected_shared_extra_records +
             trace_wait_records + 2ULL * kWorkers + dcci_records +
@@ -6600,14 +7497,11 @@ inline Metrics Validate(
         const uint64_t logical_expected_trace_records =
             physical_expected_trace_records;
 #endif
-        // central ticket 的每个 owned task 直接从 Materialize 开始。Alloc owner 追加
-        // Materialize/Register/metadata/outputs/copy/flush/AllocComplete 七条，
-        // 每个普通 owner 追加
-        // Materialize/Register/metadata/outputs/copy/flush/Fanin/
-        // WinnerBuild 八条；每组四个实际 kernel 再各有 Kernel+Commit 两条。
-        // shared 每核各保留 RuntimePlanBuild 和 FinalDrain 两条
-        // 父 span，不再把 Plan Build 冒充 OrchestrationReplay；
-        // private 仍保持既有父区间口径。
+        // Scalar central ticket 的 owned task 从 Materialize 开始，保留
+        // 七/八条 Build 子记录；SIMT writer 第一版不接入 Scalar trace
+        // sidecar。两种 backend 的 96 个 Scalar 都各保留一条粗
+        // RuntimePlanBuild 和一条 FinalDrain 父 span，private 则维持原
+        // 有口径。
         // 真实等待按运行时次数加入。
         Expect(trace_shape_ok, "swimlane header and per-worker capacities are valid", &metrics);
         Expect(trace_dropped == 0, "swimlane records fit without drops", &metrics);

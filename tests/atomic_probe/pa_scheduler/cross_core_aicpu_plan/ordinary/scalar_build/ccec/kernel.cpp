@@ -394,7 +394,55 @@ __aicore__ inline void CcecOps::PmuWindowStop(
 
 }  // namespace
 
-#if defined(PA_COMPETE_FIRST_SPLIT_FINISH) && defined(PA_BUILD_AIC)
+#if defined(PA_SIMT_EXTERNAL_BUILD_AIV_HELPERS)
+static_assert(
+    pa_scheduler::kCompiledRuntimePlanBuildBackend ==
+        pa_scheduler::RuntimePlanBuildBackend::Simt,
+    "SIMT external-build helpers require the SIMT backend identity"
+);
+static_assert(
+    pa_scheduler::kRuntimePlanBuildWorkers == 4U,
+    "SIMT external-build helpers require four Build leaders"
+);
+
+// AIV0 已经在调用此 helper 前对 startup identity cache lines 做 acquire。
+// 这里保持严格只读，供正式 SIMT entry 在任何自身 GM write 之前拒绝
+// backend/ABI/mode/workers/sizeof/variant 混件。
+extern "C" __attribute__((noinline, used, visibility("hidden")))
+__aicore__ bool pa_scheduler_simt_runtime_plan_preflight_aiv(
+    __gm__ pa_scheduler::SchedulerState *state
+) {
+    return pa_scheduler::RuntimePlanBuildIdentityPreflight(state);
+}
+
+// 该 TU 独占真正的 CcecOps 与 RunScheduler 实例。其余 63 个 AIV 走
+// 三参 Scalar continuation；AIV0 在 VF V->S join 后携带唯一 active
+// external Build window 进入四参 continuation，成为第 96 个启动参与者。
+extern "C" __attribute__((noinline, used, visibility("hidden")))
+__aicore__ void pa_scheduler_simt_runtime_plan_continuation_aiv(
+    __gm__ pa_scheduler::SchedulerState *state,
+    uint32_t worker_id,
+    uint64_t external_build_begin,
+    uint64_t external_build_end,
+    uint32_t external_build_active
+) {
+    if (external_build_active == 0U) {
+        pa_scheduler::RunScheduler<CcecOps>(
+            state, worker_id, pa_scheduler::CoreRole::Aiv
+        );
+        return;
+    }
+    const pa_scheduler::RuntimePlanExternalBuildWindow window{
+        external_build_begin,
+        external_build_end,
+        external_build_active,
+        0U,
+    };
+    pa_scheduler::RunScheduler<CcecOps>(
+        state, worker_id, pa_scheduler::CoreRole::Aiv, window
+    );
+}
+#elif defined(PA_COMPETE_FIRST_SPLIT_FINISH) && defined(PA_BUILD_AIC)
 // runtime entry/state-owner TU 每次 launch 只调用一次该 orchestration；它
 // 不是 kernel entry，最终由 version script 局部化，避免污染 runtime 入口枚举。
 extern "C" __attribute__((noinline, used)) __aicore__ void
