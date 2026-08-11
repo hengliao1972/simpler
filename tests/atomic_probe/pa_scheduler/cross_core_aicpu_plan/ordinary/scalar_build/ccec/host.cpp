@@ -533,9 +533,9 @@ bool MakeOwnerTensorMetadata(
 }
 
 bool BuildOwnerRequest(
-    pa_scheduler::SchedulerState *state_device, void *runtime_plan_cells,
-    uint32_t capacity, uint32_t batches,
-    pa_scheduler::aicpu_owner::OwnerRequest *request
+    pa_scheduler::SchedulerState *state_device, void *runtime_plan_cells, void *task_trace_records,
+    uint32_t task_trace_capacity, void *operation_trace_records, uint32_t operation_trace_capacity, uint32_t capacity,
+    uint32_t batches, pa_scheduler::aicpu_owner::OwnerRequest *request
 ) {
     using namespace pa_scheduler::aicpu_owner;
     if (state_device == nullptr || runtime_plan_cells == nullptr ||
@@ -557,6 +557,26 @@ bool BuildOwnerRequest(
     request->header.tensor_count = 6U;
     request->header.scalar_count = 1U;
     request->header.context_tensor_index = 4U;
+#if PA_BUILD_SWIMLANE
+    if (task_trace_records == nullptr || task_trace_capacity != capacity) {
+        return false;
+    }
+    request->header.task_trace_records = reinterpret_cast<uint64_t>(task_trace_records);
+    request->header.task_trace_capacity = task_trace_capacity;
+    request->header.task_trace_record_bytes = sizeof(AicpuPlanTaskTraceRecord);
+    if (operation_trace_records == nullptr ||
+        operation_trace_capacity != pa_scheduler::aicpu_plan_trace::CapacityForPlanCells(capacity)) {
+        return false;
+    }
+    request->header.operation_trace_records = reinterpret_cast<uint64_t>(operation_trace_records);
+    request->header.operation_trace_capacity = operation_trace_capacity;
+    request->header.operation_trace_record_bytes = sizeof(pa_scheduler::aicpu_plan_trace::Record);
+#else
+    if (task_trace_records != nullptr || task_trace_capacity != 0U || operation_trace_records != nullptr ||
+        operation_trace_capacity != 0U) {
+        return false;
+    }
+#endif
 
     constexpr uint32_t kHeads = 16U;
     constexpr uint32_t kHeadDim = 128U;
@@ -597,29 +617,44 @@ bool ValidateOwnerResult(
 ) {
     using namespace pa_scheduler::aicpu_owner;
     const bool ok =
-        result.magic == kResultMagic &&
-        result.version == kRequestVersion &&
-        result.status == static_cast<int32_t>(OwnerStatus::Ok) &&
-        result.backend.status == 0 &&
-        result.backend.task_count == expected_tasks &&
-        result.backend.begin_count == expected_tasks &&
-        result.backend.finish_count == expected_tasks &&
-        result.backend.published_count == expected_tasks &&
-        result.backend.alloc_count + result.backend.aic_count +
-                result.backend.aiv_count ==
-            expected_tasks &&
-        result.backend.fatal_code == 0 &&
-        result.begin_ns != 0U && result.end_ns >= result.begin_ns;
+        result.magic == kResultMagic && result.version == kRequestVersion &&
+        result.status == static_cast<int32_t>(OwnerStatus::Ok) && result.backend.status == 0 &&
+        result.backend.task_count == expected_tasks && result.backend.begin_count == expected_tasks &&
+        result.backend.finish_count == expected_tasks && result.backend.published_count == expected_tasks &&
+        result.backend.alloc_count + result.backend.aic_count + result.backend.aiv_count == expected_tasks &&
+        result.backend.fatal_code == 0 && result.begin_ns != 0U
+#if PA_BUILD_SWIMLANE
+        && result.begin_ns < result.input_ready_ns && result.input_ready_ns < result.backend_bound_ns &&
+        result.backend_bound_ns < result.orchestration_end_ns &&
+        result.orchestration_end_ns < result.backend_closed_ns && result.backend_closed_ns < result.end_ns &&
+        result.backend.trace_count == expected_tasks &&
+        result.backend.trace_record_bytes == sizeof(AicpuPlanTaskTraceRecord) &&
+        result.backend.operation_trace_count != 0U &&
+        result.backend.operation_trace_record_bytes == sizeof(pa_scheduler::aicpu_plan_trace::Record) &&
+        result.backend.operation_trace_dropped == 0U
+#else
+        && result.end_ns >= result.begin_ns && result.input_ready_ns == 0U && result.backend_bound_ns == 0U &&
+        result.orchestration_end_ns == 0U && result.backend_closed_ns == 0U && result.backend.trace_count == 0U &&
+        result.backend.trace_record_bytes == 0U && result.backend.operation_trace_count == 0U &&
+        result.backend.operation_trace_record_bytes == 0U && result.backend.operation_trace_dropped == 0U
+#endif
+        ;
     if (!ok) {
         std::fprintf(
             stderr,
             "AICPU Plan owner result mismatch: owner_status=%d "
             "backend_status=%d tasks=%u/%u begin=%u finish=%u "
-            "published=%u fatal=%d\n",
-            result.status, result.backend.status,
-            result.backend.task_count, expected_tasks,
-            result.backend.begin_count, result.backend.finish_count,
-            result.backend.published_count, result.backend.fatal_code
+            "published=%u fatal=%d trace=%u/%uB operations=%u/%uB "
+            "dropped=%u timeline="
+            "[%llu,%llu,%llu,%llu,%llu,%llu]\n",
+            result.status, result.backend.status, result.backend.task_count, expected_tasks, result.backend.begin_count,
+            result.backend.finish_count, result.backend.published_count, result.backend.fatal_code,
+            result.backend.trace_count, result.backend.trace_record_bytes, result.backend.operation_trace_count,
+            result.backend.operation_trace_record_bytes, result.backend.operation_trace_dropped,
+            static_cast<unsigned long long>(result.begin_ns), static_cast<unsigned long long>(result.input_ready_ns),
+            static_cast<unsigned long long>(result.backend_bound_ns),
+            static_cast<unsigned long long>(result.orchestration_end_ns),
+            static_cast<unsigned long long>(result.backend_closed_ns), static_cast<unsigned long long>(result.end_ns)
         );
     }
     return ok;
@@ -2583,6 +2618,33 @@ int main(int argc, char **argv) {
         );
         return EXIT_FAILURE;
     }
+#if PA_BUILD_SWIMLANE
+    constexpr size_t kAicpuTaskTraceBytes =
+        static_cast<size_t>(kRuntimePlanCapacity) * sizeof(AicpuPlanTaskTraceRecord);
+    ScopedAlignedAclDeviceAllocation aicpu_task_trace_allocation;
+    if (!aicpu_task_trace_allocation.Allocate(
+            kAicpuTaskTraceBytes, pa_scheduler::aicpu_owner::kCacheLineBytes, "aclrtMalloc(AICPU TaskPlan trace)"
+        )) {
+        return EXIT_FAILURE;
+    }
+    void *aicpu_task_trace_device = aicpu_task_trace_allocation.GetAligned();
+    constexpr uint32_t kAicpuOperationTraceCapacity =
+        pa_scheduler::aicpu_plan_trace::CapacityForPlanCells(kRuntimePlanCapacity);
+    static_assert(kAicpuOperationTraceCapacity != 0U, "AICPU operation trace capacity overflowed");
+    constexpr size_t kAicpuOperationTraceBytes =
+        static_cast<size_t>(kAicpuOperationTraceCapacity) * sizeof(pa_scheduler::aicpu_plan_trace::Record);
+    ScopedAlignedAclDeviceAllocation aicpu_operation_trace_allocation;
+    if (!aicpu_operation_trace_allocation.Allocate(
+            kAicpuOperationTraceBytes, pa_scheduler::aicpu_owner::kCacheLineBytes,
+            "aclrtMalloc(AICPU atomic/cache operation trace)"
+        )) {
+        return EXIT_FAILURE;
+    }
+    void *aicpu_operation_trace_device = aicpu_operation_trace_allocation.GetAligned();
+#else
+    void *aicpu_task_trace_device = nullptr;
+    void *aicpu_operation_trace_device = nullptr;
+#endif
 #endif
 
     // 真实 PTO 负载使用独立 GM，不解引用调度器中只用于依赖建模的 synthetic tensor 地址。
@@ -2697,6 +2759,8 @@ int main(int argc, char **argv) {
     double pmu_json_submit_span_us = 0.0;
     PmuValidation pmu_json_validation;
     for (uint32_t run = 1; run <= options.runs; ++run) {
+        std::vector<AicpuPlanTaskTraceRecord> aicpu_task_trace_records;
+        std::vector<pa_scheduler::aicpu_plan_trace::Record> aicpu_operation_trace_records;
         pa_scheduler::host::InitializeState(state.get(), options);
 #if PTO_FDWIC_SHARED_MAP
         // 每轮都先清掉全部可消费 Plan cell，随后才把同一块 128B 对齐 GM
@@ -2854,14 +2918,25 @@ int main(int argc, char **argv) {
         alignas(pa_scheduler::aicpu_owner::kAtomicIsolationBytes)
             pa_scheduler::aicpu_owner::OwnerRequest owner_request{};
         if (!BuildOwnerRequest(
-                static_cast<pa_scheduler::SchedulerState *>(state_device),
-                runtime_plan_cells_device, kRuntimePlanCapacity,
+                static_cast<pa_scheduler::SchedulerState *>(state_device), runtime_plan_cells_device,
+                aicpu_task_trace_device,
+#if PA_BUILD_SWIMLANE
+                kRuntimePlanCapacity,
+#else
+                0U,
+#endif
+                aicpu_operation_trace_device,
+#if PA_BUILD_SWIMLANE
+                kAicpuOperationTraceCapacity,
+#else
+                0U,
+#endif
+                kRuntimePlanCapacity,
                 options.batches, &owner_request
             ) ||
             !CheckAcl(
                 aclrtMemcpy(
-                    owner_request_device, sizeof(owner_request),
-                    &owner_request, sizeof(owner_request),
+                    owner_request_device, sizeof(owner_request), &owner_request, sizeof(owner_request),
                     ACL_MEMCPY_HOST_TO_DEVICE
                 ),
                 "aclrtMemcpy(H2D AICPU Plan owner request)"
@@ -3089,6 +3164,47 @@ int main(int argc, char **argv) {
             all_passed = false;
             break;
         }
+#if PA_BUILD_SWIMLANE
+        if (clock_correlation_required) {
+            aicpu_task_trace_records.resize(owner_request.result.backend.trace_count);
+            if (!CheckAcl(
+                    aclrtMemcpy(
+                        aicpu_task_trace_records.data(),
+                        aicpu_task_trace_records.size() * sizeof(aicpu_task_trace_records[0]), aicpu_task_trace_device,
+                        aicpu_task_trace_records.size() * sizeof(aicpu_task_trace_records[0]), ACL_MEMCPY_DEVICE_TO_HOST
+                    ),
+                    "aclrtMemcpy(D2H AICPU TaskPlan trace)"
+                )) {
+                execution_ok = false;
+                all_passed = false;
+                break;
+            }
+            if (owner_request.result.backend.operation_trace_count > kAicpuOperationTraceCapacity) {
+                std::fprintf(
+                    stderr, "AICPU operation trace count exceeds capacity: %u/%u.\n",
+                    owner_request.result.backend.operation_trace_count, kAicpuOperationTraceCapacity
+                );
+                execution_ok = false;
+                all_passed = false;
+                break;
+            }
+            aicpu_operation_trace_records.resize(owner_request.result.backend.operation_trace_count);
+            if (!CheckAcl(
+                    aclrtMemcpy(
+                        aicpu_operation_trace_records.data(),
+                        aicpu_operation_trace_records.size() * sizeof(aicpu_operation_trace_records[0]),
+                        aicpu_operation_trace_device,
+                        aicpu_operation_trace_records.size() * sizeof(aicpu_operation_trace_records[0]),
+                        ACL_MEMCPY_DEVICE_TO_HOST
+                    ),
+                    "aclrtMemcpy(D2H AICPU operation trace)"
+                )) {
+                execution_ok = false;
+                all_passed = false;
+                break;
+            }
+        }
+#endif
         const double producer_us = static_cast<double>(
             owner_request.result.end_ns - owner_request.result.begin_ns
         ) / 1000.0;
@@ -3457,23 +3573,21 @@ int main(int argc, char **argv) {
                     trace_header, options.swimlane_json,
 #endif
                     workload_options.mode,
-                    real_compute
-                        ? workload_options.repeats
-                        : pa_scheduler::WorkloadCounts{
-                              options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
-                          },
-                    real_compute
-                        ? pa_scheduler::host::RealComputePatternName(workload_options.pattern)
-                        : "none",
-                    options.final_barrier_shape, options.trace_atomics,
-                    read_trace_records
+                    real_compute ? workload_options.repeats :
+                                   pa_scheduler::WorkloadCounts{
+                                       options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
+                                   },
+                    real_compute ? pa_scheduler::host::RealComputePatternName(workload_options.pattern) : "none",
+                    options.final_barrier_shape, options.trace_atomics, read_trace_records
 #if PTO_FDWIC_SHARED_MAP
-                    , read_submit_claim_records,
-                    owner_request.result.backend.task_count,
-                    true,
-                    owner_request.result.begin_ns,
-                    owner_request.result.end_ns,
+                    ,
+                    read_submit_claim_records, owner_request.result.backend.task_count, true, &owner_request.result,
+                    aicpu_task_trace_records, aicpu_operation_trace_records,
+#if PA_BUILD_SWIMLANE
                     clock_correlation_evidence
+#else
+                    pa_scheduler::aicpu_clock::ClockCorrelationEvidence{}
+#endif
 #endif
                 )) {
                 postprocess_ok = false;
@@ -3597,6 +3711,13 @@ int main(int argc, char **argv) {
         );
     }
 #if PTO_FDWIC_SHARED_MAP
+#if PA_BUILD_SWIMLANE
+    cleanup_ok &= CheckAcl(
+        aclrtFree(aicpu_operation_trace_allocation.ReleaseRaw()), "aclrtFree(AICPU operation trace raw allocation)"
+    );
+    cleanup_ok &=
+        CheckAcl(aclrtFree(aicpu_task_trace_allocation.ReleaseRaw()), "aclrtFree(AICPU TaskPlan trace raw allocation)");
+#endif
     cleanup_ok &= CheckAcl(
         aclrtFree(owner_request_allocation.ReleaseRaw()),
         "aclrtFree(AICPU Plan owner request raw allocation)"

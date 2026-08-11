@@ -13,7 +13,7 @@
 #define PA_SCHEDULER_COMMON_HOST_SUPPORT_H
 
 #include "pa_model.h"
-#include "../aicpu/aicpu_clock_correlation_abi.h"
+#include "../aicpu/aicpu_plan_owner_abi.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -2644,35 +2644,287 @@ inline bool ValidateAicpuClockCorrelationForExport(
     return true;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+inline const char *AicpuTaskKindName(uint8_t kind) {
+    const char *names[] = {"Alloc", "QK", "SF", "PV", "UP"};
+    return kind < sizeof(names) / sizeof(names[0]) ? names[kind] : "Unknown";
+}
+
+inline const char *AicpuTaskEngineName(uint8_t engine) {
+    const char *names[] = {"metadata", "aic", "aiv"};
+    return engine < sizeof(names) / sizeof(names[0]) ? names[engine] : "unknown";
+}
+
+inline const char *AicpuOperationScopeName(uint16_t scope) {
+    const char *names[] = {
+        "owner_setup",      "backend_bind",  "task_stage",    "task_publish",
+        "frontier_advance", "ready_publish", "backend_close", "fatal_publish",
+    };
+    return scope < sizeof(names) / sizeof(names[0]) ? names[scope] : "unknown";
+}
+
+inline const char *AicpuOperationName(uint8_t operation) {
+    const char *names[] = {
+        "atomic_load_acquire", "cache_clean_cvac", "cache_discard_civac", "barrier_dsb_sy",
+        "barrier_isb",         "gm_store",         "scalar_work",
+    };
+    return operation < sizeof(names) / sizeof(names[0]) ? names[operation] : "unknown";
+}
+
+inline const char *AicpuOperationTargetName(uint8_t target) {
+    const char *names[] = {
+        "none",          "request_tensors",   "request_scalars",  "context_lens",       "runtime_plan_control",
+        "fatal",         "closed_task_count", "planned_frontier", "build_next",         "build_workers_done",
+        "build_release", "cell_control",      "cell_payload",     "payload_validation",
+    };
+    return target < sizeof(names) / sizeof(names[0]) ? names[target] : "unknown";
+}
+
+inline bool ValidateAicpuTaskTraceForExport(
+    const aicpu_owner::OwnerResult &owner, const std::vector<AicpuPlanTaskTraceRecord> &records,
+    const SharedHostTaskPlan &plan
+) {
+    if (owner.backend.task_count != plan.total_tasks || owner.backend.trace_count != plan.total_tasks ||
+        owner.backend.trace_record_bytes != sizeof(AicpuPlanTaskTraceRecord) || records.size() != plan.total_tasks ||
+        !(owner.begin_ns < owner.input_ready_ns && owner.input_ready_ns < owner.backend_bound_ns &&
+          owner.backend_bound_ns < owner.orchestration_end_ns && owner.orchestration_end_ns < owner.backend_closed_ns &&
+          owner.backend_closed_ns < owner.end_ns)) {
+        std::fprintf(
+            stderr,
+            "swimlane export rejected malformed AICPU owner/task trace "
+            "envelope: tasks=%u trace=%u/%zu record_bytes=%u.\n",
+            owner.backend.task_count, owner.backend.trace_count, records.size(), owner.backend.trace_record_bytes
+        );
+        return false;
+    }
+
+    uint64_t previous_publish_end_ns = owner.backend_bound_ns;
+    for (uint32_t task_id = 0U; task_id < plan.total_tasks; ++task_id) {
+        const SharedHostPlannedTask *expected = plan.TaskAt(task_id);
+        const AicpuPlanTaskTraceRecord &record = records[task_id];
+        if (expected == nullptr) return false;
+        uint8_t expected_engine = 0U;
+        switch (expected->kind) {
+        case TaskKind::Alloc:
+            expected_engine = 0U;
+            break;
+        case TaskKind::Qk:
+        case TaskKind::Pv:
+            expected_engine = 1U;
+            break;
+        case TaskKind::Sf:
+        case TaskKind::Up:
+            expected_engine = 2U;
+            break;
+        case TaskKind::Count:
+            return false;
+        }
+        uint16_t expected_outputs = 0U;
+        switch (expected->kind) {
+        case TaskKind::Alloc:
+            expected_outputs = 3U;
+            break;
+        case TaskKind::Qk:
+            expected_outputs = 1U;
+            break;
+        case TaskKind::Sf:
+            expected_outputs = 3U;
+            break;
+        case TaskKind::Pv:
+            expected_outputs = 1U;
+            break;
+        case TaskKind::Up:
+            expected_outputs = 0U;
+            break;
+        case TaskKind::Count:
+            return false;
+        }
+        const bool non_last_publish_inside_orchestration =
+            task_id + 1U == plan.total_tasks || record.publish_end_ns <= owner.orchestration_end_ns;
+        if (record.task_id != task_id || record.task_kind != static_cast<uint8_t>(expected->kind) ||
+            record.function_id != SharedTraceFunctionId(expected->kind) || record.engine_class != expected_engine ||
+            record.group != expected->group_index || record.output_count != expected_outputs ||
+            record.payload_lines == 0U || record.payload_lines > aicpu_plan::kMaxPlanPayloadLines ||
+            record.reserved[0] != 0U || record.reserved[1] != 0U || record.reserved[2] != 0U ||
+            record.build_begin_ns < previous_publish_end_ns ||
+            !(owner.backend_bound_ns <= record.build_begin_ns && record.build_begin_ns < record.begin_end_ns &&
+              record.begin_end_ns < record.finish_begin_ns && record.finish_begin_ns < record.finish_end_ns &&
+              record.finish_end_ns < record.publish_begin_ns && record.publish_begin_ns < record.publish_end_ns &&
+              record.finish_end_ns <= owner.orchestration_end_ns && non_last_publish_inside_orchestration &&
+              record.publish_end_ns <= owner.backend_closed_ns)) {
+            std::fprintf(
+                stderr,
+                "swimlane export rejected AICPU TaskPlan trace at task %u: "
+                "kind=%u function=%d engine=%u group=%u payload=%u "
+                "timeline=[%llu,%llu,%llu,%llu,%llu,%llu].\n",
+                task_id, record.task_kind, record.function_id, record.engine_class, record.group, record.payload_lines,
+                static_cast<unsigned long long>(record.build_begin_ns),
+                static_cast<unsigned long long>(record.begin_end_ns),
+                static_cast<unsigned long long>(record.finish_begin_ns),
+                static_cast<unsigned long long>(record.finish_end_ns),
+                static_cast<unsigned long long>(record.publish_begin_ns),
+                static_cast<unsigned long long>(record.publish_end_ns)
+            );
+            return false;
+        }
+        previous_publish_end_ns = record.publish_end_ns;
+    }
+    return true;
+}
+
+inline bool ValidateAicpuOperationTraceForExport(
+    const aicpu_owner::OwnerResult &owner, const std::vector<pa_scheduler::aicpu_plan_trace::Record> &records,
+    const std::vector<AicpuPlanTaskTraceRecord> &tasks
+) {
+    using pa_scheduler::aicpu_plan_trace::Operation;
+    using pa_scheduler::aicpu_plan_trace::Scope;
+    using pa_scheduler::aicpu_plan_trace::Target;
+    constexpr uint32_t kNoIndex = pa_scheduler::aicpu_plan_trace::kNoTargetIndex;
+    if (owner.backend.operation_trace_count == 0U || owner.backend.operation_trace_count != records.size() ||
+        owner.backend.operation_trace_record_bytes != sizeof(pa_scheduler::aicpu_plan_trace::Record) ||
+        owner.backend.operation_trace_dropped != 0U) {
+        std::fprintf(
+            stderr,
+            "swimlane export rejected malformed AICPU operation trace "
+            "summary: records=%zu result=%u/%uB dropped=%u.\n",
+            records.size(), owner.backend.operation_trace_count, owner.backend.operation_trace_record_bytes,
+            owner.backend.operation_trace_dropped
+        );
+        return false;
+    }
+    uint64_t previous_end_ns = owner.begin_ns;
+    for (size_t index = 0U; index < records.size(); ++index) {
+        const pa_scheduler::aicpu_plan_trace::Record &record = records[index];
+        const auto scope = static_cast<Scope>(record.scope);
+        const auto operation = static_cast<Operation>(record.operation);
+        const auto target = static_cast<Target>(record.target);
+        uint64_t parent_begin_ns = 0U;
+        uint64_t parent_end_ns = 0U;
+        bool task_scoped = false;
+        switch (scope) {
+        case Scope::OwnerSetup:
+            parent_begin_ns = owner.begin_ns;
+            parent_end_ns = owner.input_ready_ns;
+            break;
+        case Scope::BackendBind:
+            parent_begin_ns = owner.input_ready_ns;
+            parent_end_ns = owner.backend_bound_ns;
+            break;
+        case Scope::TaskStage:
+            task_scoped = true;
+            if (record.task_id < tasks.size()) {
+                parent_begin_ns = tasks[record.task_id].finish_begin_ns;
+                parent_end_ns = tasks[record.task_id].finish_end_ns;
+            }
+            break;
+        case Scope::TaskPublish:
+        case Scope::FrontierAdvance:
+        case Scope::ReadyPublish:
+            task_scoped = true;
+            if (record.task_id < tasks.size()) {
+                parent_begin_ns = tasks[record.task_id].publish_begin_ns;
+                parent_end_ns = tasks[record.task_id].publish_end_ns;
+            }
+            break;
+        case Scope::BackendClose:
+            parent_begin_ns = owner.orchestration_end_ns;
+            parent_end_ns = owner.backend_closed_ns;
+            break;
+        case Scope::FatalPublish:
+        case Scope::Count:
+            break;
+        }
+        const bool cache_operation =
+            operation == Operation::CacheCleanCvac || operation == Operation::CacheDiscardCivac;
+        const bool cell_target = target == Target::CellControl || target == Target::CellPayload;
+        bool reserved_zero = true;
+        for (uint8_t value : record.reserved) {
+            reserved_zero = reserved_zero && value == 0U;
+        }
+        const bool operation_target_valid =
+            (operation == Operation::AtomicLoadAcquire &&
+             (target == Target::Fatal || target == Target::ClosedTaskCount || target == Target::PlannedFrontier ||
+              target == Target::BuildNext || target == Target::BuildWorkersDone || target == Target::BuildRelease ||
+              target == Target::CellControl)) ||
+            (cache_operation && target != Target::None && target != Target::PayloadValidation) ||
+            ((operation == Operation::BarrierDsbSy || operation == Operation::BarrierIsb) && target == Target::None) ||
+            (operation == Operation::GmStore &&
+             (target == Target::Fatal || target == Target::ClosedTaskCount || target == Target::PlannedFrontier ||
+              target == Target::CellControl || target == Target::CellPayload)) ||
+            (operation == Operation::ScalarWork && target == Target::PayloadValidation);
+        if (static_cast<uint16_t>(scope) >= static_cast<uint16_t>(Scope::Count) ||
+            static_cast<uint8_t>(operation) >= static_cast<uint8_t>(Operation::Count) ||
+            static_cast<uint8_t>(target) >= static_cast<uint8_t>(Target::Count) || !operation_target_valid ||
+            !reserved_zero || record.calls == 0U ||
+            (cache_operation ? record.lines == 0U || record.calls != record.lines : record.lines != 0U) ||
+            (task_scoped ? record.task_id >= tasks.size() : record.task_id != pa_scheduler::aicpu_plan_trace::kNoTaskId
+            ) ||
+            parent_begin_ns == 0U || parent_end_ns <= parent_begin_ns || record.begin_ns < previous_end_ns ||
+            record.begin_ns < parent_begin_ns || record.end_ns <= record.begin_ns || record.end_ns > parent_end_ns ||
+            (cell_target ? record.first_target_index == kNoIndex || record.last_target_index == kNoIndex ||
+                               record.first_target_index > record.last_target_index ||
+                               record.last_target_index >= kRuntimePlanConsumerCapacity :
+                           record.first_target_index != kNoIndex || record.last_target_index != kNoIndex) ||
+            ((operation != Operation::AtomicLoadAcquire && operation != Operation::GmStore &&
+              operation != Operation::ScalarWork) &&
+             (record.first_value != 0 || record.last_value != 0))) {
+            std::fprintf(
+                stderr,
+                "swimlane export rejected AICPU operation trace at "
+                "record %zu: task=%u scope=%u op=%u target=%u "
+                "calls=%u lines=%u target_range=[%u,%u] "
+                "timeline=[%llu,%llu].\n",
+                index, record.task_id, record.scope, record.operation, record.target, record.calls, record.lines,
+                record.first_target_index, record.last_target_index, static_cast<unsigned long long>(record.begin_ns),
+                static_cast<unsigned long long>(record.end_ns)
+            );
+            return false;
+        }
+        previous_end_ns = record.end_ns;
+    }
+    return true;
+}
+#endif
+
 template <
     typename ReadRecords
 #if PTO_FDWIC_SHARED_MAP
-    , typename ReadSubmitClaimRecords
+    ,
+    typename ReadSubmitClaimRecords
 #endif
->
+    >
 inline bool ExportSwimlaneRecords(
 #if PTO_FDWIC_SHARED_MAP
-    const TraceHeader &header, const SchedulerState &state,
-    const std::string &output_path,
+    const TraceHeader &header, const SchedulerState &state, const std::string &output_path,
 #else
     const TraceHeader &header, const std::string &output_path,
 #endif
-    WinnerWorkloadMode workload_mode, const WorkloadCounts &workload_counts,
-    const char *workload_pattern, FinalBarrierShape final_barrier_shape,
-    bool atomic_trace_enabled, ReadRecords read_records
+    WinnerWorkloadMode workload_mode, const WorkloadCounts &workload_counts, const char *workload_pattern,
+    FinalBarrierShape final_barrier_shape, bool atomic_trace_enabled, ReadRecords read_records
 #if PTO_FDWIC_SHARED_MAP
-    , ReadSubmitClaimRecords read_submit_claim_records,
-    uint32_t runtime_plan_producer_task_count,
-    bool require_aicpu_producer,
-    uint64_t runtime_plan_producer_begin_ns,
-    uint64_t runtime_plan_producer_end_ns,
-    const aicpu_clock::ClockCorrelationEvidence
-        &aicpu_clock_correlation
+    ,
+    ReadSubmitClaimRecords read_submit_claim_records, uint32_t runtime_plan_producer_task_count,
+    bool require_aicpu_producer, const aicpu_owner::OwnerResult *runtime_plan_producer,
+    const std::vector<AicpuPlanTaskTraceRecord> &aicpu_task_trace_records,
+    const std::vector<pa_scheduler::aicpu_plan_trace::Record> &aicpu_operation_trace_records,
+    const aicpu_clock::ClockCorrelationEvidence &aicpu_clock_correlation
 #endif
 ) {
     if (!ValidateTraceHeader(header, "swimlane export")) return false;
     bool has_aicpu_producer = false;
 #if PTO_FDWIC_SHARED_MAP
+    if ((require_aicpu_producer && runtime_plan_producer == nullptr) ||
+        (!require_aicpu_producer && (runtime_plan_producer != nullptr || !aicpu_task_trace_records.empty() ||
+                                     !aicpu_operation_trace_records.empty()))) {
+        std::fprintf(
+            stderr, "swimlane export rejected inconsistent AICPU producer/trace "
+                    "presence.\n"
+        );
+        return false;
+    }
+    const uint64_t runtime_plan_producer_begin_ns =
+        runtime_plan_producer == nullptr ? 0U : runtime_plan_producer->begin_ns;
+    const uint64_t runtime_plan_producer_end_ns = runtime_plan_producer == nullptr ? 0U : runtime_plan_producer->end_ns;
     if (!ValidateAicpuClockCorrelationForExport(
             require_aicpu_producer, header.frequency_hz,
             runtime_plan_producer_begin_ns,
@@ -2691,6 +2943,9 @@ inline bool ExportSwimlaneRecords(
     int64_t exported_build_workers_done = 0;
     int64_t exported_build_release = 0;
     int64_t exported_runtime_plan_fatal = 0;
+    size_t exported_aicpu_operation_records = 0U;
+    uint32_t exported_aicpu_operation_record_bytes = 0U;
+    uint32_t exported_aicpu_operation_dropped = 0U;
 #if PTO_FDWIC_SHARED_MAP
     // Plan-ahead 不再生成旧 Submit/Claim endpoint sidecar。为了不
     // 改动既有 Host 调用 ABI，暂时保留 callback 参数，但绝不
@@ -2706,6 +2961,15 @@ inline bool ExportSwimlaneRecords(
             "swimlane export rejected invalid shared task plan: %s\n",
             shared_plan_error.c_str()
         );
+        return false;
+    }
+    if (has_aicpu_producer &&
+        !ValidateAicpuTaskTraceForExport(*runtime_plan_producer, aicpu_task_trace_records, shared_plan)) {
+        return false;
+    }
+    if (has_aicpu_producer && !ValidateAicpuOperationTraceForExport(
+                                  *runtime_plan_producer, aicpu_operation_trace_records, aicpu_task_trace_records
+                              )) {
         return false;
     }
     const int64_t expected_task_count =
@@ -2758,6 +3022,11 @@ inline bool ExportSwimlaneRecords(
         plan_control.build_workers_done.value;
     exported_build_release = plan_control.build_release.value;
     exported_runtime_plan_fatal = plan_control.fatal.value;
+    if (has_aicpu_producer) {
+        exported_aicpu_operation_records = aicpu_operation_trace_records.size();
+        exported_aicpu_operation_record_bytes = runtime_plan_producer->backend.operation_trace_record_bytes;
+        exported_aicpu_operation_dropped = runtime_plan_producer->backend.operation_trace_dropped;
+    }
 #endif
     if (workload_mode != WinnerWorkloadMode::ScalarNop &&
         workload_mode != WinnerWorkloadMode::RealCompute) {
@@ -2804,7 +3073,8 @@ inline bool ExportSwimlaneRecords(
             if (core.atomic_calls != 0 || core.poll_calls != 0 || core.poll_batch_records != 0) {
                 std::fprintf(
                     stderr,
-                    "phase-only swimlane worker %u unexpectedly reports atomic counters: calls=%u polls=%u batches=%u\n",
+                    "phase-only swimlane worker %u unexpectedly reports atomic counters: calls=%u polls=%u "
+                    "batches=%u\n",
                     worker, core.atomic_calls, core.poll_calls, core.poll_batch_records
                 );
                 return false;
@@ -2853,6 +3123,8 @@ inline bool ExportSwimlaneRecords(
         "\"runtime_plan_build_trace_coverage\":\"%s\","
         "\"runtime_plan_producer_task_count\":%u,"
         "\"runtime_plan_task_count\":%u,"
+        "\"aicpu_operation_trace\":{\"enabled\":%s,"
+        "\"records\":%zu,\"record_bytes\":%u,\"dropped\":%u},"
         "\"runtime_plan_terminal\":{"
         "\"planned_frontier\":%lld,\"closed_task_count\":%lld,"
         "\"build_next\":%lld,\"build_workers_done\":%lld,"
@@ -2867,39 +3139,27 @@ inline bool ExportSwimlaneRecords(
         "\"counts\":{\"qk\":%u,\"sf\":%u,\"pv\":%u,\"up\":%u},"
         "\"unit\":\"%s\",\"input_pattern\":\"%s\","
         "\"engine_mapping\":%s},\"core_types\":[",
-        atomic_trace_enabled ? 4U : 1U,
-        PTO_FDWIC_SHARED_MAP ? "shared" : "private",
-        aicpu_plan::kRuntimePlanAbiVersion,
-        RuntimePlanBuildBackendName(), kRuntimePlanBuildWorkers,
-        kWorkers, RuntimePlanBuildTraceCoverageName(),
-        exported_runtime_plan_producer_task_count,
-        exported_runtime_plan_task_count,
-        static_cast<long long>(exported_planned_frontier),
-        static_cast<long long>(exported_closed_task_count),
-        static_cast<long long>(exported_build_next),
-        static_cast<long long>(exported_build_workers_done),
-        static_cast<long long>(exported_build_release),
+        atomic_trace_enabled ? 4U : 1U, PTO_FDWIC_SHARED_MAP ? "shared" : "private", aicpu_plan::kRuntimePlanAbiVersion,
+        RuntimePlanBuildBackendName(), kRuntimePlanBuildWorkers, kWorkers, RuntimePlanBuildTraceCoverageName(),
+        exported_runtime_plan_producer_task_count, exported_runtime_plan_task_count,
+        has_aicpu_producer ? "true" : "false", exported_aicpu_operation_records, exported_aicpu_operation_record_bytes,
+        exported_aicpu_operation_dropped, static_cast<long long>(exported_planned_frontier),
+        static_cast<long long>(exported_closed_task_count), static_cast<long long>(exported_build_next),
+        static_cast<long long>(exported_build_workers_done), static_cast<long long>(exported_build_release),
         static_cast<long long>(exported_runtime_plan_fatal),
-        has_aicpu_producer
-            ? "joint_aicpu_aicore_structure"
-            : "host_cpu_functional_structure",
-        RuntimePlanPipelineName(), RuntimePlanLaunchOrderName(),
-        RuntimePlanProducerReadyName(),
-        RuntimePlanConsumerAdmissionName(),
-        RuntimePlanPipelinePrefillTasks(),
-        static_cast<unsigned long long>(header.frequency_hz), kWorkers,
-        header.version,
+        has_aicpu_producer ? "joint_aicpu_aicore_structure" : "host_cpu_functional_structure",
+        RuntimePlanPipelineName(), RuntimePlanLaunchOrderName(), RuntimePlanProducerReadyName(),
+        RuntimePlanConsumerAdmissionName(), RuntimePlanPipelinePrefillTasks(),
+        static_cast<unsigned long long>(header.frequency_hz), kWorkers, header.version,
         ActiveFinalBarrierName(final_barrier_shape),
-        workload_mode == WinnerWorkloadMode::RealCompute ? "real-compute" : "scalar-nop",
-        workload_counts.qk, workload_counts.sf, workload_counts.pv, workload_counts.up,
-        workload_mode == WinnerWorkloadMode::RealCompute
-            ? "complete_128x128_engine_pipeline_iteration"
-            : "scalar_nop_instruction",
+        workload_mode == WinnerWorkloadMode::RealCompute ? "real-compute" : "scalar-nop", workload_counts.qk,
+        workload_counts.sf, workload_counts.pv, workload_counts.up,
+        workload_mode == WinnerWorkloadMode::RealCompute ? "complete_128x128_engine_pipeline_iteration" :
+                                                           "scalar_nop_instruction",
         workload_pattern,
-        workload_mode == WinnerWorkloadMode::RealCompute
-            ? "{\"qk\":\"cube_matmul\",\"sf\":\"vector_add\","
-              "\"pv\":\"cube_matmul\",\"up\":\"vector_mul\"}"
-            : "null"
+        workload_mode == WinnerWorkloadMode::RealCompute ? "{\"qk\":\"cube_matmul\",\"sf\":\"vector_add\","
+                                                           "\"pv\":\"cube_matmul\",\"up\":\"vector_mul\"}" :
+                                                           "null"
     );
     for (uint32_t worker = 0; worker < kWorkers; ++worker) {
         std::fprintf(output, "%s\"%s\"", worker == 0 ? "" : ",", worker < kAicWorkers ? "aic" : "aiv");
@@ -3084,11 +3344,90 @@ inline bool ExportSwimlaneRecords(
         static_cast<unsigned long long>(producer_summary.dcci_lines),
         static_cast<unsigned long long>(producer_summary.dropped_records)
     );
-    std::fprintf(
-        output,
-        "},\n\"aicore_tasks\":[],\n\"aicpu_tasks\":[],\n"
-        "\"aicpu_scheduler_phases\":[],\n\"aicpu_orchestrator_phases\":["
-    );
+    std::fprintf(output, "},\n\"aicore_tasks\":[],\n\"aicpu_tasks\":[");
+#if PTO_FDWIC_SHARED_MAP
+    if (has_aicpu_producer) {
+        for (size_t index = 0U; index < aicpu_task_trace_records.size(); ++index) {
+            const AicpuPlanTaskTraceRecord &record = aicpu_task_trace_records[index];
+            std::fprintf(
+                output,
+                "%s{\"task_id\":%u,\"task_kind\":\"%s\","
+                "\"function_id\":%d,\"engine\":\"%s\","
+                "\"group\":%u,\"output_count\":%u,"
+                "\"payload_lines\":%u,"
+                "\"clock\":\"aicpu_monotonic_raw_ns\","
+                "\"build_begin_ns\":%llu,\"begin_end_ns\":%llu,"
+                "\"finish_begin_ns\":%llu,\"finish_end_ns\":%llu,"
+                "\"publish_begin_ns\":%llu,\"publish_end_ns\":%llu}",
+                index == 0U ? "" : ",", record.task_id, AicpuTaskKindName(record.task_kind), record.function_id,
+                AicpuTaskEngineName(record.engine_class), record.group, record.output_count, record.payload_lines,
+                static_cast<unsigned long long>(record.build_begin_ns),
+                static_cast<unsigned long long>(record.begin_end_ns),
+                static_cast<unsigned long long>(record.finish_begin_ns),
+                static_cast<unsigned long long>(record.finish_end_ns),
+                static_cast<unsigned long long>(record.publish_begin_ns),
+                static_cast<unsigned long long>(record.publish_end_ns)
+            );
+        }
+    }
+#endif
+    std::fprintf(output, "],\n\"aicpu_operations\":[");
+#if PTO_FDWIC_SHARED_MAP
+    if (has_aicpu_producer) {
+        for (size_t index = 0U; index < aicpu_operation_trace_records.size(); ++index) {
+            const pa_scheduler::aicpu_plan_trace::Record &record = aicpu_operation_trace_records[index];
+            const int64_t task_id =
+                record.task_id == pa_scheduler::aicpu_plan_trace::kNoTaskId ? -1 : static_cast<int64_t>(record.task_id);
+            const int64_t first_target = record.first_target_index == pa_scheduler::aicpu_plan_trace::kNoTargetIndex ?
+                                             -1 :
+                                             static_cast<int64_t>(record.first_target_index);
+            const int64_t last_target = record.last_target_index == pa_scheduler::aicpu_plan_trace::kNoTargetIndex ?
+                                            -1 :
+                                            static_cast<int64_t>(record.last_target_index);
+            std::fprintf(
+                output,
+                "%s{\"sequence\":%zu,\"task_id\":%lld,"
+                "\"scope\":\"%s\",\"operation\":\"%s\","
+                "\"target\":\"%s\","
+                "\"clock\":\"aicpu_monotonic_raw_ns\","
+                "\"begin_ns\":%llu,\"end_ns\":%llu,"
+                "\"calls\":%u,\"lines\":%u,"
+                "\"first_target_index\":%lld,"
+                "\"last_target_index\":%lld,"
+                "\"first_value\":%lld,\"last_value\":%lld}",
+                index == 0U ? "" : ",", index, static_cast<long long>(task_id), AicpuOperationScopeName(record.scope),
+                AicpuOperationName(record.operation), AicpuOperationTargetName(record.target),
+                static_cast<unsigned long long>(record.begin_ns), static_cast<unsigned long long>(record.end_ns),
+                record.calls, record.lines, static_cast<long long>(first_target), static_cast<long long>(last_target),
+                static_cast<long long>(record.first_value), static_cast<long long>(record.last_value)
+            );
+        }
+    }
+#endif
+    std::fprintf(output, "],\n\"aicpu_scheduler_phases\":[");
+#if PTO_FDWIC_SHARED_MAP
+    if (has_aicpu_producer) {
+        const char *phase_names[] = {
+            "OwnerSetup", "BackendBind", "Orchestration", "BackendClose", "OwnerFinalize",
+        };
+        const uint64_t phase_points[] = {
+            runtime_plan_producer->begin_ns,          runtime_plan_producer->input_ready_ns,
+            runtime_plan_producer->backend_bound_ns,  runtime_plan_producer->orchestration_end_ns,
+            runtime_plan_producer->backend_closed_ns, runtime_plan_producer->end_ns,
+        };
+        for (size_t index = 0U; index < sizeof(phase_names) / sizeof(phase_names[0]); ++index) {
+            std::fprintf(
+                output,
+                "%s{\"name\":\"%s\","
+                "\"clock\":\"aicpu_monotonic_raw_ns\","
+                "\"begin_ns\":%llu,\"end_ns\":%llu}",
+                index == 0U ? "" : ",", phase_names[index], static_cast<unsigned long long>(phase_points[index]),
+                static_cast<unsigned long long>(phase_points[index + 1U])
+            );
+        }
+    }
+#endif
+    std::fprintf(output, "],\n\"aicpu_orchestrator_phases\":[");
 #if PTO_FDWIC_SHARED_MAP
     if (has_aicpu_producer) {
         std::fprintf(
@@ -6749,27 +7088,21 @@ inline Metrics Validate(
             "[CROSS_CORE_PAYLOAD_FAILURE] first_bad_task=%u "
             "reason=%s tensor=%u field=%s validated=%u "
             "actual={addr=%llu,size=%llu,owner=%llu,offset=%llu,ndims=%u,dtype=%u,manual=%u,contiguous=%u,extent=%llu} "
-            "expected={addr=%llu,size=%llu,owner=%llu,offset=%llu,ndims=%u,dtype=%u,manual=%u,contiguous=%u,extent=%llu}\n",
-            cross_core_exec_payload_validation.first_bad_task,
-            cross_core_exec_payload_validation.first_bad_reason,
+            "expected={addr=%llu,size=%llu,owner=%llu,offset=%llu,ndims=%u,dtype=%u,manual=%u,contiguous=%u,extent=%"
+            "llu}\n",
+            cross_core_exec_payload_validation.first_bad_task, cross_core_exec_payload_validation.first_bad_reason,
             cross_core_exec_payload_validation.first_bad_tensor,
             cross_core_exec_payload_validation.first_bad_tensor_field,
-            cross_core_exec_payload_validation.validated_tasks,
-            static_cast<unsigned long long>(actual.buffer_addr),
-            static_cast<unsigned long long>(actual.buffer_size),
-            static_cast<unsigned long long>(actual.owner_task_id),
-            static_cast<unsigned long long>(actual.start_offset),
-            actual.ndims, static_cast<uint32_t>(actual.dtype),
-            actual.manual_dep ? 1U : 0U,
-            actual.is_contiguous ? 1U : 0U,
+            cross_core_exec_payload_validation.validated_tasks, static_cast<unsigned long long>(actual.buffer_addr),
+            static_cast<unsigned long long>(actual.buffer_size), static_cast<unsigned long long>(actual.owner_task_id),
+            static_cast<unsigned long long>(actual.start_offset), actual.ndims, static_cast<uint32_t>(actual.dtype),
+            actual.manual_dep ? 1U : 0U, actual.is_contiguous ? 1U : 0U,
             static_cast<unsigned long long>(actual.extent_elem_cache),
             static_cast<unsigned long long>(expected.buffer_addr),
             static_cast<unsigned long long>(expected.buffer_size),
             static_cast<unsigned long long>(expected.owner_task_id),
-            static_cast<unsigned long long>(expected.start_offset),
-            expected.ndims, static_cast<uint32_t>(expected.dtype),
-            expected.manual_dep ? 1U : 0U,
-            expected.is_contiguous ? 1U : 0U,
+            static_cast<unsigned long long>(expected.start_offset), expected.ndims,
+            static_cast<uint32_t>(expected.dtype), expected.manual_dep ? 1U : 0U, expected.is_contiguous ? 1U : 0U,
             static_cast<unsigned long long>(expected.extent_elem_cache)
         );
     }
@@ -7533,14 +7866,12 @@ inline Metrics Validate(
         &metrics
     );
     Expect(
-        shared_runtime_plan_control_ok &&
-            submits == expected_submits &&
-            shared_insert_completions_ok &&
-            cross_core_exec_cells_ok &&
-            cross_core_exec_payload_validation.protocol_ok,
-        kHostUsesSimtRuntimePlanBuild
-            ? "SIMT Build reaches strict insert completion and runtime execution closure without Scalar Build counters"
-            : "every acquired Plan cell decodes and finishes before release, strict insert completion, and runtime execution closure",
+        shared_runtime_plan_control_ok && submits == expected_submits && shared_insert_completions_ok &&
+            cross_core_exec_cells_ok && cross_core_exec_payload_validation.protocol_ok,
+        kHostUsesSimtRuntimePlanBuild ?
+            "SIMT Build reaches strict insert completion and runtime execution closure without Scalar Build counters" :
+            "every acquired Plan cell decodes and finishes before release, strict insert completion, and runtime "
+            "execution closure",
         &metrics
     );
     Expect(

@@ -24,6 +24,10 @@ namespace {
 
 using namespace pa_scheduler::aicpu_plan;
 
+#ifndef PA_BUILD_SWIMLANE
+#define PA_BUILD_SWIMLANE 0
+#endif
+
 template <typename Function>
 Function Load(void *handle, const char *name)
 {
@@ -42,6 +46,200 @@ bool Check(bool condition, const char *message)
 {
     if (!condition) std::cerr << "FAIL: " << message << '\n';
     return condition;
+}
+
+AicpuPlanBackendConfig MakeBackendConfig(
+    void *control, void *cells, uint32_t capacity, std::vector<AicpuPlanTaskTraceRecord> &trace_records,
+    std::vector<pa_scheduler::aicpu_plan_trace::Record> &operation_records,
+    pa_scheduler::aicpu_plan_trace::State &operation_state
+) {
+#if PA_BUILD_SWIMLANE
+    trace_records.assign(capacity, AicpuPlanTaskTraceRecord{});
+    operation_records.assign(
+        pa_scheduler::aicpu_plan_trace::CapacityForPlanCells(capacity), pa_scheduler::aicpu_plan_trace::Record{}
+    );
+    operation_state = pa_scheduler::aicpu_plan_trace::State{
+        operation_records.data(), static_cast<uint32_t>(operation_records.size()), 0U, 0U, 0U,
+    };
+    return AicpuPlanBackendConfig{
+        control,          cells, capacity, 0U, trace_records.data(), capacity, sizeof(AicpuPlanTaskTraceRecord),
+        &operation_state, 0U,    0U,
+    };
+#else
+    trace_records.clear();
+    operation_records.clear();
+    operation_state = pa_scheduler::aicpu_plan_trace::State{};
+    return AicpuPlanBackendConfig{
+        control, cells, capacity, 0U, nullptr, 0U, 0U, nullptr, 0U, 0U,
+    };
+#endif
+}
+
+pa_scheduler::aicpu_plan_trace::State *MakeOperationTraceState(
+    uint32_t capacity, std::vector<pa_scheduler::aicpu_plan_trace::Record> &records,
+    pa_scheduler::aicpu_plan_trace::State &state
+) {
+#if PA_BUILD_SWIMLANE
+    records.assign(
+        pa_scheduler::aicpu_plan_trace::CapacityForPlanCells(capacity), pa_scheduler::aicpu_plan_trace::Record{}
+    );
+    state = pa_scheduler::aicpu_plan_trace::State{
+        records.data(), static_cast<uint32_t>(records.size()), 0U, 0U, 0U,
+    };
+    return &state;
+#else
+    (void)capacity;
+    records.clear();
+    state = pa_scheduler::aicpu_plan_trace::State{};
+    return nullptr;
+#endif
+}
+
+bool CheckBackendTrace(
+    const AicpuPlanBackendResult &result, const std::vector<AicpuPlanTaskTraceRecord> &records,
+    const std::vector<pa_scheduler::aicpu_plan_trace::Record> &operation_records,
+    const pa_scheduler::aicpu_plan_trace::State &operation_state, const char *message
+) {
+#if PA_BUILD_SWIMLANE
+    bool valid = result.status == 0 && result.trace_count == result.task_count &&
+                 result.trace_record_bytes == sizeof(AicpuPlanTaskTraceRecord) &&
+                 records.size() >= result.trace_count && result.operation_trace_count == operation_state.count &&
+                 result.operation_trace_count != 0U && result.operation_trace_count <= operation_records.size() &&
+                 result.operation_trace_record_bytes == sizeof(pa_scheduler::aicpu_plan_trace::Record) &&
+                 result.operation_trace_dropped == 0U && operation_state.dropped == 0U;
+    uint64_t previous_publish_end_ns = 0U;
+    uint8_t previous_kind = 0U;
+    uint8_t previous_group = 0U;
+    constexpr uint16_t kExpectedOutputs[] = {3U, 1U, 3U, 1U, 0U};
+    for (uint32_t task_id = 0U; valid && task_id < result.trace_count; ++task_id) {
+        const AicpuPlanTaskTraceRecord &record = records[task_id];
+        const uint8_t kind = record.task_kind;
+        const uint8_t expected_group =
+            kind == 0U ? 0U :
+            kind == 1U ? (previous_kind == 0U ? 0U : static_cast<uint8_t>(previous_group + 1U)) :
+                         previous_group;
+        const int16_t expected_function = kind == 0U ? int16_t{-1} : static_cast<int16_t>(kind - 1U);
+        const uint8_t expected_engine = kind == 0U ? 0U : (kind == 1U || kind == 3U) ? 1U : 2U;
+        valid = kind < 5U && record.task_id == task_id && record.function_id == expected_function &&
+                record.engine_class == expected_engine && record.group == expected_group &&
+                record.output_count == kExpectedOutputs[kind] && record.payload_lines >= 1U &&
+                record.payload_lines <= kMaxPlanPayloadLines && record.reserved[0] == 0U && record.reserved[1] == 0U &&
+                record.reserved[2] == 0U && record.build_begin_ns >= previous_publish_end_ns &&
+                record.build_begin_ns < record.begin_end_ns && record.begin_end_ns < record.finish_begin_ns &&
+                record.finish_begin_ns < record.finish_end_ns && record.finish_end_ns < record.publish_begin_ns &&
+                record.publish_begin_ns < record.publish_end_ns;
+        previous_publish_end_ns = record.publish_end_ns;
+        previous_kind = kind;
+        previous_group = record.group;
+    }
+    uint64_t previous_operation_end = 0U;
+    bool saw_atomic = false;
+    bool saw_cache_clean = false;
+    bool saw_cache_discard = false;
+    bool saw_dsb = false;
+    bool saw_isb = false;
+    bool saw_store = false;
+    bool saw_scalar = false;
+    bool saw_merged_bind_cell_discard = false;
+    bool saw_merged_bind_cell_load = false;
+    uint64_t prepared_cell_discard_calls = 0U;
+    uint64_t task_publish_dsb_calls = 0U;
+    uint64_t task_publish_isb_calls = 0U;
+    for (uint32_t index = 0U; valid && index < result.operation_trace_count; ++index) {
+        const pa_scheduler::aicpu_plan_trace::Record &record = operation_records[index];
+        bool reserved_zero = true;
+        for (uint8_t value : record.reserved) {
+            reserved_zero = reserved_zero && value == 0U;
+        }
+        valid = reserved_zero && record.begin_ns >= previous_operation_end && record.end_ns > record.begin_ns &&
+                record.calls != 0U &&
+                record.scope < static_cast<uint16_t>(pa_scheduler::aicpu_plan_trace::Scope::Count) &&
+                record.operation < static_cast<uint8_t>(pa_scheduler::aicpu_plan_trace::Operation::Count) &&
+                record.target < static_cast<uint8_t>(pa_scheduler::aicpu_plan_trace::Target::Count);
+        previous_operation_end = record.end_ns;
+        const auto operation = static_cast<pa_scheduler::aicpu_plan_trace::Operation>(record.operation);
+        const auto scope = static_cast<pa_scheduler::aicpu_plan_trace::Scope>(record.scope);
+        const auto target = static_cast<pa_scheduler::aicpu_plan_trace::Target>(record.target);
+        const bool cache_operation = pa_scheduler::aicpu_plan_trace::IsCacheOperation(operation);
+        valid = valid && (cache_operation ? record.lines != 0U && record.calls == record.lines : record.lines == 0U);
+        if (target == pa_scheduler::aicpu_plan_trace::Target::CellControl &&
+            operation == pa_scheduler::aicpu_plan_trace::Operation::CacheDiscardCivac) {
+            prepared_cell_discard_calls += record.calls;
+        }
+        if (scope == pa_scheduler::aicpu_plan_trace::Scope::TaskPublish) {
+            if (operation == pa_scheduler::aicpu_plan_trace::Operation::BarrierDsbSy) {
+                task_publish_dsb_calls += record.calls;
+            } else if (operation == pa_scheduler::aicpu_plan_trace::Operation::BarrierIsb) {
+                task_publish_isb_calls += record.calls;
+            }
+        }
+        if (scope == pa_scheduler::aicpu_plan_trace::Scope::BackendBind &&
+            target == pa_scheduler::aicpu_plan_trace::Target::CellControl && record.calls == records.size() &&
+            record.first_target_index == 0U && record.last_target_index + 1U == records.size()) {
+            saw_merged_bind_cell_discard = saw_merged_bind_cell_discard ||
+                                           operation == pa_scheduler::aicpu_plan_trace::Operation::CacheDiscardCivac;
+            saw_merged_bind_cell_load =
+                saw_merged_bind_cell_load || operation == pa_scheduler::aicpu_plan_trace::Operation::AtomicLoadAcquire;
+        }
+        switch (operation) {
+        case pa_scheduler::aicpu_plan_trace::Operation::AtomicLoadAcquire:
+            saw_atomic = true;
+            break;
+        case pa_scheduler::aicpu_plan_trace::Operation::CacheCleanCvac:
+            saw_cache_clean = true;
+            break;
+        case pa_scheduler::aicpu_plan_trace::Operation::CacheDiscardCivac:
+            saw_cache_discard = true;
+            break;
+        case pa_scheduler::aicpu_plan_trace::Operation::BarrierDsbSy:
+            saw_dsb = true;
+            break;
+        case pa_scheduler::aicpu_plan_trace::Operation::BarrierIsb:
+            saw_isb = true;
+            break;
+        case pa_scheduler::aicpu_plan_trace::Operation::GmStore:
+            saw_store = true;
+            break;
+        case pa_scheduler::aicpu_plan_trace::Operation::ScalarWork:
+            saw_scalar = true;
+            break;
+        case pa_scheduler::aicpu_plan_trace::Operation::Count:
+            valid = false;
+            break;
+        }
+    }
+    valid = valid && saw_atomic && saw_cache_clean && saw_cache_discard && saw_dsb && saw_isb && saw_store &&
+            saw_scalar;
+    if constexpr (pa_scheduler::kRuntimePlanPipelineIsPlanAheadClosed) {
+        // PlanAheadClosed 按需分块准备 cell control，不再要求 bind 阶段
+        // 单条记录覆盖整个 capacity。它必须覆盖 [0, N)，最多只可
+        // 因 128-cell 分块多准备 127 个 cell；task publish 内不得重新
+        // 引入逐 task DSB/ISB。
+        const uint64_t required = result.task_count == 0U ? 1U : result.task_count;
+        const uint64_t rounded = (required + 127U) / 128U * 128U;
+        const uint64_t maximum_prepared = rounded < records.size() ? rounded : records.size();
+        valid = valid && prepared_cell_discard_calls >= result.task_count &&
+                prepared_cell_discard_calls == maximum_prepared &&
+                task_publish_dsb_calls == 0U && task_publish_isb_calls == 0U;
+    } else {
+        // StreamingFuture 有并发 consumer，仍必须在 bind 时一次性准备
+        // 全容量，并在每个 task 的 payload/control 发布点完成两个 DSB
+        // 和一个 ISB。
+        valid = valid && prepared_cell_discard_calls == records.size() &&
+                saw_merged_bind_cell_discard && saw_merged_bind_cell_load &&
+                task_publish_dsb_calls == 2U * result.task_count &&
+                task_publish_isb_calls == result.task_count;
+    }
+    return Check(valid, message);
+#else
+    return Check(
+        result.trace_count == 0U && result.trace_record_bytes == 0U && records.empty() &&
+            result.operation_trace_count == 0U && result.operation_trace_record_bytes == 0U &&
+            result.operation_trace_dropped == 0U && operation_records.empty() && operation_state.count == 0U &&
+            operation_state.dropped == 0U,
+        message
+    );
+#endif
 }
 
 Tensor External(
@@ -90,7 +288,7 @@ int main(int argc, char **argv)
     using Result = AicpuPlanBackendResult (*)();
     using Entry = void (*)(const L2TaskArgs &);
     using Config = PTO2OrchestrationConfig (*)(const L2TaskArgs &);
-    using Initialize = int32_t (*)(void *, void *, uint32_t);
+    using Initialize = int32_t (*)(void *, void *, uint32_t, pa_scheduler::aicpu_plan_trace::State *);
     using Stage = int32_t (*)(
         void *, void *, uint32_t,
         const void *, uint32_t, int32_t, uint8_t, uint8_t, uint32_t,
@@ -199,10 +397,12 @@ int main(int argc, char **argv)
         partial_cells_memory, 0,
         kPartialCapacity * sizeof(RuntimeTaskPlanCell)
     );
+    std::vector<pa_scheduler::aicpu_plan_trace::Record> partial_operation_records;
+    pa_scheduler::aicpu_plan_trace::State partial_operation_state{};
     ok &= Check(
         initialize(
-            partial_control_memory, partial_cells_memory,
-            kPartialCapacity
+            partial_control_memory, partial_cells_memory, kPartialCapacity,
+            MakeOperationTraceState(kPartialCapacity, partial_operation_records, partial_operation_state)
         ) == 0,
         "partial-pack initialize failed"
     );
@@ -266,8 +466,13 @@ int main(int argc, char **argv)
     const auto check_early_build_close = [&](bool set_build_next) {
         std::memset(&close_control, 0, sizeof(close_control));
         std::memset(&close_cell, 0, sizeof(close_cell));
+        std::vector<pa_scheduler::aicpu_plan_trace::Record> close_operation_records;
+        pa_scheduler::aicpu_plan_trace::State close_operation_state{};
         bool case_ok = Check(
-            initialize(&close_control, &close_cell, 1U) == 0,
+            initialize(
+                &close_control, &close_cell, 1U,
+                MakeOperationTraceState(1U, close_operation_records, close_operation_state)
+            ) == 0,
             "early-build close initialize failed"
         );
         // 从协议层可关闭的 Ready/Open 状态注入 consumer 进度：NotReady 下现有
@@ -321,9 +526,12 @@ int main(int argc, char **argv)
         cells_memory, 0,
         kExpectedTasks * sizeof(RuntimeTaskPlanCell)
     );
-    const AicpuPlanBackendConfig backend_config{
-        control_memory, cells_memory, kExpectedTasks, 0U,
-    };
+    std::vector<AicpuPlanTaskTraceRecord> task_trace_records;
+    std::vector<pa_scheduler::aicpu_plan_trace::Record> operation_trace_records;
+    pa_scheduler::aicpu_plan_trace::State operation_trace_state{};
+    const AicpuPlanBackendConfig backend_config = MakeBackendConfig(
+        control_memory, cells_memory, kExpectedTasks, task_trace_records, operation_trace_records, operation_trace_state
+    );
     ok &= Check(bind(&backend_config) == 0, "backend bind failed");
     auto *control = static_cast<RuntimePlanControl *>(control_memory);
     auto *cells = static_cast<RuntimeTaskPlanCell *>(cells_memory);
@@ -333,11 +541,15 @@ int main(int argc, char **argv)
         "short Plan bind did not remain NotReady"
     );
     if (ok) entry(args);
-    constexpr int64_t kShortPrecloseFrontier = 5;
+    constexpr int64_t kShortPublishedPrefix = 5;
+    constexpr int64_t kShortPrecloseFrontier =
+        pa_scheduler::kRuntimePlanPipelineIsStreamingFuture
+            ? kShortPublishedPrefix
+            : 0;
     constexpr int64_t kExpectedShortReadyState =
         pa_scheduler::kRuntimePlanPipelineIsStreamingFuture &&
             kRuntimePlanReadyPrefillTasks <=
-                static_cast<uint32_t>(kShortPrecloseFrontier)
+                static_cast<uint32_t>(kShortPublishedPrefix)
             ? kPlanOpenTaskCount
             : kPlanProducerNotReadyTaskCount;
     ok &= Check(
@@ -361,6 +573,10 @@ int main(int argc, char **argv)
         backend_result.aic_count == 6U &&
         backend_result.aiv_count == 6U,
         "actual Alloc/AIC/AIV callback distribution changed"
+    );
+    ok &= CheckBackendTrace(
+        backend_result, task_trace_records, operation_trace_records, operation_trace_state,
+        "actual callback trace did not cover the 14-task Plan"
     );
 
     RuntimePlanStorageRef storage{};
@@ -627,9 +843,13 @@ int main(int argc, char **argv)
         );
         cells[task].control.value = 0;
     }
-    const AicpuPlanBackendConfig short_config{
-        control_memory, cells_memory, kShortCapacity, 0U,
-    };
+    std::vector<AicpuPlanTaskTraceRecord> short_trace_records;
+    std::vector<pa_scheduler::aicpu_plan_trace::Record> short_operation_records;
+    pa_scheduler::aicpu_plan_trace::State short_operation_state{};
+    const AicpuPlanBackendConfig short_config = MakeBackendConfig(
+        control_memory, cells_memory, kShortCapacity, short_trace_records, short_operation_records,
+        short_operation_state
+    );
     ok &= Check(bind(&short_config) == 0, "short-capacity bind failed");
     if (ok) entry(args);
     ok &= Check(close() != 0, "short-capacity producer unexpectedly closed");
@@ -710,9 +930,13 @@ int main(int argc, char **argv)
     }
     std::memset(exact_control_memory, 0, sizeof(RuntimePlanControl));
     std::memset(exact_cells_memory, 0, exact_cells_bytes);
-    const AicpuPlanBackendConfig exact_config{
-        exact_control_memory, exact_cells_memory, kExactCapacity, 0U,
-    };
+    std::vector<AicpuPlanTaskTraceRecord> exact_trace_records;
+    std::vector<pa_scheduler::aicpu_plan_trace::Record> exact_operation_records;
+    pa_scheduler::aicpu_plan_trace::State exact_operation_state{};
+    const AicpuPlanBackendConfig exact_config = MakeBackendConfig(
+        exact_control_memory, exact_cells_memory, kExactCapacity, exact_trace_records, exact_operation_records,
+        exact_operation_state
+    );
     auto *exact_control =
         static_cast<RuntimePlanControl *>(exact_control_memory);
     auto *exact_cells =
@@ -745,7 +969,9 @@ int main(int argc, char **argv)
         exact_before_close.aic_count == 0U &&
         exact_before_close.aiv_count == 0U &&
         exact_control->planned_frontier.value ==
-            static_cast<int64_t>(kExactTasks - 1U) &&
+            (pa_scheduler::kRuntimePlanPipelineIsStreamingFuture
+                 ? static_cast<int64_t>(kExactTasks - 1U)
+                 : 0) &&
         exact_control->closed_task_count.value ==
             kPlanProducerNotReadyTaskCount &&
         exact_cells[kExactTasks - 1U].control.value == 0 &&
@@ -770,13 +996,17 @@ int main(int argc, char **argv)
         exact_last.task_id == kExactTasks - 1U,
         "N==threshold did not force Ready and close exactly"
     );
+    ok &= CheckBackendTrace(
+        exact_result, exact_trace_records, exact_operation_records, exact_operation_state,
+        "exact-threshold callback trace did not close"
+    );
 
     if constexpr (kExactTasks < kMaxRuntimeTasks) {
         // 同一地址复用为 threshold+1 个 Alloc。第 threshold+1 个
-        // Begin 会发布前一个 pending cell，使 frontier 精确达到
-        // threshold。StreamingFuture 此时在 entry 内 Open；
-        // PlanAheadClosed 必须继续保持 NotReady。随后的 fatal 在两条
-        // policy 下都必须转为 -3。
+        // Begin 会发布前一个 pending cell。StreamingFuture 此时把
+        // frontier 推进到 threshold 并在 entry 内 Open；PlanAheadClosed
+        // 保持 frontier=0/NotReady，留到 close 一次性验证。随后的
+        // fatal 在两条 policy 下都必须转为 -3。
         const uint32_t above_query_shape[3] = {
             kExactCapacity, kHeads, kHeadDim,
         };
@@ -826,7 +1056,9 @@ int main(int argc, char **argv)
             above_result.finish_count == kExactCapacity &&
             above_result.published_count == kExactTasks &&
             exact_control->planned_frontier.value ==
-                static_cast<int64_t>(kExactTasks) &&
+                (pa_scheduler::kRuntimePlanPipelineIsStreamingFuture
+                     ? static_cast<int64_t>(kExactTasks)
+                     : 0) &&
             exact_control->closed_task_count.value ==
                 (pa_scheduler::kRuntimePlanPipelineIsStreamingFuture
                     ? kPlanOpenTaskCount
@@ -853,9 +1085,14 @@ int main(int argc, char **argv)
     // 256 * (Alloc/QK/SF/PV/UP) = 1280 个 task。除了锁定计数和
     // canonical wire，还在同一 storage 上清零后再跑一轮并做
     // byte-for-byte 比较。这个门槛会直接捕到 single-pack 丢字、
-    // 尾 cache-line 非 canonical zero 或 SharedOutputRef 不稳定。
+    // 尾 cache-line 非 canonical zero 或 SharedOutputRef 不稳定。storage
+    // 仍使用正式 4352-cell 最大容量，以同时锁定
+    // PlanAheadClosed 只准备 1280-cell 实际前缀，StreamingFuture
+    // 仍在 bind 准备全容量。
     constexpr uint32_t kBulkBatch = 256U;
     constexpr uint32_t kBulkTasks = kBulkBatch * 5U;
+    constexpr uint32_t kBulkCapacity = kMaxRuntimeTasks;
+    static_assert(kBulkTasks < kBulkCapacity, "B256 must leave unused formal Plan capacity");
     alignas(64) std::array<int32_t, kBulkBatch> bulk_context_lens{};
     bulk_context_lens.fill(4096);
     const uint32_t bulk_query_shape[3] = {
@@ -902,7 +1139,7 @@ int main(int argc, char **argv)
     void *bulk_control_memory = nullptr;
     void *bulk_cells_memory = nullptr;
     const size_t bulk_cells_bytes =
-        static_cast<size_t>(kBulkTasks) * sizeof(RuntimeTaskPlanCell);
+        static_cast<size_t>(kBulkCapacity) * sizeof(RuntimeTaskPlanCell);
     if (posix_memalign(
             &bulk_control_memory, kAtomicIsolationBytes,
             sizeof(RuntimePlanControl)
@@ -914,9 +1151,13 @@ int main(int argc, char **argv)
         std::cerr << "B256 aligned allocation failed\n";
         return 2;
     }
-    const AicpuPlanBackendConfig bulk_config{
-        bulk_control_memory, bulk_cells_memory, kBulkTasks, 0U,
-    };
+    std::vector<AicpuPlanTaskTraceRecord> bulk_trace_records;
+    std::vector<pa_scheduler::aicpu_plan_trace::Record> bulk_operation_records;
+    pa_scheduler::aicpu_plan_trace::State bulk_operation_state{};
+    const AicpuPlanBackendConfig bulk_config = MakeBackendConfig(
+        bulk_control_memory, bulk_cells_memory, kBulkCapacity, bulk_trace_records, bulk_operation_records,
+        bulk_operation_state
+    );
     std::vector<uint8_t> bulk_first_run(bulk_cells_bytes);
     std::array<double, 2> bulk_producer_us{};
     for (uint32_t run = 0U; run < 2U; ++run) {
@@ -934,12 +1175,16 @@ int main(int argc, char **argv)
             "B256 bind did not remain NotReady"
         );
         if (ok) entry(bulk_args);
-        constexpr int64_t kBulkPrecloseFrontier =
+        constexpr int64_t kBulkPublishedPrefix =
             static_cast<int64_t>(kBulkTasks - 5U);
+        constexpr int64_t kBulkPrecloseFrontier =
+            pa_scheduler::kRuntimePlanPipelineIsStreamingFuture
+                ? kBulkPublishedPrefix
+                : 0;
         constexpr int64_t kExpectedBulkReadyState =
             pa_scheduler::kRuntimePlanPipelineIsStreamingFuture &&
                 kRuntimePlanReadyPrefillTasks <=
-                    static_cast<uint32_t>(kBulkPrecloseFrontier)
+                    static_cast<uint32_t>(kBulkPublishedPrefix)
                 ? kPlanOpenTaskCount
                 : kPlanProducerNotReadyTaskCount;
         ok &= Check(
@@ -965,6 +1210,10 @@ int main(int argc, char **argv)
             bulk_result.aic_count == 2U * kBulkBatch &&
             bulk_result.aiv_count == 2U * kBulkBatch,
             "B256 callback/task distribution changed"
+        );
+        ok &= CheckBackendTrace(
+            bulk_result, bulk_trace_records, bulk_operation_records, bulk_operation_state,
+            "B256 callback trace did not close"
         );
         auto *bulk_cells =
             static_cast<RuntimeTaskPlanCell *>(bulk_cells_memory);

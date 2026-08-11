@@ -132,8 +132,12 @@ validate_artifacts() {
 
     local lines=()
     mapfile -t lines < "$manifest"
-    if [[ ${#lines[@]} -ne 35 ||
-          "${lines[0]:-}" != "# schema=pa_scheduler_artifacts/v9" ||
+    local expected_aicpu_task_trace=0
+    if [[ "$variant" == "swimlane" ]]; then
+        expected_aicpu_task_trace=1
+    fi
+    if [[ ${#lines[@]} -ne 41 ||
+          "${lines[0]:-}" != "# schema=pa_scheduler_artifacts/v11" ||
           "${lines[1]:-}" != "# tensormap_mode=shared" ||
           "${lines[2]:-}" != "# tensormap_mode_id=1" ||
           "${lines[3]:-}" != "# tensormap_ring_cap=128" ||
@@ -162,7 +166,13 @@ validate_artifacts() {
           "${lines[26]:-}" != "# runtime_plan_execute_workers=96" ||
           "${lines[27]:-}" != "# clock_correlation_abi=2" ||
           "${lines[28]:-}" != "# clock_correlation_samples=8" ||
-          "${lines[29]:-}" != "# clock_correlation_max_alignment_error_ns=50000" ]]; then
+          "${lines[29]:-}" != "# clock_correlation_max_alignment_error_ns=50000" ||
+          "${lines[30]:-}" != "# aicpu_task_trace_enabled=$expected_aicpu_task_trace" ||
+          "${lines[31]:-}" != "# aicpu_task_trace_record_bytes=64" ||
+          "${lines[32]:-}" != "# aicpu_operation_trace_enabled=$expected_aicpu_task_trace" ||
+          "${lines[33]:-}" != "# aicpu_operation_trace_record_bytes=64" ||
+          "${lines[34]:-}" != "# aicpu_operation_trace_fixed_records=64" ||
+          "${lines[35]:-}" != "# aicpu_operation_trace_records_per_plan_cell=32" ]]; then
         artifact_failure "$variant" \
             "manifest backend/ABI/trace identity does not match"
         return 1
@@ -170,7 +180,7 @@ validate_artifacts() {
 
     local index digest filename extra
     for index in "${!artifacts[@]}"; do
-        read -r digest filename extra <<< "${lines[index + 30]}"
+        read -r digest filename extra <<< "${lines[index + 36]}"
         if [[ ! "$digest" =~ ^[[:xdigit:]]{64}$ ||
               "$filename" != "${artifacts[index]}" ||
               -n "${extra:-}" ]]; then

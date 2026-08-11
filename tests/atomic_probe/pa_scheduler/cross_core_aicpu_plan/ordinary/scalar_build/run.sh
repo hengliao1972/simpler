@@ -190,8 +190,12 @@ validate_ccec_artifacts() {
 
     local lines=()
     mapfile -t lines < "$manifest"
-    if [[ ${#lines[@]} -ne 30 ||
-          "${lines[0]:-}" != "# schema=pa_scheduler_artifacts/v8" ||
+    local expected_aicpu_task_trace=0
+    if [[ "$variant" == "swimlane" ]]; then
+        expected_aicpu_task_trace=1
+    fi
+    if [[ ${#lines[@]} -ne 36 ||
+          "${lines[0]:-}" != "# schema=pa_scheduler_artifacts/v10" ||
           "${lines[1]:-}" != "# tensormap_mode=shared" ||
           "${lines[2]:-}" != "# tensormap_mode_id=1" ||
           "${lines[3]:-}" != "# tensormap_ring_cap=128" ||
@@ -215,14 +219,20 @@ validate_ccec_artifacts() {
           "${lines[21]:-}" != "# prefill=$READY_PREFILL_TASKS" ||
           "${lines[22]:-}" != "# clock_correlation_abi=2" ||
           "${lines[23]:-}" != "# clock_correlation_samples=8" ||
-          "${lines[24]:-}" != "# clock_correlation_max_alignment_error_ns=50000" ]]; then
+          "${lines[24]:-}" != "# clock_correlation_max_alignment_error_ns=50000" ||
+          "${lines[25]:-}" != "# aicpu_task_trace_enabled=$expected_aicpu_task_trace" ||
+          "${lines[26]:-}" != "# aicpu_task_trace_record_bytes=64" ||
+          "${lines[27]:-}" != "# aicpu_operation_trace_enabled=$expected_aicpu_task_trace" ||
+          "${lines[28]:-}" != "# aicpu_operation_trace_record_bytes=64" ||
+          "${lines[29]:-}" != "# aicpu_operation_trace_fixed_records=64" ||
+          "${lines[30]:-}" != "# aicpu_operation_trace_records_per_plan_cell=32" ]]; then
         ccec_artifact_failure "$variant" "manifest identity or trace layout does not match"
         return 1
     fi
 
     local index digest filename extra
     for index in "${!artifacts[@]}"; do
-        read -r digest filename extra <<< "${lines[index + 25]}"
+        read -r digest filename extra <<< "${lines[index + 31]}"
         if [[ ! "$digest" =~ ^[[:xdigit:]]{64}$ ||
               "$filename" != "${artifacts[index]}" || -n "${extra:-}" ]]; then
             ccec_artifact_failure "$variant" "manifest checksum entry is malformed"

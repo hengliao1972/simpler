@@ -117,6 +117,7 @@ LANE_NAMES = {0: "AIC", 1: "AIV0", 2: "AIV1"}
 # four-timestamp correlation below has closed to at most 50 us.
 AICPU_PROCESS_ID = 1_000_000
 AICPU_THREAD_ID = 1
+AICPU_TASK_THREAD_ID = 2
 AICPU_CORRELATION_SAMPLE_COUNT = 8
 AICPU_CORRELATION_PRE_SAMPLES = 4
 AICPU_CORRELATION_POST_SAMPLES = 4
@@ -125,6 +126,51 @@ AICPU_CLOCK_SCALE_DEN = 1_000_000_000
 AICPU_MAX_ALIGNMENT_ERROR_NS = 50_000
 AICPU_PRODUCER_PHASE_NAME = "RuntimePlanProducer"
 AICPU_PRODUCER_CLOCK = "aicpu_monotonic_raw_ns"
+AICPU_OWNER_PHASE_NAMES = (
+    "OwnerSetup",
+    "BackendBind",
+    "Orchestration",
+    "BackendClose",
+    "OwnerFinalize",
+)
+AICPU_TASK_KIND_NAMES = ("Alloc", "QK", "SF", "PV", "UP")
+AICPU_TASK_ENGINE_NAMES = ("metadata", "aic", "aiv")
+AICPU_MAX_PLAN_PAYLOAD_LINES = 69
+AICPU_OPERATION_SCOPES = (
+    "owner_setup",
+    "backend_bind",
+    "task_stage",
+    "task_publish",
+    "frontier_advance",
+    "ready_publish",
+    "backend_close",
+    "fatal_publish",
+)
+AICPU_OPERATION_NAMES = (
+    "atomic_load_acquire",
+    "cache_clean_cvac",
+    "cache_discard_civac",
+    "barrier_dsb_sy",
+    "barrier_isb",
+    "gm_store",
+    "scalar_work",
+)
+AICPU_OPERATION_TARGETS = (
+    "none",
+    "request_tensors",
+    "request_scalars",
+    "context_lens",
+    "runtime_plan_control",
+    "fatal",
+    "closed_task_count",
+    "planned_frontier",
+    "build_next",
+    "build_workers_done",
+    "build_release",
+    "cell_control",
+    "cell_payload",
+    "payload_validation",
+)
 
 
 def _scalar_thread_id(lane: int) -> int:
@@ -538,10 +584,13 @@ def _validate_aicpu_runtime_plan_producer(
         )
     orchestrator_phases = data.get("aicpu_orchestrator_phases")
     aicpu_tasks = data.get("aicpu_tasks")
+    aicpu_operations = data.get("aicpu_operations")
     scheduler_phases = data.get("aicpu_scheduler_phases")
+    operation_summary = metadata.get("aicpu_operation_trace")
     if producer_domain == "host-cpu":
         for field, value in (
             ("aicpu_tasks", aicpu_tasks),
+            ("aicpu_operations", aicpu_operations),
             ("aicpu_scheduler_phases", scheduler_phases),
             ("aicpu_orchestrator_phases", orchestrator_phases),
         ):
@@ -559,16 +608,63 @@ def _validate_aicpu_runtime_plan_producer(
                 "metadata.aicpu_aicore_causal_capture_bracket is only valid "
                 "for runtime_plan_producer_domain=aicpu"
             )
+        if operation_summary is not None:
+            expected_summary = {
+                "enabled": False,
+                "records": 0,
+                "record_bytes": 0,
+                "dropped": 0,
+            }
+            if operation_summary != expected_summary:
+                raise ValueError(
+                    "metadata.aicpu_operation_trace must be disabled for "
+                    "runtime_plan_producer_domain=host-cpu"
+                )
         metadata["profiling_scope"] = "host-cpu-functional-only"
         metadata["joint_profiling"] = False
         return None
 
-    if aicpu_tasks != []:
-        raise ValueError("aicpu_tasks must be an empty array for the Plan owner capture")
-    if scheduler_phases != []:
-        raise ValueError(
-            "aicpu_scheduler_phases must be an empty array for the Plan owner capture"
-        )
+    if not isinstance(aicpu_tasks, list):
+        raise ValueError("aicpu_tasks must be an array")
+    if aicpu_operations is None and operation_summary is None:
+        aicpu_operations = []
+        metadata["aicpu_operation_trace"] = {
+            "enabled": False,
+            "records": 0,
+            "record_bytes": 0,
+            "dropped": 0,
+            "legacy_absent": True,
+        }
+    elif not isinstance(aicpu_operations, list):
+        raise ValueError("aicpu_operations must be an array")
+    else:
+        expected_operation_summary_fields = {
+            "enabled", "records", "record_bytes", "dropped"
+        }
+        if (
+            not isinstance(operation_summary, dict)
+            or set(operation_summary) != expected_operation_summary_fields
+            or operation_summary.get("enabled") is not True
+            or _integer(
+                operation_summary.get("records"),
+                "metadata.aicpu_operation_trace.records",
+            ) != len(aicpu_operations)
+            or _integer(
+                operation_summary.get("record_bytes"),
+                "metadata.aicpu_operation_trace.record_bytes",
+            ) != 64
+            or _integer(
+                operation_summary.get("dropped"),
+                "metadata.aicpu_operation_trace.dropped",
+            ) != 0
+            or not aicpu_operations
+        ):
+            raise ValueError(
+                "metadata.aicpu_operation_trace must describe a complete "
+                "non-empty 64-byte AICPU operation trace"
+            )
+    if not isinstance(scheduler_phases, list):
+        raise ValueError("aicpu_scheduler_phases must be an array")
     if not isinstance(orchestrator_phases, list):
         raise ValueError("aicpu_orchestrator_phases must be an array")
     if len(orchestrator_phases) != 1:
@@ -605,6 +701,383 @@ def _validate_aicpu_runtime_plan_producer(
             "aicpu_orchestrator_phases[0] requires a non-empty positive "
             f"interval: begin_ns={owner_begin_ns} end_ns={owner_end_ns}"
         )
+
+    if len(scheduler_phases) != len(AICPU_OWNER_PHASE_NAMES):
+        raise ValueError(
+            "aicpu_scheduler_phases must contain exactly the five real "
+            "RuntimePlanProducer phases"
+        )
+    normalized_scheduler_phases: list[dict[str, Any]] = []
+    previous_phase_end = owner_begin_ns
+    for index, expected_name in enumerate(AICPU_OWNER_PHASE_NAMES):
+        raw_phase = scheduler_phases[index]
+        label = f"aicpu_scheduler_phases[{index}]"
+        if not isinstance(raw_phase, dict):
+            raise ValueError(f"{label} must be a JSON object")
+        if set(raw_phase) != expected_phase_fields:
+            raise ValueError(
+                f"{label} must contain exactly {sorted(expected_phase_fields)}"
+            )
+        if raw_phase.get("name") != expected_name:
+            raise ValueError(
+                f"{label}.name must be {expected_name!r}"
+            )
+        if raw_phase.get("clock") != AICPU_PRODUCER_CLOCK:
+            raise ValueError(
+                f"{label}.clock must be {AICPU_PRODUCER_CLOCK!r}"
+            )
+        phase_begin = _integer(
+            raw_phase.get("begin_ns"), f"{label}.begin_ns"
+        )
+        phase_end = _integer(
+            raw_phase.get("end_ns"), f"{label}.end_ns"
+        )
+        if phase_begin != previous_phase_end or phase_end <= phase_begin:
+            raise ValueError(
+                "aicpu_scheduler_phases must be an exact non-empty "
+                "partition of RuntimePlanProducer"
+            )
+        normalized_scheduler_phases.append({
+            "name": expected_name,
+            "raw_clock": AICPU_PRODUCER_CLOCK,
+            "raw_begin_ns": phase_begin,
+            "raw_end_ns": phase_end,
+        })
+        previous_phase_end = phase_end
+    if previous_phase_end != owner_end_ns:
+        raise ValueError(
+            "aicpu_scheduler_phases must close exactly at "
+            "RuntimePlanProducer.end_ns"
+        )
+
+    producer_task_count = _integer(
+        metadata.get("runtime_plan_producer_task_count"),
+        "metadata.runtime_plan_producer_task_count",
+    )
+    task_kind_ids = metadata.get("runtime_plan_task_kinds")
+    if (
+        producer_task_count <= 0
+        or len(aicpu_tasks) != producer_task_count
+        or not isinstance(task_kind_ids, list)
+        or len(task_kind_ids) != producer_task_count
+    ):
+        raise ValueError(
+            "aicpu_tasks must exactly cover "
+            "metadata.runtime_plan_producer_task_count"
+        )
+    expected_task_fields = {
+        "task_id",
+        "task_kind",
+        "function_id",
+        "engine",
+        "group",
+        "output_count",
+        "payload_lines",
+        "clock",
+        "build_begin_ns",
+        "begin_end_ns",
+        "finish_begin_ns",
+        "finish_end_ns",
+        "publish_begin_ns",
+        "publish_end_ns",
+    }
+    orchestration_begin_ns = int(
+        normalized_scheduler_phases[2]["raw_begin_ns"]
+    )
+    orchestration_end_ns = int(
+        normalized_scheduler_phases[2]["raw_end_ns"]
+    )
+    backend_closed_ns = int(
+        normalized_scheduler_phases[3]["raw_end_ns"]
+    )
+    normalized_tasks: list[dict[str, Any]] = []
+    previous_publish_end = orchestration_begin_ns
+    previous_kind = -1
+    previous_group = 0
+    for index, raw_task in enumerate(aicpu_tasks):
+        label = f"aicpu_tasks[{index}]"
+        if not isinstance(raw_task, dict):
+            raise ValueError(f"{label} must be a JSON object")
+        if set(raw_task) != expected_task_fields:
+            raise ValueError(
+                f"{label} must contain exactly {sorted(expected_task_fields)}"
+            )
+        task_id = _integer(raw_task.get("task_id"), f"{label}.task_id")
+        kind_id = _integer(task_kind_ids[index], f"runtime_plan_task_kinds[{index}]")
+        function_id = _integer(
+            raw_task.get("function_id"), f"{label}.function_id"
+        )
+        group = _integer(raw_task.get("group"), f"{label}.group")
+        output_count = _integer(
+            raw_task.get("output_count"), f"{label}.output_count"
+        )
+        payload_lines = _integer(
+            raw_task.get("payload_lines"), f"{label}.payload_lines"
+        )
+        if kind_id < 0 or kind_id >= len(AICPU_TASK_KIND_NAMES):
+            raise ValueError(f"{label} has invalid task kind {kind_id}")
+        expected_group = 0
+        if kind_id != 0:
+            if kind_id == 1:
+                expected_group = (
+                    0 if previous_kind == 0 else previous_group + 1
+                )
+            else:
+                expected_group = previous_group
+        expected_function = -1 if kind_id == 0 else kind_id - 1
+        expected_engine = AICPU_TASK_ENGINE_NAMES[
+            0 if kind_id == 0 else 1 if kind_id in (1, 3) else 2
+        ]
+        expected_outputs = (3, 1, 3, 1, 0)[kind_id]
+        timestamps = {
+            field: _integer(raw_task.get(field), f"{label}.{field}")
+            for field in (
+                "build_begin_ns",
+                "begin_end_ns",
+                "finish_begin_ns",
+                "finish_end_ns",
+                "publish_begin_ns",
+                "publish_end_ns",
+            )
+        }
+        if (
+            task_id != index
+            or raw_task.get("task_kind") != AICPU_TASK_KIND_NAMES[kind_id]
+            or function_id != expected_function
+            or raw_task.get("engine") != expected_engine
+            or group != expected_group
+            or group < 0
+            or group >= 4
+            or output_count != expected_outputs
+            or payload_lines <= 0
+            or payload_lines > AICPU_MAX_PLAN_PAYLOAD_LINES
+            or raw_task.get("clock") != AICPU_PRODUCER_CLOCK
+            or timestamps["build_begin_ns"] < previous_publish_end
+            or not (
+                orchestration_begin_ns <= timestamps["build_begin_ns"]
+                < timestamps["begin_end_ns"]
+                < timestamps["finish_begin_ns"]
+                < timestamps["finish_end_ns"]
+                < timestamps["publish_begin_ns"]
+                < timestamps["publish_end_ns"]
+                <= backend_closed_ns
+            )
+            or timestamps["finish_end_ns"] > orchestration_end_ns
+            or (
+                index + 1 < producer_task_count
+                and timestamps["publish_end_ns"] > orchestration_end_ns
+            )
+            or (
+                index + 1 == producer_task_count
+                and timestamps["publish_begin_ns"] < orchestration_end_ns
+            )
+        ):
+            raise ValueError(
+                f"{label} has invalid identity or callback timeline"
+            )
+        normalized_tasks.append({
+            "task_id": task_id,
+            "task_kind": AICPU_TASK_KIND_NAMES[kind_id],
+            "task_kind_id": kind_id,
+            "function_id": function_id,
+            "engine": expected_engine,
+            "group": group,
+            "output_count": output_count,
+            "payload_lines": payload_lines,
+            "raw_clock": AICPU_PRODUCER_CLOCK,
+            **{f"raw_{field}": value for field, value in timestamps.items()},
+        })
+        previous_publish_end = timestamps["publish_end_ns"]
+        previous_kind = kind_id
+        previous_group = group
+
+    expected_operation_fields = {
+        "sequence",
+        "task_id",
+        "scope",
+        "operation",
+        "target",
+        "clock",
+        "begin_ns",
+        "end_ns",
+        "calls",
+        "lines",
+        "first_target_index",
+        "last_target_index",
+        "first_value",
+        "last_value",
+    }
+    normalized_operations: list[dict[str, Any]] = []
+    previous_operation_end = owner_begin_ns
+    for index, raw_operation in enumerate(aicpu_operations):
+        label = f"aicpu_operations[{index}]"
+        if not isinstance(raw_operation, dict):
+            raise ValueError(f"{label} must be a JSON object")
+        if set(raw_operation) != expected_operation_fields:
+            raise ValueError(
+                f"{label} must contain exactly "
+                f"{sorted(expected_operation_fields)}"
+            )
+        sequence = _integer(
+            raw_operation.get("sequence"), f"{label}.sequence"
+        )
+        task_id = _integer(
+            raw_operation.get("task_id"), f"{label}.task_id"
+        )
+        scope = raw_operation.get("scope")
+        operation = raw_operation.get("operation")
+        target = raw_operation.get("target")
+        begin_ns = _integer(
+            raw_operation.get("begin_ns"), f"{label}.begin_ns"
+        )
+        end_ns = _integer(
+            raw_operation.get("end_ns"), f"{label}.end_ns"
+        )
+        calls = _integer(raw_operation.get("calls"), f"{label}.calls")
+        lines = _integer(raw_operation.get("lines"), f"{label}.lines")
+        first_target_index = _integer(
+            raw_operation.get("first_target_index"),
+            f"{label}.first_target_index",
+        )
+        last_target_index = _integer(
+            raw_operation.get("last_target_index"),
+            f"{label}.last_target_index",
+        )
+        first_value = _integer(
+            raw_operation.get("first_value"), f"{label}.first_value"
+        )
+        last_value = _integer(
+            raw_operation.get("last_value"), f"{label}.last_value"
+        )
+        task_scoped = scope in {
+            "task_stage", "task_publish", "frontier_advance",
+            "ready_publish",
+        }
+        if scope == "owner_setup":
+            parent_begin = int(
+                normalized_scheduler_phases[0]["raw_begin_ns"]
+            )
+            parent_end = int(
+                normalized_scheduler_phases[0]["raw_end_ns"]
+            )
+        elif scope == "backend_bind":
+            parent_begin = int(
+                normalized_scheduler_phases[1]["raw_begin_ns"]
+            )
+            parent_end = int(
+                normalized_scheduler_phases[1]["raw_end_ns"]
+            )
+        elif scope == "task_stage" and 0 <= task_id < len(normalized_tasks):
+            parent_begin = int(
+                normalized_tasks[task_id]["raw_finish_begin_ns"]
+            )
+            parent_end = int(
+                normalized_tasks[task_id]["raw_finish_end_ns"]
+            )
+        elif (
+            scope in {"task_publish", "frontier_advance", "ready_publish"}
+            and 0 <= task_id < len(normalized_tasks)
+        ):
+            parent_begin = int(
+                normalized_tasks[task_id]["raw_publish_begin_ns"]
+            )
+            parent_end = int(
+                normalized_tasks[task_id]["raw_publish_end_ns"]
+            )
+        elif scope == "backend_close":
+            parent_begin = int(
+                normalized_scheduler_phases[3]["raw_begin_ns"]
+            )
+            parent_end = int(
+                normalized_scheduler_phases[3]["raw_end_ns"]
+            )
+        else:
+            parent_begin = 0
+            parent_end = 0
+        cache_operation = operation in {
+            "cache_clean_cvac", "cache_discard_civac"
+        }
+        cell_target = target in {"cell_control", "cell_payload"}
+        operation_target_valid = (
+            operation == "atomic_load_acquire"
+            and target in {
+                "fatal", "closed_task_count", "planned_frontier",
+                "build_next", "build_workers_done", "build_release",
+                "cell_control",
+            }
+        ) or (
+            cache_operation
+            and target not in {"none", "payload_validation"}
+        ) or (
+            operation in {"barrier_dsb_sy", "barrier_isb"}
+            and target == "none"
+        ) or (
+            operation == "gm_store"
+            and target in {
+                "fatal", "closed_task_count", "planned_frontier",
+                "cell_control", "cell_payload",
+            }
+        ) or (
+            operation == "scalar_work"
+            and target == "payload_validation"
+        )
+        if (
+            sequence != index
+            or scope not in AICPU_OPERATION_SCOPES
+            or operation not in AICPU_OPERATION_NAMES
+            or target not in AICPU_OPERATION_TARGETS
+            or raw_operation.get("clock") != AICPU_PRODUCER_CLOCK
+            or not operation_target_valid
+            or calls <= 0
+            or (cache_operation and (lines <= 0 or calls != lines))
+            or (not cache_operation and lines != 0)
+            or (task_scoped and not (0 <= task_id < len(normalized_tasks)))
+            or (not task_scoped and task_id != -1)
+            or parent_begin <= 0
+            or parent_end <= parent_begin
+            or begin_ns < previous_operation_end
+            or begin_ns < parent_begin
+            or end_ns <= begin_ns
+            or end_ns > parent_end
+            or (
+                cell_target
+                and (
+                    first_target_index < 0
+                    or last_target_index < first_target_index
+                )
+            )
+            or (
+                not cell_target
+                and (first_target_index != -1 or last_target_index != -1)
+            )
+            or (
+                operation not in {
+                    "atomic_load_acquire", "gm_store", "scalar_work"
+                }
+                and (first_value != 0 or last_value != 0)
+            )
+        ):
+            raise ValueError(
+                f"{label} has invalid identity, operation semantics, or "
+                "parent containment"
+            )
+        normalized_operations.append({
+            "sequence": sequence,
+            "task_id": task_id,
+            "scope": scope,
+            "operation": operation,
+            "target": target,
+            "raw_clock": AICPU_PRODUCER_CLOCK,
+            "raw_begin_ns": begin_ns,
+            "raw_end_ns": end_ns,
+            "calls": calls,
+            "lines": lines,
+            "first_target_index": first_target_index,
+            "last_target_index": last_target_index,
+            "first_value": first_value,
+            "last_value": last_value,
+        })
+        previous_operation_end = end_ns
 
     correlation = metadata.get("aicpu_aicore_clock_correlation")
     if not isinstance(correlation, dict):
@@ -962,6 +1435,102 @@ def _validate_aicpu_runtime_plan_producer(
             "mapped RuntimePlanProducer does not lie inside the mapped "
             "AICPU causal calibration window"
         )
+    mapped_scheduler_phases: list[dict[str, Any]] = []
+    for scheduler_phase in normalized_scheduler_phases:
+        phase_begin = (
+            _scaled_nearest(
+                int(scheduler_phase["raw_begin_ns"]),
+                scale_num,
+                scale_den,
+            )
+            + computed_mid
+        )
+        phase_end = (
+            _scaled_nearest(
+                int(scheduler_phase["raw_end_ns"]),
+                scale_num,
+                scale_den,
+            )
+            + computed_mid
+        )
+        if phase_begin < mapped_begin or phase_end > mapped_end or phase_end <= phase_begin:
+            raise ValueError(
+                "mapped AICPU owner phase is empty or outside "
+                "RuntimePlanProducer"
+            )
+        mapped_scheduler_phases.append({
+            **scheduler_phase,
+            "mapped_begin_tick": phase_begin,
+            "mapped_end_tick": phase_end,
+        })
+
+    mapped_tasks: list[dict[str, Any]] = []
+    timestamp_fields = (
+        "build_begin_ns",
+        "begin_end_ns",
+        "finish_begin_ns",
+        "finish_end_ns",
+        "publish_begin_ns",
+        "publish_end_ns",
+    )
+    for task in normalized_tasks:
+        mapped_task = dict(task)
+        for field in timestamp_fields:
+            mapped_task[f"mapped_{field[:-3]}_tick"] = (
+                _scaled_nearest(
+                    int(task[f"raw_{field}"]),
+                    scale_num,
+                    scale_den,
+                )
+                + computed_mid
+            )
+        mapped_points = [
+            int(mapped_task[f"mapped_{field[:-3]}_tick"])
+            for field in timestamp_fields
+        ]
+        if not (
+            mapped_begin
+            <= mapped_points[0]
+            and all(
+                begin < end
+                for begin, end in zip(mapped_points, mapped_points[1:])
+            )
+            and mapped_points[-1]
+            <= mapped_end
+        ):
+            raise ValueError(
+                "mapped AICPU TaskPlan detail is empty, reordered, or "
+                "outside RuntimePlanProducer"
+            )
+        mapped_tasks.append(mapped_task)
+    mapped_operations: list[dict[str, Any]] = []
+    for operation in normalized_operations:
+        operation_begin = (
+            _scaled_nearest(
+                int(operation["raw_begin_ns"]), scale_num, scale_den
+            )
+            + computed_mid
+        )
+        operation_end = (
+            _scaled_nearest(
+                int(operation["raw_end_ns"]), scale_num, scale_den
+            )
+            + computed_mid
+        )
+        if (
+            operation_begin < mapped_begin
+            or operation_end <= operation_begin
+            or operation_end > mapped_end
+        ):
+            raise ValueError(
+                "mapped AICPU operation is empty or outside "
+                "RuntimePlanProducer"
+            )
+        mapped_operations.append({
+            **operation,
+            "mapped_begin_tick": operation_begin,
+            "mapped_end_tick": operation_end,
+        })
     normalized = {
         "name": AICPU_PRODUCER_PHASE_NAME,
         "raw_clock": AICPU_PRODUCER_CLOCK,
@@ -976,6 +1545,11 @@ def _validate_aicpu_runtime_plan_producer(
         "mapping": "aicore_tick=round(scale_num*aicpu_ns/scale_den)+offset_mid_tick",
     }
     metadata["aicpu_runtime_plan_producer"] = normalized
+    metadata["aicpu_runtime_plan_scheduler_phases"] = (
+        mapped_scheduler_phases
+    )
+    metadata["aicpu_runtime_plan_tasks"] = mapped_tasks
+    metadata["aicpu_runtime_plan_operations"] = mapped_operations
     metadata["profiling_scope"] = "aicpu-aicore-joint"
     metadata["joint_profiling"] = True
     metadata["aicpu_aicore_causal_capture_window"] = {
@@ -4272,6 +4846,20 @@ def convert(  # noqa: PLR0912, PLR0915
                         "tid": AICPU_THREAD_ID,
                         "args": {"sort_index": AICPU_THREAD_ID},
                     },
+                    {
+                        "ph": "M",
+                        "name": "thread_name",
+                        "pid": AICPU_PROCESS_ID,
+                        "tid": AICPU_TASK_THREAD_ID,
+                        "args": {"name": "TaskPlan"},
+                    },
+                    {
+                        "ph": "M",
+                        "name": "thread_sort_index",
+                        "pid": AICPU_PROCESS_ID,
+                        "tid": AICPU_TASK_THREAD_ID,
+                        "args": {"sort_index": AICPU_TASK_THREAD_ID},
+                    },
                 ):
                     first = _emit_event(output, metadata_event, first)
                 producer_begin = int(
@@ -4314,6 +4902,231 @@ def convert(  # noqa: PLR0912, PLR0915
                     first,
                 )
                 emitted += 1
+                for owner_phase in capture_metadata[
+                    "aicpu_runtime_plan_scheduler_phases"
+                ]:
+                    phase_begin = int(owner_phase["mapped_begin_tick"])
+                    phase_end = int(owner_phase["mapped_end_tick"])
+                    first = _emit_event(
+                        output,
+                        {
+                            "ph": "X",
+                            "name": owner_phase["name"],
+                            "cat": "aicpu.owner",
+                            "pid": AICPU_PROCESS_ID,
+                            "tid": AICPU_THREAD_ID,
+                            "ts": round(
+                                (phase_begin - base_cycle) * factor, 3
+                            ),
+                            "dur": round(
+                                (phase_end - phase_begin) * factor, 3
+                            ),
+                            "args": {
+                                "raw_clock": owner_phase["raw_clock"],
+                                "raw_begin_ns": owner_phase["raw_begin_ns"],
+                                "raw_end_ns": owner_phase["raw_end_ns"],
+                            },
+                        },
+                        first,
+                    )
+                    emitted += 1
+                for task in capture_metadata[
+                    "aicpu_runtime_plan_tasks"
+                ]:
+                    task_id = int(task["task_id"])
+                    task_kind = str(task["task_kind"])
+                    common_args = {
+                        "task_id": task_id,
+                        "task_kind": task_kind,
+                        "function_id": int(task["function_id"]),
+                        "engine": task["engine"],
+                        "group": int(task["group"]),
+                        "output_count": int(task["output_count"]),
+                        "payload_lines": int(task["payload_lines"]),
+                    }
+                    task_begin = int(task["mapped_build_begin_tick"])
+                    task_end = int(task["mapped_publish_end_tick"])
+                    first = _emit_event(
+                        output,
+                        {
+                            "ph": "X",
+                            "name": f"task_plan.{task_kind}#{task_id}",
+                            "cat": "aicpu.task_plan",
+                            "pid": AICPU_PROCESS_ID,
+                            "tid": AICPU_TASK_THREAD_ID,
+                            "ts": round(
+                                (task_begin - base_cycle) * factor, 3
+                            ),
+                            "dur": round(
+                                (task_end - task_begin) * factor, 3
+                            ),
+                            "args": common_args,
+                        },
+                        first,
+                    )
+                    emitted += 1
+                    detail_spans = (
+                        (
+                            "begin",
+                            int(task["mapped_build_begin_tick"]),
+                            int(task["mapped_begin_end_tick"]),
+                        ),
+                        (
+                            "orchestration",
+                            int(task["mapped_begin_end_tick"]),
+                            int(task["mapped_finish_begin_tick"]),
+                        ),
+                        (
+                            "stage_payload",
+                            int(task["mapped_finish_begin_tick"]),
+                            int(task["mapped_finish_end_tick"]),
+                        ),
+                        (
+                            "defer_publish",
+                            int(task["mapped_finish_end_tick"]),
+                            int(task["mapped_publish_begin_tick"]),
+                        ),
+                        (
+                            "publish",
+                            int(task["mapped_publish_begin_tick"]),
+                            int(task["mapped_publish_end_tick"]),
+                        ),
+                    )
+                    for detail_name, detail_begin, detail_end in detail_spans:
+                        first = _emit_event(
+                            output,
+                            {
+                                "ph": "X",
+                                "name": (
+                                    f"task_plan.{detail_name}#{task_id}"
+                                ),
+                                "cat": "aicpu.task_plan.detail",
+                                "pid": AICPU_PROCESS_ID,
+                                "tid": AICPU_TASK_THREAD_ID,
+                                "ts": round(
+                                    (detail_begin - base_cycle) * factor,
+                                    3,
+                                ),
+                                "dur": round(
+                                    (detail_end - detail_begin) * factor,
+                                    3,
+                                ),
+                                "args": common_args,
+                            },
+                            first,
+                        )
+                        emitted += 1
+                for operation in capture_metadata[
+                    "aicpu_runtime_plan_operations"
+                ]:
+                    task_id = int(operation["task_id"])
+                    scope = str(operation["scope"])
+                    operation_name = str(operation["operation"])
+                    target = str(operation["target"])
+                    calls = int(operation["calls"])
+                    lines = int(operation["lines"])
+                    suffix = f"#{task_id}" if task_id >= 0 else "#owner"
+                    call_suffix = f"×{calls}" if calls > 1 else ""
+                    if operation_name == "atomic_load_acquire":
+                        category = "aicpu.atomic"
+                        event_name = (
+                            f"atomic.{scope}.{target}.load_acquire"
+                            f"{call_suffix}{suffix}"
+                        )
+                    elif operation_name in {
+                        "cache_clean_cvac", "cache_discard_civac"
+                    }:
+                        category = "aicpu.cache"
+                        instruction = (
+                            "dc_cvac"
+                            if operation_name == "cache_clean_cvac"
+                            else "dc_civac"
+                        )
+                        event_name = (
+                            f"cache.{scope}.{target}.{instruction}"
+                            f"×{calls}.lines{lines}{suffix}"
+                        )
+                    elif operation_name in {
+                        "barrier_dsb_sy", "barrier_isb"
+                    }:
+                        category = "aicpu.barrier"
+                        instruction = (
+                            "dsb_sy"
+                            if operation_name == "barrier_dsb_sy"
+                            else "isb"
+                        )
+                        event_name = (
+                            f"barrier.{scope}.{instruction}"
+                            f"{call_suffix}{suffix}"
+                        )
+                    elif operation_name == "gm_store":
+                        category = "aicpu.gm"
+                        event_name = (
+                            f"gm.{scope}.{target}.store"
+                            f"{call_suffix}{suffix}"
+                        )
+                    else:
+                        category = "aicpu.scalar"
+                        event_name = (
+                            f"scalar.{scope}.{target}"
+                            f"{call_suffix}{suffix}"
+                        )
+                    operation_begin = int(
+                        operation["mapped_begin_tick"]
+                    )
+                    operation_end = int(operation["mapped_end_tick"])
+                    first = _emit_event(
+                        output,
+                        {
+                            "ph": "X",
+                            "name": event_name,
+                            "cat": category,
+                            "pid": AICPU_PROCESS_ID,
+                            "tid": (
+                                AICPU_TASK_THREAD_ID
+                                if task_id >= 0
+                                else AICPU_THREAD_ID
+                            ),
+                            "ts": round(
+                                (operation_begin - base_cycle) * factor,
+                                3,
+                            ),
+                            "dur": round(
+                                (operation_end - operation_begin) * factor,
+                                3,
+                            ),
+                            "args": {
+                                "sequence": int(operation["sequence"]),
+                                "task_id": task_id,
+                                "scope": scope,
+                                "operation": operation_name,
+                                "target": target,
+                                "calls": calls,
+                                "lines": lines,
+                                "first_target_index": int(
+                                    operation["first_target_index"]
+                                ),
+                                "last_target_index": int(
+                                    operation["last_target_index"]
+                                ),
+                                "first_value": int(
+                                    operation["first_value"]
+                                ),
+                                "last_value": int(
+                                    operation["last_value"]
+                                ),
+                                "raw_clock": operation["raw_clock"],
+                                "raw_begin_ns": int(
+                                    operation["raw_begin_ns"]
+                                ),
+                                "raw_end_ns": int(
+                                    operation["raw_end_ns"]
+                                ),
+                            },
+                        },
+                        first,
+                    )
+                    emitted += 1
             # 每个物理 block 建一个 process；每条硬件 lane 再拆成 runtime
             # 与 kernel 两个 thread，避免等待/提交阶段覆盖 kernel 执行条。
             for block_id in blocks:

@@ -8,10 +8,12 @@
 
 #include <cstdint>
 
+#include "aicpu_plan_operation_trace.h"
+
 extern "C" {
 
 int32_t aicpu_plan_adapter_initialize(
-    void *control, void *cells, uint32_t capacity
+    void *control, void *cells, uint32_t capacity, pa_scheduler::aicpu_plan_trace::State *operation_trace_state
 );
 
 // actual runtime 的 L0TaskArgs 和 standalone 的 PA adapter 使用同一份

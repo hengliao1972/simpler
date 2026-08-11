@@ -11,9 +11,15 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <ctime>
+
 #include "dist_engine/dist_engine_api.h"
 
 namespace {
+
+#ifndef PA_BUILD_SWIMLANE
+#define PA_BUILD_SWIMLANE 0
+#endif
 
 constexpr uint8_t kMetaPresent = uint8_t{1} << 7U;
 constexpr uint8_t kLastInBatch = uint8_t{1} << 6U;
@@ -75,6 +81,35 @@ struct BackendState {
 };
 
 BackendState g_backend{};
+
+#if PA_BUILD_SWIMLANE
+constexpr uint64_t kNanosecondsPerSecond = UINT64_C(1000000000);
+
+uint64_t MonotonicNanoseconds() {
+    timespec timestamp{};
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp) != 0) return 0U;
+    return static_cast<uint64_t>(timestamp.tv_sec) * kNanosecondsPerSecond + static_cast<uint64_t>(timestamp.tv_nsec);
+}
+
+AicpuPlanTaskTraceRecord *TaskTrace(uint32_t task_id) {
+    if (g_backend.config.task_trace_records == nullptr || task_id >= g_backend.config.task_trace_capacity ||
+        g_backend.config.task_trace_record_bytes != sizeof(AicpuPlanTaskTraceRecord)) {
+        return nullptr;
+    }
+    return &static_cast<AicpuPlanTaskTraceRecord *>(g_backend.config.task_trace_records)[task_id];
+}
+
+bool RefreshOperationTraceResult() {
+    pa_scheduler::aicpu_plan_trace::State *state = g_backend.config.operation_trace_state;
+    if (state == nullptr || state->records == nullptr || state->count > state->capacity) {
+        return false;
+    }
+    g_backend.result.operation_trace_count = state->count;
+    g_backend.result.operation_trace_record_bytes = sizeof(pa_scheduler::aicpu_plan_trace::Record);
+    g_backend.result.operation_trace_dropped = state->dropped;
+    return state->dropped == 0U;
+}
+#endif
 
 void Fail(AicpuPlanBackendStatus status, int32_t fatal_code = 0)
 {
@@ -162,21 +197,50 @@ bool ValidTransition(
 bool PublishPending(bool has_following, bool last_in_batch)
 {
     if (!g_backend.pending.valid) return true;
+#if PA_BUILD_SWIMLANE
+    AicpuPlanTaskTraceRecord *trace = TaskTrace(g_backend.pending.task_id);
+    const uint64_t publish_begin_ns = MonotonicNanoseconds();
+    if (trace == nullptr || publish_begin_ns == 0U || trace->finish_end_ns == 0U ||
+        publish_begin_ns <= trace->finish_end_ns) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+        return false;
+    }
+    trace->publish_begin_ns = publish_begin_ns;
+#endif
     const uint8_t flags = EncodeFlags(
         g_backend.pending.kind, g_backend.pending.group,
         has_following, last_in_batch
     );
-    if (flags == 0U ||
-        aicpu_plan_adapter_publish_staged(
-            g_backend.config.control, g_backend.config.cells,
-            g_backend.config.capacity,
-            g_backend.pending.staged_metadata,
-            g_backend.pending.payload_lines, flags
-        ) != 0) {
+    if (flags == 0U) {
         Fail(AicpuPlanBackendStatus::PublishFailed);
         return false;
     }
+    const int32_t publish_status = aicpu_plan_adapter_publish_staged(
+        g_backend.config.control, g_backend.config.cells, g_backend.config.capacity, g_backend.pending.staged_metadata,
+        g_backend.pending.payload_lines, flags
+    );
+#if PA_BUILD_SWIMLANE
+    if (!RefreshOperationTraceResult()) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+        return false;
+    }
+#endif
+    if (publish_status != 0) {
+        Fail(AicpuPlanBackendStatus::PublishFailed);
+        return false;
+    }
+#if PA_BUILD_SWIMLANE
+    const uint64_t publish_end_ns = MonotonicNanoseconds();
+    if (publish_end_ns == 0U || publish_end_ns <= trace->publish_begin_ns) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+        return false;
+    }
+    trace->publish_end_ns = publish_end_ns;
+#endif
     ++g_backend.result.published_count;
+#if PA_BUILD_SWIMLANE
+    g_backend.result.trace_count = g_backend.result.published_count;
+#endif
     g_backend.pending.valid = false;
     return true;
 }
@@ -227,6 +291,21 @@ DistCompeteFirstTicket BeginTask(
         Fail(AicpuPlanBackendStatus::BadSequence);
         return ticket;
     }
+#if PA_BUILD_SWIMLANE
+    AicpuPlanTaskTraceRecord *trace = TaskTrace(task_id);
+    const uint64_t build_begin_ns = MonotonicNanoseconds();
+    if (trace == nullptr || build_begin_ns == 0U) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+        return ticket;
+    }
+    *trace = AicpuPlanTaskTraceRecord{};
+    trace->build_begin_ns = build_begin_ns;
+    trace->task_id = task_id;
+    trace->function_id = static_cast<int16_t>(function_id);
+    trace->task_kind = static_cast<uint8_t>(kind);
+    trace->engine_class = static_cast<uint8_t>(engine);
+    trace->group = group;
+#endif
     g_backend.active = ActiveTicket{
         task_id, g_backend.current_batch_start,
         function_id, kind, engine, group, true,
@@ -247,6 +326,13 @@ DistCompeteFirstTicket BeginTask(
     ticket.kernel_id = static_cast<int16_t>(function_id);
     ticket.won = 1U;
     ticket.ready = 1U;
+#if PA_BUILD_SWIMLANE
+    trace->begin_end_ns = MonotonicNanoseconds();
+    if (trace->begin_end_ns <= trace->build_begin_ns) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+        return DistCompeteFirstTicket{};
+    }
+#endif
     return ticket;
 }
 
@@ -256,6 +342,16 @@ bool FinishTask(
     ObservedEngine expected_engine, int32_t expected_function
 )
 {
+#if PA_BUILD_SWIMLANE
+    AicpuPlanTaskTraceRecord *trace = ticket.task_id < 0 ? nullptr : TaskTrace(static_cast<uint32_t>(ticket.task_id));
+    const uint64_t finish_begin_ns = MonotonicNanoseconds();
+    if (trace == nullptr || finish_begin_ns == 0U || trace->begin_end_ns == 0U ||
+        finish_begin_ns <= trace->begin_end_ns) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+        return false;
+    }
+    trace->finish_begin_ns = finish_begin_ns;
+#endif
     if (!g_backend.active.active || ticket.ready == 0U ||
         ticket.won == 0U || ticket.task_id < 0 ||
         static_cast<uint32_t>(ticket.task_id) !=
@@ -272,18 +368,24 @@ bool FinishTask(
     );
     uint32_t payload_lines = 0U;
     uint16_t actual_output_count = 0U;
-    if (provisional == 0U ||
-        aicpu_plan_adapter_stage(
-            g_backend.config.control, g_backend.config.cells,
-            g_backend.config.capacity,
-            &args, g_backend.active.task_id,
-            g_backend.active.function_id,
-            static_cast<uint8_t>(g_backend.active.engine), provisional,
-            g_backend.active.batch_start,
-            g_backend.pending.staged_metadata, &payload_lines,
-            &actual_output_count
-        ) != 0 ||
-        actual_output_count != expected_output_count) {
+    if (provisional == 0U) {
+        Fail(AicpuPlanBackendStatus::BadTaskArgs);
+        g_backend.active.active = false;
+        return false;
+    }
+    const int32_t stage_status = aicpu_plan_adapter_stage(
+        g_backend.config.control, g_backend.config.cells, g_backend.config.capacity, &args, g_backend.active.task_id,
+        g_backend.active.function_id, static_cast<uint8_t>(g_backend.active.engine), provisional,
+        g_backend.active.batch_start, g_backend.pending.staged_metadata, &payload_lines, &actual_output_count
+    );
+#if PA_BUILD_SWIMLANE
+    if (!RefreshOperationTraceResult()) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+        g_backend.active.active = false;
+        return false;
+    }
+#endif
+    if (stage_status != 0 || actual_output_count != expected_output_count) {
         Fail(AicpuPlanBackendStatus::BadTaskArgs);
         g_backend.active.active = false;
         return false;
@@ -298,6 +400,15 @@ bool FinishTask(
     g_backend.pending.group = g_backend.active.group;
     g_backend.pending.valid = true;
     g_backend.active.active = false;
+#if PA_BUILD_SWIMLANE
+    trace->output_count = actual_output_count;
+    trace->payload_lines = static_cast<uint16_t>(payload_lines);
+    trace->finish_end_ns = MonotonicNanoseconds();
+    if (trace->finish_end_ns <= trace->finish_begin_ns) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+        return false;
+    }
+#endif
     ++g_backend.result.finish_count;
     return true;
 }
@@ -373,16 +484,52 @@ extern "C" int32_t aicpu_plan_backend_bind(
         config->reserved != 0U) {
         return static_cast<int32_t>(AicpuPlanBackendStatus::BadConfig);
     }
+#if PA_BUILD_SWIMLANE
+    if (config->task_trace_records == nullptr ||
+        (reinterpret_cast<uintptr_t>(config->task_trace_records) & (alignof(AicpuPlanTaskTraceRecord) - 1U)) != 0U ||
+        config->task_trace_capacity != config->capacity ||
+        config->task_trace_record_bytes != sizeof(AicpuPlanTaskTraceRecord) ||
+        config->operation_trace_state == nullptr || config->operation_trace_state->records == nullptr ||
+        (reinterpret_cast<uintptr_t>(config->operation_trace_state->records) &
+         (alignof(pa_scheduler::aicpu_plan_trace::Record) - 1U)) != 0U ||
+        config->operation_trace_state->capacity !=
+            pa_scheduler::aicpu_plan_trace::CapacityForPlanCells(config->capacity) ||
+        config->operation_trace_initial_count > config->operation_trace_state->capacity ||
+        config->operation_trace_reserved != 0U ||
+        config->operation_trace_state->count > config->operation_trace_state->capacity ||
+        config->operation_trace_state->dropped != 0U || config->operation_trace_state->reserved != 0U) {
+        return static_cast<int32_t>(AicpuPlanBackendStatus::BadConfig);
+    }
+#else
+    if (config->task_trace_records != nullptr || config->task_trace_capacity != 0U ||
+        config->task_trace_record_bytes != 0U || config->operation_trace_state != nullptr ||
+        config->operation_trace_initial_count != 0U || config->operation_trace_reserved != 0U) {
+        return static_cast<int32_t>(AicpuPlanBackendStatus::BadConfig);
+    }
+#endif
     BackendState clean{};
     clean.config = *config;
     clean.result.status =
         static_cast<int32_t>(AicpuPlanBackendStatus::Ok);
     clean.result.fatal_code = 0;
+#if PA_BUILD_SWIMLANE
+    clean.result.trace_record_bytes = sizeof(AicpuPlanTaskTraceRecord);
+    clean.result.operation_trace_record_bytes = sizeof(pa_scheduler::aicpu_plan_trace::Record);
+#endif
     clean.bound = true;
     g_backend = clean;
-    if (aicpu_plan_adapter_initialize(
-            config->control, config->cells, config->capacity
-        ) != 0) {
+#if PA_BUILD_SWIMLANE
+    config->operation_trace_state->count = config->operation_trace_initial_count;
+    config->operation_trace_state->dropped = 0U;
+#endif
+    const int32_t initialize_status =
+        aicpu_plan_adapter_initialize(config->control, config->cells, config->capacity, config->operation_trace_state);
+#if PA_BUILD_SWIMLANE
+    if (!RefreshOperationTraceResult()) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+    }
+#endif
+    if (initialize_status != 0) {
         Fail(AicpuPlanBackendStatus::BadConfig);
     }
     return g_backend.result.status;
@@ -402,11 +549,20 @@ extern "C" int32_t aicpu_plan_backend_close()
                  : AicpuPlanBackendStatus::NotBound);
         return g_backend.result.status;
     }
-    if (!PublishPending(false, true) ||
-        aicpu_plan_adapter_close(
-            g_backend.config.control, g_backend.config.cells,
-            g_backend.config.capacity, g_backend.result.finish_count
-        ) != 0) {
+    if (!PublishPending(false, true)) {
+        Fail(AicpuPlanBackendStatus::CloseFailed);
+        return g_backend.result.status;
+    }
+    const int32_t close_status = aicpu_plan_adapter_close(
+        g_backend.config.control, g_backend.config.cells, g_backend.config.capacity, g_backend.result.finish_count
+    );
+#if PA_BUILD_SWIMLANE
+    if (!RefreshOperationTraceResult()) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+        return g_backend.result.status;
+    }
+#endif
+    if (close_status != 0) {
         Fail(AicpuPlanBackendStatus::CloseFailed);
         return g_backend.result.status;
     }
@@ -417,6 +573,11 @@ extern "C" int32_t aicpu_plan_backend_close()
 
 extern "C" AicpuPlanBackendResult aicpu_plan_backend_result()
 {
+#if PA_BUILD_SWIMLANE
+    if (g_backend.bound && !RefreshOperationTraceResult()) {
+        Fail(AicpuPlanBackendStatus::TraceFailed);
+    }
+#endif
     return g_backend.result;
 }
 

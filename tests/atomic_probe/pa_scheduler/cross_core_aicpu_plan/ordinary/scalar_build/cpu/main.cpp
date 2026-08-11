@@ -778,21 +778,16 @@ int main(int argc, char **argv) {
                     *trace_header, options.swimlane_json,
 #endif
                     workload_options.mode,
-                    real_compute
-                        ? workload_options.repeats
-                        : pa_scheduler::WorkloadCounts{
-                              options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
-                          },
-                    real_compute
-                        ? pa_scheduler::host::RealComputePatternName(workload_options.pattern)
-                        : "none",
-                    options.final_barrier_shape, options.trace_atomics,
-                    read_trace_records
+                    real_compute ? workload_options.repeats :
+                                   pa_scheduler::WorkloadCounts{
+                                       options.nops.qk, options.nops.sf, options.nops.pv, options.nops.up
+                                   },
+                    real_compute ? pa_scheduler::host::RealComputePatternName(workload_options.pattern) : "none",
+                    options.final_barrier_shape, options.trace_atomics, read_trace_records
 #if PTO_FDWIC_SHARED_MAP
-                    , read_submit_claim_records,
-                    plan_result.task_count,
-                    false,
-                    0U, 0U,
+                    ,
+                    read_submit_claim_records, plan_result.task_count, false, nullptr,
+                    std::vector<AicpuPlanTaskTraceRecord>{}, std::vector<pa_scheduler::aicpu_plan_trace::Record>{},
                     pa_scheduler::aicpu_clock::ClockCorrelationEvidence{}
 #endif
                 )) {

@@ -90,6 +90,7 @@ fi
 COMPACT_GENERIC_TRACE=0
 case "$BUILD_VARIANT" in
     swimlane)
+        AICPU_TASK_TRACE=1
         PHASE_NAME="none"
         PHASE_ID=0
         BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/$PIPELINE_KEY/swimlane"
@@ -105,6 +106,7 @@ case "$BUILD_VARIANT" in
         )
         ;;
     perf-clock)
+        AICPU_TASK_TRACE=0
         PHASE_NAME="none"
         PHASE_ID=0
         BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/$PIPELINE_KEY/perf-clock"
@@ -571,6 +573,7 @@ echo "[BUILD] AICPU real-PA Plan owner"
 "$HCC" -std=c++17 -O3 -g -fPIC -fno-gnu-unique \
     -Wall -Wextra -Werror -Wno-unused-but-set-parameter \
     -DPTO_FDWIC_SHARED_MAP=1 -DPTO_FDWIC_SCHEDULER_MODE=1 \
+    "-DPA_BUILD_SWIMLANE=$AICPU_TASK_TRACE" \
     "${PIPELINE_DEFINES[@]}" \
     "${AICPU_COMMON_INCLUDES[@]}" \
     -shared -Wl,-z,defs -Wl,--build-id \
@@ -653,7 +656,7 @@ if [[ "$BUILD_VARIANT" == "swimlane" ]]; then
 fi
 
 # host、kernel、AICPU owner 与 dispatcher 全部成功后才发布统一
-# manifest。v8 同时固化 Runtime Plan ABI、容量、producer 入口、独立
+# manifest。v10 同时固化 Runtime Plan ABI、容量、producer 入口、独立
 # clock-correlation 四时间戳协议与
 # Plan/Build pipeline policy；
 # run.sh 只消费带完整 manifest 的目录，因此中断重编不会混用新旧镜像。
@@ -684,7 +687,7 @@ cleanup_manifest_tmp() {
 }
 trap cleanup_manifest_tmp EXIT
 {
-    printf '# schema=pa_scheduler_artifacts/v8\n'
+    printf '# schema=pa_scheduler_artifacts/v10\n'
     printf '# tensormap_mode=%s\n' "$TENSORMAP_MODE"
     printf '# tensormap_mode_id=%u\n' "$TENSORMAP_MODE_ID"
     printf '# tensormap_ring_cap=%u\n' "$TENSORMAP_RING_CAP"
@@ -714,6 +717,12 @@ trap cleanup_manifest_tmp EXIT
     printf '# clock_correlation_abi=%u\n' 2
     printf '# clock_correlation_samples=%u\n' 8
     printf '# clock_correlation_max_alignment_error_ns=%u\n' 50000
+    printf '# aicpu_task_trace_enabled=%u\n' "$AICPU_TASK_TRACE"
+    printf '# aicpu_task_trace_record_bytes=%u\n' 64
+    printf '# aicpu_operation_trace_enabled=%u\n' "$AICPU_TASK_TRACE"
+    printf '# aicpu_operation_trace_record_bytes=%u\n' 64
+    printf '# aicpu_operation_trace_fixed_records=%u\n' 64
+    printf '# aicpu_operation_trace_records_per_plan_cell=%u\n' 32
     (cd "$BUILD_DIR" && sha256sum "${ARTIFACTS[@]}")
 } > "$MANIFEST_TMP"
 mv -f -- "$MANIFEST_TMP" "$MANIFEST_PATH"

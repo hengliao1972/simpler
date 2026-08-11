@@ -95,8 +95,12 @@ for policy_index in "${!POLICY_IDS[@]}"; do
 
     HOST_SO="$host_policy_dir/libpaged_attention_aicpu_plan.so"
     HOST_TEST="$host_policy_dir/test_pa_orchestration_so"
+    HOST_TRACE_SO="$host_policy_dir/libpaged_attention_aicpu_plan_trace.so"
+    HOST_TRACE_TEST="$host_policy_dir/test_pa_orchestration_so_trace"
     AARCH64_SO="$aarch64_policy_dir/libpaged_attention_aicpu_plan.so"
-    rm -f -- "$HOST_SO" "$HOST_TEST" "$AARCH64_SO"
+    rm -f -- \
+        "$HOST_SO" "$HOST_TEST" "$HOST_TRACE_SO" "$HOST_TRACE_TEST" \
+        "$AARCH64_SO"
 
     echo "[BUILD] AICPU policy=$policy_name host smoke"
     build_so \
@@ -119,6 +123,21 @@ for policy_index in "${!POLICY_IDS[@]}"; do
         exit 1
     fi
     "$HOST_TEST" "$HOST_SO"
+
+    echo "[BUILD] AICPU policy=$policy_name trace-on host smoke"
+    build_so \
+        "${CXX:-g++}" "$HOST_TRACE_SO" "$policy" \
+        -DPA_BUILD_SWIMLANE=1 \
+        "${HOST_SANITIZE_FLAGS[@]}"
+    "${CXX:-g++}" -std=c++17 -O2 -g -Wall -Wextra -Werror \
+        "${COMMON_DEFINES[@]}" \
+        -DPA_BUILD_SWIMLANE=1 \
+        "-DPA_RUNTIME_PLAN_PIPELINE_POLICY=$policy" \
+        "${COMMON_INCLUDES[@]}" \
+        "${HOST_SANITIZE_FLAGS[@]}" \
+        "$SCRIPT_DIR/test_pa_orchestration_so.cpp" -ldl \
+        -o "$HOST_TRACE_TEST"
+    "$HOST_TRACE_TEST" "$HOST_TRACE_SO"
 
     echo "[BUILD] AICPU policy=$policy_name AArch64 SO"
     build_so \
@@ -247,27 +266,86 @@ if ! awk '
     exit 1
 fi
 
-# Finish callback 只预写 control=Empty 的 GM payload。在最终 flags
-# 尚未知道时不得执行 cache clean/barrier，更不得发布
-# control；真正的可见性边界只在 publish_staged。
+# Finish callback 只预写 control=Empty 的 GM payload。PlanAheadClosed
+# 可在 pack 前按需执行 cell-control civac+barrier+Empty 检查，
+# 但最终 flags 尚未知道时不得对 payload 执行 cvac，更不得
+# 发布 control；真正的 payload 可见性边界只在 publish_staged。
 STAGE_DISASSEMBLY="$($LLVM_OBJDUMP_BIN -d --demangle \
     --disassemble-symbols=aicpu_plan_adapter_stage "$AARCH64_SO")"
-if grep -Eq 'dc[[:space:]]+(cvac|civac)|dsb[[:space:]]+sy|isb' \
-    <<< "$STAGE_DISASSEMBLY"; then
-    echo "AICPU Plan stage unexpectedly made Empty-cell payload globally visible for policy=$policy_name" >&2
-    exit 1
+if [[ "$policy_name" == "plan-ahead-closed" ]]; then
+    if grep -Eq 'dc[[:space:]]+cvac' <<< "$STAGE_DISASSEMBLY"; then
+        echo "AICPU Plan stage unexpectedly cleaned Empty-cell payload for policy=$policy_name" >&2
+        exit 1
+    fi
+else
+    if grep -Eq 'dc[[:space:]]+(cvac|civac)|dsb[[:space:]]+sy|isb' \
+        <<< "$STAGE_DISASSEMBLY"; then
+        echo "AICPU Plan stage unexpectedly made Empty-cell payload globally visible for policy=$policy_name" >&2
+        exit 1
+    fi
 fi
 if ! grep -Eq 'str[[:space:]]+x[0-9]+,' <<< "$STAGE_DISASSEMBLY"; then
     echo "AICPU Plan stage no longer contains the direct GM payload pack for policy=$policy_name" >&2
     exit 1
 fi
 
-# single-pack 路径必须先对最终 GM payload 执行 exact clean，完成
-# barrier 后才写 cell control；control 自身又要 clean+barrier+isb。
-# 这道产物门槛与 Host 的 canonical payload 校验配合，防止后续
-# “优化”把 Published 提到 payload 可见之前。
+# StreamingFuture 必须逐 task 完成 payload -> Published 发布。
+# PlanAheadClosed 没有并发 consumer，只发出 exact payload/control
+# clean，由 close 的最终 frontier DSB 统一等待完成。
 PUBLISH_DISASSEMBLY="$($LLVM_OBJDUMP_BIN -d --demangle \
     --disassemble-symbols=aicpu_plan_adapter_publish_staged "$AARCH64_SO")"
+if [[ "$policy_name" == "plan-ahead-closed" ]]; then
+if ! awk '
+    /dc[[:space:]]+cvac/ && !payload_clean { payload_clean = NR; next }
+    /str[[:space:]]+x[0-9]+,/ && payload_clean && !control_store {
+        control_store = NR; next
+    }
+    /dc[[:space:]]+cvac/ && control_store && !control_clean {
+        control_clean = NR; next
+    }
+    END {
+        exit(payload_clean && control_store && control_clean &&
+             payload_clean < control_store &&
+             control_store < control_clean ? 0 : 1)
+    }
+' <<< "$PUBLISH_DISASSEMBLY" ||
+   grep -Eq 'dsb[[:space:]]+sy|isb' <<< "$PUBLISH_DISASSEMBLY"; then
+    echo "AICPU Plan-ahead publish gate failed for policy=$policy_name: expected deferred payload cvac -> control store -> cvac without a per-task barrier" >&2
+    exit 1
+fi
+
+CLOSE_DISASSEMBLY="$($LLVM_OBJDUMP_BIN -d --demangle \
+    --disassemble-symbols=aicpu_plan_adapter_close "$AARCH64_SO")"
+if ! awk '
+    /ldar/ && !validated_load { validated_load = NR }
+    /dsb[[:space:]]+sy/ && validated_load && !frontier_barrier {
+        frontier_barrier = NR; next
+    }
+    /str[[:space:]]+x[0-9]+,[[:space:]]*\[x[0-9]+\]/ &&
+        frontier_barrier && !frontier_store { frontier_store = NR; next }
+    /dc[[:space:]]+cvac/ && frontier_store && !frontier_clean {
+        frontier_clean = NR; next
+    }
+    /dsb[[:space:]]+sy/ && frontier_clean && !frontier_publish_barrier {
+        frontier_publish_barrier = NR; next
+    }
+    /isb/ && frontier_publish_barrier && !frontier_isb {
+        frontier_isb = NR
+    }
+    END {
+        exit(validated_load && frontier_barrier && frontier_store &&
+             frontier_clean && frontier_publish_barrier && frontier_isb &&
+             validated_load < frontier_barrier &&
+             frontier_barrier < frontier_store &&
+             frontier_store < frontier_clean &&
+             frontier_clean < frontier_publish_barrier &&
+             frontier_publish_barrier < frontier_isb ? 0 : 1)
+    }
+' <<< "$CLOSE_DISASSEMBLY"; then
+    echo "AICPU Plan-ahead close gate failed for policy=$policy_name: expected validation -> DSB -> final frontier store/clean -> DSB -> ISB" >&2
+    exit 1
+fi
+else
 if ! awk '
     /dc[[:space:]]+cvac/ && !payload_clean { payload_clean = NR; next }
     /dsb[[:space:]]+sy/ && payload_clean && !payload_barrier {
@@ -295,6 +373,7 @@ if ! awk '
 ' <<< "$PUBLISH_DISASSEMBLY"; then
     echo "AICPU Plan publish cache-order gate failed for policy=$policy_name: expected payload cvac -> dsb -> control store -> cvac -> dsb -> isb" >&2
     exit 1
+fi
 fi
 done
 

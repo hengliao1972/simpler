@@ -159,8 +159,72 @@ def _set_aicpu_timing(
     metadata["performance_representative"] = False
     metadata["aicpu_aicore_clock_correlation"] = correlation
     metadata["aicpu_aicore_causal_capture_bracket"] = causal_bracket
-    capture["aicpu_tasks"] = []
-    capture["aicpu_scheduler_phases"] = []
+    owner_span = owner_end_ns - owner_begin_ns
+    phase_points = [
+        owner_begin_ns,
+        owner_begin_ns + owner_span // 16,
+        owner_begin_ns + owner_span // 8,
+        owner_begin_ns + owner_span * 7 // 8,
+        owner_begin_ns + owner_span * 15 // 16,
+        owner_end_ns,
+    ]
+    capture["aicpu_scheduler_phases"] = [
+        {
+            "name": name,
+            "clock": "aicpu_monotonic_raw_ns",
+            "begin_ns": phase_points[index],
+            "end_ns": phase_points[index + 1],
+        }
+        for index, name in enumerate((
+            "OwnerSetup",
+            "BackendBind",
+            "Orchestration",
+            "BackendClose",
+            "OwnerFinalize",
+        ))
+    ]
+    orchestration_begin = phase_points[2]
+    orchestration_end = phase_points[3]
+    task_window = (orchestration_end - orchestration_begin) // 5
+    tasks: list[dict[str, object]] = []
+    task_identities = (
+        ("Alloc", -1, "metadata", 3),
+        ("QK", 0, "aic", 1),
+        ("SF", 1, "aiv", 3),
+        ("PV", 2, "aic", 1),
+        ("UP", 3, "aiv", 0),
+    )
+    previous_publish_end = orchestration_begin
+    for task_id, (kind, function_id, engine, output_count) in enumerate(
+        task_identities
+    ):
+        build_begin = previous_publish_end + 1
+        begin_end = build_begin + max(1, task_window // 8)
+        finish_begin = begin_end + max(1, task_window // 3)
+        finish_end = finish_begin + max(1, task_window // 4)
+        if task_id + 1 == len(task_identities):
+            publish_begin = phase_points[3] + 1
+        else:
+            publish_begin = finish_end + max(1, task_window // 8)
+        publish_end = publish_begin + max(1, task_window // 8)
+        tasks.append({
+            "task_id": task_id,
+            "task_kind": kind,
+            "function_id": function_id,
+            "engine": engine,
+            "group": 0,
+            "output_count": output_count,
+            "payload_lines": 4 + task_id,
+            "clock": "aicpu_monotonic_raw_ns",
+            "build_begin_ns": build_begin,
+            "begin_end_ns": begin_end,
+            "finish_begin_ns": finish_begin,
+            "finish_end_ns": finish_end,
+            "publish_begin_ns": publish_begin,
+            "publish_end_ns": publish_end,
+        })
+        previous_publish_end = publish_end
+    capture["aicpu_tasks"] = tasks
     capture["aicpu_orchestrator_phases"] = phases
 
 
@@ -560,6 +624,238 @@ class RuntimePlanConverterAbiTest(unittest.TestCase):
             {sample["round_nonce"] for sample in samples[4:]},
             {2_222},
         )
+        aicpu_task_events = [
+            event
+            for event in merged["traceEvents"]
+            if event.get("ph") == "X"
+            and event.get("pid") == MODULE.AICPU_PROCESS_ID
+            and str(event.get("name", "")).startswith("task_plan.")
+        ]
+        self.assertEqual(len(aicpu_task_events), 30)
+        self.assertTrue(all(event["dur"] > 0 for event in aicpu_task_events))
+        self.assertEqual(
+            {
+                event["name"].split("#", maxsplit=1)[0]
+                for event in aicpu_task_events
+                if event["cat"] == "aicpu.task_plan.detail"
+            },
+            {
+                "task_plan.begin",
+                "task_plan.orchestration",
+                "task_plan.stage_payload",
+                "task_plan.defer_publish",
+                "task_plan.publish",
+            },
+        )
+        self.assertEqual(
+            {
+                event["name"]
+                for event in aicpu_task_events
+                if event["name"].startswith("task_plan.Alloc")
+            },
+            {"task_plan.Alloc#0"},
+        )
+        owner_phase_events = [
+            event
+            for event in merged["traceEvents"]
+            if event.get("ph") == "X"
+            and event.get("pid") == MODULE.AICPU_PROCESS_ID
+            and event.get("name") in {
+                "OwnerSetup", "BackendBind", "Orchestration",
+                "BackendClose", "OwnerFinalize",
+            }
+        ]
+        self.assertEqual(len(owner_phase_events), 5)
+
+    def test_aicpu_operation_trace_is_nested_in_taskplan_lane(self) -> None:
+        capture = _runtime_plan_capture()
+        tasks = capture["aicpu_tasks"]
+        assert isinstance(tasks, list) and isinstance(tasks[0], dict)
+        publish_begin = int(tasks[0]["publish_begin_ns"])
+        phases = capture["aicpu_scheduler_phases"]
+        assert isinstance(phases, list) and isinstance(phases[0], dict)
+        owner_setup_begin = int(phases[0]["begin_ns"])
+        metadata = capture["metadata"]
+        assert isinstance(metadata, dict)
+        metadata["aicpu_operation_trace"] = {
+            "enabled": True,
+            "records": 7,
+            "record_bytes": 64,
+            "dropped": 0,
+        }
+        operation_specs = (
+            (
+                -1, "owner_setup", "cache_discard_civac",
+                "request_tensors", owner_setup_begin + 1, 2, 2, -1,
+            ),
+            (
+                0, "task_publish", "atomic_load_acquire",
+                "fatal", publish_begin + 1, 1, 0, -1,
+            ),
+            (
+                0, "task_publish", "gm_store",
+                "cell_payload", publish_begin + 2, 1, 0, 0,
+            ),
+            (
+                0, "task_publish", "scalar_work",
+                "payload_validation", publish_begin + 3, 1, 0, -1,
+            ),
+            (
+                0, "task_publish", "cache_clean_cvac",
+                "cell_payload", publish_begin + 4, 4, 4, 0,
+            ),
+            (
+                0, "task_publish", "barrier_dsb_sy",
+                "none", publish_begin + 5, 1, 0, -1,
+            ),
+            (
+                0, "task_publish", "barrier_isb",
+                "none", publish_begin + 6, 1, 0, -1,
+            ),
+        )
+        capture["aicpu_operations"] = [
+            {
+                "sequence": sequence,
+                "task_id": task_id,
+                "scope": scope,
+                "operation": operation,
+                "target": target,
+                "clock": "aicpu_monotonic_raw_ns",
+                "begin_ns": begin_ns,
+                "end_ns": begin_ns + 1,
+                "calls": calls,
+                "lines": lines,
+                "first_target_index": target_index,
+                "last_target_index": target_index,
+                "first_value": 1 if operation == "scalar_work" else 0,
+                "last_value": 1 if operation == "scalar_work" else 0,
+            }
+            for sequence, (
+                task_id, scope, operation, target, begin_ns,
+                calls, lines, target_index,
+            ) in enumerate(operation_specs)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            raw_path = Path(directory) / "aicpu_operation_raw.json"
+            merged_path = Path(directory) / "aicpu_operation_merged.json"
+            raw_path.write_text(json.dumps(capture), encoding="utf-8")
+            MODULE.convert(raw_path, merged_path)
+            merged = json.loads(
+                merged_path.read_text(encoding="utf-8")
+            )
+
+        operation_events = [
+            event
+            for event in merged["traceEvents"]
+            if event.get("cat") in {
+                "aicpu.atomic", "aicpu.cache", "aicpu.barrier",
+                "aicpu.gm", "aicpu.scalar",
+            }
+        ]
+        self.assertEqual(len(operation_events), 7)
+        events_by_name = {
+            str(event["name"]): event for event in operation_events
+        }
+        self.assertEqual(
+            set(events_by_name),
+            {
+                "cache.owner_setup.request_tensors.dc_civac×2.lines2#owner",
+                "atomic.task_publish.fatal.load_acquire#0",
+                "gm.task_publish.cell_payload.store#0",
+                "scalar.task_publish.payload_validation#0",
+                "cache.task_publish.cell_payload.dc_cvac×4.lines4#0",
+                "barrier.task_publish.dsb_sy#0",
+                "barrier.task_publish.isb#0",
+            },
+        )
+        self.assertEqual(
+            events_by_name[
+                "cache.owner_setup.request_tensors.dc_civac×2.lines2#owner"
+            ]["tid"],
+            MODULE.AICPU_THREAD_ID,
+        )
+        self.assertTrue(
+            all(
+                event["tid"] == MODULE.AICPU_TASK_THREAD_ID
+                for name, event in events_by_name.items()
+                if name.endswith("#0")
+            )
+        )
+        self.assertTrue(all(event["dur"] > 0 for event in operation_events))
+
+    def test_aicpu_operation_trace_malformed_input_fails_closed(self) -> None:
+        def make_capture() -> dict[str, object]:
+            capture = _runtime_plan_capture()
+            tasks = capture["aicpu_tasks"]
+            metadata = capture["metadata"]
+            assert isinstance(tasks, list) and isinstance(tasks[0], dict)
+            assert isinstance(metadata, dict)
+            publish_begin = int(tasks[0]["publish_begin_ns"])
+            metadata["aicpu_operation_trace"] = {
+                "enabled": True,
+                "records": 1,
+                "record_bytes": 64,
+                "dropped": 0,
+            }
+            capture["aicpu_operations"] = [{
+                "sequence": 0,
+                "task_id": 0,
+                "scope": "task_publish",
+                "operation": "atomic_load_acquire",
+                "target": "fatal",
+                "clock": "aicpu_monotonic_raw_ns",
+                "begin_ns": publish_begin + 1,
+                "end_ns": publish_begin + 2,
+                "calls": 1,
+                "lines": 0,
+                "first_target_index": -1,
+                "last_target_index": -1,
+                "first_value": 0,
+                "last_value": 0,
+            }]
+            return capture
+
+        cases = (
+            (
+                "dropped record",
+                lambda capture: capture["metadata"][
+                    "aicpu_operation_trace"
+                ].__setitem__("dropped", 1),
+                "complete non-empty",
+            ),
+            (
+                "summary count mismatch",
+                lambda capture: capture["metadata"][
+                    "aicpu_operation_trace"
+                ].__setitem__("records", 2),
+                "complete non-empty",
+            ),
+            (
+                "invalid atomic target",
+                lambda capture: capture["aicpu_operations"][0].__setitem__(
+                    "target", "none"
+                ),
+                "operation semantics",
+            ),
+            (
+                "outside parent interval",
+                lambda capture: capture["aicpu_operations"][0].__setitem__(
+                    "end_ns",
+                    capture["aicpu_tasks"][0]["publish_end_ns"] + 1,
+                ),
+                "parent containment",
+            ),
+        )
+        for name, mutate, message in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                capture = make_capture()
+                mutate(capture)
+                raw_path = Path(directory) / "malformed_operation.json"
+                merged_path = Path(directory) / "merged.json"
+                raw_path.write_text(json.dumps(capture), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, message):
+                    MODULE.convert(raw_path, merged_path)
+                self.assertFalse(merged_path.exists())
 
     def test_host_cpu_domain_is_explicit_and_never_fakes_an_aicpu_lane(
         self,
@@ -575,6 +871,8 @@ class RuntimePlanConverterAbiTest(unittest.TestCase):
         metadata["timing_scope"] = "host-cpu-functional-capture"
         metadata.pop("aicpu_aicore_clock_correlation")
         metadata.pop("aicpu_aicore_causal_capture_bracket")
+        capture["aicpu_tasks"] = []
+        capture["aicpu_scheduler_phases"] = []
         capture["aicpu_orchestrator_phases"] = []
         with tempfile.TemporaryDirectory() as directory:
             raw_path = Path(directory) / "host_cpu.json"
@@ -705,6 +1003,71 @@ class RuntimePlanConverterAbiTest(unittest.TestCase):
                     path.write_text(json.dumps(capture), encoding="utf-8")
                     with self.assertRaisesRegex(ValueError, expected):
                         MODULE._load_and_validate(path)
+
+    def test_aicpu_taskplan_detail_requires_complete_real_trace(
+        self,
+    ) -> None:
+        cases: list[tuple[str, dict[str, object], str]] = []
+
+        missing_tasks = _runtime_plan_capture()
+        missing_tasks.pop("aicpu_tasks")
+        cases.append(("missing_tasks", missing_tasks, "must be an array"))
+
+        incomplete_tasks = _runtime_plan_capture()
+        tasks = incomplete_tasks["aicpu_tasks"]
+        assert isinstance(tasks, list)
+        tasks.pop()
+        cases.append((
+            "incomplete_tasks",
+            incomplete_tasks,
+            "must exactly cover",
+        ))
+
+        wrong_identity = _runtime_plan_capture()
+        tasks = wrong_identity["aicpu_tasks"]
+        assert isinstance(tasks, list) and isinstance(tasks[2], dict)
+        tasks[2]["engine"] = "aic"
+        cases.append((
+            "wrong_identity",
+            wrong_identity,
+            "invalid identity or callback timeline",
+        ))
+
+        broken_owner_partition = _runtime_plan_capture()
+        phases = broken_owner_partition["aicpu_scheduler_phases"]
+        assert isinstance(phases, list) and isinstance(phases[1], dict)
+        phases[1]["begin_ns"] = int(phases[1]["begin_ns"]) + 1
+        cases.append((
+            "broken_owner_partition",
+            broken_owner_partition,
+            "exact non-empty partition",
+        ))
+
+        oversized_payload = _runtime_plan_capture()
+        tasks = oversized_payload["aicpu_tasks"]
+        assert isinstance(tasks, list) and isinstance(tasks[0], dict)
+        tasks[0]["payload_lines"] = 70
+        cases.append((
+            "oversized_payload",
+            oversized_payload,
+            "invalid identity or callback timeline",
+        ))
+
+        with tempfile.TemporaryDirectory() as directory:
+            for name, capture, expected in cases:
+                with self.subTest(name=name):
+                    path = Path(directory) / f"{name}.json"
+                    path.write_text(json.dumps(capture), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, expected):
+                        MODULE._load_and_validate(path)
+
+            maximum_payload = _runtime_plan_capture()
+            tasks = maximum_payload["aicpu_tasks"]
+            assert isinstance(tasks, list) and isinstance(tasks[0], dict)
+            tasks[0]["payload_lines"] = 69
+            path = Path(directory) / "maximum_payload.json"
+            path.write_text(json.dumps(maximum_payload), encoding="utf-8")
+            MODULE._load_and_validate(path)
 
     def test_aicpu_producer_rejects_empty_or_reversed_intervals(
         self,
@@ -851,17 +1214,27 @@ class RuntimePlanConverterAbiTest(unittest.TestCase):
                 capture = _runtime_plan_capture()
                 metadata = capture["metadata"]
                 phases = capture["aicpu_orchestrator_phases"]
+                scheduler_phases = capture["aicpu_scheduler_phases"]
                 assert isinstance(metadata, dict)
                 assert isinstance(phases, list) and isinstance(phases[0], dict)
+                assert isinstance(scheduler_phases, list)
                 bracket = metadata["aicpu_aicore_causal_capture_bracket"]
                 assert isinstance(bracket, dict)
                 if boundary == "begin":
                     phases[0]["begin_ns"] = bracket[
                         "aicpu_pre_receive_max_ns"
                     ]
+                    assert isinstance(scheduler_phases[0], dict)
+                    scheduler_phases[0]["begin_ns"] = phases[0][
+                        "begin_ns"
+                    ]
                 else:
                     phases[0]["end_ns"] = bracket[
                         "aicpu_post_send_min_ns"
+                    ]
+                    assert isinstance(scheduler_phases[-1], dict)
+                    scheduler_phases[-1]["end_ns"] = phases[0][
+                        "end_ns"
                     ]
                 path = Path(directory) / f"owner_{boundary}.json"
                 path.write_text(json.dumps(capture), encoding="utf-8")
@@ -929,6 +1302,8 @@ class RuntimePlanConverterAbiTest(unittest.TestCase):
             "aicpu_aicore_causal_capture_bracket",
         ):
             metadata.pop(field)
+        capture["aicpu_tasks"] = []
+        capture["aicpu_scheduler_phases"] = []
         capture["aicpu_orchestrator_phases"] = []
 
         with tempfile.TemporaryDirectory() as directory:

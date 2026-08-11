@@ -23,6 +23,10 @@ namespace {
 
 using namespace pa_scheduler::aicpu_owner;
 
+#ifndef PA_BUILD_SWIMLANE
+#define PA_BUILD_SWIMLANE 0
+#endif
+
 constexpr uint64_t kNanosecondsPerSecond = UINT64_C(1000000000);
 
 uint64_t MonotonicNanoseconds()
@@ -180,6 +184,66 @@ void InvalidateRegion(const void *address, size_t bytes)
 #endif
 }
 
+#if PA_BUILD_SWIMLANE
+bool AppendOwnerOperation(
+    pa_scheduler::aicpu_plan_trace::State *state, uint64_t begin_ns, uint64_t end_ns,
+    pa_scheduler::aicpu_plan_trace::Operation operation, pa_scheduler::aicpu_plan_trace::Target target, uint32_t calls,
+    uint32_t lines
+) {
+    return pa_scheduler::aicpu_plan_trace::Append(
+        state, begin_ns, end_ns, pa_scheduler::aicpu_plan_trace::kNoTaskId,
+        pa_scheduler::aicpu_plan_trace::Scope::OwnerSetup, operation, target, calls, lines,
+        pa_scheduler::aicpu_plan_trace::kNoTargetIndex, pa_scheduler::aicpu_plan_trace::kNoTargetIndex, 0, 0, false
+    );
+}
+
+bool TraceOwnerInvalidateRegion(
+    pa_scheduler::aicpu_plan_trace::State *state, const void *address, size_t bytes,
+    pa_scheduler::aicpu_plan_trace::Target target
+) {
+    if (state == nullptr || address == nullptr || bytes == 0U) return false;
+    const uintptr_t begin_line = reinterpret_cast<uintptr_t>(address) & ~uintptr_t{63U};
+    const uintptr_t end_line = (reinterpret_cast<uintptr_t>(address) + bytes + 63U) & ~uintptr_t{63U};
+    const uint32_t lines = static_cast<uint32_t>((end_line - begin_line) / kCacheLineBytes);
+    const uint64_t cache_begin = pa_scheduler::aicpu_plan_trace::TimestampNanoseconds();
+#if defined(__aarch64__)
+    for (uintptr_t line = begin_line; line < end_line; line += kCacheLineBytes) {
+        __asm__ volatile("dc civac, %0" : : "r"(line) : "memory");
+    }
+#else
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+#endif
+    const uint64_t cache_end = pa_scheduler::aicpu_plan_trace::TimestampNanoseconds();
+    if (!AppendOwnerOperation(
+            state, cache_begin, cache_end, pa_scheduler::aicpu_plan_trace::Operation::CacheDiscardCivac, target, lines,
+            lines
+        )) {
+        return false;
+    }
+#if defined(__aarch64__)
+    const uint64_t barrier_begin = pa_scheduler::aicpu_plan_trace::TimestampNanoseconds();
+    FullBarrier();
+    const uint64_t barrier_end = pa_scheduler::aicpu_plan_trace::TimestampNanoseconds();
+    if (!AppendOwnerOperation(
+            state, barrier_begin, barrier_end, pa_scheduler::aicpu_plan_trace::Operation::BarrierDsbSy,
+            pa_scheduler::aicpu_plan_trace::Target::None, 1U, 0U
+        )) {
+        return false;
+    }
+    const uint64_t instruction_begin = pa_scheduler::aicpu_plan_trace::TimestampNanoseconds();
+    InstructionBarrier();
+    const uint64_t instruction_end = pa_scheduler::aicpu_plan_trace::TimestampNanoseconds();
+    if (!AppendOwnerOperation(
+            state, instruction_begin, instruction_end, pa_scheduler::aicpu_plan_trace::Operation::BarrierIsb,
+            pa_scheduler::aicpu_plan_trace::Target::None, 1U, 0U
+        )) {
+        return false;
+    }
+#endif
+    return true;
+}
+#endif
+
 void CleanRegion(const void *address, size_t bytes)
 {
 #if defined(__aarch64__)
@@ -211,24 +275,33 @@ bool IsZero(const void *address, size_t bytes)
 bool HeaderValid(const OwnerRequestHeader &header)
 {
     using namespace pa_scheduler::aicpu_plan;
-    if (header.magic != kRequestMagic ||
-        header.version != kRequestVersion ||
-        header.request_bytes != sizeof(OwnerRequest) ||
-        header.runtime_plan_control == 0U ||
-        header.runtime_plan_cells == 0U ||
-        header.context_lens == 0U || header.capacity == 0U ||
-        header.capacity > kMaxRuntimeTasks || header.batches == 0U ||
-        header.tensor_count == 0U ||
-        header.tensor_count > kMaxTensorInputs ||
-        header.scalar_count > kMaxScalarInputs ||
-        header.context_tensor_index >= header.tensor_count ||
-        (header.runtime_plan_control %
-             pa_scheduler::aicpu_owner::kAtomicIsolationBytes) != 0U ||
-        (header.runtime_plan_cells %
-             pa_scheduler::aicpu_owner::kAtomicIsolationBytes) != 0U ||
+    if (header.magic != kRequestMagic || header.version != kRequestVersion ||
+        header.request_bytes != sizeof(OwnerRequest) || header.runtime_plan_control == 0U ||
+        header.runtime_plan_cells == 0U || header.context_lens == 0U || header.capacity == 0U ||
+        header.capacity > kMaxRuntimeTasks || header.batches == 0U || header.tensor_count == 0U ||
+        header.tensor_count > kMaxTensorInputs || header.scalar_count > kMaxScalarInputs ||
+        header.context_tensor_index >= header.tensor_count || header.reserved0 != 0U ||
+        (header.runtime_plan_control % pa_scheduler::aicpu_owner::kAtomicIsolationBytes) != 0U ||
+        (header.runtime_plan_cells % pa_scheduler::aicpu_owner::kAtomicIsolationBytes) != 0U ||
         !IsZero(header.reserved, sizeof(header.reserved))) {
         return false;
     }
+#if PA_BUILD_SWIMLANE
+    if (header.task_trace_records == 0U || (header.task_trace_records & (kCacheLineBytes - 1U)) != 0U ||
+        header.task_trace_capacity != header.capacity ||
+        header.task_trace_record_bytes != sizeof(AicpuPlanTaskTraceRecord) || header.operation_trace_records == 0U ||
+        (header.operation_trace_records & (kCacheLineBytes - 1U)) != 0U ||
+        header.operation_trace_capacity != pa_scheduler::aicpu_plan_trace::CapacityForPlanCells(header.capacity) ||
+        header.operation_trace_record_bytes != sizeof(pa_scheduler::aicpu_plan_trace::Record)) {
+        return false;
+    }
+#else
+    if (header.task_trace_records != 0U || header.task_trace_capacity != 0U || header.task_trace_record_bytes != 0U ||
+        header.operation_trace_records != 0U || header.operation_trace_capacity != 0U ||
+        header.operation_trace_record_bytes != 0U) {
+        return false;
+    }
+#endif
     return true;
 }
 
@@ -333,11 +406,17 @@ void PublishFailureIfAddressable(const OwnerRequestHeader &header)
     InstructionBarrier();
 }
 
+struct OwnerTimeline {
+    uint64_t input_ready_ns;
+    uint64_t backend_bound_ns;
+    uint64_t orchestration_end_ns;
+    uint64_t backend_closed_ns;
+};
+
 void PublishResult(
-    OwnerRequest *request, OwnerStatus status,
-    const AicpuPlanBackendResult &backend, uint64_t begin_ns
-)
-{
+    OwnerRequest *request, OwnerStatus status, const AicpuPlanBackendResult &backend, uint64_t begin_ns,
+    const OwnerTimeline &timeline
+) {
     OwnerResult result{};
     result.magic = kResultMagic;
     result.version = kRequestVersion;
@@ -345,16 +424,50 @@ void PublishResult(
     result.backend = backend;
     result.begin_ns = begin_ns;
     result.end_ns = MonotonicNanoseconds();
+    result.input_ready_ns = timeline.input_ready_ns;
+    result.backend_bound_ns = timeline.backend_bound_ns;
+    result.orchestration_end_ns = timeline.orchestration_end_ns;
+    result.backend_closed_ns = timeline.backend_closed_ns;
+    if (result.end_ns == 0U && status == OwnerStatus::Ok) {
+        result.status = static_cast<int32_t>(OwnerStatus::ClockReadFailed);
+    }
     request->result = result;
     CleanRegion(&request->result, sizeof(request->result));
     FullBarrier();
     InstructionBarrier();
 }
 
-OwnerStatus RunOwner(OwnerRequest *request, AicpuPlanBackendResult &backend)
-{
+OwnerStatus RunOwner(OwnerRequest *request, AicpuPlanBackendResult &backend, OwnerTimeline &timeline) {
+#if !PA_BUILD_SWIMLANE
+    (void)timeline;
+#endif
     const OwnerRequestHeader header = request->header;
     if (!HeaderValid(header)) return OwnerStatus::BadRequest;
+
+#if PA_BUILD_SWIMLANE
+    pa_scheduler::aicpu_plan_trace::State operation_trace{
+        reinterpret_cast<pa_scheduler::aicpu_plan_trace::Record *>(static_cast<uintptr_t>(header.operation_trace_records
+        )),
+        header.operation_trace_capacity,
+        0U,
+        0U,
+        0U,
+    };
+    if (!TraceOwnerInvalidateRegion(
+            &operation_trace, request->tensors, static_cast<size_t>(header.tensor_count) * sizeof(TensorMetadata),
+            pa_scheduler::aicpu_plan_trace::Target::RequestTensors
+        ) ||
+        !TraceOwnerInvalidateRegion(
+            &operation_trace, request->scalars, static_cast<size_t>(header.scalar_count) * sizeof(uint64_t),
+            pa_scheduler::aicpu_plan_trace::Target::RequestScalars
+        ) ||
+        !TraceOwnerInvalidateRegion(
+            &operation_trace, reinterpret_cast<const void *>(static_cast<uintptr_t>(header.context_lens)),
+            static_cast<size_t>(header.batches) * sizeof(int32_t), pa_scheduler::aicpu_plan_trace::Target::ContextLens
+        )) {
+        return OwnerStatus::TraceFailed;
+    }
+#else
 
     InvalidateRegion(
         request->tensors,
@@ -366,6 +479,7 @@ OwnerStatus RunOwner(OwnerRequest *request, AicpuPlanBackendResult &backend)
         reinterpret_cast<const void *>(
             static_cast<uintptr_t>(header.context_lens)),
         static_cast<size_t>(header.batches) * sizeof(int32_t));
+#endif
 
     ChipStorageTaskArgs storage;
     storage.clear();
@@ -396,26 +510,63 @@ OwnerStatus RunOwner(OwnerRequest *request, AicpuPlanBackendResult &backend)
         config.expected_arg_count != 7) {
         return OwnerStatus::BadOrchestrationConfig;
     }
+#if PA_BUILD_SWIMLANE
+    timeline.input_ready_ns = MonotonicNanoseconds();
+    if (timeline.input_ready_ns == 0U) return OwnerStatus::ClockReadFailed;
+#endif
 
     const AicpuPlanBackendConfig backend_config{
-        reinterpret_cast<void *>(
-            static_cast<uintptr_t>(header.runtime_plan_control)),
-        reinterpret_cast<void *>(
-            static_cast<uintptr_t>(header.runtime_plan_cells)),
+        reinterpret_cast<void *>(static_cast<uintptr_t>(header.runtime_plan_control)),
+        reinterpret_cast<void *>(static_cast<uintptr_t>(header.runtime_plan_cells)),
         header.capacity,
         0U,
+        reinterpret_cast<void *>(static_cast<uintptr_t>(header.task_trace_records)),
+        header.task_trace_capacity,
+        header.task_trace_record_bytes,
+#if PA_BUILD_SWIMLANE
+        &operation_trace,
+        operation_trace.count,
+        0U,
+#else
+        nullptr,
+        0U,
+        0U,
+#endif
     };
     if (aicpu_plan_backend_bind(&backend_config) != 0) {
         backend = aicpu_plan_backend_result();
         return OwnerStatus::BackendBindFailed;
     }
+#if PA_BUILD_SWIMLANE
+    timeline.backend_bound_ns = MonotonicNanoseconds();
+    if (timeline.backend_bound_ns == 0U) return OwnerStatus::ClockReadFailed;
+#endif
     aicpu_orchestration_entry(args);
+#if PA_BUILD_SWIMLANE
+    timeline.orchestration_end_ns = MonotonicNanoseconds();
+    if (timeline.orchestration_end_ns == 0U) {
+        return OwnerStatus::ClockReadFailed;
+    }
+#endif
     if (aicpu_plan_backend_close() != 0) {
         backend = aicpu_plan_backend_result();
         return OwnerStatus::BackendCloseFailed;
     }
+#if PA_BUILD_SWIMLANE
+    timeline.backend_closed_ns = MonotonicNanoseconds();
+    if (timeline.backend_closed_ns == 0U) {
+        return OwnerStatus::ClockReadFailed;
+    }
+#endif
     backend = aicpu_plan_backend_result();
     if (backend.status != 0) return OwnerStatus::BackendReportedFailure;
+#if PA_BUILD_SWIMLANE
+    if (backend.operation_trace_count != operation_trace.count ||
+        backend.operation_trace_record_bytes != sizeof(pa_scheduler::aicpu_plan_trace::Record) ||
+        backend.operation_trace_dropped != 0U || operation_trace.dropped != 0U) {
+        return OwnerStatus::TraceFailed;
+    }
+#endif
     return OwnerStatus::Ok;
 }
 
@@ -449,10 +600,35 @@ int plan_protocol_aicpu_exec(void *argument)
     InvalidateRegion(&request->header, sizeof(request->header));
     const uint64_t begin_ns = MonotonicNanoseconds();
     AicpuPlanBackendResult backend{};
-    const OwnerStatus status = RunOwner(request, backend);
+    OwnerTimeline timeline{};
+    OwnerStatus status = begin_ns == 0U ? OwnerStatus::ClockReadFailed : RunOwner(request, backend, timeline);
+#if PA_BUILD_SWIMLANE
+    if (status == OwnerStatus::Ok) {
+        if (backend.trace_count != backend.task_count ||
+            backend.trace_record_bytes != sizeof(AicpuPlanTaskTraceRecord) || backend.operation_trace_count == 0U ||
+            backend.operation_trace_count > request->header.operation_trace_capacity ||
+            backend.operation_trace_record_bytes != sizeof(pa_scheduler::aicpu_plan_trace::Record) ||
+            backend.operation_trace_dropped != 0U) {
+            status = OwnerStatus::TraceFailed;
+        } else {
+            CleanRegion(
+                reinterpret_cast<const void *>(static_cast<uintptr_t>(request->header.task_trace_records)),
+                static_cast<size_t>(backend.trace_count) * sizeof(AicpuPlanTaskTraceRecord)
+            );
+            // observer 自己把 trace 回写 GM 的 clean 不再递归记录，否则
+            // 记录该 clean 又要求再 clean 一次，无法形成有限闭包。
+            CleanRegion(
+                reinterpret_cast<const void *>(static_cast<uintptr_t>(request->header.operation_trace_records)),
+                static_cast<size_t>(backend.operation_trace_count) * sizeof(pa_scheduler::aicpu_plan_trace::Record)
+            );
+            FullBarrier();
+            InstructionBarrier();
+        }
+    }
+#endif
     if (status != OwnerStatus::Ok) {
         PublishFailureIfAddressable(request->header);
     }
-    PublishResult(request, status, backend, begin_ns);
+    PublishResult(request, status, backend, begin_ns, timeline);
     return 0;
 }

@@ -16,7 +16,7 @@ namespace pa_scheduler::aicpu_owner {
 
 constexpr uint64_t kRequestMagic = UINT64_C(0x5041504c414e5251);
 constexpr uint64_t kResultMagic = UINT64_C(0x5041504c414e5253);
-constexpr uint32_t kRequestVersion = 1U;
+constexpr uint32_t kRequestVersion = 3U;
 constexpr uint32_t kOwnerCommandRun = aicpu_clock::kOwnerCommandRun;
 constexpr uint32_t kOwnerCommandClockCorrelation =
     aicpu_clock::kOwnerCommandClockCorrelation;
@@ -35,6 +35,8 @@ enum class OwnerStatus : int32_t {
     BackendBindFailed = 5,
     BackendCloseFailed = 6,
     BackendReportedFailure = 7,
+    TraceFailed = 8,
+    ClockReadFailed = 9,
 };
 
 // Host/AICPU 之间只传无指针的通用 Tensor 元数据。buffer_addr 是被描述的
@@ -70,7 +72,14 @@ struct alignas(kAtomicIsolationBytes) OwnerRequestHeader {
     uint32_t tensor_count;
     uint32_t scalar_count;
     uint32_t context_tensor_index;
-    uint32_t reserved[17];
+    uint32_t reserved0;
+    uint64_t task_trace_records;
+    uint32_t task_trace_capacity;
+    uint32_t task_trace_record_bytes;
+    uint64_t operation_trace_records;
+    uint32_t operation_trace_capacity;
+    uint32_t operation_trace_record_bytes;
+    uint32_t reserved[8];
 };
 
 struct alignas(kAtomicIsolationBytes) OwnerResult {
@@ -80,7 +89,10 @@ struct alignas(kAtomicIsolationBytes) OwnerResult {
     AicpuPlanBackendResult backend;
     uint64_t begin_ns;
     uint64_t end_ns;
-    uint64_t reserved[4];
+    uint64_t input_ready_ns;
+    uint64_t backend_bound_ns;
+    uint64_t orchestration_end_ns;
+    uint64_t backend_closed_ns;
 };
 
 struct alignas(kAtomicIsolationBytes) OwnerRequest {

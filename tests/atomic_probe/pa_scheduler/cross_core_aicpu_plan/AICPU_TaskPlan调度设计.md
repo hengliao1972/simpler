@@ -178,8 +178,9 @@ Plan backend 保持现有 orchestration API 签名，但改变其 device 实现�
   Tensor/TensorCreateInfo、scalar、显式依赖和 symbolic output reference
   single-Pack 到目标 GM PlanCell，control 仍保持 Empty；
 - 下一次 Begin 或最终 Close 只补 final flags、校验同一份 GM wire，再按
-  payload clean、barrier、Published control 发布，不保留完整 payload
-  staging 副本；
+  payload clean、Published control 的逻辑顺序发布，不保留完整
+  payload staging 副本；StreamingFuture 在每个 task 上完成 barrier，
+  PlanAheadClosed 则在 Close 发布最终 frontier 前统一完成；
 - orchestration entry 正常返回后才封口 Plan；
 - SO 加载、config、符号或 descriptor 校验失败时 fail-closed，不唤醒
   AICore 进入半发布 Plan。
@@ -202,10 +203,13 @@ ordinary/scalar_build/build/<backend>/shared/plan-ahead-closed/<variant>/
 ordinary/scalar_build/build/<backend>/shared/streaming-future-pN/<variant>/
 ```
 
-CCEC `pa_scheduler_artifacts/v6` manifest 必须固定 Runtime Plan ABI、
+Scalar CCEC `pa_scheduler_artifacts/v10`（formal SIMT 为 `v11`）manifest
+必须固定 Runtime Plan ABI、
 `scheduler_input`、`pipeline`、`launch_order`、`producer_ready`、
 `consumer_admission`、`prefill` 以及 Host/kernel/AICPU owner/dispatcher
-四件套 SHA256。Build identity 也编码 streaming bit，运行入口必须拒绝
+四件套 SHA256，并固定 AICPU task/operation trace 是否开启、两者 64B
+record，以及 operation buffer 的固定余量和每 cell 容量。Build identity
+也编码 streaming bit，运行入口必须拒绝
 跨 policy、跨 prefill 或跨 ABI 混件。
 
 泳道输出目录带相同 policy key；raw metadata 显式保存上述 policy、
@@ -219,6 +223,31 @@ Scalar child/VF atomic 记录。converter 只对
 ABI v2 的历史缺字段 raw 推断 legacy `plan-ahead-closed`，并标记
 `inferred_legacy_policy=true`；ABI v3 缺少显式 policy 必须拒绝。这样历史
 回放、串行长期基线和并发实验不会落到同一模糊身份中。
+
+正式 AICPU-domain raw 还必须携带实测的两级构建明细：
+
+- Owner lane 用 `OwnerSetup/BackendBind/Orchestration/BackendClose/
+  OwnerFinalize` 五段无缝分割 `RuntimePlanProducer`；
+- TaskPlan lane 对 Closed(N) 中的每个 task 记录
+  `begin/orchestration/stage_payload/defer_publish/publish`。其中
+  `defer_publish` 是 payload 已完成后，等待下一 callback 或
+  backend close 确定 `has_following/last_in_batch` flags 的真实区间；
+- task id/kind/function/engine/group/output count/payload lines 必须与
+  device Closed(N) 和 Host 事后 oracle 逐项闭合。缺 task、错序、
+  时间线不连续或 identity 不符都直接拒绝，不用 PA 公式
+  推演时间；
+- 第三级 operation 明细必须落回上述真实父区间：acquire load、AICPU
+  cache maintenance（`dc cvac/dc civac`）、`dsb sy/isb`、关键 GM store
+  和 payload 校验均保存 scope/target/次数。这里不能把 ARM `dc` 指令
+  假称为 AICore `dcci`；两者承担相似的 GM 可见性职责，但 ISA 与执行核
+  不同。
+
+连续同类操作允许形成一个区间，但必须保留精确 `calls/lines` 与首末 cell
+index。operation buffer 以 `64 + 32 * plan_capacity` 条 64B record 分配，
+只在 swimlane variant 存在；count/size/drop、时间单调性、父区间包含和
+target 语义均 fail-closed。trace buffer 自身最后一次写回 GM 的 clean 是
+observer 导出动作，不递归记录，否则“记录该 clean”会再次产生待 clean 的
+记录而无法形成有限闭包。
 
 正式 profiling 只合并两个设备时钟域：AICPU producer 使用
 `CLOCK_MONOTONIC_RAW`，AICore 使用 `SYS_CNT`。每次 capture 在主体前、后
@@ -291,8 +320,9 @@ A5 Scalar 之间不假定 cache coherence。每个 PlanCell 必须遵守：
 AICPU producer:
   ordinary store 完整 payload
   -> exact cache clean(payload_lines)
-  -> store barrier
-  -> publish cell control
+  -> StreamingFuture: DSB -> ordinary store + exact clean(cell control) -> DSB -> ISB
+  -> PlanAheadClosed: ordinary store + exact clean(cell control)，Close 的最终 frontier DSB
+     统一完成全部先行 clean
 
 AICore consumer:
   return-ready observe cell control
@@ -306,7 +336,9 @@ control 与 payload 分离 cache line。atomic-only line 不存普通 payload，
 
 同一 Plan storage 跨 run 复用时还必须处理 Host DMA 与 AICPU cache
 不一致：Host 清零同一 GM 后，AICPU 在读取 cell control 前先丢弃上一轮
-clean-valid control 行，并在统一 `dsb sy + isb` 后再检查 Empty。当前实现
+clean-valid control 行，并在统一 `dsb sy + isb` 后再检查 Empty。
+StreamingFuture 在 bind 时处理全容量；PlanAheadClosed 没有并发 consumer，
+按 128-cell 单调前缀分块只覆盖实际 `[0,N)`。当前实现
 使用仓内已验证的 `dc civac`；它成立的前提是上一轮唯一 producer 写已经
 `dc cvac + dsb` 变成 clean，之后没有 ordinary writer，且新一轮 AICore
 尚未启动。不得把该协议扩展到可能含 dirty ordinary payload 或并发 atomic
@@ -595,6 +627,9 @@ S0 至少需要以下证据：
 - 正式泳道必须同时包含 AICPU producer 与 AICore，不再接受 AICore-only
   结果；Host wall duration 只能作为 trace-free 运行的独立摘要，不能进入
   联合泳道的时钟映射、lane 或 raw metadata；
+- AICPU Owner 五段、逐 task 五段和逐 operation 明细只在 swimlane 构建中取时。
+  trace-free 构建不分配 task/operation trace buffer，也不执行新增的阶段
+  `clock_gettime`；因此结构取证不改写权威性能口径；
 - 相关握手发生在主体前后，因此 structural capture 已发生设备运行时预热；
   必须标记 `clock_correlation_warmup_before_pipeline=true`、
   `timing_scope=calibrated-structural-capture` 和

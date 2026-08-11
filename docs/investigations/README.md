@@ -84,6 +84,7 @@ that ...".
 
 Newest first.
 
+- [2026-08 — Removing ISB from AICPU Plan publish regressed producer time](2026-08-aicpu-plan-publish-isb-removal.md)
 - [2026-08 — Intermediate SIMT ordinary builder counts were not retained](2026-08-simt-ordinary-builder-topology.md)
 - [2026-08 — SIMT DAG region shortcuts regressed the CCEC hot path](2026-08-simt-dag-region-shortcut.md)
 - [2026-08 — SIMT DAG metadata prefix did not reduce end-to-end time](2026-08-simt-dag-metadata-prefix.md)

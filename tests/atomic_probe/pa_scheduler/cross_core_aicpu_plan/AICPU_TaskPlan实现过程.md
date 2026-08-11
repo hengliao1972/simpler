@@ -55,7 +55,8 @@ S0 当时只有
   scalar 和显式依赖；
 - PlanCell 数组由 `RuntimePlanStorageRef` 引用运行期外置 GM，避免按最大
   task 容量固定膨胀 SchedulerState；
-- producer 按 payload clean、barrier、control publish 的顺序发布；
+- producer 按 payload clean、control publish 的逻辑顺序发布；
+  StreamingFuture 逐 task 完成 barrier，PlanAheadClosed 在 Close 统一收口；
 - consumer 观察 control 后按发布的 payload line 数 invalidate 并校验。
 
 六条 Plan 控制状态分别占用 128B：连续发布前沿、最终 task 数、Build
@@ -737,7 +738,8 @@ MissingPlanCell，不能把 Close 与 cell publication 的独立可见性顺序�
 AICPU producer 同时改为 single-Pack：`Finish` 在 callback 引用仍有效时
 直接 Pack 到目标 GM cell，保持 control=Empty；下一次 `Begin` 或最终 Close
 只补齐 final flags、校验同一份 GM wire，再按
-`payload clean -> barrier -> Published control` 发布。pending 状态只保留
+`payload clean -> Published control` 的逻辑顺序发布。StreamingFuture
+逐 task 完成 barrier，PlanAheadClosed 由 Close 统一收口。pending 状态只保留
 一条隔离线内的 metadata，不再保存并二次复制完整 4416B payload。
 
 正常成功终态对两条策略相同，其中 `W=96`：
@@ -764,12 +766,17 @@ ordinary/scalar_build/build/<backend>/shared/plan-ahead-closed/<variant>/
 ordinary/scalar_build/build/<backend>/shared/streaming-future-pN/<variant>/
 ```
 
-CCEC manifest 升为 `pa_scheduler_artifacts/v6`，除 Runtime Plan ABI v3、
+Scalar CCEC manifest 升为 `pa_scheduler_artifacts/v10`，formal SIMT 为
+`pa_scheduler_artifacts/v11`。除 Runtime Plan ABI v3、
 容量、variant 和四件套 SHA256 外，还固定
 `pipeline/launch_order/producer_ready/consumer_admission/prefill` 与
-`scheduler_input`。运行入口会同时检查 26 行 manifest、SHA、源码新旧和
-编译期 Build identity；因此不能把一个 policy 的 Host、kernel、AICPU SO
-或 dispatcher 与另一个 policy 混用。
+`scheduler_input`，并固定
+`aicpu_task_trace_enabled=0|1`、`aicpu_task_trace_record_bytes=64`，
+以及 operation trace 的开关、64B record、64 条固定余量和每 plan-cell
+32 条容量。运行入口会同时检查 Scalar 36 行/SIMT 41 行 manifest、SHA、
+源码新旧和编译期 Build
+identity；因此不能把一个 policy 的 Host、kernel、AICPU SO 或
+dispatcher 与另一个 policy 混用。
 
 新采集的泳道输出目录名同样包含 `plan-ahead-closed` 或
 `streaming-future-pN`。raw metadata 显式记录 Runtime Plan ABI、pipeline
@@ -792,6 +799,82 @@ offset 区间的交集完成映射，相关误差必须 `<=50us`。raw 必须逐
 与 nonce，不能只保留最终 offset。Host 只负责 launch/sync，不属于泳道
 时钟域，不生成 Host lane，raw 也不保存 Host timestamp、clock bracket 或
 lane metadata。
+
+2026-08-11 补齐 AICPU 内部 TaskPlan 构建明细。Owner request ABI 从 v1
+经 task trace v2 升到 operation trace v3；swimlane 构建由 Host 提供两块
+64B 对齐 buffer。逐 task trace 在真实 Begin/Finish/publish callback 边界
+记录 `CLOCK_MONOTONIC_RAW`；另一块记录 producer 实际执行的低层操作。
+owner 闭合后统一 clean，Host 只在 stream sync 后回拷。raw 现在包含：
+
+- `aicpu_scheduler_phases`：Owner 的 `OwnerSetup/BackendBind/
+  Orchestration/BackendClose/OwnerFinalize` 五段精确分区；
+- `aicpu_tasks`：逐 task 身份、output/payload 大小及
+  `begin/orchestration/stage_payload/defer_publish/publish` 五段真实
+  时间边界。`defer_publish` 明确表示 backend 必须等到下一
+  callback（最后一个 task 则等 backend close）才能确定 flags；
+- `aicpu_operations`：按 `owner_setup/backend_bind/task_stage/
+  task_publish/frontier_advance/ready_publish/backend_close` 归属记录
+  acquire load、`dc cvac`、`dc civac`、`dsb sy`、`isb`、关键 ordinary
+  GM store 和最终 payload wire 校验。AICPU 不执行 AICore `dcci`，因此
+  merged 名称坚持使用真实 ARM 指令 `dc_cvac/dc_civac`。
+
+operation record 固定 64B，保存 task/scope/target、首末时间、calls、
+cache lines、首末 cell index 和首末值。只合并语义完全相同且连续的操作：
+例如优化前保留的 structural capture 中，bind 对 4352 个
+cell-control 的 `dc civac` 和 acquire load 各形成一个
+区间，但分别保留 `calls=4352` 与 index `0..4351`。这样不会退化成逐 cell
+大文件，也不会因合并丢掉操作数量。Host 与 converter 都检查 count、record
+size、drop、严格时间顺序、父区间包含和 target 语义，任一不闭合就拒绝
+生成 merged。
+
+converter 使用原有 4+4 四时闳相关样本映射每一个 AICPU
+时间戳，不直接拼接两个时钟域，也不按 PA 周期公式伪造
+task 时长。它还会 fail-closed 检查 Owner 五段无缝分割、
+Closed(N) 的逐 task 全覆盖、callback 顺序、identity 和 69-line
+payload 上限。最终 Perfetto 在独立 AICPU process 中保留 Owner 和
+TaskPlan 两条 lane；task 外层区间与五个子区间形成可展开的
+包含关系；低层 operation 继续嵌套在对应 Owner 或 TaskPlan lane 上。
+新增逐 task、Owner 阶段和逐操作取时在 trace-free 构建中全部编译掉，
+权威性能仍只取 trace-free warm 运行。
+
+Host dlopen smoke 现在对两条 pipeline policy 分别运行 trace-off 和
+trace-on 两种 native AICPU backend。trace-on 会真实执行 B256/1280-task
+orchestration callback，逐条检查 task identity、engine/group/output/payload、
+六个时间戳的严格顺序和前后 task 发布顺序，并检查七类 operation 均实际
+出现、cache `calls=lines`。StreamingFuture 仍要求 bind 一次性准备全容量；
+PlanAheadClosed 则检查按 128-cell 分块精确覆盖 `[0,N)`，且
+`task_publish` 内的 DSB/ISB 计数必须为零。trace-off 反向检查
+task/operation trace count 和 record bytes 全为零。因此明细不只是
+converter 的合成 fixture，而是经过真实 callback 链生成和校验。
+
+真实 A5 device 0 的 ordinary Scalar 闭合结果如下：
+
+- B1 scalar-nop smoke 的 AICPU 5-task Plan、AICore 调度语义、atomic/
+  DCCI 和零 drop 全部 PASS；
+- B256、`real-compute=6,28,4,1` 的 capture 产生 1280 条 raw
+  AICPU task、5 个 Owner phase，merged 中有 1 个
+  `RuntimePlanProducer`、5 个 Owner 子区间、1280 个 task 外层区间和
+  6400 个 task 子区间；五种子区间各 1280 个，没有空区间或
+  错 lane；
+- 该 structural capture 的 `pipeline_e2e=5915.159us`、
+  `producer_exec=2580.959us`，仅用于结构取证，不作为无埋点
+  性能数据；raw/merged 文件约为 4MiB/11MiB；
+- trace-free B1 perf-clock 同样在 A5 通过，确认 owner phase 和
+  task trace 未残留在权威性能构建中。
+
+同日进一步完成 AICPU atomic/cache 明细实机闭合。B256、
+`real-compute=6,28,4,1` 产生 25,138 条 operation record、零 drop：
+18,964 次 acquire load、15,119 条 `dc cvac`、4,381 条 `dc civac`、
+3,082 次 `dsb sy`、1,544 次 `isb`，以及 2,819 次关键 GM store 和
+1,280 次 payload wire 校验。full trace 的 `pipeline_e2e=13193.825us`、
+`producer_exec=9742.788us` 明显包含逐操作取时开销，只是结构证据，不能
+替代 trace-free 性能。
+
+formal SIMT 的两次 B256 额外运行中，AICPU 1280-task 明细已经
+通过 Host 的逐条校验，但 merged 发布被既有 AICore 因果门槛
+拒绝：最早 FDWIC 起点比 pre-correlation 早约
+`4.23e9` tick，两次可重现。本次没有放宽该 fail-closed 规则来强行
+生成 SIMT 图；这不影响 Scalar 实际图对 AICPU 明细的闭合。
 
 ### 8.4 AICPU+AICore joint structural capture 合同
 
@@ -853,3 +936,47 @@ manifest 和 raw；prefill 只作为另一条独立变量。这个 limited-K adm
 
 本轮只优化 ordinary Scalar 的 Plan/Build 阶段关系。DAG TensorMap、DAG
 Scalar 和 DAG SIMT 都继续冻结，不在 limited-K 或 pipeline A/B 中顺带实现。
+
+### 8.7 PlanAheadClosed 发布维护收缩
+
+operation 明细暴露出的 4,381 次 `dc civac`、3,082 次 `dsb sy`和
+1,544 次 `isb` 中，有三类是 PlanAheadClosed 不需要的过度维护：
+
+- consumer 在 Close 完成前根本不会启动，因此不需要每个
+  task 都同步等待 `payload cvac -> DSB -> control cvac -> DSB -> ISB`；
+- 生产期不需要每个 batch 重复发布 `planned_frontier`；
+- B256 实际只有 1280 个 task，不需要在 bind 时为 4352-cell
+  最大容量全量执行 `dc civac` 和 Empty 检查。
+
+最终实现保留了每个实际 payload line 的 `dc cvac` 和每个实际
+cell control 的 `dc cvac`；这两类是 AICPU ordinary store 对 AICore
+consumer 可见的必需操作，没有删除。改动只是：
+
+1. task publish 仍精确 clean payload/control，但不再做逐 task DSB/ISB；
+   Close 发布最终 frontier 前的 DSB 一次等待全部先行 cache
+   maintenance 完成；
+2. `planned_frontier` 在生产期保持 0，Close 校验全部 Published
+   cell 后一次推进到 N；
+3. cell-control 复用准备按 128-cell 单调前缀分块执行，Close
+   只要求覆盖 `[0,N)`。B256 的 `dc civac` 因此从 4352 次
+   降为 1280 次，不再为 `cell[N]` 多准备一个 128-cell 块。
+
+StreamingFuture 的全容量 bind 准备、逐 task payload/control 屏障和
+生产期 frontier/Ready 发布全部保持原样，因为该 policy 的 consumer
+会与 producer 并发读 future cell。
+
+真实 A5 device 0，B256、1280 tasks、`real-compute=6,28,4,1`、
+trace-free、同进程 warm 中位数如下。最终版为 20 轮，全部
+execution/semantic/postprocess PASS；基线为优化前 10 轮。
+
+| 版本 | Plan wall | Producer exec | AICore wall | startup→FinalDrain | Pipeline E2E |
+| ---- | ----: | ----: | ----: | ----: | ----: |
+| 优化前 | 2031.848us | 1944.186us | 2487.716us | 2449.952us | 4529.819us |
+| 去掉生产期 frontier 重复发布 | 1914.995us | 1824.717us | — | — | 4401.727us |
+| 再合并逐 task barrier | 1437.055us | 1343.615us | 2479.637us | 2449.607us | 3923.493us |
+| 再收缩 cell-control 准备前缀（最终） | 1366.861us | 1281.816us | 2483.902us | 2451.542us | 3850.988us |
+
+最终相对基线，Plan wall 减少 664.987us（32.73%），producer exec
+减少 662.370us（34.07%），pipeline E2E 减少 678.831us（14.99%）。
+AICore wall 只变化 0.15%，说明收益确实来自 AICPU Plan 维护收缩，
+没有通过减少 task 数、计算负载或 AICore 工作量获得。
