@@ -400,7 +400,7 @@ PA 首例只能使用已有 symbolic `SharedTaskOutputs/FdwicOutputRef` deferred
 | S0 | 固定 Plan ABI、AICPU/AICore 发布合同和正确性门槛 | 已闭合 |
 | S1 | 接通真实 AICPU orchestration SO 和 Plan backend | 已闭合，正式 A5 owner/dispatcher 已通过 |
 | S2 | ordinary Scalar Build，CPU 后 A5 B1/B256 | 已闭合，Plan-only B1 与 full B1/B256 均通过 |
-| S3 | 在同一 Plan ABI 上替换为 ordinary SIMT Build | 已闭合四 leader/通用 writer/窄完整 Build 的 CPU 与 CCEC machine-code 门槛；正式 runtime/A5 尚未实现 |
+| S3 | 在同一 Plan ABI 上替换为 ordinary SIMT Build | 已闭合四 leader、通用 writer、窄完整 Build、真实 SchedulerState 映射和双 TU production-shape gate；正式 RunScheduler/Host/A5 尚未实现 |
 | S4 | 证明 ordinary 闭合后迁移 DAG Scalar Build | 未实现 |
 | S5 | 在 DAG 上替换为 SIMT Build | 未实现 |
 | S6 | 在正确性与观测闭合后做性能收敛 | ordinary Scalar 已有首组无泳道样本，尚未收敛 |

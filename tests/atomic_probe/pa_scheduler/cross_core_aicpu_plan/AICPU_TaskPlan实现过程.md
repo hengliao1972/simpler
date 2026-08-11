@@ -537,3 +537,89 @@ TaskCell vend/flag 与 SharedExecCell。现有 Exec policy 要求
 独立的 Execute owner 字段不绑定。leader 身份与 Build 统计通过独占 GM
 sidecar 在 VF join 后归并，不能覆盖后续 96 个 Scalar Execute worker 的
 结果，也不能通过扩大 owner 取值范围绕过现有 Host/device 校验。
+
+### 7.8 真实 SchedulerState 映射已经闭合
+
+2026-08-11 新增
+`ordinary/simt_build/common/simt_real_state_runtime.h`，把窄 canonical
+Build 直接接到 ordinary Scalar 已有的真实状态；它只保存一个
+`SchedulerState *`，不分配第二份 TensorMap、heap、TaskCell 或 ExecCell。
+映射关系固定为：
+
+- fresh output 直接使用 `SharedOutputCell` 的 `last_writer`、descriptor 和
+  `published`；
+- symbol history 使用真实 `SharedWriterHistoryCell`；
+- ordinary writer 使用真实 bucket、slot、absolute sequence 和 tail；
+- output heap 直接复用 8-shard `ReserveSharedOutputHeap`；
+- 严格插入 completion 仍位于每 task tournament root 的第二条隔离线；
+- metadata-only task 直接发布真实同一 `TaskCell` 的 `vend/flag`；
+- executable task 直接发布正式 `SharedExecCell::BUILT`，并共用
+  `SharedExecFatalControl`。
+
+这层桥不解释 PA kind，也不从 task id 恢复 batch、engine 或函数。调用方
+每次取得 ticket 后先 `BindTask(task_id)`；算子 adapter 只能核对 Plan v2
+header 中的 `adapter_flags/adapter_data/function_id/engine`。四个 SIMT
+leader 的 Build owner 使用 `0..3`，满足现有 device/Host
+`build_owner < 96` 合同；物理 leader 身份另写 report，不借越界 owner
+编码诊断信息。
+
+ordinary 写侧没有调用 Scalar 的 ordinary-store + writer DCCI 实现，而是
+保留相同的 head/tail/absolute-seq 算法，把 slot payload 改成四个
+`stcg` word，随后 fence，再依次发布 seq 和 tail。reader 仍直接调用真实
+`SharedLookupRegion<..., NoReclaim=true>`，保持 control、DCCI、payload、
+control 双检以及 `[N-H,N)` writer 窗口。metadata completion 则使用两个
+返回型 atomic 发布 vend 和 flag，不能改成 stcg。
+
+审计期间发现并修正了一个 C++ 对象模型问题：布局相同并不允许把
+`SharedWriterHistoryCell` 当作窄 history 类型，或把
+`SimtWriterRegion[]` 当作 `SharedRegionValue[]`。当前 history accessor
+返回真实类型，ordinary preflight/append 逐项构造真实 value；source gate
+禁止这些 structured `reinterpret_cast`。保留的 raw `uint64_t *` 只用于
+A5 stcg wire store，不是把一个已启动的结构对象冒充成另一个结构类型。
+
+新增的 CPU real-state gate 使用真实约 1GiB `SchedulerState` 虚拟映射，
+动态覆盖：fresh descriptor/published、symbol future-writer 回溯、同 bucket
+两个 ordinary entry、8-shard heap、metadata completion、owner 0..3 的
+ExecCell BUILT、scheduler/Plan 双 fatal、越界 accessor，以及空 heap base
+在任何 FetchAdd 前拒绝。O2、ASan 和 UBSan 全部 PASS。
+
+独立 CCEC gate 以 `dav-c310-vec -O3 -Werror` 生成完整 machine object 和
+优化 IR，锁定真实状态地址、s32/s64/u64 atomic、stcg、fence 与 reader
+DCCI。它同时复现并消除了旧的 `TensorDesc` local/GM 转换后端宽度问题：
+SIMT 路径按同一溢出规则构造 value `SharedRegionValue`，直接进入真实
+generic lookup，而不重新引入 Scalar pointer union。
+
+失败语义仍是 terminal fail-stop，而不是事务回滚。completion 前会尽力
+撤销本 task 独占的 output 控制字；heap cursor、symbol/ordinary 已发布前缀
+或 completion 后失败不并发倒退。任一失败必须同时发布 scheduler 与 Plan
+fatal，禁止 build release 和 Execute；下一轮由 Host 全量重置相关状态。
+
+### 7.9 双 TU production-shape runtime gate
+
+新增 `ordinary/simt_build/ccec_runtime/`，验证正式接线所需的双 TU 形态
+能够完整生成和静态链接：
+
+```text
+mixed AIV0 entry（SIMT 身份）
+  -> 在 VF 前记录起点并获取 closed Plan
+  -> async_invoke 128-thread VF
+  -> 4 个 warp lane0 Attach/Take/Bind/Build/Arrive/Release
+  -> success 或 fatal 都执行 V->S join
+  -> DCCI 获取 4 条隔离 leader report
+  -> 调用另一 TU 的 Scalar continuation
+```
+
+四条 leader report 以及 launch/continuation report 各占 128B，writer 使用
+`stcg -> fence -> magic`，AIV0 join 后才 invalidate/read。Scalar
+continuation 会再次返回型读取 build release、Plan fatal 和 scheduler fatal，
+不是空占位。当前最终 ELF 只有一个 2140B GLOBAL mixed entry、一个
+93376B LOCAL VF 和一个 300B LOCAL Scalar continuation，metadata 为
+`MIX_VF=4`，没有未定义 GLOBAL 或 relocation；动态 ticket、完整 Build、
+四次唯一 arrival、release 以及 fatal/success continuation 都存在于优化 IR。
+
+这一阶段仍然是 production-shape gate，不是正式 mode：它没有修改
+`scalar_build` 的 Host、kernel、manifest、`run.sh` 或 Host oracle，也没有
+在 A5 上验证 AICPU->SIMT、leader->AIV0、AIV0->Scalar 的可见性。下一阶段
+必须把 backend hook 接入正式 RunScheduler，并把 Scalar Build 统计口径改成
+SIMT 直接状态 oracle；不能通过伪造 96 个 Scalar 的 submits/wins 来满足旧
+Host 校验。

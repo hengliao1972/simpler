@@ -770,9 +770,8 @@ PA_DEVICE bool PublishWriterMetadataAndCompletion(
         return false;
     }
 
-    PA_GM SimtWriterHistoryCell *history = nullptr;
     if (scratch.symbol_count != 0U) {
-        history = runtime.WriterHistory(task_id);
+        auto *history = runtime.WriterHistory(task_id);
         if (history == nullptr) return false;
         for (uint32_t symbol = 0U;
              symbol < scratch.symbol_count; ++symbol) {
@@ -946,10 +945,10 @@ PA_DEVICE bool ResolveSymbolWriterBefore(
             ++traversed > reader_task + 1U) {
             return false;
         }
-        PA_GM SimtWriterHistoryCell *history =
+        auto *history =
             runtime.WriterHistory(static_cast<uint32_t>(latest));
         if (history == nullptr) return false;
-        Ops::InvalidateRegion(history, sizeof(SimtWriterHistoryCell));
+        Ops::InvalidateRegion(history, sizeof(*history));
         if (history->magic != kSimtWriterHistoryMagic ||
             history->writer_task != latest || history->reserved != 0U ||
             history->count == 0U ||

@@ -1,0 +1,6 @@
+{
+  global:
+    aicpu_plan_simt_runtime_0_mix_aiv;
+  local:
+    *;
+};
