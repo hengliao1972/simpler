@@ -300,6 +300,241 @@ def _overlaps(left: Event, right: Event) -> bool:
     return max(left.start_cycle, right.start_cycle) < min(left.end_cycle, right.end_cycle)
 
 
+def _producer_union_overlap_bounds(
+    producer_begin_without_offset: int,
+    producer_end_without_offset: int,
+    offset_lower: int,
+    offset_upper: int,
+    offset_mid: int,
+    intervals: Sequence[tuple[int, int]],
+) -> dict[str, int]:
+    if not intervals:
+        return {
+            "minimum_cycles": 0,
+            "midpoint_cycles": 0,
+            "maximum_cycles": 0,
+        }
+    candidates = {offset_lower, offset_upper, offset_mid}
+    for start, end in intervals:
+        for breakpoint in (
+            start - producer_begin_without_offset,
+            end - producer_begin_without_offset,
+            start - producer_end_without_offset,
+            end - producer_end_without_offset,
+        ):
+            if offset_lower <= breakpoint <= offset_upper:
+                candidates.add(breakpoint)
+
+    def _overlap(offset: int) -> int:
+        producer_begin = producer_begin_without_offset + offset
+        producer_end = producer_end_without_offset + offset
+        return _interval_union_cycles([
+            (
+                max(start, producer_begin),
+                min(end, producer_end),
+            )
+            for start, end in intervals
+            if max(start, producer_begin) < min(end, producer_end)
+        ])
+
+    values = [_overlap(offset) for offset in candidates]
+    return {
+        "minimum_cycles": min(values),
+        "midpoint_cycles": _overlap(offset_mid),
+        "maximum_cycles": max(values),
+    }
+
+
+def _analyze_aicpu_runtime_plan_producer(
+    metadata: dict[str, Any],
+    events: Sequence[Event],
+    frequency_hz: int,
+) -> dict[str, Any] | None:
+    """Report producer timing without adding it to 96-core exclusives."""
+
+    producer = metadata.get("aicpu_runtime_plan_producer")
+    if producer is None:
+        return None
+    correlation = metadata.get("aicpu_aicore_clock_correlation")
+    if not isinstance(producer, dict) or not isinstance(correlation, dict):
+        raise ValueError("validated AICPU producer correlation is missing")
+
+    runtime_builds = [
+        event for event in events if event.phase == "RuntimePlanBuild"
+    ]
+    final_drains = [
+        event for event in events if event.phase == "FinalDrain"
+    ]
+    kernels = [event for event in events if event.phase == "Kernel"]
+    if not runtime_builds or not final_drains:
+        raise ValueError(
+            "AICPU producer analysis requires RuntimePlanBuild and FinalDrain parents"
+        )
+    build_intervals = [
+        (event.start_cycle, event.end_cycle) for event in runtime_builds
+    ]
+    final_drain_intervals = [
+        (event.start_cycle, event.end_cycle) for event in final_drains
+    ]
+    build_start = min(start for start, _end in build_intervals)
+    build_end = max(end for _start, end in build_intervals)
+    final_drain_start = min(
+        start for start, _end in final_drain_intervals
+    )
+    final_drain_end = max(
+        end for _start, end in final_drain_intervals
+    )
+    kernel_intervals = [
+        (event.start_cycle, event.end_cycle) for event in kernels
+    ]
+    kernel_start = (
+        min(start for start, _end in kernel_intervals)
+        if kernel_intervals
+        else None
+    )
+    kernel_end = (
+        max(end for _start, end in kernel_intervals)
+        if kernel_intervals
+        else None
+    )
+    offset_lower = int(correlation["offset_lower_tick"])
+    offset_upper = int(correlation["offset_upper_tick"])
+    offset_mid = int(correlation["offset_mid_tick"])
+    mapped_begin = int(producer["mapped_begin_tick"])
+    mapped_end = int(producer["mapped_end_tick"])
+    begin_without_offset = mapped_begin - offset_mid
+    end_without_offset = mapped_end - offset_mid
+    build_overlap = _producer_union_overlap_bounds(
+        begin_without_offset,
+        end_without_offset,
+        offset_lower,
+        offset_upper,
+        offset_mid,
+        build_intervals,
+    )
+    final_drain_overlap = _producer_union_overlap_bounds(
+        begin_without_offset,
+        end_without_offset,
+        offset_lower,
+        offset_upper,
+        offset_mid,
+        final_drain_intervals,
+    )
+    kernel_overlap = _producer_union_overlap_bounds(
+        begin_without_offset,
+        end_without_offset,
+        offset_lower,
+        offset_upper,
+        offset_mid,
+        kernel_intervals,
+    )
+    producer_to_build_gap = {
+        "minimum_cycles": build_start - (
+            end_without_offset + offset_upper
+        ),
+        "midpoint_cycles": build_start - (
+            end_without_offset + offset_mid
+        ),
+        "maximum_cycles": build_start - (
+            end_without_offset + offset_lower
+        ),
+    }
+
+    pipeline = metadata.get("pipeline")
+    producer_end_upper = end_without_offset + offset_upper
+    if pipeline == "plan-ahead-closed":
+        if producer_end_upper > build_start:
+            raise ValueError(
+                "plan-ahead-closed AICPU producer must finish before the "
+                "earliest RuntimePlanBuild boundary, including alignment error"
+            )
+        expected_relationship = "producer-completes-before-build"
+    elif pipeline == "streaming-future":
+        # Streaming permits producer/Build overlap; it does not guarantee it.
+        # A zero-overlap capture is important negative evidence and must not be
+        # discarded merely because the compiled policy allowed concurrency.
+        if build_overlap["minimum_cycles"] > 0:
+            expected_relationship = "proven-overlap"
+        elif build_overlap["maximum_cycles"] > 0:
+            expected_relationship = "possible-overlap"
+        else:
+            expected_relationship = "no-overlap"
+    else:
+        raise ValueError(f"unsupported Runtime Plan pipeline: {pipeline!r}")
+
+    def _with_us(cycles: dict[str, int]) -> dict[str, Any]:
+        result: dict[str, Any] = dict(cycles)
+        result.update({
+            key.replace("cycles", "us"): value * 1_000_000 / frequency_hz
+            for key, value in cycles.items()
+        })
+        return result
+
+    duration_ns = int(producer["duration_ns"])
+    return {
+        "name": "RuntimePlanProducer",
+        "raw_clock": producer["raw_clock"],
+        "raw_begin_ns": int(producer["raw_begin_ns"]),
+        "raw_end_ns": int(producer["raw_end_ns"]),
+        "duration_ns": duration_ns,
+        "duration_us": duration_ns / 1_000,
+        "mapped_begin_tick": mapped_begin,
+        "mapped_end_tick": mapped_end,
+        "clock_alignment": {
+            "status": correlation["status"],
+            "sample_count": len(correlation["samples"]),
+            "offset_lower_tick": offset_lower,
+            "offset_upper_tick": offset_upper,
+            "offset_mid_tick": offset_mid,
+            "alignment_error_tick": int(
+                producer["alignment_error_tick"]
+            ),
+            "alignment_error_us": float(
+                producer["alignment_error_us"]
+            ),
+            "limit_us": 50.0,
+        },
+        "runtime_plan_build_envelope": {
+            "start_cycle": build_start,
+            "end_cycle": build_end,
+        },
+        "runtime_plan_build_interval_union": {
+            "event_count": len(runtime_builds),
+            "global_interval_union_cycles": _interval_union_cycles(
+                build_intervals
+            ),
+            "producer_overlap": _with_us(build_overlap),
+        },
+        "producer_to_earliest_runtime_plan_build_gap": _with_us(
+            producer_to_build_gap
+        ),
+        "aicore_execute_kernel": {
+            "event_count": len(kernels),
+            "envelope_start_cycle": kernel_start,
+            "envelope_end_cycle": kernel_end,
+            "global_interval_union_cycles": _interval_union_cycles(
+                kernel_intervals
+            ),
+            "producer_overlap_with_kernel_union": _with_us(
+                kernel_overlap
+            ),
+        },
+        "aicore_final_drain_envelope": {
+            "start_cycle": final_drain_start,
+            "end_cycle": final_drain_end,
+        },
+        "aicore_final_drain_interval_union": {
+            "event_count": len(final_drains),
+            "global_interval_union_cycles": _interval_union_cycles(
+                final_drain_intervals
+            ),
+            "producer_overlap": _with_us(final_drain_overlap),
+        },
+        "pipeline_relationship": expected_relationship,
+        "included_in_96_core_exclusive_closure": False,
+    }
+
+
 def _interval_union_cycles(intervals: Sequence[tuple[int, int]]) -> int:
     """只用整数 cycle 计算区间并集，绝不先换算成浮点微秒。"""
 
@@ -1937,6 +2172,307 @@ def _residual_breakdown(
     }
 
 
+def _analyze_aicpu_plan_simt_coarse(
+    input_path: Path,
+    frequency_hz: int,
+    trace_schema_version: int,
+    events: Sequence[Event],
+    num_cores: int,
+    metadata: dict[str, Any],
+    runtime_builds_by_lane: dict[tuple[int, int], list[Event]],
+    final_drains_by_lane: dict[tuple[int, int], list[Event]],
+) -> dict[str, Any]:
+    """Close formal SIMT using coarse parents and direct terminal state.
+
+    The four VF leaders intentionally emit neither Scalar Build children nor
+    TraceAtomic rows.  Consequently the whole RuntimePlanBuild parent remains
+    residual here; reporting Materialize ownership would fabricate evidence.
+    """
+
+    if metadata.get("runtime_plan_build_trace_coverage") != (
+        "simt-coarse-direct-state"
+    ):
+        raise ValueError("SIMT analyzer requires coarse direct-state coverage")
+    task_count = int(metadata["runtime_plan_task_count"])
+    build_workers = int(metadata["runtime_plan_build_workers"])
+    execute_workers = int(metadata["runtime_plan_execute_workers"])
+    if build_workers != 4 or execute_workers != num_cores:
+        raise ValueError("SIMT analyzer worker identity does not close")
+
+    runtime_build_by_lane = {
+        lane_key: rows[0]
+        for lane_key, rows in runtime_builds_by_lane.items()
+    }
+    kernels_by_final_drain, final_drain_kernel_rows = (
+        _associate_kernels_to_parents(
+            events, final_drains_by_lane, parent_name="FinalDrain"
+        )
+    )
+    kernels = [event for event in events if event.phase == "Kernel"]
+    orphan_kernel_rows = sorted(
+        event.row_index
+        for event in kernels
+        if event.row_index not in final_drain_kernel_rows
+    )
+    if orphan_kernel_rows:
+        raise ValueError(
+            "SIMT AICPU Plan Kernel must be contained by FinalDrain: "
+            f"orphan_rows={orphan_kernel_rows[:8]}"
+        )
+
+    per_core: list[dict[str, Any]] = []
+    for core_id in range(num_cores):
+        block_id, lane, role = _standalone_topology(core_id)
+        lane_key = (core_id, lane)
+        runtime_build = runtime_build_by_lane[lane_key]
+        final_drain = final_drains_by_lane[lane_key][0]
+        if final_drain.start_cycle < runtime_build.end_cycle:
+            raise ValueError(
+                f"core {core_id} FinalDrain overlaps RuntimePlanBuild"
+            )
+        final_kernel_union = _interval_union_cycles([
+            (kernel.start_cycle, kernel.end_cycle)
+            for kernel in kernels_by_final_drain[final_drain.row_index]
+        ])
+        final_residual = final_drain.duration - final_kernel_union
+        transition = final_drain.start_cycle - runtime_build.end_cycle
+        worker_completion = (
+            final_drain.end_cycle - runtime_build.start_cycle
+        )
+        if final_residual < 0:
+            raise ValueError(
+                f"core {core_id} FinalDrain partition is negative"
+            )
+        metrics = {
+            "runtime_plan_build": runtime_build.duration,
+            "materialize": 0,
+            "register": 0,
+            "fanin": 0,
+            "winner_build": 0,
+            "alloc_complete": 0,
+            "planned_build_union": 0,
+            "runtime_plan_build_residual": runtime_build.duration,
+            "build_to_final_drain_residual": transition,
+            "final_drain": final_drain.duration,
+            "final_drain_kernel_union": final_kernel_union,
+            "final_drain_residual": final_residual,
+            "worker_completion": worker_completion,
+        }
+        if (
+            final_kernel_union + final_residual
+            != final_drain.duration
+        ):
+            raise AssertionError(
+                f"core {core_id} FinalDrain partition does not close"
+            )
+        if (
+            runtime_build.duration + transition + final_drain.duration
+            != worker_completion
+        ):
+            raise AssertionError(
+                f"core {core_id} worker completion partition does not close"
+            )
+        per_core.append({
+            "core_id": core_id,
+            "block_id": block_id,
+            "lane": lane,
+            "role": role,
+            "planned_build_count": 0,
+            "runtime_plan_build_start_cycle": runtime_build.start_cycle,
+            "runtime_plan_build_end_cycle": runtime_build.end_cycle,
+            "final_drain_start_cycle": final_drain.start_cycle,
+            "final_drain_end_cycle": final_drain.end_cycle,
+            "metrics_cycles": metrics,
+        })
+
+    aggregate_metrics = {
+        metric: sum(
+            core["metrics_cycles"][metric] for core in per_core
+        )
+        for metric in AICPU_PLAN_METRICS
+    }
+    runtime_build_partition = aggregate_metrics[
+        "runtime_plan_build_residual"
+    ]
+    final_drain_partition = (
+        aggregate_metrics["final_drain_kernel_union"]
+        + aggregate_metrics["final_drain_residual"]
+    )
+    worker_completion_partition = (
+        aggregate_metrics["runtime_plan_build"]
+        + aggregate_metrics["build_to_final_drain_residual"]
+        + aggregate_metrics["final_drain"]
+    )
+    if runtime_build_partition != aggregate_metrics[
+        "runtime_plan_build"
+    ]:
+        raise AssertionError("SIMT RuntimePlanBuild residual does not close")
+    if final_drain_partition != aggregate_metrics["final_drain"]:
+        raise AssertionError("SIMT FinalDrain partition does not close")
+    if worker_completion_partition != aggregate_metrics[
+        "worker_completion"
+    ]:
+        raise AssertionError("SIMT worker completion does not close")
+
+    role_statistics: dict[str, Any] = {}
+    for role, expected_count in (
+        ("aic", EXPECTED_AIC_CORES),
+        ("aiv", EXPECTED_AIV_CORES),
+    ):
+        role_cores = [core for core in per_core if core["role"] == role]
+        if len(role_cores) != expected_count:
+            raise ValueError(
+                f"role {role} has {len(role_cores)} cores, "
+                f"expected {expected_count}"
+            )
+        role_statistics[role] = {
+            "core_count": len(role_cores),
+            "metrics": {
+                metric: _distribution([
+                    core["metrics_cycles"][metric]
+                    for core in role_cores
+                ])
+                for metric in AICPU_PLAN_METRICS
+            },
+        }
+
+    overlays = {}
+    for phase in OVERLAY_PHASES:
+        phase_events = [
+            event for event in events if event.phase == phase
+        ]
+        overlays[phase] = {
+            "event_count": len(phase_events),
+            "aggregate_duration_cycles": sum(
+                event.duration for event in phase_events
+            ),
+            "included_in_additive_totals": False,
+        }
+    runtime_builds = list(runtime_build_by_lane.values())
+    global_start = min(parent.start_cycle for parent in runtime_builds)
+    global_end = max(parent.end_cycle for parent in runtime_builds)
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "input": str(input_path),
+        "capture": {
+            "trace_schema_version": trace_schema_version,
+            "tensormap_mode": "shared",
+            "submit_topology": AICPU_PLAN_CENTRAL_BUILD_TOPOLOGY,
+            "runtime_plan_build_backend": "simt",
+            "runtime_plan_build_trace_coverage":
+                "simt-coarse-direct-state",
+            "shared_metadata_ordering": metadata.get(
+                "shared_metadata_ordering", "global_writer_chain"
+            ),
+            "clock_freq_hz": frequency_hz,
+            "core_count": num_cores,
+            "build_worker_count": build_workers,
+            "execute_worker_count": execute_workers,
+            "event_count": len(events),
+            "task_count_global": task_count,
+            "terminal_build_task_count": task_count,
+            "planned_build_count": 0,
+            "observed_scalar_build_child_count": 0,
+        },
+        "validation": {
+            "status": "PASS",
+            "dropped_records": 0,
+            "core_ids_complete": True,
+            "role_map_complete": True,
+            "task_identity_from_direct_terminal_metadata": True,
+            "simt_build_worker_terminal_exact": True,
+            "scalar_build_children_absent": True,
+            "runtime_plan_build_parent_exactly_one_per_core": True,
+            "final_drain_parent_exactly_one_per_core": True,
+            "submit_records": 0,
+            "claim_records": 0,
+            "orchestration_replay_records": 0,
+            "runtime_plan_build_partition_exact": True,
+            "build_to_final_drain_non_overlapping": True,
+            "final_drain_partition_exact": True,
+            "worker_completion_partition_exact": True,
+            "kernel_unique_parent_complete": True,
+        },
+        "semantics": {
+            "cycle_arithmetic": "raw_integer_cycles",
+            "tensormap_mode": "shared",
+            "submit_topology": AICPU_PLAN_CENTRAL_BUILD_TOPOLOGY,
+            "task_identity": (
+                "producer task_count plus device terminal control and "
+                "validated task-kind metadata; no VF owner row is synthesized"
+            ),
+            "runtime_plan_build_children": [
+                "RuntimePlanBuildResidual"
+            ],
+            "runtime_plan_build_residual": (
+                "the complete coarse RuntimePlanBuild parent; formal SIMT "
+                "does not export Scalar Materialize/Register/Fanin children"
+            ),
+            "build_to_final_drain_residual": (
+                "observed gap from RuntimePlanBuild.end to FinalDrain.start"
+            ),
+            "final_drain_children": [
+                "KernelUnion", "FinalDrainResidual"
+            ],
+            "worker_completion_children": [
+                "RuntimePlanBuild",
+                "BuildToFinalDrainResidual",
+                "FinalDrain",
+            ],
+            "overlay_phases": list(OVERLAY_PHASES),
+            "overlays_are_additive": False,
+            "p95_method": "nearest_rank",
+        },
+        "global_runtime_plan_build_makespan": {
+            "start_cycle": global_start,
+            "end_cycle": global_end,
+            "duration_cycles": global_end - global_start,
+            "duration_us": (
+                (global_end - global_start) * 1_000_000 / frequency_hz
+            ),
+            "semantics": (
+                "cross-core wall-clock envelope of coarse "
+                "RuntimePlanBuild parents; not aggregate core-work"
+            ),
+        },
+        "aggregate_core_work": {
+            "metrics_cycles": aggregate_metrics,
+            "closure": {
+                "runtime_plan_build_partition": {
+                    "parent_cycles": aggregate_metrics[
+                        "runtime_plan_build"
+                    ],
+                    "coarse_residual_cycles": runtime_build_partition,
+                    "exact": True,
+                },
+                "final_drain_partition": {
+                    "parent_cycles": aggregate_metrics["final_drain"],
+                    "kernel_union_plus_residual_cycles":
+                        final_drain_partition,
+                    "exact": True,
+                },
+                "worker_completion_partition": {
+                    "parent_cycles": aggregate_metrics[
+                        "worker_completion"
+                    ],
+                    "runtime_plan_build_plus_transition_plus_"
+                    "final_drain_cycles": worker_completion_partition,
+                    "exact": True,
+                },
+            },
+            "semantics": "sum of per-core cycles; not wall-clock duration",
+        },
+        "per_role_core_statistics": role_statistics,
+        "kernel_containment": {
+            "total_events": len(kernels),
+            "inside_final_drain_events": len(final_drain_kernel_rows),
+            "orphan_events": 0,
+        },
+        "overlays": overlays,
+        "per_core": per_core,
+    }
+
+
 def _analyze_aicpu_plan_central_build(  # noqa: PLR0912, PLR0915
     input_path: Path,
     frequency_hz: int,
@@ -1969,6 +2505,18 @@ def _analyze_aicpu_plan_central_build(  # noqa: PLR0912, PLR0915
     runtime_builds_by_lane = _group_v4_parents(events, "RuntimePlanBuild")
     final_drains_by_lane = _group_v4_parents(events, "FinalDrain")
     runtime_build_by_lane = {lane_key: rows[0] for lane_key, rows in runtime_builds_by_lane.items()}
+
+    if metadata.get("runtime_plan_build_backend") == "simt":
+        return _analyze_aicpu_plan_simt_coarse(
+            input_path,
+            frequency_hz,
+            trace_schema_version,
+            events,
+            num_cores,
+            metadata,
+            runtime_builds_by_lane,
+            final_drains_by_lane,
+        )
 
     task_events: dict[tuple[int, int], list[Event]] = defaultdict(list)
     materializes: dict[tuple[int, int], Event] = {}
@@ -2369,6 +2917,8 @@ def _analyze_aicpu_plan_central_build(  # noqa: PLR0912, PLR0915
 
 def analyze_capture(  # noqa: PLR0912, PLR0915
     input_path: Path,
+    *,
+    allow_host_cpu_functional: bool = False,
 ) -> dict[str, Any]:
     """读取 schema-v3/v5 raw，完成全部门禁后返回可 JSON 序列化报告。"""
 
@@ -2380,7 +2930,10 @@ def analyze_capture(  # noqa: PLR0912, PLR0915
         core_by_block_lane,
         _base_cycle,
         metadata,
-    ) = _load_and_validate(input_path)
+    ) = _load_and_validate(
+        input_path,
+        allow_host_cpu_functional=allow_host_cpu_functional,
+    )
     _restore_v5_shared_efdrain(
         rows,
         trace_schema_version,
@@ -2406,7 +2959,7 @@ def analyze_capture(  # noqa: PLR0912, PLR0915
         raise ValueError("block/lane to core mapping is incomplete")
 
     if submit_topology == AICPU_PLAN_CENTRAL_BUILD_TOPOLOGY:
-        return _analyze_aicpu_plan_central_build(
+        report = _analyze_aicpu_plan_central_build(
             input_path,
             frequency_hz,
             trace_schema_version,
@@ -2414,6 +2967,108 @@ def analyze_capture(  # noqa: PLR0912, PLR0915
             num_cores,
             metadata,
         )
+        producer_report = _analyze_aicpu_runtime_plan_producer(
+            metadata,
+            events,
+            frequency_hz,
+        )
+        report["capture"]["runtime_plan_producer_domain"] = (
+            metadata.get("runtime_plan_producer_domain")
+        )
+        report["capture"]["timing_scope"] = metadata.get(
+            "timing_scope"
+        )
+        report["capture"][
+            "clock_correlation_warmup_before_pipeline"
+        ] = metadata.get("clock_correlation_warmup_before_pipeline")
+        report["capture"]["performance_representative"] = metadata.get(
+            "performance_representative"
+        )
+        report["capture"]["profiling_scope"] = metadata.get(
+            "profiling_scope"
+        )
+        report["capture"]["joint_profiling"] = metadata.get(
+            "joint_profiling"
+        )
+        if producer_report is not None:
+            report["aicpu_runtime_plan_producer"] = producer_report
+            report["aicpu_aicore_joint_timing"] = {
+                "pipeline": metadata.get("pipeline"),
+                "timing_scope": metadata.get("timing_scope"),
+                "performance_representative": metadata.get(
+                    "performance_representative"
+                ),
+                "absolute_performance_interpretation": (
+                    "structural/relative overlap only; pre-correlation "
+                    "warms AICPU and AIV, so absolute warm performance must "
+                    "come from trace-free runs"
+                ),
+                "producer_duration_us": producer_report["duration_us"],
+                "alignment_error_us": producer_report[
+                    "clock_alignment"
+                ]["alignment_error_us"],
+                "producer_to_build_gap": producer_report[
+                    "producer_to_earliest_runtime_plan_build_gap"
+                ],
+                "build_overlap": producer_report[
+                    "runtime_plan_build_interval_union"
+                ]["producer_overlap"],
+                "execute_kernel_union_overlap": producer_report[
+                    "aicore_execute_kernel"
+                ]["producer_overlap_with_kernel_union"],
+                "final_drain_overlap": producer_report[
+                    "aicore_final_drain_interval_union"
+                ]["producer_overlap"],
+                "aicore": {
+                    "runtime_plan_build_envelope": producer_report[
+                        "runtime_plan_build_envelope"
+                    ],
+                    "runtime_plan_build_interval_union": producer_report[
+                        "runtime_plan_build_interval_union"
+                    ],
+                    "execute_kernel": producer_report[
+                        "aicore_execute_kernel"
+                    ],
+                    "final_drain_envelope": producer_report[
+                        "aicore_final_drain_envelope"
+                    ],
+                    "final_drain_interval_union": producer_report[
+                        "aicore_final_drain_interval_union"
+                    ],
+                },
+                "aicpu_aicore_causal_capture_window": metadata.get(
+                    "aicpu_aicore_causal_capture_window"
+                ),
+                "included_in_96_core_exclusive_closure": False,
+            }
+            report["validation"].update({
+                "joint_aicpu_aicore_profiling": True,
+                "aicpu_clock_correlation_valid": True,
+                "aicpu_alignment_error_within_50us": True,
+                "all_aicore_events_inside_causal_capture_window": True,
+                "aicpu_pipeline_relationship_valid": True,
+                "aicpu_producer_excluded_from_96_core_exclusive_closure":
+                    True,
+            })
+            report["semantics"]["aicpu_runtime_plan_producer"] = (
+                "real AICPU CLOCK_MONOTONIC_RAW Plan-owner interval mapped "
+                "through an eight-sample causal clock correlation; reported "
+                "separately and excluded from all 96-core additive closures; "
+                "the pre-correlation round makes this a calibrated structural "
+                "capture, not cold-start performance evidence"
+            )
+        else:
+            # host-cpu is accepted only through the explicit functional
+            # escape hatch.  It must never look like a successful joint
+            # profiling report merely because the AICore closures passed.
+            report["validation"]["status"] = "FUNCTIONAL_ONLY"
+            report["validation"]["joint_aicpu_aicore_profiling"] = False
+            report["validation"]["host_cpu_functional_capture"] = True
+            report["semantics"]["profiling_scope"] = (
+                "host-cpu functional validation only; no AICPU lane or "
+                "AICPU/AICore joint profiling claim"
+            )
+        return report
 
     submits_by_lane, task_ids = _validate_and_group_submits(events, submit_topology)
     task_kind_by_id: dict[int, int] | None = None
@@ -2914,14 +3569,22 @@ def analyze_capture(  # noqa: PLR0912, PLR0915
     return report
 
 
-def write_analysis(input_path: Path, output_path: Path) -> Path:
+def write_analysis(
+    input_path: Path,
+    output_path: Path,
+    *,
+    allow_host_cpu_functional: bool = False,
+) -> Path:
     """先完成全部分析，再用同目录临时文件原子发布 JSON。"""
 
     input_path = Path(input_path)
     output_path = Path(output_path)
     if input_path.resolve() == output_path.resolve():
         raise ValueError("analysis output path must differ from input raw path")
-    report = analyze_capture(input_path)
+    report = analyze_capture(
+        input_path,
+        allow_host_cpu_functional=allow_host_cpu_functional,
+    )
     document = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2957,9 +3620,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         help="排他分析 JSON 输出路径",
     )
+    parser.add_argument(
+        "--host-cpu-functional",
+        action="store_true",
+        help=(
+            "explicitly accept a host-cpu functional capture; report status "
+            "is FUNCTIONAL_ONLY, never joint profiling PASS"
+        ),
+    )
     arguments = parser.parse_args(argv)
     try:
-        output = write_analysis(arguments.input, arguments.output)
+        output = write_analysis(
+            arguments.input,
+            arguments.output,
+            allow_host_cpu_functional=arguments.host_cpu_functional,
+        )
     except (OSError, ValueError) as error:
         print(f"exclusive swimlane analysis failed: {error}", file=sys.stderr)
         return 1

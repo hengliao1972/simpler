@@ -33,6 +33,53 @@ case "$SHARED_INSERT_TURN_GROUPS" in
         exit 1
         ;;
 esac
+# Pipeline policy is part of every compiled image and its output path.  Accept
+# the stable human names at the shell boundary, but always pass the common
+# header its numeric 0/1 ABI.
+PIPELINE_POLICY_INPUT="${PA_RUNTIME_PLAN_PIPELINE_POLICY:-0}"
+case "$PIPELINE_POLICY_INPUT" in
+    0|plan-ahead-closed)
+        PIPELINE_POLICY_ID=0
+        PIPELINE_NAME="plan-ahead-closed"
+        PIPELINE_KEY="$PIPELINE_NAME"
+        LAUNCH_ORDER="plan-sync-before-aicore"
+        PRODUCER_READY="closed"
+        CONSUMER_ADMISSION="closed-only"
+        READY_PREFILL_TASKS=0
+        SCHEDULER_INPUT="aicpu_closed_runtime_plan"
+        if [[ -n "${PA_AICPU_PLAN_READY_PREFILL_TASKS+x}" ]]; then
+            echo "plan-ahead-closed does not accept PA_AICPU_PLAN_READY_PREFILL_TASKS." >&2
+            exit 1
+        fi
+        ;;
+    1|streaming-future)
+        PIPELINE_POLICY_ID=1
+        PIPELINE_NAME="streaming-future"
+        LAUNCH_ORDER="dual-stream-overlap"
+        PRODUCER_READY="prefill"
+        CONSUMER_ADMISSION="ready-future-ticket"
+        READY_PREFILL_TASKS="${PA_AICPU_PLAN_READY_PREFILL_TASKS:-128}"
+        if [[ ! "$READY_PREFILL_TASKS" =~ ^[0-9]+$ ]] ||
+           ((READY_PREFILL_TASKS == 0 || READY_PREFILL_TASKS > 32768)); then
+            echo "PA_AICPU_PLAN_READY_PREFILL_TASKS must be an integer in [1, 32768]." >&2
+            exit 1
+        fi
+        PIPELINE_KEY="streaming-future-p${READY_PREFILL_TASKS}"
+        SCHEDULER_INPUT="aicpu_streaming_runtime_plan"
+        ;;
+    *)
+        echo "PA_RUNTIME_PLAN_PIPELINE_POLICY must be 0|plan-ahead-closed or 1|streaming-future." >&2
+        exit 1
+        ;;
+esac
+PIPELINE_DEFINES=(
+    "-DPA_RUNTIME_PLAN_PIPELINE_POLICY=$PIPELINE_POLICY_ID"
+)
+if [[ "$PIPELINE_POLICY_ID" -eq 1 ]]; then
+    PIPELINE_DEFINES+=(
+        "-DPA_AICPU_PLAN_READY_PREFILL_TASKS=$READY_PREFILL_TASKS"
+    )
+fi
 # CCEC 不生成跨证据链的统一 ELF。swimlane 与 perf-clock 分别拥有
 # 独立目录和编译身份；首阶段不提供 submit-PMU。
 BUILD_VARIANT="${1:-swimlane}"
@@ -45,7 +92,7 @@ case "$BUILD_VARIANT" in
     swimlane)
         PHASE_NAME="none"
         PHASE_ID=0
-        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/swimlane"
+        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/$PIPELINE_KEY/swimlane"
         COMPACT_GENERIC_TRACE="$TENSORMAP_MODE_ID"
         VARIANT_DEFINES=(
             "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
@@ -60,7 +107,7 @@ case "$BUILD_VARIANT" in
     perf-clock)
         PHASE_NAME="none"
         PHASE_ID=0
-        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/perf-clock"
+        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/$PIPELINE_KEY/perf-clock"
         VARIANT_DEFINES=(
             "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
             -DPA_BUILD_SWIMLANE=0
@@ -102,8 +149,10 @@ VARIANT_DEFINES+=("-DPTO_FDWIC_TENSORMAP_RING_CAP=$TENSORMAP_RING_CAP")
 VARIANT_DEFINES+=(
     "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$SHARED_INSERT_TURN_GROUPS"
     -DPA_CCEC_BLOCK_LOCAL_STATS=1
+    "${PIPELINE_DEFINES[@]}"
 )
 echo "[BUILD] shared insert-turn groups=$SHARED_INSERT_TURN_GROUPS"
+echo "[BUILD] pipeline=$PIPELINE_NAME launch_order=$LAUNCH_ORDER producer_ready=$PRODUCER_READY consumer_admission=$CONSUMER_ADMISSION prefill=$READY_PREFILL_TASKS"
 
 # 编译只依赖本目录源码与用户安装的 CANN/PTO 头，不引用 pa_scheduler 目录外的 simpler 构建产物。
 if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
@@ -144,6 +193,23 @@ done
 
 mkdir -p "$BUILD_DIR"
 rm -f -- "$BUILD_DIR/$ARTIFACT_MANIFEST_NAME"
+
+CLOCK_CORRELATION_HOST_TEST="$BUILD_DIR/.test_aicpu_clock_correlation"
+"$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+    "$AICPU_DIR/test_aicpu_clock_correlation.cpp" \
+    -o "$CLOCK_CORRELATION_HOST_TEST"
+"$CLOCK_CORRELATION_HOST_TEST"
+rm -f -- "$CLOCK_CORRELATION_HOST_TEST"
+echo "[CHECK] clock-correlation interval/intersection fail-closed tests passed"
+if grep -Eq \
+        'HostMonotonicRawNanoseconds|CLOCK_MONOTONIC_RAW|pipeline_(begin|end)_raw_ns|ValidateOwnerClockBracket' \
+        "$SCRIPT_DIR/host.cpp" ||
+   grep -Eq 'pipeline_(begin|end)_raw_ns' \
+        "$AICPU_DIR/aicpu_clock_correlation_abi.h"; then
+    echo "CCEC Host/evidence must not treat Host RAW as the AICPU clock domain." >&2
+    exit 1
+fi
+echo "[CHECK] Host absolute clock is excluded from device correlation evidence"
 # 旧复制目录可能残留 PMU owner；当前两类构建主动清除，避免运行时误加载。
 rm -f \
     "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so" \
@@ -170,9 +236,9 @@ COMMON_FLAGS=(
 
 # direct Plan entry 不恢复旧 callback split，但 LocalStats 仍会跨 noinline
 # Build/Execute helper 传引用。CCEC 对这种栈引用没有可靠合同，因此按已验证
-# 的 A5 block-local 机制为 AIC/AIV 各保留一份精确 1152B 状态。relocate
+# 的 A5 block-local 机制为 AIC/AIV 各保留一份精确 1216B 状态。relocate
 # 让最终 mixed ELF 把两份状态排成互不重叠的连续区域。
-BLOCK_LOCAL_STATS_BYTES=1152
+BLOCK_LOCAL_STATS_BYTES=1216
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
     -mllvm "-cce-block-local-reserve-size=$BLOCK_LOCAL_STATS_BYTES"
@@ -221,6 +287,61 @@ COMMON_FLAGS+=(
         -o "$SHARED_PROTOCOL_PROBE_AIV_ELF" \
         "$SHARED_PROTOCOL_PROBE_AIV_OBJECT"
 )
+
+# 泳道中的 AICPU producer 必须通过独立的四时间戳握手映射到 AICore
+# SYS_CNT。该 AIV ELF 不链接进被测 mixed kernel，Host 也只在 JSON capture
+# 前后启动它，因此不会改变 Plan/Build 指令布局或性能窗口。
+CLOCK_CORRELATION_OBJECT="$BUILD_DIR/pa_scheduler_clock_correlation_aiv.o"
+CLOCK_CORRELATION_ELF="$BUILD_DIR/pa_scheduler_clock_correlation_kernel.o"
+CLOCK_CORRELATION_ENTRY="pa_clock_correlation_0_mix_aiv"
+echo "[BUILD] standalone AICPU/AICore clock-correlation AIV"
+"$CCEC" \
+    -c -O3 -g -x cce -Wall -Werror -std=c++17 \
+    --cce-aicore-only \
+    --cce-aicore-arch=dav-c310-vec \
+    -mllvm -cce-aicore-stack-size=0x8000 \
+    -mllvm -cce-aicore-function-stack-size=0x8000 \
+    -mllvm -cce-aicore-record-overflow=false \
+    -mllvm -cce-aicore-addr-transform \
+    -mllvm -cce-aicore-dcci-insert-for-scalar=false \
+    -mllvm -cce-aicore-dcci-before-kernel-end=false \
+    -I"$PTO_INCLUDE_ROOT/include" \
+    -o "$CLOCK_CORRELATION_OBJECT" \
+    "$SCRIPT_DIR/clock_correlation_kernel.cpp"
+"$LD" -m aicorelinux -Ttext=0 -static \
+    -o "$CLOCK_CORRELATION_ELF" "$CLOCK_CORRELATION_OBJECT"
+CLOCK_CORRELATION_SYMBOLS="$(
+    "$READELF_BIN" --symbols --wide --sym-base=10 \
+        "$CLOCK_CORRELATION_ELF"
+)"
+CLOCK_CORRELATION_SECTIONS="$(
+    "$READELF_BIN" --sections --wide "$CLOCK_CORRELATION_ELF"
+)"
+if ! awk -v name="$CLOCK_CORRELATION_ENTRY" \
+    '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" &&
+     $NF == name && $3 + 0 > 0 {count++}
+     END {exit count != 1}' <<<"$CLOCK_CORRELATION_SYMBOLS" ||
+   [[ "$CLOCK_CORRELATION_SECTIONS" != *".ascend.meta.$CLOCK_CORRELATION_ENTRY"* ]]; then
+    echo "Clock-correlation ELF is missing its sole non-empty AIV entry/metadata." >&2
+    exit 1
+fi
+if [[ -n "$(
+    "$READELF_BIN" --relocs --wide "$CLOCK_CORRELATION_ELF" |
+        sed -n '/Relocation section/p'
+)" ]]; then
+    echo "Clock-correlation ELF must not retain relocations." >&2
+    exit 1
+fi
+while IFS= read -r global_func; do
+    if [[ "$global_func" != "$CLOCK_CORRELATION_ENTRY" ]]; then
+        echo "Unexpected GLOBAL clock-correlation device function: $global_func" >&2
+        exit 1
+    fi
+done < <(
+    awk '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" {print $NF}' \
+        <<<"$CLOCK_CORRELATION_SYMBOLS"
+)
+echo "[CHECK] standalone clock-correlation entry/metadata/closure gates passed"
 
 # 同一入口源码分别面向 cube 与 vector ISA 编译，宏只选择各自的全局入口和 mixed metadata。
 echo "[BUILD] CCEC AIC entry (dav-c310-cube)"
@@ -418,7 +539,7 @@ if ((16#$aic_stats_offset != 0)) ||
    ((16#$aiv_stats_offset != BLOCK_LOCAL_STATS_BYTES)) ||
    ((16#$final_block_local_size_hex != 2 * BLOCK_LOCAL_STATS_BYTES)) ||
    ((final_block_local_alignment != 64)); then
-    echo "Final mixed ELF must contain two non-overlapping 1152B role-local LocalStats objects." >&2
+    echo "Final mixed ELF must contain two non-overlapping 1216B role-local LocalStats objects." >&2
     exit 1
 fi
 echo "[CHECK] final mixed ELF keeps two non-overlapping block-local LocalStats objects"
@@ -450,6 +571,7 @@ echo "[BUILD] AICPU real-PA Plan owner"
 "$HCC" -std=c++17 -O3 -g -fPIC -fno-gnu-unique \
     -Wall -Wextra -Werror -Wno-unused-but-set-parameter \
     -DPTO_FDWIC_SHARED_MAP=1 -DPTO_FDWIC_SCHEDULER_MODE=1 \
+    "${PIPELINE_DEFINES[@]}" \
     "${AICPU_COMMON_INCLUDES[@]}" \
     -shared -Wl,-z,defs -Wl,--build-id \
     "$PA_ORCHESTRATION_SOURCE" \
@@ -513,12 +635,32 @@ echo "[BUILD] CCEC host runner"
     -ldl \
     -o "$BUILD_DIR/pa_scheduler_host"
 
+if [[ "$BUILD_VARIANT" == "swimlane" ]]; then
+    JOINT_ANALYZE_REJECTION_LOG="$BUILD_DIR/.joint_analyze_rejection.log"
+    if "$BUILD_DIR/pa_scheduler_host" \
+            --kernel "$BUILD_DIR/pa_scheduler_kernel.o" \
+            --analyze-swimlane \
+            >"$JOINT_ANALYZE_REJECTION_LOG" 2>&1 ||
+       ! grep -Fq \
+            "use --swimlane-json and the ordinary offline joint AICPU/AICore analyzer" \
+            "$JOINT_ANALYZE_REJECTION_LOG"; then
+        echo "CCEC swimlane Host must reject the legacy AICore-only analyzer." >&2
+        rm -f -- "$JOINT_ANALYZE_REJECTION_LOG"
+        exit 1
+    fi
+    rm -f -- "$JOINT_ANALYZE_REJECTION_LOG"
+    echo "[EXPECTED REJECTION] CCEC Host forbids legacy AICore-only analysis"
+fi
+
 # host、kernel、AICPU owner 与 dispatcher 全部成功后才发布统一
-# manifest。v5 同时固化 closed-Plan ABI、容量与 producer 入口；
+# manifest。v8 同时固化 Runtime Plan ABI、容量、producer 入口、独立
+# clock-correlation 四时间戳协议与
+# Plan/Build pipeline policy；
 # run.sh 只消费带完整 manifest 的目录，因此中断重编不会混用新旧镜像。
 ARTIFACTS=(
     pa_scheduler_host
     pa_scheduler_kernel.o
+    pa_scheduler_clock_correlation_kernel.o
     libpa_scheduler_plan_aicpu.so
     libpa_scheduler_plan_dispatcher.so
 )
@@ -542,7 +684,7 @@ cleanup_manifest_tmp() {
 }
 trap cleanup_manifest_tmp EXIT
 {
-    printf '# schema=pa_scheduler_artifacts/v5\n'
+    printf '# schema=pa_scheduler_artifacts/v8\n'
     printf '# tensormap_mode=%s\n' "$TENSORMAP_MODE"
     printf '# tensormap_mode_id=%u\n' "$TENSORMAP_MODE_ID"
     printf '# tensormap_ring_cap=%u\n' "$TENSORMAP_RING_CAP"
@@ -559,11 +701,19 @@ trap cleanup_manifest_tmp EXIT
     printf '# variant=%s\n' "$BUILD_VARIANT"
     printf '# phase=%s\n' "$PHASE_NAME"
     printf '# phase_id=%u\n' "$PHASE_ID"
-    printf '# runtime_plan_abi=%u\n' 2
+    printf '# runtime_plan_abi=%u\n' 3
     printf '# runtime_plan_cell_bytes=%u\n' 4608
     printf '# runtime_plan_capacity=%u\n' 4352
     printf '# plan_owner_entry=%s\n' plan_protocol_aicpu_exec
-    printf '# scheduler_input=%s\n' aicpu_closed_runtime_plan
+    printf '# scheduler_input=%s\n' "$SCHEDULER_INPUT"
+    printf '# pipeline=%s\n' "$PIPELINE_NAME"
+    printf '# launch_order=%s\n' "$LAUNCH_ORDER"
+    printf '# producer_ready=%s\n' "$PRODUCER_READY"
+    printf '# consumer_admission=%s\n' "$CONSUMER_ADMISSION"
+    printf '# prefill=%u\n' "$READY_PREFILL_TASKS"
+    printf '# clock_correlation_abi=%u\n' 2
+    printf '# clock_correlation_samples=%u\n' 8
+    printf '# clock_correlation_max_alignment_error_ns=%u\n' 50000
     (cd "$BUILD_DIR" && sha256sum "${ARTIFACTS[@]}")
 } > "$MANIFEST_TMP"
 mv -f -- "$MANIFEST_TMP" "$MANIFEST_PATH"

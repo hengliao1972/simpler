@@ -36,7 +36,10 @@ enum class ObservedEngine : uint8_t {
 };
 
 struct PendingPlan {
-    alignas(128) uint8_t staged_cell[4608];
+    // payload 已经在 Finish callback 存活期间唯一一次 Pack 到
+    // control=Empty 的目标 GM cell。这里只保留不含指针的窄
+    // metadata，供下一个 Begin/close patch 最终 flags 并发布。
+    alignas(128) uint8_t staged_metadata[128];
     uint32_t payload_lines;
     uint32_t task_id;
     uint32_t batch_start;
@@ -85,7 +88,8 @@ void Fail(AicpuPlanBackendStatus status, int32_t fatal_code = 0)
             ? static_cast<int64_t>(fatal_code)
             : static_cast<int64_t>(status);
         aicpu_plan_adapter_publish_fatal(
-            g_backend.config.control, published
+            g_backend.config.control, g_backend.config.cells,
+            g_backend.config.capacity, published
         );
     }
 }
@@ -166,7 +170,7 @@ bool PublishPending(bool has_following, bool last_in_batch)
         aicpu_plan_adapter_publish_staged(
             g_backend.config.control, g_backend.config.cells,
             g_backend.config.capacity,
-            g_backend.pending.staged_cell,
+            g_backend.pending.staged_metadata,
             g_backend.pending.payload_lines, flags
         ) != 0) {
         Fail(AicpuPlanBackendStatus::PublishFailed);
@@ -270,11 +274,13 @@ bool FinishTask(
     uint16_t actual_output_count = 0U;
     if (provisional == 0U ||
         aicpu_plan_adapter_stage(
+            g_backend.config.control, g_backend.config.cells,
+            g_backend.config.capacity,
             &args, g_backend.active.task_id,
             g_backend.active.function_id,
             static_cast<uint8_t>(g_backend.active.engine), provisional,
             g_backend.active.batch_start,
-            g_backend.pending.staged_cell, &payload_lines,
+            g_backend.pending.staged_metadata, &payload_lines,
             &actual_output_count
         ) != 0 ||
         actual_output_count != expected_output_count) {

@@ -113,6 +113,24 @@ PA_SIMT_PLAN_DEVICE bool AttachClosedPlan(
     return true;
 }
 
+template <typename ConsumerOps>
+PA_SIMT_PLAN_DEVICE aicpu_plan::PlanReadyObservation ObservePlanReady(const aicpu_plan::RuntimePlanView &view) {
+    return aicpu_plan::ObserveRuntimePlanReady<ConsumerOps>(view);
+}
+
+template <typename ConsumerOps>
+PA_SIMT_PLAN_DEVICE aicpu_plan::BuildReservation TakeOpenBuildTicket(const aicpu_plan::RuntimePlanView &view) {
+    return aicpu_plan::TakeOpenPlanBuildTicket<ConsumerOps>(view);
+}
+
+template <typename ConsumerOps>
+PA_SIMT_PLAN_DEVICE aicpu_plan::BuildTicketResolveStatus ResolveOpenBuildTicket(
+    const aicpu_plan::RuntimePlanView &view, uint32_t task_id, aicpu_plan::RuntimeTaskPlanHeader &header,
+    aicpu_plan::RuntimeTaskPlanLayout &layout
+) {
+    return aicpu_plan::ResolveOpenPlanBuildTicket<ConsumerOps>(view, task_id, header, layout);
+}
+
 // Attach 成功后的唯一热路 atomic 是 build_next FetchAdd。区别只在
 // 消费者人口：Scalar 是 96 个 worker，SIMT 是 4 个 warp leader，
 // 因此正常终态分别是 N+96 与 N+4。ticket 只分配 task id；

@@ -35,10 +35,24 @@
 
 namespace pa_scheduler::aicpu_plan {
 
-constexpr uint32_t kRuntimePlanAbiVersion = 2U;
+#ifndef PA_AICPU_PLAN_READY_PREFILL_TASKS
+#define PA_AICPU_PLAN_READY_PREFILL_TASKS 128U
+#endif
+
+constexpr uint32_t kRuntimePlanAbiVersion = 3U;
 constexpr uint32_t kPlanCacheLineBytes = 64U;
 constexpr uint32_t kAtomicIsolationBytes = 128U;
 constexpr uint32_t kMaxRuntimeTasks = 32768U;
+// AICPU ordinary producer 在发布 Ready/Open 前至少保留这一段连续
+// Published 前缀。小于 threshold 的合法运行期 capacity/短 Plan 会保持
+// NotReady，并由 Close 强制 Ready；宏用于 64/128/256 等 A5 扫描构建。
+constexpr uint32_t kRuntimePlanReadyPrefillTasks =
+    static_cast<uint32_t>(PA_AICPU_PLAN_READY_PREFILL_TASKS);
+static_assert(
+    kRuntimePlanReadyPrefillTasks > 0U &&
+        kRuntimePlanReadyPrefillTasks <= kMaxRuntimeTasks,
+    "runtime Plan Ready prefill must be in (0, max_tasks]"
+);
 constexpr uint32_t kMaxTaskTensors = 32U;
 constexpr uint32_t kMaxTaskScalars = 16U;
 constexpr uint32_t kMaxExplicitDependencies = 16U;
@@ -98,7 +112,26 @@ enum class BuildReservationStatus : uint8_t {
     Fatal,
 };
 
+enum class PlanReadyStatus : uint8_t {
+    NotReady,
+    Open,
+    Closed,
+    Fatal,
+};
+
+enum class BuildTicketResolveStatus : uint8_t {
+    Pending,
+    Acquired,
+    Closed,
+    MissingPlanCell,
+    InvalidControl,
+    InvalidPayload,
+    Fatal,
+};
+
 constexpr uint32_t kInvalidFunctionId = UINT32_MAX;
+constexpr int64_t kPlanProducerReadyFailedTaskCount = -3;
+constexpr int64_t kPlanProducerNotReadyTaskCount = -2;
 constexpr int64_t kPlanOpenTaskCount = -1;
 constexpr int64_t kBuildReleasePending = -1;
 constexpr int64_t kBuildReleaseFailed = -2;
@@ -206,8 +239,11 @@ static_assert(sizeof(RuntimeTaskPlanCell) == 4608U, "Plan cell stride changed");
 static_assert(alignof(RuntimeTaskPlanCell) == kAtomicIsolationBytes, "Plan cell base alignment changed");
 static_assert(sizeof(RuntimeTaskPlanCell) % kAtomicIsolationBytes == 0U, "Plan cell stride must preserve 128B alignment");
 
-// planned_frontier 是连续已发布条目数，即首个尚未发布的 task_id；有效
-// 前缀严格为 [0, planned_frontier)。closed_task_count=-1 表示仍开放。
+// planned_frontier 是 producer 已验证的连续发布前缀，即首个尚未纳入
+// 前缀的 task_id。cell 可以先于 frontier 发布，消费者以自己的 cell
+// control 为唯一 ready 条件。closed_task_count=-3 表示 ready 初始化失败，
+// -2 表示 producer 尚在清理复用地址，-1 表示已 ready 且仍开放，非负值
+// 表示最终任务数。
 struct alignas(kAtomicIsolationBytes) RuntimePlanControl {
     PlanAtomicLine planned_frontier;
     PlanAtomicLine closed_task_count;
@@ -254,6 +290,11 @@ struct RuntimePlanView {
 struct BuildReservation {
     BuildReservationStatus status;
     uint32_t task_id;
+};
+
+struct PlanReadyObservation {
+    PlanReadyStatus status;
+    uint32_t task_count;
 };
 
 enum class BuildArrivalStatus : uint8_t {
@@ -769,19 +810,35 @@ AICPU_PLAN_DEVICE bool ValidateRuntimeTaskPlanPayload(
 // PublishControl。AICPU 的 PublishControl 是 ordinary store + exact clean；
 // AIC/AIV 通过 return-ready atomic observe 读取它。
 template <typename ProducerOps, typename Source>
-AICPU_PLAN_DEVICE PlanPublishResult PublishRuntimeTaskPlan(
-    const RuntimePlanView &view, const RuntimeTaskPlanSpec &spec,
-    const Source &source
-)
-{
-    if (view.control == nullptr || view.cells == nullptr || spec.task_id >= view.capacity ||
-        ProducerOps::LoadControl(&view.control->fatal.value) != 0 ||
-        ProducerOps::LoadControl(&view.control->closed_task_count.value) !=
-            kPlanOpenTaskCount ||
-        ProducerOps::LoadControl(&view.control->planned_frontier.value) !=
-            static_cast<int64_t>(spec.task_id) ||
+AICPU_PLAN_DEVICE PlanPublishResult
+PublishRuntimeTaskPlan(const RuntimePlanView &view, const RuntimeTaskPlanSpec &spec, const Source &source) {
+    if (view.control == nullptr || view.cells == nullptr ||
+        spec.task_id >= view.capacity ||
+        ProducerOps::LoadControl(&view.control->fatal.value) != 0) {
+        return PlanPublishResult::CellUnavailable;
+    }
+    const int64_t closed = ProducerOps::LoadControl(
+        &view.control->closed_task_count.value
+    );
+    // Ready prefill 与 Ready 后 streaming 共用同一条顺序发布路径。
+    // NotReady 期间 consumer 只观察 closed，绝不会触碰这些 cell；一旦
+    // Open，future-ticket 仍直接以各自 cell control 为唯一 ready 条件。
+    if (closed != kPlanProducerNotReadyTaskCount &&
+        closed != kPlanOpenTaskCount) {
+        return PlanPublishResult::CellUnavailable;
+    }
+    const int64_t frontier = ProducerOps::LoadControl(&view.control->planned_frontier.value);
+    if (frontier < 0 || frontier > static_cast<int64_t>(spec.task_id) ||
         ProducerOps::LoadControl(&view.cells[spec.task_id].control.value) != 0) {
         return PlanPublishResult::CellUnavailable;
+    }
+    if (static_cast<int64_t>(spec.task_id) > frontier) {
+        const uint32_t predecessor = spec.task_id - 1U;
+        const DecodedPlanCellControl decoded =
+            DecodePlanCellControl(ProducerOps::LoadControl(&view.cells[predecessor].control.value));
+        if (!decoded.valid || decoded.phase != PlanCellPhase::Published || decoded.task_id != predecessor) {
+            return PlanPublishResult::CellUnavailable;
+        }
     }
     RuntimeTaskPlanLayout layout{};
     if (!PackRuntimeTaskPlan<ProducerOps>(view.cells[spec.task_id], spec, source, layout)) {
@@ -797,42 +854,159 @@ AICPU_PLAN_DEVICE PlanPublishResult PublishRuntimeTaskPlan(
 }
 
 template <typename ProducerOps>
-AICPU_PLAN_DEVICE bool AdvancePlannedFrontier(
-    const RuntimePlanView &view, uint32_t expected_task_id
-)
-{
-    if (expected_task_id >= view.capacity ||
-        ProducerOps::LoadControl(&view.control->planned_frontier.value) !=
-            static_cast<int64_t>(expected_task_id)) {
+AICPU_PLAN_DEVICE bool RuntimePlanCanPublishReady(
+    const RuntimePlanView &view
+) {
+    if (view.control == nullptr || view.cells == nullptr ||
+        view.capacity == 0U ||
+        ProducerOps::LoadControl(
+            &view.control->closed_task_count.value
+        ) != kPlanProducerNotReadyTaskCount) {
         return false;
     }
-    ProducerOps::StoreBarrier();
-    ProducerOps::PublishControl(
-        &view.control->planned_frontier.value,
-        static_cast<int64_t>(expected_task_id) + 1
+    const int64_t frontier = ProducerOps::LoadControl(
+        &view.control->planned_frontier.value
     );
+    if (frontier < 0 || frontier > static_cast<int64_t>(view.capacity) ||
+        ProducerOps::LoadControl(&view.control->build_next.value) != 0 ||
+        ProducerOps::LoadControl(&view.control->build_workers_done.value) != 0 ||
+        ProducerOps::LoadControl(&view.control->build_release.value) != kBuildReleasePending ||
+        ProducerOps::LoadControl(&view.control->fatal.value) != 0) {
+        return false;
+    }
     return true;
 }
 
 template <typename ProducerOps>
-AICPU_PLAN_DEVICE bool CloseRuntimePlan(
-    const RuntimePlanView &view, uint32_t final_task_count
-)
-{
-    if (final_task_count > view.capacity ||
-        ProducerOps::LoadControl(&view.control->planned_frontier.value) != static_cast<int64_t>(final_task_count) ||
-        ProducerOps::LoadControl(&view.control->closed_task_count.value) !=
-            kPlanOpenTaskCount ||
-        ProducerOps::LoadControl(&view.control->build_next.value) != 0 ||
-        ProducerOps::LoadControl(&view.control->build_workers_done.value) != 0 ||
-        ProducerOps::LoadControl(&view.control->build_release.value) !=
-            kBuildReleasePending ||
+AICPU_PLAN_DEVICE bool PublishRuntimePlanReady(const RuntimePlanView &view) {
+    if (!RuntimePlanCanPublishReady<ProducerOps>(view)) {
+        return false;
+    }
+    // Producer 必须在 initialize 时完成全部 cell control 的 discard/Empty
+    // 校验。frontier 可以在 NotReady 预填期间前进；Advance helper 已逐项
+    // 验证该连续前缀。此处刻意不重复扫描 cell，确保 Ready 是独立的最后
+    // 一次 control 发布，也避免为预填前缀再付一轮 cache 观察。
+    ProducerOps::StoreBarrier();
+    ProducerOps::PublishControl(&view.control->closed_task_count.value, kPlanOpenTaskCount);
+    return true;
+}
+
+template <typename ProducerOps>
+AICPU_PLAN_DEVICE bool PublishRuntimePlanReadyFailed(const RuntimePlanView &view) {
+    if (view.control == nullptr || view.cells == nullptr ||
+        view.capacity == 0U) {
+        return false;
+    }
+    const int64_t closed = ProducerOps::LoadControl(
+        &view.control->closed_task_count.value
+    );
+    if (closed != kPlanProducerNotReadyTaskCount &&
+        closed != kPlanOpenTaskCount) {
+        return false;
+    }
+    // 初始化失败时其他 control 可能尚未完成 reset，不能把唤醒依赖于
+    // fatal 行；Open 后的 producer fatal 也用同一个终止 sentinel 立即
+    // 唤醒 future-ticket。消费者只依赖 closed=-3，不要求读取 fatal。
+    ProducerOps::StoreBarrier();
+    ProducerOps::PublishControl(&view.control->closed_task_count.value, kPlanProducerReadyFailedTaskCount);
+    return true;
+}
+
+template <typename ConsumerOps>
+AICPU_PLAN_DEVICE PlanReadyObservation ObserveRuntimePlanReady(const RuntimePlanView &view) {
+    if (view.control == nullptr || view.cells == nullptr || view.capacity == 0U) {
+        return {PlanReadyStatus::Fatal, 0U};
+    }
+    const int64_t closed = ConsumerOps::LoadControl(&view.control->closed_task_count.value);
+    // ready 前只允许轮询这一条 line；其他 control 仍可能由 producer
+    // discard/reset，提前读取会与同地址复用的 cache 维护并发。
+    if (closed == kPlanProducerNotReadyTaskCount) {
+        return {PlanReadyStatus::NotReady, 0U};
+    }
+    if (closed == kPlanProducerReadyFailedTaskCount) {
+        return {PlanReadyStatus::Fatal, 0U};
+    }
+    if (closed < kPlanOpenTaskCount || closed > static_cast<int64_t>(view.capacity) ||
+        ConsumerOps::LoadControl(&view.control->fatal.value) != 0) {
+        return {PlanReadyStatus::Fatal, 0U};
+    }
+    const int64_t frontier = ConsumerOps::LoadControl(&view.control->planned_frontier.value);
+    if (frontier < 0 || frontier > static_cast<int64_t>(view.capacity) || (closed >= 0 && closed != frontier)) {
+        return {PlanReadyStatus::Fatal, 0U};
+    }
+    return closed == kPlanOpenTaskCount ? PlanReadyObservation{PlanReadyStatus::Open, 0U} :
+                                          PlanReadyObservation{PlanReadyStatus::Closed, static_cast<uint32_t>(closed)};
+}
+
+template <typename ProducerOps>
+AICPU_PLAN_DEVICE bool
+AdvancePlannedFrontierTo(const RuntimePlanView &view, uint32_t expected_frontier, uint32_t new_frontier) {
+    if (view.control == nullptr || view.cells == nullptr || expected_frontier >= new_frontier ||
+        new_frontier > view.capacity ||
         ProducerOps::LoadControl(&view.control->fatal.value) != 0) {
+        return false;
+    }
+    const int64_t closed = ProducerOps::LoadControl(
+        &view.control->closed_task_count.value
+    );
+    if ((closed != kPlanProducerNotReadyTaskCount &&
+         closed != kPlanOpenTaskCount) ||
+        ProducerOps::LoadControl(
+            &view.control->planned_frontier.value
+        ) != static_cast<int64_t>(expected_frontier)) {
+        return false;
+    }
+    for (uint32_t task_id = expected_frontier; task_id < new_frontier; ++task_id) {
+        const DecodedPlanCellControl decoded =
+            DecodePlanCellControl(ProducerOps::LoadControl(&view.cells[task_id].control.value));
+        if (!decoded.valid || decoded.phase != PlanCellPhase::Published || decoded.task_id != task_id) {
+            return false;
+        }
+    }
+    ProducerOps::StoreBarrier();
+    ProducerOps::PublishControl(&view.control->planned_frontier.value, static_cast<int64_t>(new_frontier));
+    return true;
+}
+
+template <typename ProducerOps>
+AICPU_PLAN_DEVICE bool AdvancePlannedFrontier(const RuntimePlanView &view, uint32_t expected_task_id) {
+    if (expected_task_id == UINT32_MAX) return false;
+    return AdvancePlannedFrontierTo<ProducerOps>(view, expected_task_id, expected_task_id + 1U);
+}
+
+template <typename ProducerOps>
+AICPU_PLAN_DEVICE bool CloseRuntimePlan(const RuntimePlanView &view, uint32_t final_task_count) {
+    if (view.control == nullptr || view.cells == nullptr || final_task_count > view.capacity ||
+        ProducerOps::LoadControl(&view.control->planned_frontier.value) != static_cast<int64_t>(final_task_count) ||
+        ProducerOps::LoadControl(&view.control->closed_task_count.value) != kPlanOpenTaskCount ||
+        ProducerOps::LoadControl(&view.control->build_release.value) != kBuildReleasePending ||
+        ProducerOps::LoadControl(&view.control->fatal.value) != 0) {
+        return false;
+    }
+    // 发布严格连续，因此 N 位置仍 Empty 足以证明不存在被遗漏在最终
+    // task_count 之外的已发布后缀；N==capacity 时没有哨兵 cell。
+    if (final_task_count < view.capacity &&
+        ProducerOps::LoadControl(&view.cells[final_task_count].control.value) != 0) {
         return false;
     }
     ProducerOps::StoreBarrier();
     ProducerOps::PublishControl(&view.control->closed_task_count.value, final_task_count);
     return true;
+}
+
+// 调用方必须先通过 ObserveRuntimePlanReady 观察到 Open/Closed，并且每个
+// worker 在解析完当前 ticket 前不得再次调用。函数本身的热路只包含一次
+// build_next FetchAdd；ticket 可以指向尚未发布的未来 cell。
+template <typename ConsumerOps>
+AICPU_PLAN_DEVICE BuildReservation TakeOpenPlanBuildTicket(const RuntimePlanView &view) {
+    if (view.control == nullptr || view.cells == nullptr || view.capacity == 0U) {
+        return {BuildReservationStatus::Fatal, 0U};
+    }
+    const int64_t ticket = ConsumerOps::FetchAddControl(&view.control->build_next.value, 1);
+    if (ticket < 0 || static_cast<uint64_t>(ticket) > UINT32_MAX) {
+        return {BuildReservationStatus::Fatal, 0U};
+    }
+    return {BuildReservationStatus::Reserved, static_cast<uint32_t>(ticket)};
 }
 
 // 首版固定 Plan-ahead：AICPU 完整关闭 Plan 后才唤醒 96 个 Scalar。
@@ -943,6 +1117,67 @@ AICPU_PLAN_DEVICE PlanAcquireResult AcquireRuntimeTaskPlan(
         return PlanAcquireResult::InvalidPayload;
     }
     return PlanAcquireResult::Acquired;
+}
+
+template <typename ConsumerOps>
+AICPU_PLAN_DEVICE BuildTicketResolveStatus ResolveOpenPlanBuildTicket(
+    const RuntimePlanView &view, uint32_t task_id, RuntimeTaskPlanHeader &header, RuntimeTaskPlanLayout &layout
+) {
+    if (view.control == nullptr || view.cells == nullptr || view.capacity == 0U) {
+        return BuildTicketResolveStatus::Fatal;
+    }
+    if (task_id < view.capacity) {
+        const PlanAcquireResult acquired = AcquireRuntimeTaskPlan<ConsumerOps>(view, task_id, header, layout);
+        if (acquired == PlanAcquireResult::Acquired) {
+            return BuildTicketResolveStatus::Acquired;
+        }
+        if (acquired == PlanAcquireResult::InvalidControl) {
+            return BuildTicketResolveStatus::InvalidControl;
+        }
+        if (acquired == PlanAcquireResult::InvalidPayload) {
+            return BuildTicketResolveStatus::InvalidPayload;
+        }
+        if (acquired == PlanAcquireResult::FatalObserved) {
+            return BuildTicketResolveStatus::Fatal;
+        }
+    }
+
+    // Empty（或容量之外的终止票）在开放期只是 future ticket。读取 close
+    // 覆盖 producer 在 cell control 首次观察之后完成 Close 的竞态；Close
+    // 的 release 发布保证 ticket<N 时此后仍 Empty 就是真正的缺失 cell。
+    const int64_t closed = ConsumerOps::LoadControl(&view.control->closed_task_count.value);
+    if (closed == kPlanOpenTaskCount) {
+        return ConsumerOps::LoadControl(&view.control->fatal.value) == 0 ? BuildTicketResolveStatus::Pending :
+                                                                           BuildTicketResolveStatus::Fatal;
+    }
+    if (closed < 0 || closed > static_cast<int64_t>(view.capacity) ||
+        ConsumerOps::LoadControl(&view.control->fatal.value) != 0) {
+        return BuildTicketResolveStatus::Fatal;
+    }
+    if (task_id >= static_cast<uint32_t>(closed)) {
+        return BuildTicketResolveStatus::Closed;
+    }
+
+    // 第一次 cell 观察可能在线性化于本次 Close acquire 之前。Close 的
+    // release 保证 [0,N) 此时已经 Published，但 consumer 仍必须在观察
+    // 到 Close 之后重读同一 control，才能把 Empty 定性为真正缺失。
+    const PlanAcquireResult after_close =
+        AcquireRuntimeTaskPlan<ConsumerOps>(
+            view, task_id, header, layout
+        );
+    if (after_close == PlanAcquireResult::Acquired) {
+        return BuildTicketResolveStatus::Acquired;
+    }
+    if (after_close == PlanAcquireResult::InvalidControl) {
+        return BuildTicketResolveStatus::InvalidControl;
+    }
+    if (after_close == PlanAcquireResult::InvalidPayload) {
+        return BuildTicketResolveStatus::InvalidPayload;
+    }
+    if (after_close == PlanAcquireResult::FatalObserved) {
+        return BuildTicketResolveStatus::Fatal;
+    }
+    return BuildTicketResolveStatus::MissingPlanCell;
 }
 
 }  // namespace pa_scheduler::aicpu_plan

@@ -40,6 +40,29 @@ AIV_LOCAL_MEMORY_BYTES=$((224 * 1024))
 TENSORMAP_MODE="shared"
 TENSORMAP_MODE_ID=1
 TENSORMAP_RING_CAP=128
+PIPELINE_NAME="streaming-future"
+PIPELINE_POLICY_ID=1
+LAUNCH_ORDER="dual-stream-overlap"
+PRODUCER_READY="prefill"
+CONSUMER_ADMISSION="ready-future-ticket"
+case "${PA_RUNTIME_PLAN_PIPELINE_POLICY:-1}" in
+    1|streaming-future) ;;
+    *)
+        echo "ordinary SIMT requires PA_RUNTIME_PLAN_PIPELINE_POLICY=1|streaming-future." >&2
+        exit 1
+        ;;
+esac
+READY_PREFILL_TASKS="${PA_AICPU_PLAN_READY_PREFILL_TASKS:-128}"
+if [[ ! "$READY_PREFILL_TASKS" =~ ^[0-9]+$ ]] ||
+   ((READY_PREFILL_TASKS == 0 || READY_PREFILL_TASKS > 32768)); then
+    echo "PA_AICPU_PLAN_READY_PREFILL_TASKS must be an integer in [1, 32768]." >&2
+    exit 1
+fi
+PIPELINE_KEY="streaming-future-p${READY_PREFILL_TASKS}"
+PIPELINE_DEFINES=(
+    "-DPA_RUNTIME_PLAN_PIPELINE_POLICY=$PIPELINE_POLICY_ID"
+    "-DPA_AICPU_PLAN_READY_PREFILL_TASKS=$READY_PREFILL_TASKS"
+)
 SHARED_INSERT_TURN_GROUPS="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
 case "$SHARED_INSERT_TURN_GROUPS" in
     1|2|4|8|16|32|64|128) ;;
@@ -60,7 +83,7 @@ case "$BUILD_VARIANT" in
     swimlane)
         PHASE_NAME="none"
         PHASE_ID=0
-        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/swimlane"
+        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/$PIPELINE_KEY/swimlane"
         COMPACT_GENERIC_TRACE="$TENSORMAP_MODE_ID"
         VARIANT_DEFINES=(
             "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
@@ -75,7 +98,7 @@ case "$BUILD_VARIANT" in
     perf-clock)
         PHASE_NAME="none"
         PHASE_ID=0
-        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/perf-clock"
+        BUILD_DIR="$ROOT_DIR/build/ccec/$TENSORMAP_MODE/$PIPELINE_KEY/perf-clock"
         VARIANT_DEFINES=(
             "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID"
             -DPA_BUILD_SWIMLANE=0
@@ -131,8 +154,10 @@ VARIANT_DEFINES+=(
     "-DPA_RUNTIME_PLAN_BUILD_BACKEND=$RUNTIME_PLAN_BUILD_BACKEND_ID"
     "-DPA_RUNTIME_PLAN_BUILD_WORKERS=$RUNTIME_PLAN_BUILD_WORKERS"
     -DPA_CCEC_BLOCK_LOCAL_STATS=1
+    "${PIPELINE_DEFINES[@]}"
 )
 echo "[BUILD] ordinary SIMT backend W=$RUNTIME_PLAN_BUILD_WORKERS execute=$RUNTIME_PLAN_EXECUTE_WORKERS, shared insert-turn groups=$SHARED_INSERT_TURN_GROUPS"
+echo "[BUILD] pipeline=$PIPELINE_NAME launch_order=$LAUNCH_ORDER producer_ready=$PRODUCER_READY consumer_admission=$CONSUMER_ADMISSION prefill=$READY_PREFILL_TASKS"
 
 # 编译只依赖本目录源码与用户安装的 CANN/PTO 头，不引用 pa_scheduler 目录外的 simpler 构建产物。
 if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
@@ -173,6 +198,23 @@ done
 
 mkdir -p "$BUILD_DIR"
 rm -f -- "$BUILD_DIR/$ARTIFACT_MANIFEST_NAME"
+
+CLOCK_CORRELATION_HOST_TEST="$BUILD_DIR/.test_aicpu_clock_correlation"
+"$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
+    "$AICPU_DIR/test_aicpu_clock_correlation.cpp" \
+    -o "$CLOCK_CORRELATION_HOST_TEST"
+"$CLOCK_CORRELATION_HOST_TEST"
+rm -f -- "$CLOCK_CORRELATION_HOST_TEST"
+echo "[CHECK] clock-correlation interval/intersection fail-closed tests passed"
+if grep -Eq \
+        'HostMonotonicRawNanoseconds|CLOCK_MONOTONIC_RAW|pipeline_(begin|end)_raw_ns|ValidateOwnerClockBracket' \
+        "$SCALAR_CCEC_DIR/host.cpp" ||
+   grep -Eq 'pipeline_(begin|end)_raw_ns' \
+        "$AICPU_DIR/aicpu_clock_correlation_abi.h"; then
+    echo "CCEC Host/evidence must not treat Host RAW as the AICPU clock domain." >&2
+    exit 1
+fi
+echo "[CHECK] Host absolute clock is excluded from device correlation evidence"
 # 旧复制目录可能残留 PMU owner；当前两类构建主动清除，避免运行时误加载。
 rm -f \
     "$BUILD_DIR/libpa_scheduler_pmu_owner_dispatcher.so" \
@@ -218,9 +260,9 @@ AIV_STACK_FLAGS=(
 
 # direct Plan entry 不恢复旧 callback split，但 LocalStats 仍会跨 noinline
 # Build/Execute helper 传引用。CCEC 对这种栈引用没有可靠合同，因此按已验证
-# 的 A5 block-local 机制为 AIC/AIV 各保留一份精确 1152B 状态。relocate
+# 的 A5 block-local 机制为 AIC/AIV 各保留一份精确 1216B 状态。relocate
 # 让最终 mixed ELF 把两份状态排成互不重叠的连续区域。
-BLOCK_LOCAL_STATS_BYTES=1152
+BLOCK_LOCAL_STATS_BYTES=1216
 COMMON_FLAGS+=(
     -mllvm -cce-block-local-relocate=true
     -mllvm "-cce-block-local-reserve-size=$BLOCK_LOCAL_STATS_BYTES"
@@ -250,15 +292,18 @@ do
     fi
 done
 for pattern in \
+    'pa_scheduler::kRuntimePlanPipelineIsStreamingFuture,' \
     'static __simt_vf__ __aicore__ LAUNCH_BOUND(128) void' \
-    'simt::AttachClosedPlan<SimtOps>(' \
-    'simt::TakeAttachedBuildTicket<SimtOps>(' \
+    'WaitForStreamingPlanReady<SimtOps>(' \
+    'simt::ObservePlanReady<Ops>(view)' \
+    'simt::TakeOpenBuildTicket<SimtOps>(view)' \
+    'ResolveStreamingBuildTicket<SimtOps>(' \
     'runtime.BindTask(reservation.task_id)' \
     'simt::BuildCanonicalPlanTask<SimtOps>(' \
     'simt::ArriveBuilderLeaderOnce<SimtOps>(' \
     'LastInsertCompletionPublished(' \
     'simt::PublishBuildRelease<SimtOps>(' \
-    'cce::async_invoke<BuildClosedCanonicalPlanVf>(' \
+    'cce::async_invoke<BuildStreamingCanonicalPlanVf>(' \
     'wait_flag(PIPE_V, PIPE_S, EVENT_ID0);' \
     'pa_scheduler_simt_runtime_plan_preflight_aiv(state)' \
     'pa_scheduler_simt_runtime_plan_continuation_aiv(';
@@ -305,7 +350,7 @@ ordered = [
     "const uint64_t external_build_begin =",
     "AcquireBuildIdentity(state);",
     "pa_scheduler_simt_runtime_plan_preflight_aiv(state);",
-    "cce::async_invoke<BuildClosedCanonicalPlanVf>(",
+    "cce::async_invoke<BuildStreamingCanonicalPlanVf>(",
     "wait_flag(PIPE_V, PIPE_S, EVENT_ID0);",
     "const uint64_t external_build_end =",
 ]
@@ -319,6 +364,50 @@ if source.count("identity_preflight_ok == 0U") != 1:
     raise SystemExit(
         "formal VF must contain exactly one complete identity-preflight guard"
     )
+
+ready_begin = source.index("PA_DEVICE bool WaitForStreamingPlanReady(")
+ready_end = source.index("enum class StreamingTicketStatus", ready_begin)
+ready_body = source[ready_begin:ready_end]
+if ready_body.count("simt::ObservePlanReady<Ops>(view)") != 1:
+    raise SystemExit("formal Ready attach must use exactly one ABI-v3 Ready observer")
+for forbidden in (
+    "planned_frontier",
+    "view.control->fatal",
+    "view.cells[",
+    "state->fatal",
+):
+    if forbidden in ready_body:
+        raise SystemExit(
+            "formal Ready attach touched non-closed state before producer Ready: "
+            + forbidden
+        )
+
+vf_begin = source.index("BuildStreamingCanonicalPlanVf(")
+vf_end = source.index("// 该 anchor", vf_begin)
+vf_body = source[vf_begin:vf_end]
+streaming_order = [
+    "WaitForStreamingPlanReady<SimtOps>(",
+    "simt::TakeOpenBuildTicket<SimtOps>(view)",
+    "ResolveStreamingBuildTicket<SimtOps>(",
+    "ticket_status == StreamingTicketStatus::Published",
+    "simt::BuildCanonicalPlanTask<SimtOps>(",
+    "ticket_status == StreamingTicketStatus::Closed",
+    "simt::ArriveBuilderLeaderOnce<SimtOps>(",
+    "simt::PublishBuildRelease<SimtOps>(",
+]
+streaming_positions = [vf_body.index(token) for token in streaming_order]
+if streaming_positions != sorted(streaming_positions):
+    raise SystemExit(
+        "formal VF must attach Ready, hold one future ticket through Published Build, "
+        "then terminate/arrive/release"
+    )
+for forbidden in (
+    "AttachClosedPlan",
+    "TakeAttachedBuildTicket",
+    "BuildClosedCanonicalPlanVf",
+):
+    if forbidden in source:
+        raise SystemExit("formal streaming VF retains closed-Plan path: " + forbidden)
 
 for forbidden in (
     "task_id % 5",
@@ -391,6 +480,36 @@ if host.count("(void)unlink(path);") != 2:
     raise SystemExit("formal Host must unlink the temp config on write/close failure")
 PY
 
+SIMT_POLICY0_NEGATIVE_OBJECT="$BUILD_DIR/.simt_policy0_negative.o"
+SIMT_POLICY0_NEGATIVE_LOG="$BUILD_DIR/.simt_policy0_negative.log"
+rm -f -- "$SIMT_POLICY0_NEGATIVE_OBJECT" "$SIMT_POLICY0_NEGATIVE_LOG"
+set +e
+"$CCEC" "${COMMON_FLAGS[@]}" \
+    -UPA_RUNTIME_PLAN_PIPELINE_POLICY \
+    -DPA_RUNTIME_PLAN_PIPELINE_POLICY=0 \
+    "${AIV_STACK_FLAGS[@]}" \
+    --cce-aicore-arch=dav-c310-vec \
+    -o "$SIMT_POLICY0_NEGATIVE_OBJECT" \
+    "$SCRIPT_DIR/kernel.cpp" \
+    >"$SIMT_POLICY0_NEGATIVE_LOG" 2>&1
+SIMT_POLICY0_STATUS=$?
+set -e
+if [[ "$SIMT_POLICY0_STATUS" -eq 0 ]]; then
+    echo "formal SIMT kernel unexpectedly accepted PlanAheadClosed." >&2
+    rm -f -- "$SIMT_POLICY0_NEGATIVE_OBJECT" "$SIMT_POLICY0_NEGATIVE_LOG"
+    exit 1
+fi
+if ! grep -Fq \
+    "ordinary SIMT Build requires StreamingFuture Runtime Plan policy" \
+    "$SIMT_POLICY0_NEGATIVE_LOG"; then
+    echo "formal SIMT policy0 compile failed for an unexpected reason:" >&2
+    tail -n 40 "$SIMT_POLICY0_NEGATIVE_LOG" >&2
+    rm -f -- "$SIMT_POLICY0_NEGATIVE_OBJECT" "$SIMT_POLICY0_NEGATIVE_LOG"
+    exit 1
+fi
+rm -f -- "$SIMT_POLICY0_NEGATIVE_OBJECT" "$SIMT_POLICY0_NEGATIVE_LOG"
+echo "[EXPECTED REJECTION] formal SIMT kernel rejects PlanAheadClosed"
+
 # 正式 shared PA entry 已实例化 ordered writer-delta 路径；reader
 # progress/reclaim 与旧 WriterIntentSet 仍只保留为隔离协议原语。构建
 # 额外对这些模板做真实后端代码生成和静态链接，分别锁定 cube/vector
@@ -435,6 +554,60 @@ PY
         -o "$SHARED_PROTOCOL_PROBE_AIV_ELF" \
         "$SHARED_PROTOCOL_PROBE_AIV_OBJECT"
 )
+
+# 与 Scalar backend 共用同一份正式四时间戳 capture 协议。独立 AIV ELF
+# 不进入 SIMT mixed image；Host 仅在泳道 JSON 前后使用它。
+CLOCK_CORRELATION_OBJECT="$BUILD_DIR/pa_scheduler_clock_correlation_aiv.o"
+CLOCK_CORRELATION_ELF="$BUILD_DIR/pa_scheduler_clock_correlation_kernel.o"
+CLOCK_CORRELATION_ENTRY="pa_clock_correlation_0_mix_aiv"
+echo "[BUILD] standalone AICPU/AICore clock-correlation AIV"
+"$CCEC" \
+    -c -O3 -g -x cce -Wall -Werror -std=c++17 \
+    --cce-aicore-only \
+    --cce-aicore-arch=dav-c310-vec \
+    -mllvm -cce-aicore-stack-size=0x8000 \
+    -mllvm -cce-aicore-function-stack-size=0x8000 \
+    -mllvm -cce-aicore-record-overflow=false \
+    -mllvm -cce-aicore-addr-transform \
+    -mllvm -cce-aicore-dcci-insert-for-scalar=false \
+    -mllvm -cce-aicore-dcci-before-kernel-end=false \
+    -I"$PTO_INCLUDE_ROOT/include" \
+    -o "$CLOCK_CORRELATION_OBJECT" \
+    "$SCALAR_CCEC_DIR/clock_correlation_kernel.cpp"
+"$LD" -m aicorelinux -Ttext=0 -static \
+    -o "$CLOCK_CORRELATION_ELF" "$CLOCK_CORRELATION_OBJECT"
+CLOCK_CORRELATION_SYMBOLS="$(
+    "$READELF_BIN" --symbols --wide --sym-base=10 \
+        "$CLOCK_CORRELATION_ELF"
+)"
+CLOCK_CORRELATION_SECTIONS="$(
+    "$READELF_BIN" --sections --wide "$CLOCK_CORRELATION_ELF"
+)"
+if ! awk -v name="$CLOCK_CORRELATION_ENTRY" \
+    '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" &&
+     $NF == name && $3 + 0 > 0 {count++}
+     END {exit count != 1}' <<<"$CLOCK_CORRELATION_SYMBOLS" ||
+   [[ "$CLOCK_CORRELATION_SECTIONS" != *".ascend.meta.$CLOCK_CORRELATION_ENTRY"* ]]; then
+    echo "Clock-correlation ELF is missing its sole non-empty AIV entry/metadata." >&2
+    exit 1
+fi
+if [[ -n "$(
+    "$READELF_BIN" --relocs --wide "$CLOCK_CORRELATION_ELF" |
+        sed -n '/Relocation section/p'
+)" ]]; then
+    echo "Clock-correlation ELF must not retain relocations." >&2
+    exit 1
+fi
+while IFS= read -r global_func; do
+    if [[ "$global_func" != "$CLOCK_CORRELATION_ENTRY" ]]; then
+        echo "Unexpected GLOBAL clock-correlation device function: $global_func" >&2
+        exit 1
+    fi
+done < <(
+    awk '$4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" {print $NF}' \
+        <<<"$CLOCK_CORRELATION_SYMBOLS"
+)
+echo "[CHECK] standalone clock-correlation entry/metadata/closure gates passed"
 
 # AIC 复用 Scalar 正式入口；AIV 拆成一个只含 hidden continuation 的
 # Scalar identity object，以及唯一拥有 global AIV entry/SIMT VF 的 object。
@@ -494,9 +667,11 @@ echo "[BUILD] optimized formal AIV entry/continuation LLVM bitcode"
     "$BUILD_DIR/pa_scheduler_aiv_continuation.bc.dump"
 
 for symbol in \
-    'BuildClosedCanonicalPlanVf' \
-    'AttachClosedPlan' \
-    'TakeAttachedBuildTicket' \
+    'BuildStreamingCanonicalPlanVf' \
+    'WaitForStreamingPlanReady' \
+    'ObservePlanReady' \
+    'TakeOpenBuildTicket' \
+    'ResolveStreamingBuildTicket' \
     'BindTask' \
     'BuildCanonicalPlanTask' \
     'ArriveBuilderLeaderOnce' \
@@ -517,6 +692,16 @@ do
         exit 1
     fi
 done
+for forbidden in \
+    'BuildClosedCanonicalPlanVf' \
+    'AttachClosedPlan' \
+    'TakeAttachedBuildTicket';
+do
+    if grep -Fq "$forbidden" "$BUILD_DIR/pa_scheduler_aiv_entry.bc.dump"; then
+        echo "formal streaming SIMT AIV IR retains closed-Plan symbol: $forbidden" >&2
+        exit 1
+    fi
+done
 for symbol in \
     'pa_scheduler_simt_runtime_plan_preflight_aiv' \
     'pa_scheduler_simt_runtime_plan_continuation_aiv' \
@@ -528,7 +713,7 @@ do
         exit 1
     fi
 done
-echo "[CHECK] optimized IR retains full SIMT Build and Scalar continuation"
+echo "[CHECK] optimized IR retains full streaming SIMT Build and Scalar continuation"
 
 check_workload_dispatcher_object() {
     local object_path="$1"
@@ -603,7 +788,7 @@ DEVICE_OBJECTS=(
     "$BUILD_DIR/pa_scheduler_aiv_continuation.o"
     "$BUILD_DIR/pa_scheduler_aiv_entry.o"
 )
-echo "[CHECK] closed-Plan build uses AIC + hidden AIV continuation + unique SIMT AIV entry"
+echo "[CHECK] streaming-Plan build uses AIC + hidden AIV continuation + unique SIMT AIV entry"
 
 # 静态链接把两个 device object 合成一个可由 runtime 按 1:2 比例启动的 mixed AICore ELF。
 echo "[BUILD] Static 1:2 mixed AICore ELF"
@@ -670,7 +855,7 @@ do
 done
 if ! awk \
     '$4 == "FUNC" && $5 == "LOCAL" && $7 != "UND" &&
-     $NF ~ /BuildClosedCanonicalPlanVf.*_simt_entry$/ &&
+     $NF ~ /BuildStreamingCanonicalPlanVf.*_simt_entry$/ &&
      $3 + 0 > 0 {count++}
      END {exit count != 1}' <<<"$SYMBOL_TABLE"; then
     echo "final ELF must retain one non-empty LOCAL 128-thread Build VF." >&2
@@ -787,17 +972,17 @@ if ((16#$aic_stats_offset != 0)) ||
    ((16#$aiv_stats_offset != BLOCK_LOCAL_STATS_BYTES)) ||
    ((16#$final_block_local_size_hex != 2 * BLOCK_LOCAL_STATS_BYTES)) ||
    ((final_block_local_alignment != 64)); then
-    echo "Final mixed ELF must contain two non-overlapping 1152B role-local LocalStats objects." >&2
+    echo "Final mixed ELF must contain two non-overlapping 1216B role-local LocalStats objects." >&2
     exit 1
 fi
 echo "[CHECK] final mixed ELF keeps two non-overlapping block-local LocalStats objects"
 
 if [[ -n "$("$READELF_BIN" --relocs --wide "$BUILD_DIR/pa_scheduler_kernel.o" |
       sed -n '/Relocation section/p')" ]]; then
-    echo "Final closed-Plan mixed ELF must not retain relocations." >&2
+    echo "Final streaming-Plan mixed ELF must not retain relocations." >&2
     exit 1
 fi
-echo "[CHECK] final closed-Plan ELF has no relocations"
+echo "[CHECK] final streaming-Plan ELF has no relocations"
 
 # AICPU owner 独立编译真实 PA orchestration。Host 只把通用输入元数据和
 # 空 Plan 存储地址交给它；task identity 只能由 callback backend 产生。
@@ -821,6 +1006,7 @@ echo "[BUILD] AICPU real-PA Plan owner"
     -DPTO_FDWIC_SHARED_MAP=1 -DPTO_FDWIC_SCHEDULER_MODE=1 \
     "-DPA_RUNTIME_PLAN_BUILD_BACKEND=$RUNTIME_PLAN_BUILD_BACKEND_ID" \
     "-DPA_RUNTIME_PLAN_BUILD_WORKERS=$RUNTIME_PLAN_BUILD_WORKERS" \
+    "${PIPELINE_DEFINES[@]}" \
     "${AICPU_COMMON_INCLUDES[@]}" \
     -shared -Wl,-z,defs -Wl,--build-id \
     "$PA_ORCHESTRATION_SOURCE" \
@@ -884,13 +1070,33 @@ echo "[BUILD] CCEC host runner"
     -ldl \
     -o "$BUILD_DIR/pa_scheduler_host"
 
+if [[ "$BUILD_VARIANT" == "swimlane" ]]; then
+    JOINT_ANALYZE_REJECTION_LOG="$BUILD_DIR/.joint_analyze_rejection.log"
+    if "$BUILD_DIR/pa_scheduler_host" \
+            --kernel "$BUILD_DIR/pa_scheduler_kernel.o" \
+            --analyze-swimlane \
+            >"$JOINT_ANALYZE_REJECTION_LOG" 2>&1 ||
+       ! grep -Fq \
+            "use --swimlane-json and the ordinary offline joint AICPU/AICore analyzer" \
+            "$JOINT_ANALYZE_REJECTION_LOG"; then
+        echo "CCEC swimlane Host must reject the legacy AICore-only analyzer." >&2
+        rm -f -- "$JOINT_ANALYZE_REJECTION_LOG"
+        exit 1
+    fi
+    rm -f -- "$JOINT_ANALYZE_REJECTION_LOG"
+    echo "[EXPECTED REJECTION] CCEC Host forbids legacy AICore-only analysis"
+fi
+
 # host、kernel、AICPU owner 与 dispatcher 全部成功后才发布统一
-# manifest。v6 同时固化 closed-Plan ABI、producer 入口、SIMT backend、
+# manifest。v9 同时固化 streaming-Plan ABI、producer 入口、pipeline、
+# 独立 clock-correlation 四时间戳协议、
+# policy、SIMT backend、
 # 四个 Build leader 与最终 96 Scalar Execute population；
 # run.sh 只消费带完整 manifest 的目录，因此中断重编不会混用新旧镜像。
 ARTIFACTS=(
     pa_scheduler_host
     pa_scheduler_kernel.o
+    pa_scheduler_clock_correlation_kernel.o
     libpa_scheduler_plan_aicpu.so
     libpa_scheduler_plan_dispatcher.so
 )
@@ -914,7 +1120,7 @@ cleanup_manifest_tmp() {
 }
 trap cleanup_manifest_tmp EXIT
 {
-    printf '# schema=pa_scheduler_artifacts/v6\n'
+    printf '# schema=pa_scheduler_artifacts/v9\n'
     printf '# tensormap_mode=%s\n' "$TENSORMAP_MODE"
     printf '# tensormap_mode_id=%u\n' "$TENSORMAP_MODE_ID"
     printf '# tensormap_ring_cap=%u\n' "$TENSORMAP_RING_CAP"
@@ -931,11 +1137,16 @@ trap cleanup_manifest_tmp EXIT
     printf '# variant=%s\n' "$BUILD_VARIANT"
     printf '# phase=%s\n' "$PHASE_NAME"
     printf '# phase_id=%u\n' "$PHASE_ID"
-    printf '# runtime_plan_abi=%u\n' 2
+    printf '# runtime_plan_abi=%u\n' 3
     printf '# runtime_plan_cell_bytes=%u\n' 4608
     printf '# runtime_plan_capacity=%u\n' 4352
     printf '# plan_owner_entry=%s\n' plan_protocol_aicpu_exec
-    printf '# scheduler_input=%s\n' aicpu_closed_runtime_plan
+    printf '# scheduler_input=%s\n' aicpu_streaming_runtime_plan
+    printf '# pipeline=%s\n' "$PIPELINE_NAME"
+    printf '# launch_order=%s\n' "$LAUNCH_ORDER"
+    printf '# producer_ready=%s\n' "$PRODUCER_READY"
+    printf '# consumer_admission=%s\n' "$CONSUMER_ADMISSION"
+    printf '# prefill=%u\n' "$READY_PREFILL_TASKS"
     printf '# runtime_plan_build_backend=%s\n' \
         "$RUNTIME_PLAN_BUILD_BACKEND"
     printf '# runtime_plan_build_backend_id=%u\n' \
@@ -946,6 +1157,9 @@ trap cleanup_manifest_tmp EXIT
         "$RUNTIME_PLAN_BUILD_LEADERS"
     printf '# runtime_plan_execute_workers=%u\n' \
         "$RUNTIME_PLAN_EXECUTE_WORKERS"
+    printf '# clock_correlation_abi=%u\n' 2
+    printf '# clock_correlation_samples=%u\n' 8
+    printf '# clock_correlation_max_alignment_error_ns=%u\n' 50000
     (cd "$BUILD_DIR" && sha256sum "${ARTIFACTS[@]}")
 } > "$MANIFEST_TMP"
 mv -f -- "$MANIFEST_TMP" "$MANIFEST_PATH"

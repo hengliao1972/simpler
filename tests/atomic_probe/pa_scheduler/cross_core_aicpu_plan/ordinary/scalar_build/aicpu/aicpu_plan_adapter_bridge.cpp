@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "../../../common/runtime_plan_pipeline_policy.h"
 #include "../common/aicpu_plan_pa_adapter.h"
 
 namespace {
@@ -98,48 +99,140 @@ struct AicpuProducerOps {
     }
 };
 
-// staging 仅位于 AICPU 私有内存，不需要 cache 操作，也不发布 control。
-struct StagingOps {
-    static void StorePayloadWord(volatile uint64_t *address, uint64_t value)
-    {
-        *address = value;
-    }
+// UP 的 has-following/last-in-batch 只有下一个真实 Begin（或
+// close）到来后才能确定。Finish callback 里的 L0TaskArgs 及其指向的
+// descriptor 都属于 orchestration 栈，不能把指针留到下一个 Begin。
+// 所以 Finish 趁 callback 仍存活时把 canonical payload 唯一一次
+// Pack 到目标 GM cell，但保持 cell control=Empty 且不 clean payload。
+// 下一个 Begin/close 只补上最终 flags，校验最终 GM wire，再执行
+// payload clean -> barrier -> cell Published。consumer 永远不会读
+// Empty cell 的 payload，而 backend 也不再保留任何 callback 指针。
+constexpr uint64_t kStagedPlanMetadataMagic = 0x5041535441470001ULL;
+
+struct StagedPlanMetadata {
+    uint64_t magic;
+    RuntimeTaskPlanHeader provisional_header;
+    uint32_t payload_lines;
+    uint16_t output_count;
+    uint16_t reserved;
 };
 
-struct StagedPlanSource {
-    const RuntimeTaskPlanCell &cell;
-    RuntimeTaskPlanHeader header;
-    RuntimeTaskPlanLayout layout;
+static_assert(
+    sizeof(StagedPlanMetadata) <= kAtomicIsolationBytes,
+    "staged PA metadata unexpectedly exceeds one isolated line"
+);
 
-    TensorTag TensorTagAt(uint32_t tensor) const
-    {
-        return static_cast<TensorTag>(header.tensor_tags[tensor]);
+bool HeaderMatchesExpected(
+    const RuntimeTaskPlanHeader &header,
+    const RuntimeTaskPlanHeader &expected
+)
+{
+    if (header.task_id != expected.task_id ||
+        header.function_id != expected.function_id ||
+        header.tensor_count != expected.tensor_count ||
+        header.scalar_count != expected.scalar_count ||
+        header.explicit_dep_count != expected.explicit_dep_count ||
+        header.output_count != expected.output_count ||
+        header.engine_class != expected.engine_class ||
+        header.adapter_flags != expected.adapter_flags ||
+        header.core_num != expected.core_num ||
+        header.require_sync_start != expected.require_sync_start ||
+        header.reserved0 != expected.reserved0 ||
+        header.adapter_data != expected.adapter_data ||
+        header.tensor_reference_mask != expected.tensor_reference_mask ||
+        header.abi_version != expected.abi_version) {
+        return false;
+    }
+    for (uint32_t tensor = 0U;
+         tensor < aicpu_plan::kMaxTaskTensors; ++tensor) {
+        if (header.tensor_tags[tensor] != expected.tensor_tags[tensor]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+PlanPublishResult FinalizeStagedPlan(
+    const RuntimePlanView &view, const StagedPlanMetadata &metadata,
+    uint8_t final_adapter_flags
+)
+{
+    const uint32_t task_id = metadata.provisional_header.task_id;
+    if (view.control == nullptr || view.cells == nullptr ||
+        task_id >= view.capacity ||
+        AicpuProducerOps::LoadControl(&view.control->fatal.value) != 0 ||
+        AicpuProducerOps::LoadControl(
+            &view.cells[task_id].control.value
+        ) != 0) {
+        return PlanPublishResult::CellUnavailable;
+    }
+    const int64_t closed = AicpuProducerOps::LoadControl(
+        &view.control->closed_task_count.value
+    );
+    if (closed != kPlanProducerNotReadyTaskCount &&
+        closed != kPlanOpenTaskCount) {
+        return PlanPublishResult::CellUnavailable;
+    }
+    const int64_t frontier = AicpuProducerOps::LoadControl(
+        &view.control->planned_frontier.value
+    );
+    if (frontier < 0 || frontier > static_cast<int64_t>(task_id)) {
+        return PlanPublishResult::CellUnavailable;
+    }
+    if (static_cast<int64_t>(task_id) > frontier) {
+        const uint32_t predecessor = task_id - 1U;
+        const DecodedPlanCellControl decoded = DecodePlanCellControl(
+            AicpuProducerOps::LoadControl(
+                &view.cells[predecessor].control.value
+            )
+        );
+        if (!decoded.valid ||
+            decoded.phase != PlanCellPhase::Published ||
+            decoded.task_id != predecessor) {
+            return PlanPublishResult::CellUnavailable;
+        }
     }
 
-    bool TensorIsReference(uint32_t tensor) const
-    {
-        return (header.tensor_reference_mask & (uint32_t{1} << tensor)) != 0U;
+    RuntimeTaskPlanCell &cell = view.cells[task_id];
+    RuntimeTaskPlanHeader expected = metadata.provisional_header;
+    expected.adapter_flags = final_adapter_flags;
+    AicpuProducerOps::StorePayloadWord(
+        &cell.payload.words[2],
+        RuntimeTaskPlanHeaderWord(expected, 2U)
+    );
+
+    // control 发布前对最终 GM wire 本身做完整校验。这不是
+    // 对 staging 副本的替代校验；consumer 之后 acquire 到的就是
+    // 此处校验的同一份 bytes。
+    RuntimeTaskPlanHeader header{};
+    RuntimeTaskPlanLayout validated_layout{};
+    if (!ValidateRuntimeTaskPlanPayload(
+            cell.payload, task_id, metadata.payload_lines,
+            header, validated_layout
+        ) ||
+        validated_layout.payload_lines != metadata.payload_lines ||
+        !HeaderMatchesExpected(header, expected) ||
+        !ValidatePaAdapterMetadata(
+            header.task_id,
+            static_cast<EngineClass>(header.engine_class),
+            header.adapter_flags, header.adapter_data
+        )) {
+        return PlanPublishResult::InvalidInput;
     }
 
-    uint64_t TensorWord(uint32_t tensor, uint32_t word) const
-    {
-        uint32_t offset = 0U;
-        if (!RuntimeTaskPlanTensorWordOffset(header, tensor, offset)) return 0U;
-        return cell.payload.words[offset + word];
-    }
-
-    uint64_t Scalar(uint32_t scalar) const
-    {
-        return cell.payload.words[layout.scalar_word_offset + scalar];
-    }
-
-    uint64_t ExplicitDependency(uint32_t dependency) const
-    {
-        return cell.payload.words[
-            layout.explicit_dep_word_offset + dependency
-        ];
-    }
-};
+    AicpuProducerOps::FlushRegion(
+        &cell.payload,
+        metadata.payload_lines * kPlanCacheLineBytes
+    );
+    AicpuProducerOps::StoreBarrier();
+    AicpuProducerOps::PublishControl(
+        &cell.control.value,
+        static_cast<int64_t>(EncodePlanCellControl(
+            PlanCellPhase::Published, metadata.payload_lines, task_id
+        ))
+    );
+    return PlanPublishResult::Published;
+}
 
 bool MakeView(
     void *control, void *cells, uint32_t capacity,
@@ -173,6 +266,15 @@ extern "C" int32_t aicpu_plan_adapter_initialize(
 {
     RuntimePlanView view{};
     if (!MakeView(control, cells, capacity, view)) return -1;
+    // Host 在启动 producer 前已把 closed 置为 NotReady。StreamingFuture
+    // 下 AICore 可能已经在另一条 stream 轮询；PlanAheadClosed 下虽然尚未
+    // 启动 AICore，也沿用同一安全复用协议。不能对 closed line 做 civac
+    // （它可能把旧 N 写回 GM）；用 ordinary store 覆盖本地 stale value
+    // 并精确 clean，保证 initialize 失败能从 -2 发布为 -3 ReadyFailed。
+    AicpuProducerOps::PublishControl(
+        &view.control->closed_task_count.value,
+        kPlanProducerNotReadyTaskCount
+    );
     // 同一 storage 的上一轮 Published control 可能仍以 clean-valid 形式
     // 留在 AICPU cache，而本轮 Host aclrtMemset 不会 snoop 它。必须先把
     // 所有 control 的第一条 64B line 丢弃，统一完成 cache maintenance，
@@ -191,11 +293,17 @@ extern "C" int32_t aicpu_plan_adapter_initialize(
         if (AicpuProducerOps::LoadControl(
                 &view.cells[task].control.value
             ) != 0) {
+            (void)PublishRuntimePlanReadyFailed<AicpuProducerOps>(view);
             return -2;
         }
     }
     view.control->planned_frontier.value = 0;
-    view.control->closed_task_count.value = kPlanOpenTaskCount;
+    // StreamingFuture consumer 在 cell control 的 civac+Empty 校验完成前
+    // 只允许轮询 closed line；PlanAheadClosed consumer 尚未启动。两条
+    // policy 都先保持 NotReady、完成其余 control 的 reset+clean，再在
+    // NotReady 下生产 cell。
+    view.control->closed_task_count.value =
+        kPlanProducerNotReadyTaskCount;
     view.control->build_next.value = 0;
     view.control->build_workers_done.value = 0;
     view.control->build_release.value = kBuildReleasePending;
@@ -205,20 +313,71 @@ extern "C" int32_t aicpu_plan_adapter_initialize(
 #if defined(__aarch64__)
     __asm__ volatile("isb" ::: "memory");
 #endif
+    // 初始化成功后仍保持 NotReady。两种长期保留的 pipeline policy
+    // 都允许 producer 在该状态下顺序发布 cell；PlanAheadClosed 直到
+    // Close 才开放，StreamingFuture 则可在连续前缀达到门槛后开放。
+    if (!RuntimePlanCanPublishReady<AicpuProducerOps>(view)) {
+        (void)PublishRuntimePlanReadyFailed<AicpuProducerOps>(view);
+        return -3;
+    }
     return 0;
 }
 
 extern "C" int32_t aicpu_plan_adapter_stage(
+    void *control, void *cells, uint32_t capacity,
     const void *l0_task_args, uint32_t task_id, int32_t function_id,
     uint8_t engine_class, uint8_t provisional_adapter_flags,
     uint32_t batch_start,
-    void *staged_cell, uint32_t *payload_lines, uint16_t *output_count
+    void *staged_metadata, uint32_t *payload_lines,
+    uint16_t *output_count
 )
 {
-    if (l0_task_args == nullptr || staged_cell == nullptr ||
-        payload_lines == nullptr || output_count == nullptr ||
+    if (staged_metadata == nullptr) return -1;
+    auto &metadata =
+        *static_cast<StagedPlanMetadata *>(staged_metadata);
+    // 先撤销旧 magic，包括其他入参在早期校验就失败的
+    // 路径；失败返回后任何旧 pending metadata 都不得被复用。
+    metadata.magic = 0U;
+    if (l0_task_args == nullptr || payload_lines == nullptr ||
+        output_count == nullptr ||
         engine_class > static_cast<uint8_t>(EngineClass::Aiv)) {
         return -1;
+    }
+
+    RuntimePlanView view{};
+    if (!MakeView(control, cells, capacity, view) ||
+        task_id >= view.capacity ||
+        AicpuProducerOps::LoadControl(&view.control->fatal.value) != 0 ||
+        AicpuProducerOps::LoadControl(
+            &view.cells[task_id].control.value
+        ) != 0) {
+        return -2;
+    }
+    const int64_t closed = AicpuProducerOps::LoadControl(
+        &view.control->closed_task_count.value
+    );
+    if (closed != kPlanProducerNotReadyTaskCount &&
+        closed != kPlanOpenTaskCount) {
+        return -2;
+    }
+    const int64_t frontier = AicpuProducerOps::LoadControl(
+        &view.control->planned_frontier.value
+    );
+    if (frontier < 0 || frontier > static_cast<int64_t>(task_id)) {
+        return -2;
+    }
+    if (static_cast<int64_t>(task_id) > frontier) {
+        const uint32_t predecessor = task_id - 1U;
+        const DecodedPlanCellControl decoded = DecodePlanCellControl(
+            AicpuProducerOps::LoadControl(
+                &view.cells[predecessor].control.value
+            )
+        );
+        if (!decoded.valid ||
+            decoded.phase != PlanCellPhase::Published ||
+            decoded.task_id != predecessor) {
+            return -2;
+        }
     }
 
     // 真实 L0TaskArgs 与 standalone TaskArgs 均有独立的 layout static_assert。
@@ -233,16 +392,28 @@ extern "C" int32_t aicpu_plan_adapter_stage(
             static_cast<EngineClass>(engine_class),
             provisional_adapter_flags, batch_start, spec
         )) {
-        return -2;
-    }
-
-    auto *staged = static_cast<RuntimeTaskPlanCell *>(staged_cell);
-    std::memset(staged, 0, sizeof(*staged));
-    RuntimeTaskPlanLayout layout{};
-    const PaRuntimeTaskPlanSource source{args};
-    if (!PackRuntimeTaskPlan<StagingOps>(*staged, spec, source, layout)) {
         return -3;
     }
+
+    RuntimeTaskPlanLayout layout{};
+    const PaRuntimeTaskPlanSource source{args};
+    if (!PackRuntimeTaskPlan<AicpuProducerOps>(
+            view.cells[task_id], spec, source, layout
+        )) {
+        // Pack 中途失败只会留下不可见 payload；control 仍为
+        // Empty，FinishTask 会立即发布 fatal，consumer 不会 acquire。
+        return -4;
+    }
+
+    metadata.provisional_header = DecodeRuntimeTaskPlanHeader(
+        view.cells[task_id].payload
+    );
+    metadata.payload_lines = layout.payload_lines;
+    metadata.output_count = spec.output_count;
+    metadata.reserved = 0U;
+    // magic 最后写，防止中途失败的未发布 GM payload 被下一个
+    // Begin 误当成完整 pending task。
+    metadata.magic = kStagedPlanMetadataMagic;
     *payload_lines = layout.payload_lines;
     *output_count = spec.output_count;
     return 0;
@@ -250,58 +421,83 @@ extern "C" int32_t aicpu_plan_adapter_stage(
 
 extern "C" int32_t aicpu_plan_adapter_publish_staged(
     void *control, void *cells, uint32_t capacity,
-    const void *staged_cell, uint32_t payload_lines,
+    const void *staged_metadata, uint32_t payload_lines,
     uint8_t final_adapter_flags
 )
 {
-    if (staged_cell == nullptr || payload_lines == 0U ||
+    if (staged_metadata == nullptr || payload_lines == 0U ||
         payload_lines > kMaxPlanPayloadLines) {
         return -1;
     }
     RuntimePlanView view{};
     if (!MakeView(control, cells, capacity, view)) return -2;
 
-    const auto &staged =
-        *static_cast<const RuntimeTaskPlanCell *>(staged_cell);
-    RuntimeTaskPlanHeader header{};
-    RuntimeTaskPlanLayout layout{};
-    if (!ValidateRuntimeTaskPlanPayload(
-            staged.payload,
-            DecodeRuntimeTaskPlanHeader(staged.payload).task_id,
-            payload_lines, header, layout
-        )) {
+    const auto &metadata =
+        *static_cast<const StagedPlanMetadata *>(staged_metadata);
+    const RuntimeTaskPlanHeader &provisional =
+        metadata.provisional_header;
+    if (metadata.magic != kStagedPlanMetadataMagic ||
+        metadata.reserved != 0U ||
+        metadata.payload_lines != payload_lines ||
+        metadata.output_count != provisional.output_count ||
+        provisional.task_id >= capacity ||
+        provisional.tensor_count > aicpu_plan::kMaxTaskTensors ||
+        provisional.scalar_count > aicpu_plan::kMaxTaskScalars ||
+        provisional.explicit_dep_count >
+            aicpu_plan::kMaxExplicitDependencies ||
+        provisional.abi_version != kRuntimePlanAbiVersion) {
         return -3;
     }
-    const EngineClass engine = static_cast<EngineClass>(header.engine_class);
+
+    const EngineClass engine =
+        static_cast<EngineClass>(provisional.engine_class);
     if (!ValidatePaAdapterMetadata(
-            header.task_id, engine, final_adapter_flags,
-            header.adapter_data
+            provisional.task_id, engine, final_adapter_flags,
+            provisional.adapter_data
         )) {
         return -4;
     }
 
-    const RuntimeTaskPlanSpec spec{
-        header.task_id,
-        header.function_id,
-        header.tensor_count,
-        header.scalar_count,
-        header.explicit_dep_count,
-        header.output_count,
-        engine,
-        final_adapter_flags,
-        header.core_num,
-        header.require_sync_start,
-        0U,
-        header.adapter_data,
-        header.tensor_reference_mask,
-    };
-    const StagedPlanSource source{staged, header, layout};
-    if (PublishRuntimeTaskPlan<AicpuProducerOps>(view, spec, source) !=
+    if (FinalizeStagedPlan(
+            view, metadata, final_adapter_flags
+        ) !=
         PlanPublishResult::Published) {
         return -5;
     }
-    if (!AdvancePlannedFrontier<AicpuProducerOps>(view, header.task_id)) {
-        return -6;
+    // frontier 只是已发布连续前缀的保守摘要。consumer 的
+    // future-ticket 直接观察 cell control，所以在真实 batch 尾一次
+    // 验证 [batch_start, task_id] 后跳进，避免每 task 一次
+    // frontier cvac+dsb+isb。batch_start 来自 Alloc callback provenance。
+    if ((final_adapter_flags & kSharedPaTicketLastSubmit) != 0U) {
+        const uint32_t new_frontier = provisional.task_id + 1U;
+        if (!AdvancePlannedFrontierTo<AicpuProducerOps>(
+                view, provisional.adapter_data, new_frontier
+            )) {
+            return -6;
+        }
+        // StreamingFuture 的 Ready 只在真实 batch 边界发布，因此
+        // 阈值128的G1序列会在连续 frontier=130 时 Open。PlanAheadClosed
+        // 在整个生产期都保持 -2；两条路径的短 Plan 都由 close helper
+        // 完成同一 Ready -> Closed(N) 握手。
+        const int64_t closed = AicpuProducerOps::LoadControl(
+            &view.control->closed_task_count.value
+        );
+        if constexpr (kRuntimePlanPipelineIsStreamingFuture) {
+            if (new_frontier >= kRuntimePlanReadyPrefillTasks) {
+                if (closed == kPlanProducerNotReadyTaskCount) {
+                    if (!PublishRuntimePlanReady<AicpuProducerOps>(view)) {
+                        return -7;
+                    }
+                } else if (closed != kPlanOpenTaskCount) {
+                    return -7;
+                }
+            } else if (closed != kPlanProducerNotReadyTaskCount &&
+                       closed != kPlanOpenTaskCount) {
+                return -7;
+            }
+        } else {
+            if (closed != kPlanProducerNotReadyTaskCount) return -7;
+        }
     }
     return 0;
 }
@@ -313,13 +509,37 @@ extern "C" int32_t aicpu_plan_adapter_close(
 {
     RuntimePlanView view{};
     if (!MakeView(control, cells, capacity, view)) return -1;
+    if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
+        // 串行 policy 在 Close 前不允许任何 Build consumer 已经启动。
+        if (AicpuProducerOps::LoadControl(
+                &view.control->build_next.value
+            ) != 0 ||
+            AicpuProducerOps::LoadControl(
+                &view.control->build_workers_done.value
+            ) != 0) {
+            return -3;
+        }
+    }
+    const int64_t closed = AicpuProducerOps::LoadControl(
+        &view.control->closed_task_count.value
+    );
+    if (closed == kPlanProducerNotReadyTaskCount) {
+        // PlanAheadClosed 的任意 N，以及 StreamingFuture 的短 Plan，在
+        // 这里先发布 Open，再用下一次独立 control 发布 Close(N)。串行
+        // consumer 此时尚未启动；并发 consumer 可观察任一中间状态，
+        // 都不会触碰 initialize 仍在维护的 cell。
+        if (!PublishRuntimePlanReady<AicpuProducerOps>(view)) return -2;
+    } else if (closed != kPlanOpenTaskCount) {
+        return -2;
+    }
     return CloseRuntimePlan<AicpuProducerOps>(view, final_task_count)
         ? 0
-        : -2;
+        : -3;
 }
 
 extern "C" void aicpu_plan_adapter_publish_fatal(
-    void *control, int64_t error_code
+    void *control, void *cells, uint32_t capacity,
+    int64_t error_code
 )
 {
     if (control == nullptr || error_code == 0) return;
@@ -327,4 +547,8 @@ extern "C" void aicpu_plan_adapter_publish_fatal(
     AicpuProducerOps::PublishControl(
         &plan_control->fatal.value, error_code
     );
+    RuntimePlanView view{};
+    if (MakeView(control, cells, capacity, view)) {
+        (void)PublishRuntimePlanReadyFailed<AicpuProducerOps>(view);
+    }
 }

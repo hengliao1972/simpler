@@ -295,7 +295,7 @@ static_assert(
     "probe must retain the real shared SubmitContext frame"
 );
 static_assert(
-    sizeof(pa_scheduler::LocalStats) == 1152U,
+    sizeof(pa_scheduler::LocalStats) == 1216U,
     "probe must retain the real trace-free LocalStats frame"
 );
 

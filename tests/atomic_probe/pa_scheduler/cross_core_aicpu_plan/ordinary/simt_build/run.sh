@@ -11,7 +11,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PA_SCHEDULER_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# SIMT 与 Scalar 必须消费同一套 ordinary 专用 converter/analyzer；不能
+# 回退到 pa_scheduler 根目录下语义不同的历史工具。
+PA_SCHEDULER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../../.." && pwd)"
 SCALAR_ROOT="$(cd "$SCRIPT_DIR/../scalar_build" && pwd)"
 TENSORMAP_MODE="shared"
@@ -27,13 +29,16 @@ Usage:
   ./run.sh verify           ccec [swimlane|perf-clock]
   ./run.sh perf-clock       ccec [benchmark options]
 
-本目录固定为 AICPU closed Plan + ordinary TensorMap + SIMT Build：
+本目录固定为 AICPU streaming-future Plan + ordinary TensorMap + SIMT Build：
   - AICPU producer 只发布 canonical Plan，不发布 Host task identity；
   - AIV0 启动 128-thread VF，四个 warp leader 动态领取 Build ticket；
   - VF join 后，32 AIC + 64 AIV Scalar 共同 Execute/FinalDrain；
   - 当前只提供 CCEC 正式模式；CPU 测试是 build.sh 的可行性门槛。
+  - A/B 主口径是 pipeline_e2e；aicore_time_us 包含 Host 先等
+    Plan stream 的时间，只是 AICore 上界。
 
 PA_SHARED_INSERT_TURN_GROUPS 可选 1|2|4|8|16|32|64|128（默认 1）。
+SIMT 正式路径固定 PA_RUNTIME_PLAN_PIPELINE_POLICY=1，prefill 默认 128。
 EOF
 }
 
@@ -54,6 +59,27 @@ validate_groups() {
     esac
 }
 
+resolve_pipeline_policy() {
+    case "${PA_RUNTIME_PLAN_PIPELINE_POLICY:-1}" in
+        1|streaming-future) ;;
+        *)
+            echo "ordinary SIMT requires PA_RUNTIME_PLAN_PIPELINE_POLICY=1|streaming-future." >&2
+            exit 1
+            ;;
+    esac
+    PIPELINE_NAME="streaming-future"
+    LAUNCH_ORDER="dual-stream-overlap"
+    PRODUCER_READY="prefill"
+    CONSUMER_ADMISSION="ready-future-ticket"
+    READY_PREFILL_TASKS="${PA_AICPU_PLAN_READY_PREFILL_TASKS:-128}"
+    if [[ ! "$READY_PREFILL_TASKS" =~ ^[0-9]+$ ]] ||
+       ((READY_PREFILL_TASKS == 0 || READY_PREFILL_TASKS > 32768)); then
+        echo "PA_AICPU_PLAN_READY_PREFILL_TASKS must be an integer in [1, 32768]." >&2
+        exit 1
+    fi
+    PIPELINE_KEY="streaming-future-p${READY_PREFILL_TASKS}"
+}
+
 artifact_failure() {
     local variant="$1"
     local reason="$2"
@@ -68,12 +94,13 @@ artifact_failure() {
 
 validate_artifacts() {
     local variant="$1"
-    local build_dir="$SCRIPT_DIR/build/ccec/$TENSORMAP_MODE/$variant"
+    local build_dir="$SCRIPT_DIR/build/ccec/$TENSORMAP_MODE/$PIPELINE_KEY/$variant"
     local manifest_name="pa_scheduler_artifacts.manifest"
     local manifest="$build_dir/$manifest_name"
     local artifacts=(
         pa_scheduler_host
         pa_scheduler_kernel.o
+        pa_scheduler_clock_correlation_kernel.o
         libpa_scheduler_plan_aicpu.so
         libpa_scheduler_plan_dispatcher.so
     )
@@ -90,6 +117,7 @@ validate_artifacts() {
 
     if [[ ! -x "$build_dir/pa_scheduler_host" ||
           ! -s "$build_dir/pa_scheduler_kernel.o" ||
+          ! -s "$build_dir/pa_scheduler_clock_correlation_kernel.o" ||
           ! -s "$build_dir/libpa_scheduler_plan_aicpu.so" ||
           ! -s "$build_dir/libpa_scheduler_plan_dispatcher.so" ||
           ! -s "$manifest" ]]; then
@@ -104,8 +132,8 @@ validate_artifacts() {
 
     local lines=()
     mapfile -t lines < "$manifest"
-    if [[ ${#lines[@]} -ne 26 ||
-          "${lines[0]:-}" != "# schema=pa_scheduler_artifacts/v6" ||
+    if [[ ${#lines[@]} -ne 35 ||
+          "${lines[0]:-}" != "# schema=pa_scheduler_artifacts/v9" ||
           "${lines[1]:-}" != "# tensormap_mode=shared" ||
           "${lines[2]:-}" != "# tensormap_mode_id=1" ||
           "${lines[3]:-}" != "# tensormap_ring_cap=128" ||
@@ -117,16 +145,24 @@ validate_artifacts() {
           "${lines[9]:-}" != "# variant=$variant" ||
           "${lines[10]:-}" != "# phase=none" ||
           "${lines[11]:-}" != "# phase_id=0" ||
-          "${lines[12]:-}" != "# runtime_plan_abi=2" ||
+          "${lines[12]:-}" != "# runtime_plan_abi=3" ||
           "${lines[13]:-}" != "# runtime_plan_cell_bytes=4608" ||
           "${lines[14]:-}" != "# runtime_plan_capacity=4352" ||
           "${lines[15]:-}" != "# plan_owner_entry=plan_protocol_aicpu_exec" ||
-          "${lines[16]:-}" != "# scheduler_input=aicpu_closed_runtime_plan" ||
-          "${lines[17]:-}" != "# runtime_plan_build_backend=simt" ||
-          "${lines[18]:-}" != "# runtime_plan_build_backend_id=1" ||
-          "${lines[19]:-}" != "# runtime_plan_build_workers=4" ||
-          "${lines[20]:-}" != "# runtime_plan_build_leaders=4" ||
-          "${lines[21]:-}" != "# runtime_plan_execute_workers=96" ]]; then
+          "${lines[16]:-}" != "# scheduler_input=aicpu_streaming_runtime_plan" ||
+          "${lines[17]:-}" != "# pipeline=$PIPELINE_NAME" ||
+          "${lines[18]:-}" != "# launch_order=$LAUNCH_ORDER" ||
+          "${lines[19]:-}" != "# producer_ready=$PRODUCER_READY" ||
+          "${lines[20]:-}" != "# consumer_admission=$CONSUMER_ADMISSION" ||
+          "${lines[21]:-}" != "# prefill=$READY_PREFILL_TASKS" ||
+          "${lines[22]:-}" != "# runtime_plan_build_backend=simt" ||
+          "${lines[23]:-}" != "# runtime_plan_build_backend_id=1" ||
+          "${lines[24]:-}" != "# runtime_plan_build_workers=4" ||
+          "${lines[25]:-}" != "# runtime_plan_build_leaders=4" ||
+          "${lines[26]:-}" != "# runtime_plan_execute_workers=96" ||
+          "${lines[27]:-}" != "# clock_correlation_abi=2" ||
+          "${lines[28]:-}" != "# clock_correlation_samples=8" ||
+          "${lines[29]:-}" != "# clock_correlation_max_alignment_error_ns=50000" ]]; then
         artifact_failure "$variant" \
             "manifest backend/ABI/trace identity does not match"
         return 1
@@ -134,7 +170,7 @@ validate_artifacts() {
 
     local index digest filename extra
     for index in "${!artifacts[@]}"; do
-        read -r digest filename extra <<< "${lines[index + 22]}"
+        read -r digest filename extra <<< "${lines[index + 30]}"
         if [[ ! "$digest" =~ ^[[:xdigit:]]{64}$ ||
               "$filename" != "${artifacts[index]}" ||
               -n "${extra:-}" ]]; then
@@ -148,7 +184,6 @@ validate_artifacts() {
         artifact_failure "$variant" "artifact SHA256 values do not match"
         return 1
     fi
-
     # manifest 必须晚于正式入口、SIMT adapter/runtime、被复用的 Scalar
     # continuation/Host/AICPU producer 和公共 Plan 协议。这里只比较源码
     # mtime，不读取 Host 产生的 task 身份或业务计划。
@@ -169,6 +204,10 @@ validate_artifacts() {
             -newer "$manifest" -print
         for source in \
             "$REPO_ROOT/examples/a5/fully_distributed_within_core/paged_attention_unroll/kernels/orchestration/paged_attention_orch.cpp" \
+            "$REPO_ROOT/src/a5/runtime/fully_distributed_within_core/orchestration/pto_orchestration_api.h" \
+            "$REPO_ROOT/src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/dist_engine_api.h" \
+            "$REPO_ROOT/src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/common/target.h" \
+            "$REPO_ROOT/src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/aicore/dist_engine.cpp" \
             "$REPO_ROOT/tests/atomic_probe/pa_scheduler/cross_core_aicpu_plan/common/protocol_probe/plan_aicpu_dispatcher.cpp";
         do
             if [[ "$source" -nt "$manifest" ]]; then
@@ -178,16 +217,17 @@ validate_artifacts() {
     } | head -n 1)"
     if [[ -n "$stale_source" ]]; then
         artifact_failure "$variant" \
-            "source is newer than the atomic four-artifact manifest: $stale_source"
+            "source is newer than the atomic five-artifact manifest: $stale_source"
         return 1
     fi
     echo "[CHECK] ordinary SIMT CCEC manifest verified: $manifest"
+    echo "[POLICY] pipeline=$PIPELINE_NAME launch_order=$LAUNCH_ORDER producer_ready=$PRODUCER_READY consumer_admission=$CONSUMER_ADMISSION prefill=$READY_PREFILL_TASKS"
 }
 
 run_variant() {
     local variant="$1"
     shift
-    local build_dir="$SCRIPT_DIR/build/ccec/$TENSORMAP_MODE/$variant"
+    local build_dir="$SCRIPT_DIR/build/ccec/$TENSORMAP_MODE/$PIPELINE_KEY/$variant"
     validate_artifacts "$variant"
     "$build_dir/pa_scheduler_host" \
         --kernel "$build_dir/pa_scheduler_kernel.o" "$@"
@@ -219,6 +259,20 @@ BACKEND="$2"
 shift 2
 validate_backend "$BACKEND"
 validate_groups
+resolve_pipeline_policy
+echo "[POLICY] pipeline=$PIPELINE_NAME launch_order=$LAUNCH_ORDER producer_ready=$PRODUCER_READY consumer_admission=$CONSUMER_ADMISSION prefill=$READY_PREFILL_TASKS"
+
+# Every formal action consumes the kernel colocated with the verified
+# five-artifact manifest.  A duplicate Host option must never redirect the
+# launch after that manifest has passed.
+for argument in "$@"; do
+    case "$argument" in
+        --kernel|--kernel=*)
+            echo "The $ACTION ccec action manages $argument." >&2
+            exit 1
+            ;;
+    esac
+done
 
 case "$ACTION" in
     build)
@@ -232,6 +286,20 @@ case "$ACTION" in
         run_variant swimlane "$@"
         ;;
     smoke)
+        reject_managed_options smoke "$@"
+        for argument in "$@"; do
+            case "$argument" in
+                --batches|--batches=*|--runs|--runs=*|\
+                --nop-count|--nop-count=*|--nop-counts|--nop-counts=*|\
+                --winner-workload|--winner-workload=*|\
+                --real-compute-count|--real-compute-count=*|\
+                --real-compute-counts|--real-compute-counts=*|\
+                --real-compute-pattern|--real-compute-pattern=*)
+                    echo "The smoke action fixes b1/r1/scalar-nop=0." >&2
+                    exit 1
+                    ;;
+            esac
+        done
         run_variant swimlane --batches 1 --runs 1 \
             --winner-workload scalar-nop --nop-count 0 "$@"
         ;;
@@ -245,7 +313,7 @@ case "$ACTION" in
             echo "Missing Python or pa_scheduler swimlane tools." >&2
             exit 1
         fi
-        OUTPUT_ROOT="$PA_SCHEDULER_DIR/outputs/pa_scheduler_aicpu_plan_simt_ordinary_swimlane_$(date -u +%Y%m%d_%H%M%S)_$$"
+        OUTPUT_ROOT="$PA_SCHEDULER_DIR/outputs/pa_scheduler_aicpu_plan_simt_ordinary_${PIPELINE_KEY}_swimlane_$(date -u +%Y%m%d_%H%M%S)_$$"
         BACKEND_OUTPUT="$OUTPUT_ROOT/ccec"
         RAW_JSON="$BACKEND_OUTPUT/l2_swimlane_records.json"
         mkdir -p "$BACKEND_OUTPUT"

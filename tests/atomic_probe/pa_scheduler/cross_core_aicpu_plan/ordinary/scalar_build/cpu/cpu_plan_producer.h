@@ -12,6 +12,7 @@
 #ifndef PA_SCHEDULER_AICPU_PLAN_CPU_PRODUCER_H
 #define PA_SCHEDULER_AICPU_PLAN_CPU_PRODUCER_H
 
+#include "../../../common/runtime_plan_pipeline_policy.h"
 #include "../common/aicpu_plan_pa_adapter.h"
 
 #include <cstdint>
@@ -24,6 +25,8 @@ struct ProductionResult {
     uint32_t metadata_count = 0U;
     uint32_t aic_count = 0U;
     uint32_t aiv_count = 0U;
+    uint32_t ready_frontier = UINT32_MAX;
+    bool ready_before_close = false;
 };
 
 inline aicpu_plan::EngineClass EngineForKind(TaskKind kind) {
@@ -111,8 +114,7 @@ inline bool PublishCallbackTask(
     }
     const PaRuntimeTaskPlanSource source{args};
     if (PublishRuntimeTaskPlan<ProducerOps>(view, spec, source) !=
-            PlanPublishResult::Published ||
-        !AdvancePlannedFrontier<ProducerOps>(view, task_id)) {
+            PlanPublishResult::Published) {
         return false;
     }
 
@@ -132,9 +134,11 @@ inline bool PublishCallbackTask(
     return true;
 }
 
-// 首版是明确的 Plan-ahead：独立 planner 线程完整走完真实 PA callback
-// 顺序并 Close，随后 Scalar 才开始中央 ticket Build。这个 CPU helper 只
-// 是正式 AICPU 生命周期的协议回归，不参与 A5 性能计时。
+// CPU helper 复刻正式 AICPU 的两种 pipeline policy。两者都在 NotReady
+// 下顺序发布 cell，并只在真实 batch 边界推进连续 frontier；
+// PlanAheadClosed 在生产期始终保持 -2，StreamingFuture 则在达到预填
+// 门槛后发布 Ready/Open。短 Plan 都在 Close 前强制完成 Ready。
+// 这个 helper 只做协议回归，不参与 A5 性能计时。
 template <typename ProducerOps>
 inline ProductionResult ProducePaRuntimePlan(SchedulerState *state) {
     ProductionResult result{};
@@ -147,7 +151,10 @@ inline ProductionResult ProducePaRuntimePlan(SchedulerState *state) {
     if (!aicpu_plan::MakeRuntimePlanView(
             &state->runtime_plan_control,
             state->runtime_plan_storage, view
-        )) {
+        ) ||
+        // CPU 没有 AICPU 非一致 cache，但仍要求 Host 初始化出的全部
+        // control 满足 Ready 前置条件；这里刻意不立即发布 Open。
+        !aicpu_plan::RuntimePlanCanPublishReady<ProducerOps>(view)) {
         return result;
     }
 
@@ -215,8 +222,57 @@ inline ProductionResult ProducePaRuntimePlan(SchedulerState *state) {
             block_offset += orchestration.current_nblocks;
             ++group_index;
         }
+
+        // 与真实 AICPU producer 一致：frontier 是保守的连续摘要，只在
+        // batch 完整发布后一次推进。阈值可能落在 batch 内，因此首次
+        // Ready 的 frontier 可以大于 kRuntimePlanReadyPrefillTasks。
+        if (!aicpu_plan::AdvancePlannedFrontierTo<ProducerOps>(
+                view, batch_start, result.task_count
+            )) {
+            return result;
+        }
+        const int64_t closed = ProducerOps::LoadControl(
+            &view.control->closed_task_count.value
+        );
+        if constexpr (kRuntimePlanPipelineIsStreamingFuture) {
+            if (result.task_count >=
+                    aicpu_plan::kRuntimePlanReadyPrefillTasks) {
+                if (closed ==
+                        aicpu_plan::kPlanProducerNotReadyTaskCount) {
+                    if (!aicpu_plan::PublishRuntimePlanReady<ProducerOps>(
+                            view
+                        )) {
+                        return result;
+                    }
+                    result.ready_frontier = result.task_count;
+                    result.ready_before_close = true;
+                } else if (closed != aicpu_plan::kPlanOpenTaskCount) {
+                    return result;
+                }
+            } else if (closed !=
+                           aicpu_plan::kPlanProducerNotReadyTaskCount &&
+                       closed != aicpu_plan::kPlanOpenTaskCount) {
+                return result;
+            }
+        } else {
+            if (closed != aicpu_plan::kPlanProducerNotReadyTaskCount) {
+                return result;
+            }
+        }
     }
 
+    const int64_t closed = ProducerOps::LoadControl(
+        &view.control->closed_task_count.value
+    );
+    if (closed == aicpu_plan::kPlanProducerNotReadyTaskCount) {
+        if (!aicpu_plan::PublishRuntimePlanReady<ProducerOps>(view)) {
+            return result;
+        }
+        result.ready_frontier = result.task_count;
+        result.ready_before_close = false;
+    } else if (closed != aicpu_plan::kPlanOpenTaskCount) {
+        return result;
+    }
     result.ok = aicpu_plan::CloseRuntimePlan<ProducerOps>(
         view, result.task_count
     );

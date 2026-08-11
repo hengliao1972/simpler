@@ -507,6 +507,49 @@ int main() {
     std::unique_ptr<SchedulerState> state(new SchedulerState);
     bool ok = true;
 
+    const aicpu_clock::ClockCorrelationEvidence not_applicable{};
+    bool has_aicpu_producer = true;
+    const bool cpu_domain_accepts_explicit_not_applicable =
+        ValidateAicpuClockCorrelationForExport(
+            false, aicpu_clock::kClockUnitsPerSecond,
+            0U, 0U, not_applicable,
+            &has_aicpu_producer
+        ) && !has_aicpu_producer;
+    const bool required_aicpu_rejects_not_applicable =
+        !ValidateAicpuClockCorrelationForExport(
+            true, aicpu_clock::kClockUnitsPerSecond,
+            2U, 3U, not_applicable,
+            &has_aicpu_producer
+        );
+    ok &= Check(
+        cpu_domain_accepts_explicit_not_applicable &&
+            required_aicpu_rejects_not_applicable,
+        "explicit Host/CPU producer domain rejects missing AICPU evidence"
+    );
+    aicpu_clock::ClockCorrelationEvidence causal_window{};
+    for (uint32_t index = 0U;
+         index < aicpu_clock::kSamplesPerRound; ++index) {
+        causal_window.samples[index].aicore_send_ticks =
+            10U + index;
+        causal_window.samples[
+            index + aicpu_clock::kSamplesPerRound]
+            .aicore_receive_ticks = 100U + index;
+    }
+    const bool aicore_causal_window_gate =
+        ValidateAicoreCausalCaptureBracket(
+            causal_window, 20U, 90U, false
+        ) &&
+        !ValidateAicoreCausalCaptureBracket(
+            causal_window, 13U, 90U, false
+        ) &&
+        !ValidateAicoreCausalCaptureBracket(
+            causal_window, 20U, 100U, false
+        );
+    ok &= Check(
+        aicore_causal_window_gate,
+        "FDWIC interval is strictly inside AICore pre/post causal evidence"
+    );
+
     ok &= Check(
         CheckSingleContext(state.get(), 0, 0, 1),
         "G0 context=0 -> Alloc only"

@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "aicpu_clock_correlation_abi.h"
 #include "aicpu_plan_backend_abi.h"
 
 namespace pa_scheduler::aicpu_owner {
@@ -16,7 +17,9 @@ namespace pa_scheduler::aicpu_owner {
 constexpr uint64_t kRequestMagic = UINT64_C(0x5041504c414e5251);
 constexpr uint64_t kResultMagic = UINT64_C(0x5041504c414e5253);
 constexpr uint32_t kRequestVersion = 1U;
-constexpr uint32_t kOwnerCommandRun = 1U;
+constexpr uint32_t kOwnerCommandRun = aicpu_clock::kOwnerCommandRun;
+constexpr uint32_t kOwnerCommandClockCorrelation =
+    aicpu_clock::kOwnerCommandClockCorrelation;
 constexpr uint32_t kCacheLineBytes = 64U;
 constexpr uint32_t kAtomicIsolationBytes = 128U;
 constexpr uint32_t kMaxTensorInputs = 32U;

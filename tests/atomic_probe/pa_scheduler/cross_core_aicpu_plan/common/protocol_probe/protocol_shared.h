@@ -19,8 +19,8 @@ namespace plan_protocol_probe {
 constexpr uint64_t kProbeMagic = UINT64_C(0x50354135504c414e);
 constexpr uint64_t kProducerResultMagic = UINT64_C(0x50524f4455434552);
 constexpr uint64_t kConsumerResultMagic = UINT64_C(0x434f4e53554d4552);
-constexpr uint32_t kProbeVersion = 2U;
-constexpr uint32_t kRuntimePlanAbiVersion = 2U;
+constexpr uint32_t kProbeVersion = 3U;
+constexpr uint32_t kRuntimePlanAbiVersion = 3U;
 constexpr uint32_t kCacheLineBytes = 64U;
 constexpr uint32_t kAtomicIsolationBytes = 128U;
 constexpr uint32_t kMaxTasks = 1280U;
@@ -364,7 +364,7 @@ PLAN_PROTOCOL_HD inline PayloadLayout LayoutForKind(uint32_t kind)
     return PayloadLayout{tensors, scalars, dependencies, words, (words + 7U) / 8U};
 }
 
-// ABI2 的 adapter_data 是算子 adapter 自定义的 16-bit provenance。
+// ABI3 的 adapter_data 是算子 adapter 自定义的 16-bit provenance。
 // Probe 不复用 PA 语义，而是为每个 task 生成非零、可由独立 consumer
 // oracle 重算的值，确保 wire word2 的高 16 bit 真正跨 AICPU/AIV 传递。
 PLAN_PROTOCOL_HD inline uint16_t AdapterDataForShape(const TaskShape &shape)

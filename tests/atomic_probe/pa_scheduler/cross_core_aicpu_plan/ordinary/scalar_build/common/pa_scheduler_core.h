@@ -119,12 +119,12 @@ struct LocalStats {
 #if PTO_FDWIC_SHARED_MAP
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 static_assert(
-    sizeof(LocalStats) == 1216,
+    sizeof(LocalStats) == 1280,
     "cross-core split LocalStats block-local ABI changed"
 );
 #else
 static_assert(
-    sizeof(LocalStats) == 1152,
+    sizeof(LocalStats) == 1216,
     "cross-core LocalStats block-local ABI changed"
 );
 #endif
@@ -3862,8 +3862,9 @@ static_assert(offsetof(CallbackSubmitTicket, won) == 14, "callback ticket winner
 #if PTO_FDWIC_SHARED_MAP
 // Replay Finish 与 AICPU Plan Build 复用完全相同的 Materialize/Register/
 // Fanin/exec-cell 发布主体；两者唯一不同点是业务收尾。Replay 必须闭合
-// Submit 及末 task 声明，Plan Build 的 task 数已经由 closed_task_count
-// 封口，不能再执行 CloseSharedCallbackSubmit。用编译期枚举表达该合同，
+// Submit 及末 task 声明；Plan Build 的最终 task 数由独立 producer
+// 稍后以 closed_task_count 封口，builder 不能执行
+// CloseSharedCallbackSubmit。用编译期枚举表达该合同，
 // 避免一个含义不清的 bool 把旧 replay 语义带进正式 Plan 路径。
 enum class SharedFinishMode : uint8_t {
     Replay = 0,
@@ -6170,7 +6171,8 @@ PA_DEVICE bool AttachClosedRuntimePlan(
 
     const uint64_t wait_begin = Ops::Now();
     uint32_t wait_polls = 0U;
-    int64_t closed = aicpu_plan::kPlanOpenTaskCount;
+    int64_t closed =
+        aicpu_plan::kPlanProducerNotReadyTaskCount;
     const uint32_t poll_region = AtomicPollRegionBegin<Ops>(
         stats.trace, stats.result,
         TraceAtomicPollBatchMask(
@@ -6188,21 +6190,30 @@ PA_DEVICE bool AttachClosedRuntimePlan(
             &view.control->closed_task_count.value,
             /*result_used=*/true
         );
-        if (closed != aicpu_plan::kPlanOpenTaskCount) {
+        if (closed >= 0 ||
+            closed ==
+                aicpu_plan::kPlanProducerReadyFailedTaskCount) {
+            break;
+        }
+        if (closed !=
+                aicpu_plan::kPlanProducerNotReadyTaskCount &&
+            closed != aicpu_plan::kPlanOpenTaskCount) {
             break;
         }
         Ops::SpinHint();
         ++wait_polls;
-        // Plan 尚开放时只把 closed line 作为正常热点；producer/
-        // scheduler fatal 以有界低频观察退出，不制造第二条竞争线。
+        // PlanAheadClosed 在 NotReady/Open 两个生产期都只把 closed
+        // line 当作正常热点。NotReady 时其余 Plan control 仍可能处于
+        // 地址复用 reset，不能读取；Open 后才允许低频观察 Plan fatal。
         if ((wait_polls & 255U) == 0U &&
-            (TraceAtomicControlLoad<Ops>(
-                 stats.trace, stats.result, -1,
-                 AtomicSite::RuntimePlanFatalLoad,
-                 &view.control->fatal.value,
-                 /*result_used=*/true
-             ) != 0 ||
-             IsFatal<Ops>(state, stats))) {
+            (IsFatal<Ops>(state, stats) ||
+             (closed == aicpu_plan::kPlanOpenTaskCount &&
+              TraceAtomicControlLoad<Ops>(
+                  stats.trace, stats.result, -1,
+                  AtomicSite::RuntimePlanFatalLoad,
+                  &view.control->fatal.value,
+                  /*result_used=*/true
+              ) != 0))) {
             AtomicPollRegionEnd<Ops>(
                 stats.trace, stats.result, poll_region
             );
@@ -6222,8 +6233,15 @@ PA_DEVICE bool AttachClosedRuntimePlan(
         stats.trace, stats.result, poll_region
     );
 
-    // closed 跳出轮询后，frontier/fatal 只各读一次做终态
-    // 交叉校验；不把它们误合并成 closed 等待 episode。
+    // ReadyFailed 只保证 closed line 可消费；不得读取尚未建立合同的
+    // frontier/fatal。其他负值同样 fail closed。
+    if (closed < 0) {
+        PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+        return false;
+    }
+
+    // Close 是一次性 release 终态。这里只读一次 frontier/fatal 做
+    // 交叉校验；成功后 ticket 热循环不再读取这些 producer control。
     const int64_t frontier = TraceAtomicControlLoad<Ops>(
         stats.trace, stats.result, -1,
         AtomicSite::RuntimePlanFrontierLoad,
@@ -6236,7 +6254,7 @@ PA_DEVICE bool AttachClosedRuntimePlan(
         &view.control->fatal.value,
         /*result_used=*/true
     );
-    if (closed < 0 || closed != frontier ||
+    if (closed != frontier ||
         closed > static_cast<int64_t>(view.capacity) ||
         closed > static_cast<int64_t>(
             kRuntimePlanConsumerCapacity
@@ -6249,12 +6267,130 @@ PA_DEVICE bool AttachClosedRuntimePlan(
     return true;
 }
 
+template <typename Ops>
+PA_DEVICE bool AttachReadyRuntimePlan(
+    PA_GM SchedulerState *state, LocalStats &stats,
+    aicpu_plan::RuntimePlanView &view
+) {
+    view = aicpu_plan::RuntimePlanView{nullptr, nullptr, 0U};
+    if (state == nullptr) {
+        return false;
+    }
+    // StorageRef 是 Host 在 launch 前写入的 ordinary 128B wire ABI。A5
+    // Scalar 间无 cache coherence，本核第一次解释基址前必须 exact
+    // invalidate；它不是 Plan atomic control，也不能用返回型原子读取。
+    (void)TraceConfiguredDcciInvalidate<
+        Ops, PA_BUILD_ATOMIC_SWIMLANE
+    >(
+        &stats.trace, -1, -1,
+        DcciSite::RuntimePlanStorageRefAcquire,
+        &state->runtime_plan_storage,
+        sizeof(state->runtime_plan_storage)
+    );
+    if (!aicpu_plan::MakeRuntimePlanView(
+            &state->runtime_plan_control,
+            state->runtime_plan_storage, view
+        ) ||
+        view.capacity > kRuntimePlanConsumerCapacity) {
+        PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+        return false;
+    }
+
+    const uint64_t wait_begin = Ops::Now();
+    uint32_t wait_polls = 0U;
+    int64_t closed =
+        aicpu_plan::kPlanProducerNotReadyTaskCount;
+    const uint32_t poll_region = AtomicPollRegionBegin<Ops>(
+        stats.trace, stats.result,
+        TraceAtomicPollBatchMask(
+            AtomicSite::RuntimePlanClosedLoad
+        ) |
+            TraceAtomicPollBatchMask(AtomicSite::FatalPoll)
+    );
+    while (true) {
+        closed = TraceAtomicControlLoad<Ops>(
+            stats.trace, stats.result, -1,
+            AtomicSite::RuntimePlanClosedLoad,
+            &view.control->closed_task_count.value,
+            /*result_used=*/true
+        );
+        if (closed !=
+            aicpu_plan::kPlanProducerNotReadyTaskCount) {
+            break;
+        }
+        Ops::SpinHint();
+        ++wait_polls;
+        // Producer Ready 之前只允许观察 closed line；cell control
+        // 还可能处于 AICPU discard/reset 期，不能提前触碰。
+        // scheduler fatal 以有界低频观察退出；AICPU 在
+        // Ready 前失败则由 watchdog 收敛，不能为提前读 Plan
+        // fatal 而破坏 control reset 的地址隔离。
+        if ((wait_polls & 255U) == 0U &&
+            IsFatal<Ops>(state, stats)) {
+            AtomicPollRegionEnd<Ops>(
+                stats.trace, stats.result, poll_region
+            );
+            PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+            return false;
+        }
+        if ((wait_polls & 1023U) == 0U &&
+            Ops::Now() - wait_begin > kSharedInsertWatchdogTicks) {
+            AtomicPollRegionEnd<Ops>(
+                stats.trace, stats.result, poll_region
+            );
+            PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+            return false;
+        }
+    }
+    AtomicPollRegionEnd<Ops>(
+        stats.trace, stats.result, poll_region
+    );
+
+    // ReadyFailed 与 NotReady 共用同一条 closed control line；producer
+    // 允许在其余 control 尚未完成 reset 时发布 -3 以唤醒消费者。因此
+    // 这里必须直接失败，不能先读 frontier 或 Plan fatal。
+    if (closed ==
+        aicpu_plan::kPlanProducerReadyFailedTaskCount) {
+        PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+        return false;
+    }
+
+    // Ready 观察后 frontier/fatal 只各读一次。Open 时
+    // frontier 可以继续前进；Closed 时则必须已精确封在 N。
+    const int64_t frontier = TraceAtomicControlLoad<Ops>(
+        stats.trace, stats.result, -1,
+        AtomicSite::RuntimePlanFrontierLoad,
+        &view.control->planned_frontier.value,
+        /*result_used=*/true
+    );
+    const int64_t plan_fatal = TraceAtomicControlLoad<Ops>(
+        stats.trace, stats.result, -1,
+        AtomicSite::RuntimePlanFatalLoad,
+        &view.control->fatal.value,
+        /*result_used=*/true
+    );
+    if (closed < aicpu_plan::kPlanOpenTaskCount ||
+        closed > static_cast<int64_t>(view.capacity) ||
+        frontier < 0 ||
+        frontier > static_cast<int64_t>(view.capacity) ||
+        (closed >= 0 && closed != frontier) ||
+        closed > static_cast<int64_t>(
+            kRuntimePlanConsumerCapacity
+        ) ||
+        plan_fatal != 0 || IsFatal<Ops>(state, stats)) {
+        PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+        return false;
+    }
+    return true;
+}
+
 template <typename Ops, bool Profile, typename PmuContext>
 PA_DEVICE bool BuildRuntimePlanTask(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     const aicpu_plan::RuntimePlanView &view, uint32_t task_id,
     SubmitContext &context, LocalStats &stats,
-    PmuContext &pmu_context
+    PmuContext &pmu_context,
+    int64_t acquired_cell_control = 0
 ) {
     aicpu_plan::RuntimeTaskPlanHeader header{};
     aicpu_plan::RuntimeTaskPlanLayout layout{};
@@ -6264,16 +6400,20 @@ PA_DEVICE bool BuildRuntimePlanTask(
         );
         return false;
     }
-    // closed Plan 已由 Attach 一次性核验；正常逐 task Acquire 不再读取
-    // 全局 fatal，避免 B256 额外产生 1280 次同地址返回型 atomic。cell
-    // control 的前后两次读取仍是 payload 发布/稳定性合同，必须保留。
+    // StreamingFuture 把 future-ticket 等待的最后一次 cell load
+    // 作为第一次 control 观察传进来；PlanAheadClosed 传 0，并在这里
+    // 对已封口 cell 做第一次读取。两条策略共用同一份 Decode/Build，
+    // 且都只在 DCCI 后再读一次 control 证明 payload 稳定。
     PA_GM aicpu_plan::RuntimeTaskPlanCell &cell =
         view.cells[task_id];
-    const int64_t first = TraceAtomicControlLoad<Ops>(
-        stats.trace, stats.result, static_cast<int32_t>(task_id),
-        AtomicSite::RuntimePlanCellControlLoad,
-        &cell.control.value, /*result_used=*/true
-    );
+    const int64_t first = acquired_cell_control != 0
+        ? acquired_cell_control
+        : TraceAtomicControlLoad<Ops>(
+              stats.trace, stats.result,
+              static_cast<int32_t>(task_id),
+              AtomicSite::RuntimePlanCellControlLoad,
+              &cell.control.value, /*result_used=*/true
+          );
     const aicpu_plan::DecodedPlanCellControl decoded =
         aicpu_plan::DecodePlanCellControl(first);
     if (!decoded.valid ||
@@ -6395,11 +6535,9 @@ TakeAttachedClosedRuntimePlanBuildTicket(
     uint32_t attached_task_count, LocalStats &stats
 ) {
     // AttachClosedRuntimePlan 已经一次性 acquire 并交叉校验
-    // closed_task_count/frontier/capacity；Plan closed 后这三个值不可再变。
-    // 热循环若复用公共防御型入口，每 task 会额外返回型读取 fatal、closed
-    // 和 frontier，使 N+W 个必要 FetchAdd 膨胀成约 4(N+W) 个同地址原子。
-    // 正式已附着路径只保留唯一必要的 build_next FetchAdd；fatal 在 Build
-    // 失败、越界 arrival/release 和有界等待边界统一观察。build-next 的
+    // closed_task_count/frontier/capacity；Plan closed 后这些值不可再变。
+    // 热循环只保留唯一必要的 build_next FetchAdd。首次 ticket>=N
+    // 直接终止，不读 future cell、closed、frontier 或 Plan fatal。
     if (view.control == nullptr || view.cells == nullptr ||
         attached_task_count > view.capacity) {
         return {
@@ -6426,6 +6564,183 @@ TakeAttachedClosedRuntimePlanBuildTicket(
         aicpu_plan::BuildReservationStatus::Reserved,
         static_cast<uint32_t>(ticket),
     };
+}
+
+template <typename Ops>
+PA_DEVICE aicpu_plan::BuildReservation
+TakeAndResolveOpenRuntimePlanBuildTicket(
+    PA_GM SchedulerState *state,
+    const aicpu_plan::RuntimePlanView &view,
+    LocalStats &stats, uint32_t &final_task_count,
+    int64_t &acquired_cell_control
+) {
+    final_task_count = 0U;
+    acquired_cell_control = 0;
+    if (state == nullptr || view.control == nullptr ||
+        view.cells == nullptr || view.capacity == 0U ||
+        view.capacity > kRuntimePlanConsumerCapacity) {
+        return {
+            aicpu_plan::BuildReservationStatus::Fatal, 0U
+        };
+    }
+    const int64_t ticket = TraceAtomicControlFetchAdd<Ops>(
+        stats.trace, stats.result, -1,
+        AtomicSite::RuntimePlanBuildNextFetchAdd,
+        &view.control->build_next.value, 1,
+        /*result_used=*/true
+    );
+    if (ticket < 0 ||
+        static_cast<uint64_t>(ticket) > UINT32_MAX) {
+        return {
+            aicpu_plan::BuildReservationStatus::Fatal, 0U
+        };
+    }
+    const uint32_t task_id = static_cast<uint32_t>(ticket);
+
+    // 每个 worker 只在完整 Build 当前 ticket 后才会再进入
+    // 本函数。future ticket 因此不会被退回或覆盖；开放期以
+    // 它自己的 cell control 为主轮询热点，closed/fatal 只在
+    // 首轮与每 256 轮观察。这保留唯一的 build_next
+    // FetchAdd，也避免 96 核持续竞争 producer control line。
+    const uint64_t wait_begin = Ops::Now();
+    uint32_t wait_polls = 0U;
+    bool final_close_observed = false;
+    const uint32_t poll_region = AtomicPollRegionBegin<Ops>(
+        stats.trace, stats.result,
+        TraceAtomicPollBatchMask(
+            AtomicSite::RuntimePlanCellControlLoad
+        ) |
+            TraceAtomicPollBatchMask(
+                AtomicSite::RuntimePlanClosedLoad
+            ) |
+            TraceAtomicPollBatchMask(
+                AtomicSite::RuntimePlanFatalLoad
+            ) |
+            TraceAtomicPollBatchMask(AtomicSite::FatalPoll)
+    );
+    while (true) {
+        if (task_id < view.capacity) {
+            PA_GM aicpu_plan::RuntimeTaskPlanCell &cell =
+                view.cells[task_id];
+            const int64_t control =
+                TraceAtomicControlLoad<Ops>(
+                    stats.trace, stats.result,
+                    static_cast<int32_t>(task_id),
+                    AtomicSite::RuntimePlanCellControlLoad,
+                    &cell.control.value,
+                    /*result_used=*/true
+                );
+            if (control != 0) {
+                const aicpu_plan::DecodedPlanCellControl decoded =
+                    aicpu_plan::DecodePlanCellControl(control);
+                if (decoded.valid &&
+                    decoded.phase ==
+                        aicpu_plan::PlanCellPhase::Published &&
+                    decoded.task_id == task_id) {
+                    AtomicPollRegionEnd<Ops>(
+                        stats.trace, stats.result, poll_region
+                    );
+                    acquired_cell_control = control;
+                    return {
+                        aicpu_plan::BuildReservationStatus::Reserved,
+                        task_id,
+                    };
+                }
+                AtomicPollRegionEnd<Ops>(
+                    stats.trace, stats.result, poll_region
+                );
+                return {
+                    aicpu_plan::BuildReservationStatus::Fatal, 0U
+                };
+            }
+            // Close 的 release 发布只能出现在 [0,N) 全部 cell
+            // Published 之后。观察到终态 N 后再读仍为 Empty，
+            // 就是不可恢复的 missing cell，不能继续等待。
+            if (final_close_observed) {
+                AtomicPollRegionEnd<Ops>(
+                    stats.trace, stats.result, poll_region
+                );
+                return {
+                    aicpu_plan::BuildReservationStatus::Fatal, 0U
+                };
+            }
+        }
+
+        ++wait_polls;
+        const bool check_close =
+            wait_polls == 1U ||
+            (wait_polls & 255U) == 0U ||
+            task_id >= view.capacity;
+        if (check_close) {
+            const int64_t closed = TraceAtomicControlLoad<Ops>(
+                stats.trace, stats.result, -1,
+                AtomicSite::RuntimePlanClosedLoad,
+                &view.control->closed_task_count.value,
+                /*result_used=*/true
+            );
+            if (closed >= 0) {
+                if (closed > static_cast<int64_t>(view.capacity) ||
+                    closed > static_cast<int64_t>(
+                        kRuntimePlanConsumerCapacity
+                    )) {
+                    AtomicPollRegionEnd<Ops>(
+                        stats.trace, stats.result, poll_region
+                    );
+                    return {
+                        aicpu_plan::BuildReservationStatus::Fatal, 0U
+                    };
+                }
+                final_task_count = static_cast<uint32_t>(closed);
+                if (task_id >= final_task_count) {
+                    AtomicPollRegionEnd<Ops>(
+                        stats.trace, stats.result, poll_region
+                    );
+                    return {
+                        aicpu_plan::BuildReservationStatus::Closed,
+                        0U,
+                    };
+                }
+                // cell load 可能先于本次 Close acquire。下一轮必须
+                // 再读一次同一 cell，才能把 Empty 定性为缺失。
+                final_close_observed = true;
+            } else if (closed != aicpu_plan::kPlanOpenTaskCount) {
+                AtomicPollRegionEnd<Ops>(
+                    stats.trace, stats.result, poll_region
+                );
+                return {
+                    aicpu_plan::BuildReservationStatus::Fatal, 0U
+                };
+            }
+        }
+
+        if ((wait_polls == 1U ||
+             (wait_polls & 255U) == 0U) &&
+            (TraceAtomicControlLoad<Ops>(
+                 stats.trace, stats.result, -1,
+                 AtomicSite::RuntimePlanFatalLoad,
+                 &view.control->fatal.value,
+                 /*result_used=*/true
+             ) != 0 ||
+             IsFatal<Ops>(state, stats))) {
+            AtomicPollRegionEnd<Ops>(
+                stats.trace, stats.result, poll_region
+            );
+            return {
+                aicpu_plan::BuildReservationStatus::Fatal, 0U
+            };
+        }
+        if ((wait_polls & 1023U) == 0U &&
+            Ops::Now() - wait_begin >
+                kSharedInsertWatchdogTicks) {
+            AtomicPollRegionEnd<Ops>(
+                stats.trace, stats.result, poll_region
+            );
+            return {
+                aicpu_plan::BuildReservationStatus::Fatal, 0U
+            };
+        }
+        Ops::SpinHint();
+    }
 }
 
 template <typename Ops>
@@ -6467,8 +6782,24 @@ PA_DEVICE bool RuntimePlanBuildReleaseReady(
             AtomicSite::RuntimePlanClosedLoad,
             &view.control->closed_task_count.value,
             /*result_used=*/true
-        ) != static_cast<int64_t>(task_count) ||
-        TraceAtomicControlLoad<Ops>(
+        ) != static_cast<int64_t>(task_count)) {
+        return false;
+    }
+    // Streaming 的 task_count 由 future ticket 最终观察 Close 得到，last
+    // arrival 必须再次核验最终 frontier。PlanAhead 已在每个 worker 的
+    // AttachClosed 中验证过 immutable Close/frontier，不能为串行基线
+    // 再增加一次 producer control 读取。
+    if constexpr (kRuntimePlanPipelineIsStreamingFuture) {
+        if (TraceAtomicControlLoad<Ops>(
+            stats.trace, stats.result, -1,
+            AtomicSite::RuntimePlanFrontierLoad,
+            &view.control->planned_frontier.value,
+            /*result_used=*/true
+        ) != static_cast<int64_t>(task_count)) {
+            return false;
+        }
+    }
+    if (TraceAtomicControlLoad<Ops>(
             stats.trace, stats.result, -1,
             AtomicSite::RuntimePlanBuildNextLoad,
             &view.control->build_next.value,
@@ -6501,8 +6832,18 @@ template <typename Ops>
 PA_DEVICE bool WaitRuntimePlanBuildRelease(
     PA_GM SchedulerState *state,
     const aicpu_plan::RuntimePlanView &view,
-    uint32_t task_count, LocalStats &stats
+    uint32_t &task_count, bool task_count_known,
+    LocalStats &stats
 ) {
+    if (state == nullptr || view.control == nullptr ||
+        view.cells == nullptr || view.capacity == 0U ||
+        view.capacity > kRuntimePlanConsumerCapacity ||
+        (task_count_known && task_count > view.capacity) ||
+        (kRuntimePlanPipelineIsPlanAheadClosed &&
+         !task_count_known)) {
+        PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+        return false;
+    }
     const uint64_t wait_begin = Ops::Now();
     uint32_t wait_polls = 0U;
     const uint32_t poll_region = AtomicPollRegionBegin<Ops>(
@@ -6522,10 +6863,51 @@ PA_DEVICE bool WaitRuntimePlanBuildRelease(
             &view.control->build_release.value,
             /*result_used=*/true
         );
-        if (release == static_cast<int64_t>(task_count)) {
+        if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
+            // AttachClosed 已经固定 N；串行基线只等待 release==N，成功
+            // 路径不再读取 closed/frontier/fatal。任何其他非 pending 值
+            // 都由下面的终态分支 fail closed。
+            if (release == static_cast<int64_t>(task_count)) {
+                AtomicPollRegionEnd<Ops>(
+                    stats.trace, stats.result, poll_region
+                );
+                return true;
+            }
+        } else if (release >= 0) {
+            const int64_t closed = TraceAtomicControlLoad<Ops>(
+                stats.trace, stats.result, -1,
+                AtomicSite::RuntimePlanClosedLoad,
+                &view.control->closed_task_count.value,
+                /*result_used=*/true
+            );
+            const int64_t frontier = TraceAtomicControlLoad<Ops>(
+                stats.trace, stats.result, -1,
+                AtomicSite::RuntimePlanFrontierLoad,
+                &view.control->planned_frontier.value,
+                /*result_used=*/true
+            );
+            const int64_t plan_fatal =
+                TraceAtomicControlLoad<Ops>(
+                    stats.trace, stats.result, -1,
+                    AtomicSite::RuntimePlanFatalLoad,
+                    &view.control->fatal.value,
+                    /*result_used=*/true
+                );
             AtomicPollRegionEnd<Ops>(
                 stats.trace, stats.result, poll_region
             );
+            if (release > static_cast<int64_t>(view.capacity) ||
+                release > static_cast<int64_t>(
+                    kRuntimePlanConsumerCapacity
+                ) ||
+                closed != release || frontier != release ||
+                (task_count_known &&
+                 release != static_cast<int64_t>(task_count)) ||
+                plan_fatal != 0 || IsFatal<Ops>(state, stats)) {
+                PublishRuntimePlanConsumerFatal<Ops>(state, stats);
+                return false;
+            }
+            task_count = static_cast<uint32_t>(release);
             return true;
         }
         if (release != aicpu_plan::kBuildReleasePending) {
@@ -6626,7 +7008,8 @@ PA_DEVICE bool ArriveAndWaitRuntimePlanBuildRelease(
     }
 
     return WaitRuntimePlanBuildRelease<Ops>(
-        state, view, task_count, stats
+        state, view, task_count,
+        /*task_count_known=*/true, stats
     );
 }
 #endif
@@ -6915,7 +7298,8 @@ PA_DEVICE void RunSchedulerImpl(
 
     // 每个 worker 都先发布一次启动到达标记。Plan Build 的 96 个 Scalar
     // 必须在领取中央 ticket 前完成本核 token/统计初始化；任务唯一性由
-    // AICPU closed Plan 和 build_next 保证，不再依赖 replay Claim。
+    // AICPU 逐 cell 发布、最终 Close 与 build_next 共同保证，不再
+    // 依赖 replay Claim。
 #if PA_BUILD_PERF_CLOCK
     // perf-clock 的第一次权威读数从 startup increment 前开始，
     // 与 FinalDrain 后的第二次读数组成完整端到端边界。复用
@@ -7011,12 +7395,13 @@ PA_DEVICE void RunSchedulerImpl(
     // FinalDrain 不得在错相 fatal 观察到来前发放 Execute ticket。
     const bool scheduler_entry_ok = !IsFatal<Ops>(state, stats);
     if (scheduler_entry_ok) {
-        // private 每批固定回放 Alloc/QK/SF/PV/UP；shared Plan Build 等待
-        // AICPU 完整封口后由中央 ticket 选唯一 Build owner。Execute owner
-        // 仍只消费完整 pipeline 发布的 runtime exec cell。
+        // private 每批固定回放 Alloc/QK/SF/PV/UP；shared 的阶段关系由
+        // 构建身份固定：PlanAheadClosed 严格等待 AICPU Close 后领取
+        // ticket，StreamingFuture 则在 Ready 后允许 owner 持有 future
+        // ticket 等待 cell。两者的 Build/arrival/release/Execute 主体相同。
         // CCEC 可在这里开启本 worker 私有 PMU 窗口；CPU/AscendC 适配层是空实现。
         // 窗口覆盖本 worker 的全部调度期：从 orchestration 初始化前开始，
-        // shared 窗口覆盖 Plan closed 等待、Acquire/Decode、Materialize、
+        // shared 窗口覆盖 Plan Ready/cell/Close 等待、Acquire/Decode、Materialize、
         // Register、Fanin 和 exec-cell Build；不存在 replay Claim/loser。
         // 它与全局“首 Submit.begin～末 Submit.end”口径接近但不相同，host sidecar
         // 必须按 per-worker 累计解释。泳道父边界在 PMU-only 构建中会被编译为空，
@@ -7030,12 +7415,15 @@ PA_DEVICE void RunSchedulerImpl(
             runtime_plan_build_begin =
                 TraceTimestamp<Ops>(stats.trace, stats.result);
         }
-        runtime_plan_attached = AttachClosedRuntimePlan<Ops>(
-            state, stats, runtime_plan_view, task_count
-        );
-#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
-        split_runtime.task_count = task_count;
-#endif
+        if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
+            runtime_plan_attached = AttachClosedRuntimePlan<Ops>(
+                state, stats, runtime_plan_view, task_count
+            );
+        } else {
+            runtime_plan_attached = AttachReadyRuntimePlan<Ops>(
+                state, stats, runtime_plan_view
+            );
+        }
 #endif
         orchestration_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
 #if PTO_FDWIC_SHARED_MAP
@@ -7055,16 +7443,28 @@ PA_DEVICE void RunSchedulerImpl(
         ) {
             bool build_ok = runtime_plan_attached;
             while (build_ok) {
-                const aicpu_plan::BuildReservation reservation =
-                    TakeAttachedClosedRuntimePlanBuildTicket<Ops>(
-                        runtime_plan_view, task_count, stats
-                    );
+                int64_t acquired_cell_control = 0;
+                aicpu_plan::BuildReservation reservation{};
+                if constexpr (
+                    kRuntimePlanPipelineIsPlanAheadClosed
+                ) {
+                    reservation =
+                        TakeAttachedClosedRuntimePlanBuildTicket<Ops>(
+                            runtime_plan_view, task_count, stats
+                        );
+                } else {
+                    reservation =
+                        TakeAndResolveOpenRuntimePlanBuildTicket<Ops>(
+                            state, runtime_plan_view, stats,
+                            task_count, acquired_cell_control
+                        );
+                }
                 if (reservation.status ==
                     aicpu_plan::BuildReservationStatus::Reserved) {
                     build_ok = BuildRuntimePlanTask<Ops, Profile>(
                         state, worker, runtime_plan_view,
                         reservation.task_id, context, stats,
-                        pmu_context
+                        pmu_context, acquired_cell_control
                     );
                     continue;
                 }
@@ -7084,16 +7484,23 @@ PA_DEVICE void RunSchedulerImpl(
                 break;
             }
         } else {
-            // 四个 VF leader 已经独占 Take/Build/Arrival。包括 AIV0 在内的
+            // VF Build workers 已经独占 Take/Build/Arrival。包括
+            // AIV0 在内的
             // 96 个 Scalar continuation 绝不再消费 ticket 或报到，只把
-            // closed Plan 身份与 release N 交叉校验后进入 Execute。
+            // 已附着 Plan 与 release N 交叉校验后进入 Execute。
             (void)context;
             runtime_plan_build_released =
                 runtime_plan_attached &&
                 WaitRuntimePlanBuildRelease<Ops>(
-                    state, runtime_plan_view, task_count, stats
+                    state, runtime_plan_view, task_count,
+                    /*task_count_known=*/
+                        kRuntimePlanPipelineIsPlanAheadClosed,
+                    stats
                 );
         }
+#if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
+        split_runtime.task_count = task_count;
+#endif
         if (!external_build_window_active) {
             runtime_plan_build_end =
                 TraceTimestamp<Ops>(stats.trace, stats.result);

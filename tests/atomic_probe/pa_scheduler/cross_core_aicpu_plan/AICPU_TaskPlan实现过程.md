@@ -23,27 +23,29 @@
 | S1 | 真实 AICPU orchestration SO 与 Plan backend | 已闭合，已通过正式 A5 AICPU launch 验证 |
 | S2 | ordinary Scalar Build 端到端 | 已闭合，CPU 与 A5 B1/B256 均已通过 |
 | S3 | ordinary SIMT Build 端到端 | 已正式接通；CPU/CCEC 门槛与 A5 B1/B256 perf-clock 功能全部 PASS |
-| S4 | DAG Scalar Build | 未开始 |
-| S5 | DAG SIMT Build | 未开始 |
-| S6 | 观测闭合后的性能收敛 | Scalar 已有 warm 样本；SIMT 只有冷 run1 功能样本，尚未收敛 |
+| S4 | DAG Scalar Build | 按当前要求冻结，未开始 |
+| S5 | DAG SIMT Build | 按当前要求冻结，未开始 |
+| S6 | 观测闭合后的性能收敛 | 已保留 Scalar 串行基线并接通 ABI v3 双 pipeline policy；同提交 A5 因果 A/B 尚待补齐 |
 
-当前 ordinary 的 Scalar Build 和 SIMT Build 两条完整路径都已
-闭合。两者共用真实 AICPU callback 生成的 closed canonical Plan
-v2、ordinary TensorMap 严格插入链和 96 Scalar Execute/FinalDrain。
-SIMT 只把 Build owner 替换为 AIV0 启动的 128-thread VF/四个
-warp leader，不改变 Execute population。功能路径已证明，但
-S3 当前只有冷 run1 功能样本，B256 pipeline 约 71.8ms，离
-1ms 很远，不宣称性能达标。
+S0--S3 在 ABI v2 上闭合了 ordinary Scalar/SIMT 的完整功能路径；这些
+历史阶段和数值继续保留在第 3--7 节。S6 已把公共 Plan 协议升级为 ABI
+v3，并在 ordinary Scalar 中长期保留两个编译期 policy：默认
+`plan-ahead-closed` 是串行正确性/性能基线，`streaming-future-pN` 是允许
+Plan/Build 重叠的实验路径。两者仍共享真实 AICPU callback、同一份
+canonical Plan、ordinary TensorMap 严格插入、Build、96 Scalar
+Execute/FinalDrain；差异只在 producer admission、Host launch 顺序和
+consumer ticket 解析。当前不做 DAG，也不把跨 ABI 的旧数据冒充同提交
+因果 A/B。
 
 ## 3. 2026-08-10：S0 协议门槛
 
 ### 3.1 已写入源码的协议
 
-当前只有
+S0 当时只有
 [公共 Plan 协议头](common/aicpu_plan_protocol.h)和一份 atomic/DCCI 源码覆盖检查
 草案。协议头已表达：
 
-- `RuntimeTaskPlanHeader` 为 64B；公共 wire ABI 当前为 v2，header 的
+- `RuntimeTaskPlanHeader` 为 64B；该阶段公共 wire ABI 为 v2，header 的
   16bit `adapter_data` 由算子 adapter 定义，PA 用它显式携带真实
   Alloc callback 的 `batch_start`；
 - 完整无指针 payload 最大为 4416B，共 69 条 cache line；
@@ -153,8 +155,8 @@ VF leader 和 publication 的实现方式参考，不做二次拷贝或强转。
   统一 `dsb sy + isb` 后才检查 Empty。此时 AICore 尚未启动，不存在
   并发 writer。Host 同址两轮 smoke、AArch64 反汇编顺序门槛和 A5
   同进程多轮均已通过。
-- 无泳道 pipeline 性能：已取样，见 5.4 节；B1 warm 已低于 1ms，
-  B256 仍未达成目标。
+- 无泳道 pipeline 性能：已取样，见 5.4 节；性能目标与 A/B 统一只看
+  B256，目前仍未达成。B1 只作为功能 smoke。
 
 ### 3.4 S0 收口结论
 
@@ -283,16 +285,15 @@ Plan-only B1、full B1 和 full B256 均已 PASS。B256 具体包含 1280
 时钟边界、零 Claim 计数和所有 Host 语义校验全部 PASS。该修复没有
 恢复旧 replay/split 调度流程。
 
-### 5.4 当前 A5 性能证据
+### 5.4 ABI v2 的 A5 性能证据
 
-下表是 ABI v2、跨轮 cache 修复后的同一 trace-free 产物，使用真实
+下表是当时 ABI v2、跨轮 cache 修复后的同一 trace-free 产物，使用真实
 `real-compute=6,28,4,1`，在同一 Host 进程和同一 Plan GM allocation 内
 连续运行 5 轮得到的中位数。它不是把不同构建或不同轮次的局部最优值
 拼在一起：
 
 | workload | plan_time | producer_exec | aicore_time | startup→FinalDrain | pipeline_e2e | 结果 |
 | ---- | ----: | ----: | ----: | ----: | ----: | ---- |
-| B1 | 168.773us | 103.489us | 207.296us | 156.880us | 371.006us | 5/5 PASS |
 | B256 | 2690.859us | 2626.289us | 2491.516us | 2460.846us | 5180.220us | 5/5 PASS |
 
 五个时间口径必须分开解读：
@@ -303,7 +304,6 @@ Plan-only B1、full B1 和 full B256 均已 PASS。B256 具体包含 1280
 - `producer_exec` 由 AICPU owner 内部起止时钟得到，才是真实
   orchestration callback + canonical Plan 打包的 device 执行窗口；它还包含
   owner 内的输入解析、backend bind 和 Close，但不包含 Host Path-A launch/sync。
-  例如 warm B1 的真实 producer 中位数为 103.489us。
 - `aicore_time` 是 Host wall time，覆盖 AICore launch、Build、Execute、
   FinalDrain 和 stream sync，因此也含 launch/sync 固定成本。
 - `startup→FinalDrain` 是 AICore device 内边界，从最早 Scalar startup 到
@@ -315,39 +315,27 @@ Plan-only B1、full B1 和 full B256 均已 PASS。B256 具体包含 1280
 
 `plan_time` 和 `producer_exec` 同时保留正是为了区分 Path-A Host/Runtime
 成本与真实 AICPU 业务执行；两者不得混称为“Plan 生成时间”。同进程
-首轮仍存在 Path-A 首次执行冷启动，必须与 warm 中位数分开：首轮 B1
-的 Plan/producer/AICore/pipeline 为
-`6011.888/148.512/610.054/6622.200us`，首轮 B256 为
+首轮仍存在 Path-A 首次执行 warm-up 效应，必须与 warm 中位数分开：首轮 B256 为
 `8548.902/2686.402/2934.944/11484.044us`。Host 侧 owner DSO 的加载和
 handle 初始化发生在 `pipeline_begin` 之前；这里观测到的是首次 Path-A
 执行及 runtime warm-up，不把它武断归因成 callback 业务代码。
 
-B1 第 2--5 轮 pipeline 为
-`476.197/347.080/371.006/331.096us`，证明固定冷启动不是每轮成本；
 B256 warm 仍约 5.1--5.2ms，说明其主要矛盾已经转成随 task 数增长的
-Plan 打包和 AICore Build/Execute，而非单纯冷启动。
+Plan 打包和 AICore Build/Execute，而非单纯一次性初始化。
 
-上表只能声明 ordinary Scalar 功能闭合后的当前成本。B1 warm pipeline
-已经低于 1ms；B256 仍未达到目标：AICore device 内窗口中位数为
+上表只能声明 ordinary Scalar 功能闭合后的当前成本。B1 以后只作最小
+功能 smoke，不记录或汇报性能，也不保留性能泳道。B256 仍未达到目标：
+AICore device 内窗口中位数为
 2460.846us，完整 pipeline 中位数为 5180.220us。不能只报某个子阶段，
 也不能用 Plan-only、Host oracle 或 `producer_exec` 改写 pipeline 口径。
 
-当前 ABI v2 的最终 B1 full-swimlane（真实负载）位于
-`ordinary/outputs/pa_scheduler_aicpu_plan_scalar_ordinary_swimlane_20260810_214013_1990201/ccec/`。
-它包含 5 个全局唯一 PlannedBuild、4 个 Kernel、0 个 legacy Claim，
-physical generic records 为 2165、drop 为 0；converter 与 Plan 专用
-exclusive analyzer 均 PASS。泳道 lifecycle 为 348.119us，只用于归因，
-不能与上述 trace-free 绝对值相减。
+## 6. ordinary 功能停止点
 
-## 6. 当前停止点
-
-ordinary Scalar 和 ordinary SIMT 的功能基线都已成立。根据
-用户要求，本轮在 ordinary SIMT 正式 A5 B1/B256 功能闭合后
-停止继续功能开发，不进入 DAG Scalar 或 DAG SIMT，也不启动
-新的性能优化轮次。当前
-DAG 目录只是目标布局，没有实现与 A5 证据，不得把
-ordinary 结果外推成 DAG 证据。SIMT 冷 run1 也不是可用于
-性能结论的稳态基线。
+ordinary Scalar 和 ordinary SIMT 的功能基线都已成立。S3 完成时曾按
+用户要求停止继续功能开发；之后只重新开启 S6 的 ordinary pipeline
+性能优化，不扩大功能范围。DAG Scalar 和 DAG SIMT 继续冻结，DAG 目录
+只是目标布局，没有实现与 A5 证据，不得把 ordinary 结果外推成 DAG
+证据。SIMT 首次单次样本也不是可用于性能结论的稳态基线。
 
 ## 7. 2026-08-10—2026-08-11：S3 ordinary SIMT
 
@@ -694,13 +682,174 @@ ACL 首次初始化时传入按 512B 容量步长向上取整的
 
 | workload | startup→FinalDrain | plan_time | producer_exec | aicore_time | pipeline_e2e | 结果 |
 | ---- | ----: | ----: | ----: | ----: | ----: | ---- |
-| B1 | 489.219us | 6019.780us | 153.927us | 996.086us | 7016.097us | execution/semantic/postprocess PASS |
 | B256 | 62359.163us | 8871.954us | 2959.921us | 62884.823us | 71756.980us | execution/semantic/postprocess PASS |
 
-这两条只是 formal ordinary SIMT 首次冷 run 的功能证据，不是
-多轮 warm 中位数，不能当作稳态性能基线。B1 冷 pipeline 为
-7.016ms；B256 的 AICore device 内主体已达 62.359ms，完整
+该 B256 数据只是 formal ordinary SIMT 首次单次运行的功能证据，不是
+多轮 warm 中位数，不能当作稳态性能基线。B1 只作功能 smoke，不进入
+性能表或汇报。B256 的 AICore device 内主体已达 62.359ms，完整
 pipeline 为 71.757ms，离 1ms 目标很远。本阶段只宣称
 B1/B256 的 execution、semantic 和 postprocess 全部闭合，不宣称
 SIMT 性能达标或优于 Scalar。DAG 没有实现，且已按用户要求
-在此停止继续功能开发，也不开始新的性能优化。
+在此停止继续功能开发；随后单独开启的 ordinary Scalar pipeline 性能工作
+见第 8 节，不改变本节的 S3 功能结论。
+
+## 8. 2026-08-11：S6 ordinary Scalar 双 pipeline policy
+
+### 8.1 为什么长期保留两条路径
+
+串行 Plan-ahead 不是准备在并发版本完成后删除的过渡代码。当前用
+`PA_RUNTIME_PLAN_PIPELINE_POLICY` 编译期选择 ordinary Scalar 的阶段关系：
+
+| 编译值 | 产物身份 | 定位 |
+| ---- | ---- | ---- |
+| `0`（默认） | `plan-ahead-closed` | 长期正确性基线，也是量化并发代价的稳定对照组 |
+| `1` | `streaming-future-pN` | 实验路径；`N=PA_AICPU_PLAN_READY_PREFILL_TASKS`，默认 128 |
+
+policy 被编入 Host、AICore kernel、AICPU owner/producer 与运行身份，不是
+一次运行中的动态分支。默认值保持 0；串行构建拒绝显式 prefill，避免一个
+看似无效的参数悄悄改变基线身份。当前普通 TensorMap 之外的 DAG 不在
+这轮工作范围内。
+
+### 8.2 三处差异和共享主链
+
+两条 Scalar 路径只允许在以下三处不同：
+
+| 边界 | `plan-ahead-closed` | `streaming-future-pN` |
+| ---- | ---- | ---- |
+| producer admission | producer 在生产期保持 `NotReady=-2`；完整 Plan 准备好后才做 `Open=-1 -> Closed=N`，Close 还要求 `build_next==workers_done==0` | 连续 Published 前缀在真实 batch 边界达到 prefill 后发布 `Open=-1`；Close 可与 Build 并发 |
+| Host launch | AICPU launch、plan-stream sync、再 launch AICore | AICPU 与 AICore 使用两条 stream，consumer 在 producer 后立即 launch，最后两条 stream 都必须闭合 |
+| consumer ticket | 96 Scalar 先 attach immutable Closed Plan 并缓存 N；热循环只有 `build_next.FetchAdd`，首张 `ticket>=N` 直接退出 | Ready 后 96 Scalar 可领取尚未发布的 future ticket，并轮询该 ticket 的 cell；观察 Close 后按最终 N 解析 |
+
+以下内容没有分叉：真实 orchestration callback、唯一 AICPU producer、同一
+ABI v3 `RuntimeTaskPlanCell`、Plan decode/validate、Materialize、Alloc 的
+真实 heap reserve、ordinary TensorMap 严格 `N-1 -> N` 插入、Fanin、
+exec-cell Build、engine-routed Execute 和 FinalDrain。两条路径也都禁止
+Host task identity、`task_id % 5` 和 device PA 固定公式。
+
+ABI v3 把 `closed_task_count` 明确定义为四态：`-3=ReadyFailed`、
+`-2=NotReady`、`-1=Open`、非负值 `N=Closed`。`ReadyFailed=-3` 只保证
+closed control line 已发布，consumer 不得先读取可能尚未完成 reset 的其他
+control。Streaming 的 future ticket 若先观察到 Empty，随后观察到 Close 且
+`ticket<N`，必须再次 acquire 同一个 cell；第二次仍 Empty 才能报告
+MissingPlanCell，不能把 Close 与 cell publication 的独立可见性顺序误判成
+丢任务。
+
+AICPU producer 同时改为 single-Pack：`Finish` 在 callback 引用仍有效时
+直接 Pack 到目标 GM cell，保持 control=Empty；下一次 `Begin` 或最终 Close
+只补齐 final flags、校验同一份 GM wire，再按
+`payload clean -> barrier -> Published control` 发布。pending 状态只保留
+一条隔离线内的 metadata，不再保存并二次复制完整 4416B payload。
+
+正常成功终态对两条策略相同，其中 `W=96`：
+
+```text
+closed_task_count == N
+build_next == N + W
+build_workers_done == W
+build_release == N
+fatal == 0
+```
+
+最终两条 policy 都必须得到 `planned_frontier==N`。Plan-ahead 已在 attach
+时验证 immutable Close/frontier；Streaming 的最后一个 arrival 必须在
+producer 并发结束后重新核验最终 frontier。两条 policy 共享之后的 Build release、
+Execute 和 FinalDrain 实现，避免为了做性能实验复制一套业务语义。
+
+### 8.3 产物、manifest 与 raw 隔离
+
+Scalar CPU/CCEC 产物按 policy 物理分目录：
+
+```text
+ordinary/scalar_build/build/<backend>/shared/plan-ahead-closed/<variant>/
+ordinary/scalar_build/build/<backend>/shared/streaming-future-pN/<variant>/
+```
+
+CCEC manifest 升为 `pa_scheduler_artifacts/v6`，除 Runtime Plan ABI v3、
+容量、variant 和四件套 SHA256 外，还固定
+`pipeline/launch_order/producer_ready/consumer_admission/prefill` 与
+`scheduler_input`。运行入口会同时检查 26 行 manifest、SHA、源码新旧和
+编译期 Build identity；因此不能把一个 policy 的 Host、kernel、AICPU SO
+或 dispatcher 与另一个 policy 混用。
+
+新采集的泳道输出目录名同样包含 `plan-ahead-closed` 或
+`streaming-future-pN`。raw metadata 显式记录 Runtime Plan ABI、pipeline
+及 `launch_order/producer_ready/consumer_admission/prefill`、
+`runtime_plan_build_backend/build_workers/execute_workers/
+build_trace_coverage`、`producer_task_count/task_count/task_kinds` 和
+`runtime_plan_terminal`，converter 按相同合同校验。device Closed(N) 是
+`task_count` 权威来源，并与 producer result、frontier 和 release 交叉；
+Host 重建 task plan 仍只作 oracle。Scalar coverage 固定为
+`scalar-task-detail`、W=96。历史 schema-v5 raw 若缺少 policy 字段，只允许在
+`runtime_plan_abi<3` 时推断为 legacy `plan-ahead-closed`，并写出
+`inferred_legacy_policy=true`；ABI v3 raw 缺少显式 policy 会直接拒绝。
+
+S6 的正式泳道不再只看 AICore：每份结果必须同时包含 AICPU producer 与
+AICore Build/Execute/FinalDrain。AICPU 使用 `CLOCK_MONOTONIC_RAW`，AICore
+使用 `SYS_CNT`；主体前、后分别采 4 组四时间戳
+`(AICPU send, AICore receive, AICore send, AICPU receive)`，以全部 8 组
+offset 区间的交集完成映射，相关误差必须 `<=50us`。raw 必须逐组保留四个
+原始时间戳、offset 上下界、round-trip、AICore service interval、轮次序号
+与 nonce，不能只保留最终 offset。Host 只负责 launch/sync，不属于泳道
+时钟域，不生成 Host lane，raw 也不保存 Host timestamp、clock bracket 或
+lane metadata。
+
+### 8.4 AICPU+AICore joint structural capture 合同
+
+pre-correlation 会在主体前实际启动 AICPU/AICore，因此联合泳道是校准后的
+结构取证，不是未经预热的性能样本。每份结果必须显式标记：
+
+```text
+clock_correlation_warmup_before_pipeline = true
+timing_scope = calibrated-structural-capture
+performance_representative = false
+```
+
+绝对性能只取 trace-free、同进程 warm 多轮的中位数；joint capture 只回答
+阶段位置、并行形状和重叠关系，不能与 trace-free 数值相减。分析器对
+`RuntimePlanBuild`、真实 Kernel Execute 和 FinalDrain 分别做区间 union，
+同一阶段内多个 worker 的重叠只计一次；再用映射后的 AICPU producer 区间
+求各阶段 overlap、非重叠 tail 与 signed gap。Streaming 的结果必须按这些
+真实交并关系分类，不得因 policy 名含 `streaming` 就预设已经形成有效重叠，
+也不得把 Ready/PlanCell/Close 等待归入 Build 或 Kernel。
+
+性能和正式泳道都只看 B256；B1 永久只作功能 smoke，不保留或汇报性能。
+当前留存集合限定为两个 policy × 两种真实计算参数（`1,1,1,1` 和
+`6,28,4,1`）共四份 joint structural capture。具体数值和文件路径只在四份
+均完成语义、postprocess、零 drop、时钟相关和联合分析校验后写入日期目录
+README。严格 A/B 仍要求同一源码 commit、ABI v3、single-Pack、device、
+输入、trace 配置和边界；绝对值则由各 policy 的 trace-free warm pair 给出。
+
+### 8.5 naive p128 的负结果
+
+在双 policy 正式固化前做过一次 `real-compute=6,28,4,1`、B256、同进程
+5 轮的 warm 诊断。串行 control 与“prefill 后立即放入 96 个
+future-ticket consumer”的 naive p128 结果为：
+
+| 路径 | plan time | producer exec | AICore Host span | pipeline E2E | 正确性 |
+| ---- | ----: | ----: | ----: | ----: | ---- |
+| 串行 Plan-ahead control | 2667.425us | 2590.039us | 2520.457us | 5187.986us | 5/5 PASS |
+| naive StreamingFuture p128 | 4414.344us | 4336.106us | 6543.950us | 6575.206us | 5/5 PASS |
+
+Streaming 的 `aicore_time` 从 AICore launch 起计，包含 Ready/PlanCell/Close
+等待，只能当 upper bound，不能解释成纯 Build/Execute 用时。更有判别力
+的是 producer 侧反压：Plan wall 增加 1746.919us，`producer_exec` 增加
+1746.067us；按 1280 tasks 折算，producer throughput 约下降 40.3%。若用
+串行 AICore span 作为诊断性 counterfactual，p128 只隐藏约 359.595us，
+而 pipeline 实际回退 1387.220us，即 **5.188ms -> 6.575ms**。Plan 增量
+减去隐藏量与该回退只差约 0.1us。
+
+这组数足以否定“Ready + 96 future-ticket 自旋天然最优”的默认假设，但
+还不是最终因果结论：串行 control 来自历史 ABI v2，实验路径来自 ABI v3/
+single-Pack 开发状态。最终定量结论仍以 8.4 节要求的同 commit、ABI v3、
+single-Pack warm pair 为准。
+
+### 8.6 下一步只做 ordinary Scalar admission 优化
+
+下一候选不是继续扩大 prefill 后的无界竞争人口，而是限制 Open 阶段可进入
+Build 的 Scalar 数 `K`，Close 后再让全部 96 个 Scalar 加入并收尾。建议先
+把 `K=8/16/32` 与当前 `K=96` control 分开测量，并把 K 编入构建身份、
+manifest 和 raw；prefill 只作为另一条独立变量。这个 limited-K admission
+目前**尚未实现**，不能在结果或目录名中宣称已有。
+
+本轮只优化 ordinary Scalar 的 Plan/Build 阶段关系。DAG TensorMap、DAG
+Scalar 和 DAG SIMT 都继续冻结，不在 limited-K 或 pipeline A/B 中顺带实现。

@@ -13,6 +13,7 @@
 #define PA_SCHEDULER_COMMON_HOST_SUPPORT_H
 
 #include "pa_model.h"
+#include "../aicpu/aicpu_clock_correlation_abi.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -37,6 +38,75 @@ static_assert(
             kHostSimtRuntimePlanBuildLeaders,
     "ordinary SIMT Host oracle requires exactly four Build leaders"
 );
+
+// Pipeline policy is a compile-time artifact identity.  Keep the strings in
+// one place so the Host banner and raw swimlane metadata cannot describe a
+// different launch/admission contract from the code that was compiled.
+inline constexpr const char *RuntimePlanPipelineName()
+{
+    if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
+        return "plan-ahead-closed";
+    }
+    return "streaming-future";
+}
+
+inline constexpr const char *RuntimePlanLaunchOrderName()
+{
+    if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
+        return "plan-sync-before-aicore";
+    }
+    return "dual-stream-overlap";
+}
+
+inline constexpr const char *RuntimePlanProducerReadyName()
+{
+    if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
+        return "closed";
+    }
+    return "prefill";
+}
+
+inline constexpr const char *RuntimePlanConsumerAdmissionName()
+{
+    if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
+        return "closed-only";
+    }
+    return "ready-future-ticket";
+}
+
+inline constexpr uint32_t RuntimePlanPipelinePrefillTasks()
+{
+    if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
+        return 0U;
+    }
+    return aicpu_plan::kRuntimePlanReadyPrefillTasks;
+}
+
+inline constexpr const char *RuntimePlanBuildBackendName()
+{
+    return kHostUsesSimtRuntimePlanBuild ? "simt" : "scalar";
+}
+
+inline constexpr const char *RuntimePlanBuildTraceCoverageName()
+{
+    // Scalar Build runs through TraceAtomic/phase helpers and therefore owns
+    // per-task child evidence.  The formal SIMT VF deliberately uses direct
+    // device operations; its Build proof is the terminal control state plus
+    // the coarse RuntimePlanBuild continuation span, not invented Scalar rows.
+    return kHostUsesSimtRuntimePlanBuild
+        ? "simt-coarse-direct-state"
+        : "scalar-task-detail";
+}
+
+inline constexpr const char *RuntimePlanAicoreTimeScopeName()
+{
+    // Streaming currently synchronizes the Plan stream before waiting for the
+    // AICore stream.  Its host wall interval can therefore include time spent
+    // in the Plan sync and is only an upper bound for isolated AICore work.
+    return kRuntimePlanPipelineIsStreamingFuture
+        ? "upper-bound-includes-plan-sync-wait"
+        : "aicore-stream-wall";
+}
 
 // shared host oracle 与 private 固定五 task 校验必须在预处理阶段彻底分叉。
 // private 的 #else 有意保留基线 token 形状，避免同一翻译单元内的 shared
@@ -223,6 +293,7 @@ inline ParseStatus ParseOptions(int argc, char **argv, bool require_kernel, Opti
     // CCEC host 需要外部 kernel ELF；AscendC 和 CPU 的可执行文件已包含 kernel，因此不需要该参数。
     bool nop_override_seen = false;
     bool swimlane_json_seen = false;
+    bool kernel_seen = false;
 #if PTO_FDWIC_SHARED_MAP
     bool shared_context_lens_seen = false;
 #endif
@@ -255,7 +326,12 @@ inline ParseStatus ParseOptions(int argc, char **argv, bool require_kernel, Opti
         }
         const char *value = argv[++index];
         if (argument == "--kernel" && require_kernel) {
+            if (kernel_seen) {
+                std::fprintf(stderr, "Specify --kernel only once.\n");
+                return ParseStatus::Error;
+            }
             options->kernel_path = value;
+            kernel_seen = true;
         } else if (argument == "--device") {
             if (!ParseUint(value, 0, INT32_MAX, &options->device)) return ParseStatus::Error;
         } else if (argument == "--batches") {
@@ -968,17 +1044,19 @@ inline void InitializeState(SchedulerState *state, const Options &options) {
     }
 #if PTO_FDWIC_SHARED_MAP
     // Host 只初始化空的调度状态。task identity 与 canonical payload 由
-    // AICPU callback producer 写入外置 Plan；Scalar 只在 Plan close 后
-    // 通过中央 ticket Build。Host plan 仅作运行后独立 oracle，绝不能
-    // 写回 device 调度输入。旧 replay seal/replay_done 不再参与协议，
-    // 必须保持初值；两条 Execute cursor 仍从 task 0 扫描 runtime cell。
+    // AICPU callback producer 写入外置 Plan；Scalar 在 producer 发布 Ready
+    // 后即可通过中央 ticket 流水 Build，不必等待整份 Plan close。Host plan
+    // 仅作运行后独立 oracle，绝不能写回 device 调度输入。closed 的 -2
+    // 初值同时阻止 consumer 在 AICPU 丢弃复用 cell control cache 之前触碰
+    // cell。旧 replay seal/replay_done 不再参与协议，必须保持初值；两条
+    // Execute cursor 仍从 task 0 扫描 runtime cell。
     state->replay_identity_seal.line.value = -1;
     state->replay_done.value = 0;
     state->exec_scan_cursors.aic_next.value = 0;
     state->exec_scan_cursors.aiv_next.value = 0;
     state->runtime_plan_control.planned_frontier.value = 0;
     state->runtime_plan_control.closed_task_count.value =
-        aicpu_plan::kPlanOpenTaskCount;
+        aicpu_plan::kPlanProducerNotReadyTaskCount;
     state->runtime_plan_control.build_next.value = 0;
     state->runtime_plan_control.build_workers_done.value = 0;
     state->runtime_plan_control.build_release.value =
@@ -2295,6 +2373,277 @@ inline bool ExpandSharedTraceRecords(
 }
 #endif
 
+inline bool ValidateAicoreCausalCaptureBracket(
+    const aicpu_clock::ClockCorrelationEvidence &evidence,
+    uint64_t minimum_fdwic_start_tick,
+    uint64_t maximum_fdwic_end_tick,
+    bool report_error = true
+) {
+    uint64_t aicore_pre_send_max_tick = 0U;
+    uint64_t aicore_post_receive_min_tick = UINT64_MAX;
+    for (uint32_t index = 0U;
+         index < aicpu_clock::kSamplesPerRound; ++index) {
+        aicore_pre_send_max_tick = std::max(
+            aicore_pre_send_max_tick,
+            evidence.samples[index].aicore_send_ticks
+        );
+        aicore_post_receive_min_tick = std::min(
+            aicore_post_receive_min_tick,
+            evidence.samples[
+                index + aicpu_clock::kSamplesPerRound]
+                .aicore_receive_ticks
+        );
+    }
+    const bool valid = minimum_fdwic_start_tick != UINT64_MAX &&
+        minimum_fdwic_start_tick <= maximum_fdwic_end_tick &&
+        aicore_pre_send_max_tick < minimum_fdwic_start_tick &&
+        maximum_fdwic_end_tick < aicore_post_receive_min_tick;
+    if (!valid && report_error) {
+        std::fprintf(
+            stderr,
+            "swimlane export rejected AICore FDWIC interval outside "
+            "the strict pre-send/post-receive causal bracket: "
+            "pre_send_max=%llu fdwic=[%llu,%llu] "
+            "post_receive_min=%llu.\n",
+            static_cast<unsigned long long>(
+                aicore_pre_send_max_tick),
+            static_cast<unsigned long long>(
+                minimum_fdwic_start_tick),
+            static_cast<unsigned long long>(
+                maximum_fdwic_end_tick),
+            static_cast<unsigned long long>(
+                aicore_post_receive_min_tick)
+        );
+    }
+    return valid;
+}
+
+inline bool ValidateAicpuClockCorrelationForExport(
+    bool require_aicpu_producer, uint64_t frequency_hz,
+    uint64_t owner_begin_ns, uint64_t owner_end_ns,
+    const aicpu_clock::ClockCorrelationEvidence &evidence,
+    bool *has_aicpu_producer
+) {
+    if (has_aicpu_producer == nullptr) {
+        return false;
+    }
+    *has_aicpu_producer = false;
+    const int32_t status = evidence.status;
+    if (status == static_cast<int32_t>(
+            aicpu_clock::EvidenceStatus::NotApplicable)) {
+        if (require_aicpu_producer || owner_begin_ns != 0U ||
+            owner_end_ns != 0U) {
+            std::fprintf(
+                stderr,
+                "AICPU clock correlation is NotApplicable for a required "
+                "or timestamped producer: require=%d owner=[%llu,%llu].\n",
+                require_aicpu_producer ? 1 : 0,
+                static_cast<unsigned long long>(owner_begin_ns),
+                static_cast<unsigned long long>(owner_end_ns)
+            );
+            return false;
+        }
+        return true;
+    }
+    if (!require_aicpu_producer) {
+        std::fprintf(
+            stderr,
+            "host-cpu swimlane export must not carry AICPU clock evidence.\n"
+        );
+        return false;
+    }
+    if (status != static_cast<int32_t>(
+            aicpu_clock::EvidenceStatus::Valid)) {
+        std::fprintf(
+            stderr,
+            "swimlane export rejected AICPU clock correlation status=%d.\n",
+            status
+        );
+        return false;
+    }
+    if (frequency_hz != aicpu_clock::kClockUnitsPerSecond) {
+        // The current evidence ABI stores offset_*_ns because its A5 AICore clock
+        // has exactly one tick per ns.  Do not silently reinterpret those
+        // fields when a future platform uses another SYS_CNT rate.
+        std::fprintf(
+            stderr,
+            "AICPU clock correlation evidence v%u requires 1GHz SYS_CNT, "
+            "got %llu Hz.\n",
+            aicpu_clock::kVersion,
+            static_cast<unsigned long long>(frequency_hz)
+        );
+        return false;
+    }
+    if (owner_begin_ns == 0U || owner_end_ns <= owner_begin_ns ||
+        evidence.magic != aicpu_clock::kEvidenceMagic ||
+        evidence.version != aicpu_clock::kVersion ||
+        evidence.sample_count !=
+            aicpu_clock::kEvidenceSampleCapacity ||
+        evidence.pre_samples != aicpu_clock::kSamplesPerRound ||
+        evidence.post_samples != aicpu_clock::kSamplesPerRound) {
+        std::fprintf(
+            stderr,
+            "swimlane export rejected malformed AICPU owner/correlation "
+            "identity: owner=[%llu,%llu] magic=%llu version=%u "
+            "samples=%u pre=%u post=%u.\n",
+            static_cast<unsigned long long>(owner_begin_ns),
+            static_cast<unsigned long long>(owner_end_ns),
+            static_cast<unsigned long long>(evidence.magic),
+            evidence.version, evidence.sample_count,
+            evidence.pre_samples, evidence.post_samples
+        );
+        return false;
+    }
+
+    int64_t intersection_lower = INT64_MIN;
+    int64_t intersection_upper = INT64_MAX;
+    uint64_t maximum_round_trip = 0U;
+    uint64_t maximum_service = 0U;
+    uint64_t previous_aicpu_receive = 0U;
+    uint64_t previous_aicore_send = 0U;
+    uint64_t round_nonces[aicpu_clock::kCaptureRounds] = {0U, 0U};
+    for (uint32_t index = 0U;
+         index < aicpu_clock::kEvidenceSampleCapacity; ++index) {
+        const aicpu_clock::ClockCorrelationRawSample &sample =
+            evidence.samples[index];
+        if (sample.aicpu_send_ns == 0U ||
+            sample.aicpu_receive_ns <= sample.aicpu_send_ns ||
+            sample.aicore_receive_ticks == 0U ||
+            sample.aicore_send_ticks < sample.aicore_receive_ticks ||
+            sample.aicpu_send_ns > static_cast<uint64_t>(INT64_MAX) ||
+            sample.aicpu_receive_ns > static_cast<uint64_t>(INT64_MAX) ||
+            sample.aicore_receive_ticks >
+                static_cast<uint64_t>(INT64_MAX) ||
+            sample.aicore_send_ticks >
+                static_cast<uint64_t>(INT64_MAX) ||
+            (index != 0U &&
+             (sample.aicpu_send_ns < previous_aicpu_receive ||
+              sample.aicore_receive_ticks < previous_aicore_send))) {
+            std::fprintf(
+                stderr,
+                "swimlane export rejected AICPU correlation sample %u "
+                "timestamp order.\n",
+                index
+            );
+            return false;
+        }
+        const uint32_t round =
+            index / aicpu_clock::kSamplesPerRound;
+        if (index % aicpu_clock::kSamplesPerRound == 0U) {
+            round_nonces[round] = sample.round_nonce;
+        } else if (sample.round_nonce != round_nonces[round]) {
+            std::fprintf(
+                stderr,
+                "swimlane export rejected mixed nonce in AICPU "
+                "correlation round %u.\n",
+                round
+            );
+            return false;
+        }
+        const int64_t computed_lower =
+            static_cast<int64_t>(sample.aicore_send_ticks) -
+            static_cast<int64_t>(sample.aicpu_receive_ns);
+        const int64_t computed_upper =
+            static_cast<int64_t>(sample.aicore_receive_ticks) -
+            static_cast<int64_t>(sample.aicpu_send_ns);
+        const uint64_t computed_round_trip =
+            sample.aicpu_receive_ns - sample.aicpu_send_ns;
+        const uint64_t computed_service =
+            sample.aicore_send_ticks - sample.aicore_receive_ticks;
+        if (computed_lower > computed_upper ||
+            sample.offset_lower_ns != computed_lower ||
+            sample.offset_upper_ns != computed_upper ||
+            sample.round_trip_ns != computed_round_trip ||
+            sample.aicore_service_ticks != computed_service ||
+            sample.round != index / aicpu_clock::kSamplesPerRound ||
+            sample.index_in_round !=
+                index % aicpu_clock::kSamplesPerRound ||
+            sample.round_nonce == 0U) {
+            std::fprintf(
+                stderr,
+                "swimlane export rejected inconsistent AICPU correlation "
+                "sample %u.\n",
+                index
+            );
+            return false;
+        }
+        intersection_lower = std::max(
+            intersection_lower, computed_lower
+        );
+        intersection_upper = std::min(
+            intersection_upper, computed_upper
+        );
+        maximum_round_trip = std::max(
+            maximum_round_trip, computed_round_trip
+        );
+        maximum_service = std::max(
+            maximum_service, computed_service
+        );
+        previous_aicpu_receive = sample.aicpu_receive_ns;
+        previous_aicore_send = sample.aicore_send_ticks;
+    }
+    if (intersection_lower > intersection_upper) {
+        std::fprintf(
+            stderr,
+            "swimlane export rejected empty AICPU/AICore clock offset "
+            "intersection.\n"
+        );
+        return false;
+    }
+    if (round_nonces[0] == round_nonces[1]) {
+        std::fprintf(
+            stderr,
+            "swimlane export rejected reused AICPU correlation round nonce.\n"
+        );
+        return false;
+    }
+    for (uint32_t index = 0U;
+         index < aicpu_clock::kSamplesPerRound; ++index) {
+        if (evidence.samples[index].aicpu_receive_ns >= owner_begin_ns ||
+            evidence.samples[index + aicpu_clock::kSamplesPerRound]
+                    .aicpu_send_ns <= owner_end_ns) {
+            std::fprintf(
+                stderr,
+                "swimlane export rejected AICPU owner outside the strict "
+                "pre-receive/post-send causal bracket.\n"
+            );
+            return false;
+        }
+    }
+    // Use a widened subtraction: a malformed internal caller can otherwise
+    // span almost the complete int64 range even though each endpoint alone is
+    // representable.
+    const uint64_t interval_width = static_cast<uint64_t>(
+        static_cast<__int128>(intersection_upper) -
+        static_cast<__int128>(intersection_lower)
+    );
+    const int64_t selected_offset = intersection_lower +
+        static_cast<int64_t>(interval_width / 2U);
+    const uint64_t alignment_error = static_cast<uint64_t>(std::max(
+        selected_offset - intersection_lower,
+        intersection_upper - selected_offset
+    ));
+    if (evidence.offset_lower_ns != intersection_lower ||
+        evidence.offset_upper_ns != intersection_upper ||
+        evidence.selected_offset_ns != selected_offset ||
+        evidence.alignment_error_ns != alignment_error ||
+        evidence.maximum_round_trip_ns != maximum_round_trip ||
+        evidence.maximum_aicore_service_ticks != maximum_service ||
+        alignment_error > aicpu_clock::kMaximumAlignmentErrorNs) {
+        std::fprintf(
+            stderr,
+            "swimlane export rejected inconsistent/high-error AICPU clock "
+            "aggregate: error=%llu limit=%llu.\n",
+            static_cast<unsigned long long>(alignment_error),
+            static_cast<unsigned long long>(
+                aicpu_clock::kMaximumAlignmentErrorNs)
+        );
+        return false;
+    }
+    *has_aicpu_producer = true;
+    return true;
+}
+
 template <
     typename ReadRecords
 #if PTO_FDWIC_SHARED_MAP
@@ -2312,10 +2661,36 @@ inline bool ExportSwimlaneRecords(
     const char *workload_pattern, FinalBarrierShape final_barrier_shape,
     bool atomic_trace_enabled, ReadRecords read_records
 #if PTO_FDWIC_SHARED_MAP
-    , ReadSubmitClaimRecords read_submit_claim_records
+    , ReadSubmitClaimRecords read_submit_claim_records,
+    uint32_t runtime_plan_producer_task_count,
+    bool require_aicpu_producer,
+    uint64_t runtime_plan_producer_begin_ns,
+    uint64_t runtime_plan_producer_end_ns,
+    const aicpu_clock::ClockCorrelationEvidence
+        &aicpu_clock_correlation
 #endif
 ) {
     if (!ValidateTraceHeader(header, "swimlane export")) return false;
+    bool has_aicpu_producer = false;
+#if PTO_FDWIC_SHARED_MAP
+    if (!ValidateAicpuClockCorrelationForExport(
+            require_aicpu_producer, header.frequency_hz,
+            runtime_plan_producer_begin_ns,
+            runtime_plan_producer_end_ns,
+            aicpu_clock_correlation,
+            &has_aicpu_producer
+        )) {
+        return false;
+    }
+#endif
+    uint32_t exported_runtime_plan_producer_task_count = 0U;
+    uint32_t exported_runtime_plan_task_count = 0U;
+    int64_t exported_planned_frontier = 0;
+    int64_t exported_closed_task_count = 0;
+    int64_t exported_build_next = 0;
+    int64_t exported_build_workers_done = 0;
+    int64_t exported_build_release = 0;
+    int64_t exported_runtime_plan_fatal = 0;
 #if PTO_FDWIC_SHARED_MAP
     // Plan-ahead 不再生成旧 Submit/Claim endpoint sidecar。为了不
     // 改动既有 Host 调用 ABI，暂时保留 callback 参数，但绝不
@@ -2333,6 +2708,56 @@ inline bool ExportSwimlaneRecords(
         );
         return false;
     }
+    const int64_t expected_task_count =
+        static_cast<int64_t>(shared_plan.total_tasks);
+    const int64_t expected_build_next = expected_task_count +
+        static_cast<int64_t>(kRuntimePlanBuildWorkers);
+    const aicpu_plan::RuntimePlanControl &plan_control =
+        state.runtime_plan_control;
+    if (runtime_plan_producer_task_count != shared_plan.total_tasks ||
+        plan_control.planned_frontier.value != expected_task_count ||
+        plan_control.closed_task_count.value != expected_task_count ||
+        plan_control.build_next.value != expected_build_next ||
+        plan_control.build_workers_done.value !=
+            static_cast<int64_t>(kRuntimePlanBuildWorkers) ||
+        plan_control.build_release.value != expected_task_count ||
+        plan_control.fatal.value != 0) {
+        std::fprintf(
+            stderr,
+            "swimlane export rejected non-terminal Runtime Plan: "
+            "backend=%s tasks=%u producer_tasks=%u frontier=%lld "
+            "closed=%lld build_next=%lld "
+            "workers_done=%lld release=%lld fatal=%lld.\n",
+            RuntimePlanBuildBackendName(), shared_plan.total_tasks,
+            runtime_plan_producer_task_count,
+            static_cast<long long>(
+                plan_control.planned_frontier.value),
+            static_cast<long long>(
+                plan_control.closed_task_count.value),
+            static_cast<long long>(plan_control.build_next.value),
+            static_cast<long long>(
+                plan_control.build_workers_done.value),
+            static_cast<long long>(plan_control.build_release.value),
+            static_cast<long long>(plan_control.fatal.value)
+        );
+        return false;
+    }
+    // 权威 task_count 来自 device 最终 Close，而不是 Host 复建 PA 公式；
+    // 上面的等值检查只把 shared_plan 保留为独立事后 oracle。
+    exported_runtime_plan_task_count = static_cast<uint32_t>(
+        plan_control.closed_task_count.value
+    );
+    exported_runtime_plan_producer_task_count =
+        runtime_plan_producer_task_count;
+    exported_planned_frontier =
+        plan_control.planned_frontier.value;
+    exported_closed_task_count =
+        plan_control.closed_task_count.value;
+    exported_build_next = plan_control.build_next.value;
+    exported_build_workers_done =
+        plan_control.build_workers_done.value;
+    exported_build_release = plan_control.build_release.value;
+    exported_runtime_plan_fatal = plan_control.fatal.value;
 #endif
     if (workload_mode != WinnerWorkloadMode::ScalarNop &&
         workload_mode != WinnerWorkloadMode::RealCompute) {
@@ -2421,6 +2846,21 @@ inline bool ExportSwimlaneRecords(
         "{\n\"l2_swimlane_level\":%u,\n"
         "\"metadata\":{\"tensormap_mode\":\"%s\","
         "\"submit_topology\":\"aicpu_plan_central_build\","
+        "\"runtime_plan_abi\":%u,"
+        "\"runtime_plan_build_backend\":\"%s\","
+        "\"runtime_plan_build_workers\":%u,"
+        "\"runtime_plan_execute_workers\":%u,"
+        "\"runtime_plan_build_trace_coverage\":\"%s\","
+        "\"runtime_plan_producer_task_count\":%u,"
+        "\"runtime_plan_task_count\":%u,"
+        "\"runtime_plan_terminal\":{"
+        "\"planned_frontier\":%lld,\"closed_task_count\":%lld,"
+        "\"build_next\":%lld,\"build_workers_done\":%lld,"
+        "\"build_release\":%lld,\"fatal\":%lld},"
+        "\"profiling_primary_view\":\"%s\","
+        "\"pipeline\":\"%s\",\"launch_order\":\"%s\","
+        "\"producer_ready\":\"%s\","
+        "\"consumer_admission\":\"%s\",\"prefill\":%u,"
         "\"clock_freq_hz\":%llu,\"num_cores\":%u,"
         "\"trace_schema_version\":%u,\"final_barrier\":\"%s\","
         "\"winner_workload\":{\"mode\":\"%s\","
@@ -2429,6 +2869,24 @@ inline bool ExportSwimlaneRecords(
         "\"engine_mapping\":%s},\"core_types\":[",
         atomic_trace_enabled ? 4U : 1U,
         PTO_FDWIC_SHARED_MAP ? "shared" : "private",
+        aicpu_plan::kRuntimePlanAbiVersion,
+        RuntimePlanBuildBackendName(), kRuntimePlanBuildWorkers,
+        kWorkers, RuntimePlanBuildTraceCoverageName(),
+        exported_runtime_plan_producer_task_count,
+        exported_runtime_plan_task_count,
+        static_cast<long long>(exported_planned_frontier),
+        static_cast<long long>(exported_closed_task_count),
+        static_cast<long long>(exported_build_next),
+        static_cast<long long>(exported_build_workers_done),
+        static_cast<long long>(exported_build_release),
+        static_cast<long long>(exported_runtime_plan_fatal),
+        has_aicpu_producer
+            ? "joint_aicpu_aicore_structure"
+            : "host_cpu_functional_structure",
+        RuntimePlanPipelineName(), RuntimePlanLaunchOrderName(),
+        RuntimePlanProducerReadyName(),
+        RuntimePlanConsumerAdmissionName(),
+        RuntimePlanPipelinePrefillTasks(),
         static_cast<unsigned long long>(header.frequency_hz), kWorkers,
         header.version,
         ActiveFinalBarrierName(final_barrier_shape),
@@ -2448,9 +2906,137 @@ inline bool ExportSwimlaneRecords(
     }
     std::fprintf(output, "]");
 #if PTO_FDWIC_SHARED_MAP
+    std::fprintf(
+        output,
+        ",\"runtime_plan_producer_domain\":\"%s\","
+        "\"clock_correlation_warmup_before_pipeline\":%s,"
+        "\"timing_scope\":\"%s\","
+        "\"performance_representative\":false",
+        has_aicpu_producer ? "aicpu" : "host-cpu",
+        has_aicpu_producer ? "true" : "false",
+        has_aicpu_producer
+            ? "calibrated-structural-capture"
+            : "host-cpu-functional-capture"
+    );
+    if (has_aicpu_producer) {
+        uint64_t aicpu_pre_receive_max_ns = 0U;
+        uint64_t aicpu_post_send_min_ns = UINT64_MAX;
+        uint64_t aicore_pre_send_max_tick = 0U;
+        uint64_t aicore_post_receive_min_tick = UINT64_MAX;
+        for (uint32_t index = 0U;
+             index < aicpu_clock::kSamplesPerRound; ++index) {
+            const aicpu_clock::ClockCorrelationRawSample &pre =
+                aicpu_clock_correlation.samples[index];
+            const aicpu_clock::ClockCorrelationRawSample &post =
+                aicpu_clock_correlation.samples[
+                    index + aicpu_clock::kSamplesPerRound];
+            aicpu_pre_receive_max_ns = std::max(
+                aicpu_pre_receive_max_ns, pre.aicpu_receive_ns);
+            aicpu_post_send_min_ns = std::min(
+                aicpu_post_send_min_ns, post.aicpu_send_ns);
+            aicore_pre_send_max_tick = std::max(
+                aicore_pre_send_max_tick, pre.aicore_send_ticks);
+            aicore_post_receive_min_tick = std::min(
+                aicore_post_receive_min_tick,
+                post.aicore_receive_ticks);
+        }
+        std::fprintf(
+            output,
+            ",\"aicpu_aicore_clock_correlation\":{"
+            "\"status\":\"valid\",\"version\":%u,"
+            "\"pre_samples\":%u,\"post_samples\":%u,"
+            "\"scale_num\":%llu,"
+            "\"scale_den\":%llu,\"offset_lower_tick\":%lld,"
+            "\"offset_upper_tick\":%lld,\"offset_mid_tick\":%lld,"
+            "\"alignment_error_tick\":%llu,"
+            "\"maximum_round_trip_ns\":%llu,"
+            "\"maximum_aicore_service_ticks\":%llu,\"samples\":[",
+            aicpu_clock_correlation.version,
+            aicpu_clock_correlation.pre_samples,
+            aicpu_clock_correlation.post_samples,
+            static_cast<unsigned long long>(header.frequency_hz),
+            static_cast<unsigned long long>(
+                aicpu_clock::kClockUnitsPerSecond),
+            static_cast<long long>(
+                aicpu_clock_correlation.offset_lower_ns),
+            static_cast<long long>(
+                aicpu_clock_correlation.offset_upper_ns),
+            static_cast<long long>(
+                aicpu_clock_correlation.selected_offset_ns),
+            static_cast<unsigned long long>(
+                aicpu_clock_correlation.alignment_error_ns),
+            static_cast<unsigned long long>(
+                aicpu_clock_correlation.maximum_round_trip_ns),
+            static_cast<unsigned long long>(
+                aicpu_clock_correlation.maximum_aicore_service_ticks)
+        );
+        for (uint32_t index = 0U;
+             index < aicpu_clock::kEvidenceSampleCapacity; ++index) {
+            const aicpu_clock::ClockCorrelationRawSample &sample =
+                aicpu_clock_correlation.samples[index];
+            std::fprintf(
+                output,
+                "%s{\"aicpu_send_ns\":%llu,"
+                "\"aicore_receive_tick\":%llu,"
+                "\"aicore_send_tick\":%llu,"
+                "\"aicpu_receive_ns\":%llu,"
+                "\"offset_lower_tick\":%lld,"
+                "\"offset_upper_tick\":%lld,"
+                "\"round_trip_ns\":%llu,"
+                "\"aicore_service_ticks\":%llu,"
+                "\"round\":%u,\"index_in_round\":%u,"
+                "\"round_nonce\":%llu}",
+                index == 0U ? "" : ",",
+                static_cast<unsigned long long>(
+                    sample.aicpu_send_ns),
+                static_cast<unsigned long long>(
+                    sample.aicore_receive_ticks),
+                static_cast<unsigned long long>(
+                    sample.aicore_send_ticks),
+                static_cast<unsigned long long>(
+                    sample.aicpu_receive_ns),
+                static_cast<long long>(sample.offset_lower_ns),
+                static_cast<long long>(sample.offset_upper_ns),
+                static_cast<unsigned long long>(sample.round_trip_ns),
+                static_cast<unsigned long long>(
+                    sample.aicore_service_ticks),
+                sample.round, sample.index_in_round,
+                static_cast<unsigned long long>(sample.round_nonce)
+            );
+        }
+        std::fprintf(
+            output,
+            "]},\"aicpu_aicore_causal_capture_bracket\":{"
+            "\"derivation\":\"pre-post-four-timestamp-samples\","
+            "\"aicpu_clock\":\"aicpu_monotonic_raw_ns\","
+            "\"aicpu_pre_receive_max_ns\":%llu,"
+            "\"aicpu_post_send_min_ns\":%llu,"
+            "\"aicore_clock\":\"aicore_sys_cnt_tick\","
+            "\"aicore_pre_send_max_tick\":%llu,"
+            "\"aicore_post_receive_min_tick\":%llu}",
+            static_cast<unsigned long long>(
+                aicpu_pre_receive_max_ns),
+            static_cast<unsigned long long>(
+                aicpu_post_send_min_ns),
+            static_cast<unsigned long long>(
+                aicore_pre_send_max_tick),
+            static_cast<unsigned long long>(
+                aicore_post_receive_min_tick)
+        );
+    }
     // Host task plan 仅作为运行后的业务 oracle：writer 列表描述实际
     // metadata side effect；prefix 列表描述严格 per-task completion 链。
     // 二者都不回写 device，也不参与 Build owner 或 Execute 调度。
+    std::fprintf(output, ",\"runtime_plan_task_kinds\":[");
+    bool first_task_kind = true;
+    for (const SharedHostPlannedTask &task : shared_plan.tasks) {
+        std::fprintf(
+            output, "%s%u", first_task_kind ? "" : ",",
+            static_cast<uint32_t>(task.kind)
+        );
+        first_task_kind = false;
+    }
+    std::fprintf(output, "]");
     std::fprintf(output, ",\"shared_metadata_writer_tasks\":[");
     bool first_metadata_writer = true;
     for (const SharedHostPlannedTask &task : shared_plan.tasks) {
@@ -2501,13 +3087,30 @@ inline bool ExportSwimlaneRecords(
     std::fprintf(
         output,
         "},\n\"aicore_tasks\":[],\n\"aicpu_tasks\":[],\n"
-        "\"aicpu_scheduler_phases\":[],\n\"aicpu_orchestrator_phases\":[],\n\"fdwic_events\":[\n"
+        "\"aicpu_scheduler_phases\":[],\n\"aicpu_orchestrator_phases\":["
     );
+#if PTO_FDWIC_SHARED_MAP
+    if (has_aicpu_producer) {
+        std::fprintf(
+            output,
+            "{\"name\":\"RuntimePlanProducer\","
+            "\"clock\":\"aicpu_monotonic_raw_ns\","
+            "\"begin_ns\":%llu,\"end_ns\":%llu}",
+            static_cast<unsigned long long>(
+                runtime_plan_producer_begin_ns),
+            static_cast<unsigned long long>(
+                runtime_plan_producer_end_ns)
+        );
+    }
+#endif
+    std::fprintf(output, "],\n\"fdwic_events\":[\n");
     // fdwic_events 每行固定十列：core、block、lane、task、function、phase、起止周期、flags、aux。
 
     bool success = true;
     bool first_record = true;
     uint64_t exported_records = 0;
+    uint64_t minimum_fdwic_start_tick = UINT64_MAX;
+    uint64_t maximum_fdwic_end_tick = 0U;
     TraceExportSummary observed_summary;
     std::vector<TraceStorageRecord>
         physical_scratch(kTraceRecordsPerCore);
@@ -2638,6 +3241,12 @@ inline bool ExportSwimlaneRecords(
                 success = false;
                 break;
             }
+            minimum_fdwic_start_tick = std::min(
+                minimum_fdwic_start_tick, record.start_cycle
+            );
+            maximum_fdwic_end_tick = std::max(
+                maximum_fdwic_end_tick, record.end_cycle
+            );
             if (atomic_record) {
                 ++core_atomic_records;
                 const uint32_t call_count = AtomicRecordCallCount(record);
@@ -2780,6 +3389,16 @@ inline bool ExportSwimlaneRecords(
         );
         success = false;
     }
+#if PTO_FDWIC_SHARED_MAP
+    if (success && has_aicpu_producer &&
+        !ValidateAicoreCausalCaptureBracket(
+            aicpu_clock_correlation,
+            minimum_fdwic_start_tick,
+            maximum_fdwic_end_tick
+        )) {
+        success = false;
+    }
+#endif
     if (success) std::fprintf(output, "\n]}\n");
     if (std::ferror(output) != 0) {
         std::fprintf(stderr, "Failed while writing swimlane output %s.\n", temporary_path.c_str());
@@ -7896,6 +8515,16 @@ inline void PrintBanner(const char *backend, const Options &options) {
         options.trace_enabled ? kTraceBytes : 0
     );
 #if PTO_FDWIC_SHARED_MAP
+    std::printf(
+        "pipeline=%s launch_order=%s producer_ready=%s "
+        "consumer_admission=%s prefill=%u "
+        "timing_primary_metric=pipeline_e2e aicore_time_scope=%s\n",
+        RuntimePlanPipelineName(), RuntimePlanLaunchOrderName(),
+        RuntimePlanProducerReadyName(),
+        RuntimePlanConsumerAdmissionName(),
+        RuntimePlanPipelinePrefillTasks(),
+        RuntimePlanAicoreTimeScopeName()
+    );
     std::printf(
         "shared_groups=%u shared_context_lens=",
         configured_groups

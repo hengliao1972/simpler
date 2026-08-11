@@ -30,6 +30,7 @@
 #endif
 #include "shared_exec_protocol.h"
 #include "../../../common/aicpu_plan_protocol.h"
+#include "../../../common/runtime_plan_pipeline_policy.h"
 #if defined(PA_CROSS_CORE_MODEL_DEFINED_PA_GM)
 #undef PA_GM
 #undef PA_CROSS_CORE_MODEL_DEFINED_PA_GM
@@ -134,8 +135,9 @@
 #error "compact generic trace currently supports only the production CAP=128 ABI"
 #endif
 
-// Runtime Plan 的生产者始终是 AICPU；这个开关只选择 closed Plan 之后
-// 由谁执行 Materialize/Register/Fanin/Build。0 保留现有 96 Scalar
+// Runtime Plan 的生产者始终是 AICPU；这个开关只选择 Plan consumer
+// 被 pipeline policy 放行后由谁执行 Materialize/Register/Fanin/Build。
+// 0 保留现有 96 Scalar
 // 中央 ticket 路径，1 表示由 AIV0 启动的四个 SIMT leader 完成 Build，
 // 随后 96 个 Scalar 只附着 Plan、观察 release 并执行 FinalDrain。
 #ifndef PA_RUNTIME_PLAN_BUILD_BACKEND
@@ -182,12 +184,17 @@ constexpr uint32_t kBuildIdentityCompactGenericTraceBit =
 // 无法把 W=4 与 W=96 的产物静默混接。
 constexpr uint32_t kBuildIdentityRuntimePlanSimtBit =
     1U << 30U;
+// bit29 固化 Plan/Build 的阶段关系。默认 PlanAheadClosed 保持该位为
+// 零；只有显式实验 StreamingFuture 才置位，防止 Host、AICPU 与
+// AICore 把不同的 ready/ticket 合同静默混接。
+constexpr uint32_t kBuildIdentityRuntimePlanStreamingBit =
+    1U << 29U;
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 17;
+constexpr uint32_t kBuildIdentityAbiGeneration = 19;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
-// 默认 CAP=128 时，private 保留历史 ABI 值；shared generation 12 另把
+// 默认 CAP=128 时，private 保留历史 ABI 值；shared identity 另把
 // active insert-turn G 编入低位。这样既避免 private AIC/AIV 入口因身份
 // 元数据多一条大立即数构造，也让 manifest v4 和 host/device 握手共同
 // 拒绝不同 G 的 shared 混件。非默认隔离变体继续把 CAP 编进 ABI。
@@ -224,12 +231,28 @@ static_assert(
      kBuildIdentityRuntimePlanSimtBit) == 0U,
     "existing build identity overlaps the Runtime Plan backend bit"
 );
+static_assert(
+    (kBuildIdentityAbiBaseVersion &
+     kBuildIdentityRuntimePlanStreamingBit) == 0U,
+    "existing build identity overlaps the Runtime Plan pipeline bit"
+);
 constexpr uint32_t kBuildIdentityAbiVersion =
     kBuildIdentityAbiBaseVersion |
     (kCompiledRuntimePlanBuildBackend ==
              RuntimePlanBuildBackend::Simt
          ? kBuildIdentityRuntimePlanSimtBit
+         : 0U) |
+    (kRuntimePlanPipelineIsStreamingFuture
+         ? kBuildIdentityRuntimePlanStreamingBit
          : 0U);
+static_assert(
+    (kBuildIdentityAbiVersion &
+     kBuildIdentityRuntimePlanStreamingBit) ==
+        (kRuntimePlanPipelineIsStreamingFuture
+             ? kBuildIdentityRuntimePlanStreamingBit
+             : 0U),
+    "build identity does not encode the Runtime Plan pipeline policy"
+);
 static_assert(
     (kBuildIdentityAbiVersion &
      kBuildIdentityCompactGenericTraceBit) ==
@@ -940,9 +963,9 @@ constexpr uint32_t kAtomicPollBatch = 1U << 7;
 constexpr uint32_t kAtomicRetriesShift = 8;
 constexpr uint32_t kAtomicPollCountShift = 8;
 constexpr uint32_t kAtomicPollCountMax = 0x00ffffffU;
-// closed/release 等待与旧 8 类等待一样，每个 episode 只写
+// closed/release/cell 等待与旧等待一样，每个 episode 只写
 // 一条 PollBatch；逻辑调用数仍通过 flags[31:8] 精确闭合。
-constexpr uint32_t kAtomicPollBatchSiteCount = 11;
+constexpr uint32_t kAtomicPollBatchSiteCount = 12;
 static_assert(kAtomicPollBatchSiteCount <= 32, "PollBatch enable mask supports at most 32 compact indices");
 
 // DCCI 与 Atomic 使用同一个 32B TraceRecord，但拥有完全独立的 raw ABI。
@@ -1159,6 +1182,8 @@ PA_MODEL_INLINE constexpr int32_t AtomicPollBatchIndex(AtomicSite site) {
             return 9;
         case AtomicSite::RuntimePlanFatalLoad:
             return 10;
+        case AtomicSite::RuntimePlanCellControlLoad:
+            return 11;
         default:
             return -1;
     }
@@ -1188,6 +1213,8 @@ PA_MODEL_INLINE constexpr AtomicSite AtomicPollBatchSite(uint32_t index) {
             return AtomicSite::RuntimePlanBuildReleaseLoad;
         case 10:
             return AtomicSite::RuntimePlanFatalLoad;
+        case 11:
+            return AtomicSite::RuntimePlanCellControlLoad;
         default:
             return AtomicSite::Count;
     }

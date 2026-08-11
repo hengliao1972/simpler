@@ -406,6 +406,15 @@ int main(int argc, char **argv) {
         "[NOTE] CPU scalar NOP preserves instruction count; real-compute preserves arithmetic "
         "and workspace semantics. Neither represents A5 engine timing or PMU.\n"
     );
+    std::printf(
+        "[PLAN] pipeline_policy=%s ready_prefill_tasks=%u\n",
+        pa_scheduler::kRuntimePlanPipelineIsPlanAheadClosed
+            ? "plan_ahead_closed"
+            : "streaming_future",
+        pa_scheduler::kRuntimePlanPipelineIsPlanAheadClosed
+            ? 0U
+            : pa_scheduler::aicpu_plan::kRuntimePlanReadyPrefillTasks
+    );
 
     // SchedulerState 很大，放到 heap 而不是主线程栈；trace 继续保持独立的
     // 64 字节对齐区域，以复用设备端完全相同的二进制布局。
@@ -518,30 +527,52 @@ int main(int argc, char **argv) {
         if (options.trace_enabled) {
             pa_scheduler::host::InitializeTraceHeader(trace_header);
         }
-        // Plan-ahead 首版先让独立 planner 线程完整执行 PA callback 并 Close。
-        // 这对应正式 AICPU 的单 producer 生命周期。plan_time、Scalar-only
-        // 和 producer 起点到 FinalDrain/worker join 的 pipeline_e2e 分开记录，
-        // 不能用后两者的边界把 Plan 成本藏起来。
+        // 两条长期路径共享同一 producer 和 canonical PlanCell：
+        // PlanAheadClosed 必须等 planner Close 后才创建 96 worker；
+        // StreamingFuture 则让 worker 与 producer 并发，并在 Ready 后允许
+        // future ticket。CPU 时间不冒充 A5，三个 wall 口径仍分开记录。
         pa_scheduler::cpu_plan::ProductionResult plan_result{};
         const auto pipeline_begin = std::chrono::steady_clock::now();
         const auto plan_begin = pipeline_begin;
-        std::thread planner([&]() {
+        std::chrono::steady_clock::time_point plan_end{};
+        const auto run_planner = [&]() {
             plan_result =
                 pa_scheduler::cpu_plan::ProducePaRuntimePlan<CpuOps>(
                     state.get()
                 );
-        });
-        planner.join();
-        const auto plan_end = std::chrono::steady_clock::now();
-        if (!plan_result.ok) {
-            std::fprintf(
-                stderr,
-                "Runtime Plan producer failed before CPU workers start "
-                "(published=%u).\n",
-                plan_result.task_count
-            );
-            all_passed = false;
-            break;
+            plan_end = std::chrono::steady_clock::now();
+            if (!plan_result.ok) {
+                // StreamingFuture consumer 可能正持有 future ticket；两条
+                // policy 共用 fail-closed 路径，同时发布 Plan 与 scheduler
+                // fatal。PlanAheadClosed 此时还没有创建 worker。
+                CpuOps::PublishControl(
+                    &state->runtime_plan_control.fatal.value, 1
+                );
+                pa_scheduler::aicpu_plan::RuntimePlanView failed_view{};
+                if (pa_scheduler::aicpu_plan::MakeRuntimePlanView(
+                        &state->runtime_plan_control,
+                        state->runtime_plan_storage, failed_view
+                    )) {
+                    (void)pa_scheduler::aicpu_plan::
+                        PublishRuntimePlanReadyFailed<CpuOps>(failed_view);
+                }
+                (void)CpuOps::Exchange(&state->fatal.value, int32_t{1});
+            }
+        };
+        std::thread planner(run_planner);
+        if constexpr (pa_scheduler::kRuntimePlanPipelineIsPlanAheadClosed) {
+            // 串行基线的核心边界：worker 尚不存在时 Plan 已经 Closed(N)。
+            planner.join();
+            if (!plan_result.ok) {
+                std::fprintf(
+                    stderr,
+                    "Runtime Plan producer failed before CPU workers start "
+                    "(published=%u).\n",
+                    plan_result.task_count
+                );
+                all_passed = false;
+                break;
+            }
         }
         const auto wall_begin = std::chrono::steady_clock::now();
         // 固定创建 96 个参与者：worker 0..31 扮演 AIC，32..95 扮演 AIV。
@@ -570,11 +601,52 @@ int main(int argc, char **argv) {
             });
 #endif
         }
-        // join 是本后端的 kernel 完成屏障；所有 worker 退出后才能读取最终状态，
-        // 对应设备 runner 的 aclrtSynchronizeStream。
+        // StreamingFuture 的两条并发分支都必须 join；PlanAheadClosed 的
+        // planner 已经在 worker 创建前完成。
+        if constexpr (pa_scheduler::kRuntimePlanPipelineIsStreamingFuture) {
+            planner.join();
+        }
         for (std::thread &worker : workers)
             worker.join();
         const auto wall_end = std::chrono::steady_clock::now();
+        if (!plan_result.ok) {
+            std::fprintf(
+                stderr,
+                "Runtime Plan producer failed during concurrent CPU pipeline "
+                "(published=%u).\n",
+                plan_result.task_count
+            );
+            all_passed = false;
+            break;
+        }
+        const bool expected_ready_before_close =
+            pa_scheduler::kRuntimePlanPipelineIsStreamingFuture &&
+            plan_result.task_count >=
+                pa_scheduler::aicpu_plan::kRuntimePlanReadyPrefillTasks;
+        const bool ready_timing_ok =
+            plan_result.ready_frontier != UINT32_MAX &&
+            plan_result.ready_frontier <= plan_result.task_count &&
+            plan_result.ready_before_close == expected_ready_before_close &&
+            (!plan_result.ready_before_close ||
+                plan_result.ready_frontier >=
+                    pa_scheduler::aicpu_plan::
+                        kRuntimePlanReadyPrefillTasks) &&
+            (plan_result.ready_before_close ||
+                plan_result.ready_frontier == plan_result.task_count);
+        if (!ready_timing_ok) {
+            std::fprintf(
+                stderr,
+                "Runtime Plan Ready timing violated policy %s "
+                "(tasks=%u ready_frontier=%u before_close=%u).\n",
+                pa_scheduler::kRuntimePlanPipelineIsPlanAheadClosed
+                    ? "plan_ahead_closed"
+                    : "streaming_future",
+                plan_result.task_count, plan_result.ready_frontier,
+                plan_result.ready_before_close ? 1U : 0U
+            );
+            all_passed = false;
+            break;
+        }
         const double plan_us =
             std::chrono::duration<double, std::micro>(
                 plan_end - plan_begin
@@ -583,17 +655,24 @@ int main(int argc, char **argv) {
             std::chrono::duration<double, std::micro>(
                 wall_end - wall_begin
             ).count();
+        const uint64_t pipeline_e2e_duration_ns =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    wall_end - pipeline_begin
+                ).count()
+            );
         const double pipeline_e2e_us =
-            std::chrono::duration<double, std::micro>(
-                wall_end - pipeline_begin
-            ).count();
+            static_cast<double>(pipeline_e2e_duration_ns) / 1000.0;
         std::printf(
             "[PIPELINE] tasks=%u metadata=%u AIC=%u AIV=%u "
             "plan_time_us=%.3f scalar_time_us=%.3f "
-            "pipeline_e2e_us=%.3f storage=%zu bytes\n",
+            "pipeline_e2e_us=%.3f ready_frontier=%u "
+            "ready_before_close=%u storage=%zu bytes\n",
             plan_result.task_count, plan_result.metadata_count,
             plan_result.aic_count, plan_result.aiv_count,
-            plan_us, host_us, pipeline_e2e_us, kPlanBytes
+            plan_us, host_us, pipeline_e2e_us,
+            plan_result.ready_frontier,
+            plan_result.ready_before_close ? 1U : 0U, kPlanBytes
         );
         if (real_compute) {
             const size_t output_begin =
@@ -710,7 +789,11 @@ int main(int argc, char **argv) {
                     options.final_barrier_shape, options.trace_atomics,
                     read_trace_records
 #if PTO_FDWIC_SHARED_MAP
-                    , read_submit_claim_records
+                    , read_submit_claim_records,
+                    plan_result.task_count,
+                    false,
+                    0U, 0U,
+                    pa_scheduler::aicpu_clock::ClockCorrelationEvidence{}
 #endif
                 )) {
                 postprocess_ok = false;

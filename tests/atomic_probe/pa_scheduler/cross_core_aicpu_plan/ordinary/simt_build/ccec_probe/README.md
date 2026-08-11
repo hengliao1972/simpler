@@ -1,7 +1,7 @@
-# canonical Plan v2 SIMT CCEC compile gate
+# canonical Plan v3 SIMT CCEC compile gate
 
 该目录只回答一个问题：CCEC 是否能把公共
-`RuntimeTaskPlanCell` ABI v2 的直接消费路径编译成真实 A5 SIMT VF，并在
+`RuntimeTaskPlanCell` ABI v3 的直接消费路径编译成真实 A5 SIMT VF，并在
 同一 AIV entry 中完成 `async_invoke` 与 V→S 收口。
 
 它锁定以下静态事实：

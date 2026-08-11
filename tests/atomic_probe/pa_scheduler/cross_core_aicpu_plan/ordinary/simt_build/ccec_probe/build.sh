@@ -13,11 +13,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
 KERNEL_SOURCE="$SCRIPT_DIR/kernel.cpp"
-DEVICE_OBJECT="$BUILD_DIR/aicpu_plan_simt_v2_probe_aiv.o"
-DEVICE_BITCODE="$BUILD_DIR/aicpu_plan_simt_v2_probe_aiv.bc"
-BITCODE_DUMP="$BUILD_DIR/aicpu_plan_simt_v2_probe_aiv.bc.dump"
-KERNEL_ELF="$BUILD_DIR/aicpu_plan_simt_v2_probe_kernel.o"
-ENTRY="aicpu_plan_simt_v2_probe_0_mix_aiv"
+DEVICE_OBJECT="$BUILD_DIR/aicpu_plan_simt_v3_probe_aiv.o"
+DEVICE_BITCODE="$BUILD_DIR/aicpu_plan_simt_v3_probe_aiv.bc"
+BITCODE_DUMP="$BUILD_DIR/aicpu_plan_simt_v3_probe_aiv.bc.dump"
+KERNEL_ELF="$BUILD_DIR/aicpu_plan_simt_v3_probe_kernel.o"
+ENTRY="aicpu_plan_simt_v3_probe_0_mix_aiv"
 
 if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
     echo "ASCEND_HOME_PATH is not set; source the CANN environment first." >&2
@@ -72,10 +72,10 @@ DEVICE_FLAGS=(
     -I"$ASCEND_HOME_PATH/x86_64-linux/asc/include"
 )
 
-echo "[CHECK] canonical Plan-v2 source contract"
+echo "[CHECK] canonical Plan-v3 source contract"
 required_source_patterns=(
     '#include "../common/simt_plan_build_protocol.h"'
-    'static __simt_vf__ __aicore__ LAUNCH_BOUND(128) void ConsumeCanonicalPlanV2('
+    'static __simt_vf__ __aicore__ LAUNCH_BOUND(128) void ConsumeCanonicalPlanV3('
     'simt_contract::kBuilderThreads'
     'simt_contract::kWarpSize'
     'simt_contract::kBuilderLeaders'
@@ -87,7 +87,7 @@ required_source_patterns=(
     'second_control = SimtAtomicObserve(&cell->control.value);'
     'abi_version == plan::kRuntimePlanAbiVersion'
     'expected_lines == published_lines'
-    'cce::async_invoke<ConsumeCanonicalPlanV2>('
+    'cce::async_invoke<ConsumeCanonicalPlanV3>('
     'set_flag(PIPE_V, PIPE_S, EVENT_ID0);'
     'wait_flag(PIPE_V, PIPE_S, EVENT_ID0);'
     'PublishLeaderReport(leader_reports, warp, 0U, kReportMagic);'
@@ -132,7 +132,7 @@ echo "[BUILD] CCEC optimized SIMT bitcode"
 "$LLVM_BCANALYZER" -dump "$DEVICE_BITCODE" > "$BITCODE_DUMP"
 
 required_bitcode_symbols=(
-    'ConsumeCanonicalPlanV2'
+    'ConsumeCanonicalPlanV3'
     'SimdMetadataAnchor'
     'llvm.hivm.store.vfsimt.info'
     'llvm.hivm.get.TID.X'
@@ -146,7 +146,7 @@ required_bitcode_symbols=(
 )
 for symbol in "${required_bitcode_symbols[@]}"; do
     if ! grep -Fq "$symbol" "$BITCODE_DUMP"; then
-        echo "optimized Plan-v2 SIMT bitcode is missing: $symbol" >&2
+        echo "optimized Plan-v3 SIMT bitcode is missing: $symbol" >&2
         exit 1
     fi
 done
@@ -172,7 +172,7 @@ if [[ "$global_functions" != "$ENTRY" ]]; then
     printf '%s\n' "$global_functions" >&2
     exit 1
 fi
-if ! awk '$4 == "FUNC" && $5 == "LOCAL" && $3 + 0 > 0 && $NF ~ /ConsumeCanonicalPlanV2.*_simt_entry$/ {count++}
+if ! awk '$4 == "FUNC" && $5 == "LOCAL" && $3 + 0 > 0 && $NF ~ /ConsumeCanonicalPlanV3.*_simt_entry$/ {count++}
           END {exit count != 1}' <<<"$SYMBOLS"; then
     echo "final ELF must retain exactly one non-empty LOCAL canonical Plan SIMT entry." >&2
     exit 1
@@ -196,7 +196,7 @@ fi
 METADATA_OUTPUT="$(python3 -m msobjdump -d "$KERNEL_ELF")"
 if [[ "$METADATA_OUTPUT" != *'KERNEL_TYPE: MIX_AIC_MAIN'* ||
       "$METADATA_OUTPUT" != *'MIX_TASK_RATION: [1:2]'* ]]; then
-    echo "Plan-v2 probe metadata is not MIX_AIC_MAIN [1:2]:" >&2
+    echo "Plan-v3 probe metadata is not MIX_AIC_MAIN [1:2]:" >&2
     printf '%s\n' "$METADATA_OUTPUT" >&2
     exit 1
 fi
@@ -209,11 +209,11 @@ if [[ "$AIV_META_HEX" != *'0c000400 04000000'* ||
 fi
 
 if [[ ! -s "$DEVICE_BITCODE" || ! -s "$KERNEL_ELF" ]]; then
-    echo "canonical Plan-v2 SIMT compile probe did not produce required artifacts." >&2
+    echo "canonical Plan-v3 SIMT compile probe did not produce required artifacts." >&2
     exit 1
 fi
 
 echo "[CHECK] ELF exports one AIV entry, retains one local SIMT entry and encodes SIMD_SIMT_MIX_VF=4"
-echo "[BUILD] canonical Plan-v2 SIMT CCEC compile gate complete"
+echo "[BUILD] canonical Plan-v3 SIMT CCEC compile gate complete"
 echo "[BUILD] bitcode: $DEVICE_BITCODE"
 echo "[BUILD] kernel:  $KERNEL_ELF"

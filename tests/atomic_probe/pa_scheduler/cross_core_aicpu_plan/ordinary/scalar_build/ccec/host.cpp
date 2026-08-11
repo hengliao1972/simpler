@@ -11,6 +11,7 @@
 
 #include "../common/host_support.h"
 #include "../common/winner_workload_host.h"
+#include "../aicpu/aicpu_clock_correlation_host.h"
 #include "../aicpu/aicpu_plan_owner_abi.h"
 #include "../../../common/protocol_probe/plan_aicpu_loader.h"
 #include "pmu_owner_host.h"
@@ -42,6 +43,39 @@ bool CheckAcl(aclError error, const char *label) {
     std::fprintf(stderr, "ACL error %d: %s\n", static_cast<int>(error), label);
     return false;
 }
+
+class ScopedAclStream {
+public:
+    ScopedAclStream() = default;
+    ScopedAclStream(const ScopedAclStream &) = delete;
+    ScopedAclStream &operator=(const ScopedAclStream &) = delete;
+
+    ~ScopedAclStream()
+    {
+        // 初始化后的早退路径也必须销毁已经创建的 stream。正常收尾会先
+        // Destroy 并清空句柄，避免在 aclFinalize 之后重复调用 ACL。
+        if (stream_ != nullptr) (void)aclrtDestroyStream(stream_);
+    }
+
+    bool Create(const char *label)
+    {
+        if (stream_ != nullptr) return false;
+        return CheckAcl(aclrtCreateStream(&stream_), label);
+    }
+
+    aclrtStream Get() const { return stream_; }
+
+    bool Destroy(const char *label)
+    {
+        if (stream_ == nullptr) return true;
+        const aclrtStream stream = stream_;
+        stream_ = nullptr;
+        return CheckAcl(aclrtDestroyStream(stream), label);
+    }
+
+private:
+    aclrtStream stream_ = nullptr;
+};
 
 aclError InitAclForCompiledRuntimePlanBuildBackend() {
     if constexpr (
@@ -209,6 +243,181 @@ std::vector<char> ReadBinary(const std::string &path) {
     if (!file.read(data.data(), size)) return {};
     return data;
 }
+
+#if PA_BUILD_SWIMLANE
+class ClockCorrelationKernel {
+public:
+    ClockCorrelationKernel() = default;
+    ClockCorrelationKernel(const ClockCorrelationKernel &) = delete;
+    ClockCorrelationKernel &operator=(const ClockCorrelationKernel &) = delete;
+
+    ~ClockCorrelationKernel()
+    {
+        if (binary_ != nullptr) (void)aclrtBinaryUnLoad(binary_);
+    }
+
+    bool Load(const std::string &path)
+    {
+        if (binary_ != nullptr) return false;
+        image_ = ReadBinary(path);
+        if (image_.empty()) {
+            std::fprintf(
+                stderr, "Cannot read AICPU/AICore clock correlation ELF: %s\n",
+                path.c_str()
+            );
+            return false;
+        }
+        aclrtBinaryLoadOption option{};
+        option.type = ACL_RT_BINARY_LOAD_OPT_MAGIC;
+        option.value.magic = ACL_RT_BINARY_MAGIC_ELF_AICORE;
+        aclrtBinaryLoadOptions options{&option, 1U};
+        if (!CheckAcl(
+                aclrtBinaryLoadFromData(
+                    image_.data(), image_.size(), &options, &binary_
+                ),
+                "aclrtBinaryLoadFromData(clock correlation AIV)"
+            ) ||
+            !CheckAcl(
+                aclrtBinaryGetFunctionByEntry(binary_, 0U, &function_),
+                "aclrtBinaryGetFunctionByEntry(clock correlation AIV)"
+            )) {
+            return false;
+        }
+        return function_ != nullptr;
+    }
+
+    aclrtFuncHandle Function() const { return function_; }
+
+    bool Unload()
+    {
+        function_ = nullptr;
+        if (binary_ == nullptr) return true;
+        aclrtBinHandle binary = binary_;
+        binary_ = nullptr;
+        const bool ok = CheckAcl(
+            aclrtBinaryUnLoad(binary),
+            "aclrtBinaryUnLoad(clock correlation AIV)"
+        );
+        image_.clear();
+        return ok;
+    }
+
+private:
+    std::vector<char> image_;
+    aclrtBinHandle binary_ = nullptr;
+    aclrtFuncHandle function_ = nullptr;
+};
+
+struct ClockCorrelationKernelArgs {
+    uint64_t exchange_device;
+};
+
+bool RunClockCorrelationRound(
+    uint32_t round, void *exchange_device,
+    pa_scheduler::aicpu_clock::Exchange *exchange_host,
+    pa_scheduler::aicpu_clock::ClockCorrelationEvidence *evidence,
+    const ClockCorrelationKernel &kernel,
+    plan_protocol_probe::PlanAicpuLoader &aicpu_loader,
+    aclrtStream aicore_stream, aclrtStream aicpu_stream
+)
+{
+    using namespace pa_scheduler::aicpu_clock;
+    if (round >= kCaptureRounds || exchange_device == nullptr ||
+        exchange_host == nullptr || evidence == nullptr ||
+        kernel.Function() == nullptr || aicore_stream == nullptr ||
+        aicpu_stream == nullptr) {
+        if (evidence != nullptr) {
+            evidence->status =
+                static_cast<int32_t>(EvidenceStatus::Incomplete);
+        }
+        return false;
+    }
+
+    *exchange_host = Exchange{};
+    exchange_host->config.magic = kExchangeMagic;
+    exchange_host->config.version = kVersion;
+    exchange_host->config.sample_count = kSamplesPerRound;
+    exchange_host->config.timeout_ns = kDefaultHandshakeTimeoutNs;
+    exchange_host->config.round_nonce =
+        UINT64_C(0x434c4b0000000000) |
+        (static_cast<uint64_t>(round + 1U) << 32U) |
+        static_cast<uint64_t>(evidence->sample_count + 1U);
+    if (!CheckAcl(
+            aclrtMemcpy(
+                exchange_device, sizeof(*exchange_host), exchange_host,
+                sizeof(*exchange_host), ACL_MEMCPY_HOST_TO_DEVICE
+            ),
+            "aclrtMemcpy(H2D clock correlation exchange)"
+        )) {
+        evidence->status =
+            static_cast<int32_t>(EvidenceStatus::EndpointFailed);
+        return false;
+    }
+
+    const ClockCorrelationKernelArgs aiv_args{
+        reinterpret_cast<uint64_t>(exchange_device),
+    };
+    const pa_scheduler::aicpu_owner::OwnerKernelArgs aicpu_args{
+        reinterpret_cast<uint64_t>(exchange_device),
+        pa_scheduler::aicpu_owner::kOwnerCommandClockCorrelation,
+        pa_scheduler::aicpu_owner::kRequestVersion,
+    };
+    const bool aiv_launch_ok = CheckAcl(
+        aclrtLaunchKernelWithHostArgs(
+            kernel.Function(), 1U, aicore_stream, nullptr,
+            const_cast<ClockCorrelationKernelArgs *>(&aiv_args),
+            sizeof(aiv_args), nullptr, 0U
+        ),
+        "aclrtLaunchKernelWithHostArgs(clock correlation AIV)"
+    );
+    const bool aicpu_launch_ok = aiv_launch_ok &&
+        aicpu_loader.Launch(
+            aicpu_stream,
+            const_cast<pa_scheduler::aicpu_owner::OwnerKernelArgs *>(
+                &aicpu_args
+            ),
+            sizeof(aicpu_args)
+        ) == 0;
+
+    // Both endpoints may still own the exchange after either launch succeeds.
+    // Always close both streams before D2H or reuse.
+    const bool aicpu_sync_ok = CheckAcl(
+        aclrtSynchronizeStream(aicpu_stream),
+        "aclrtSynchronizeStream(clock correlation AICPU)"
+    );
+    const bool aicore_sync_ok = CheckAcl(
+        aclrtSynchronizeStream(aicore_stream),
+        "aclrtSynchronizeStream(clock correlation AIV)"
+    );
+    if (!aiv_launch_ok || !aicpu_launch_ok || !aicpu_sync_ok ||
+        !aicore_sync_ok ||
+        !CheckAcl(
+            aclrtMemcpy(
+                exchange_host, sizeof(*exchange_host), exchange_device,
+                sizeof(*exchange_host), ACL_MEMCPY_DEVICE_TO_HOST
+            ),
+            "aclrtMemcpy(D2H clock correlation exchange)"
+        ) ||
+        !AppendClockCorrelationRound(*exchange_host, round, evidence)) {
+        evidence->status = evidence->status ==
+                static_cast<int32_t>(EvidenceStatus::Incomplete)
+            ? static_cast<int32_t>(EvidenceStatus::EndpointFailed)
+            : evidence->status;
+        std::fprintf(
+            stderr,
+            "Clock correlation round %u failed closed: status=%d "
+            "aicpu_endpoint=%d/%u aicore_endpoint=%d/%u.\n",
+            round, evidence->status,
+            exchange_host->aicpu_completion.status,
+            exchange_host->aicpu_completion.completed_samples,
+            exchange_host->aicore_completion.status,
+            exchange_host->aicore_completion.completed_samples
+        );
+        return false;
+    }
+    return true;
+}
+#endif
 
 struct PmuOptions {
     pa_scheduler::ccec_pmu::WindowMode mode = pa_scheduler::ccec_pmu::WindowMode::Off;
@@ -2145,6 +2354,15 @@ int main(int argc, char **argv) {
         );
         return EXIT_FAILURE;
     }
+    if (options.analyze_swimlane) {
+        std::fprintf(
+            stderr,
+            "--analyze-swimlane is AICore-only and is disabled for CCEC "
+            "captures; use --swimlane-json and the ordinary offline joint "
+            "AICPU/AICore analyzer.\n"
+        );
+        return EXIT_FAILURE;
+    }
 #elif PA_BUILD_SUBMIT_PMU
     // submit-pmu 是编译期固定 phase 的单轮诊断产物；host、kernel 与 owner
     // 必须共同拒绝旧校准窗口和任何泳道/phase-profile 观察代码。
@@ -2237,8 +2455,16 @@ int main(int argc, char **argv) {
         !CheckAcl(aclrtSetDevice(options.device), "aclrtSetDevice")) {
         return EXIT_FAILURE;
     }
-    aclrtStream stream = nullptr;
-    if (!CheckAcl(aclrtCreateStream(&stream), "aclrtCreateStream")) return EXIT_FAILURE;
+    // Plan producer 与 AICore consumer 分属两个 stream。StreamingFuture
+    // 用它们实现设备侧重叠；PlanAheadClosed 保留同一资源布局，
+    // 但在 Host 上以 sync 边界严格串行。两个 wrapper 同时覆盖初始化
+    // 早退；正常路径在 reset device 之前显式 Destroy。
+    ScopedAclStream plan_stream;
+    ScopedAclStream aicore_stream;
+    if (!plan_stream.Create("aclrtCreateStream(AICPU Plan)") ||
+        !aicore_stream.Create("aclrtCreateStream(AICore)")) {
+        return EXIT_FAILURE;
+    }
 
     rtDevBinary_t binary{RT_DEV_BINARY_MAGIC_ELF, 0, binary_data.data(), binary_data.size()};
     void *kernel_handle = nullptr;
@@ -2251,6 +2477,41 @@ int main(int argc, char **argv) {
         register_error = rtBinaryLoadWithoutTilingKey(binary_data.data(), binary_data.size(), &kernel_handle);
     }
     if (!CheckRt(register_error, "register mixed AICore ELF") || kernel_handle == nullptr) return EXIT_FAILURE;
+
+#if PA_BUILD_SWIMLANE
+    // Clock correlation is a capture-only side transaction.  Its standalone
+    // AIV ELF and GM exchange are loaded only when a raw swimlane will be
+    // exported; ordinary semantic/analyzer runs and all perf builds are
+    // unchanged.
+    const bool clock_correlation_required = !options.swimlane_json.empty();
+    ClockCorrelationKernel clock_correlation_kernel;
+    ScopedAlignedAclDeviceAllocation clock_correlation_allocation;
+    alignas(pa_scheduler::aicpu_owner::kAtomicIsolationBytes)
+        pa_scheduler::aicpu_clock::Exchange clock_correlation_exchange{};
+    pa_scheduler::aicpu_clock::ClockCorrelationEvidence
+        clock_correlation_evidence{};
+    if (clock_correlation_required) {
+        pa_scheduler::aicpu_clock::InitializeClockCorrelationEvidence(
+            &clock_correlation_evidence
+        );
+        const std::string clock_kernel_path = ArtifactBesideKernel(
+            options.kernel_path,
+            "pa_scheduler_clock_correlation_kernel.o"
+        );
+        if (!clock_correlation_kernel.Load(clock_kernel_path) ||
+            !clock_correlation_allocation.Allocate(
+                sizeof(pa_scheduler::aicpu_clock::Exchange),
+                pa_scheduler::aicpu_owner::kAtomicIsolationBytes,
+                "aclrtMalloc(clock correlation exchange)"
+            )) {
+            std::fprintf(
+                stderr,
+                "AICPU/AICore clock correlation is mandatory for swimlane export.\n"
+            );
+            return EXIT_FAILURE;
+        }
+    }
+#endif
 
     // SchedulerState 尾部包含按 128B 隔离的 Plan 控制线。ACL 没有给出
     // aclrtMalloc 返回地址必然满足 128B 的合同，因此多申请 127B 后使用
@@ -2372,7 +2633,7 @@ int main(int argc, char **argv) {
     );
     if (aicpu_plan_loader.Initialize(
             aicpu_plan_dispatcher_path, aicpu_plan_owner_path,
-            stream, static_cast<int32_t>(options.device)
+            plan_stream.Get(), static_cast<int32_t>(options.device)
         ) != 0) {
         std::fprintf(
             stderr,
@@ -2397,7 +2658,8 @@ int main(int argc, char **argv) {
             options.kernel_path, "libpa_scheduler_pmu_owner_aicpu.so"
         );
         if (!pmu_owner.Initialize(
-                options.device, stream, dispatcher_path, owner_path, pmu_mappings.register_bases
+                options.device, aicore_stream.Get(), dispatcher_path, owner_path,
+                pmu_mappings.register_bases
             ) ||
             !pmu_owner.Configure()) {
             (void)pmu_owner.Finalize();
@@ -2620,27 +2882,57 @@ int main(int argc, char **argv) {
             pa_scheduler::aicpu_owner::kOwnerCommandRun,
             pa_scheduler::aicpu_owner::kRequestVersion,
         };
-        // pipeline 从 AICPU producer launch 前开始。Plan 必须完整 Close
-        // 并同步后才允许 96 个 Scalar 消费；两阶段之间不做 D2H 或打印。
+#if PA_BUILD_SWIMLANE
+        if (clock_correlation_required &&
+            !RunClockCorrelationRound(
+                0U, clock_correlation_allocation.GetAligned(),
+                &clock_correlation_exchange, &clock_correlation_evidence,
+                clock_correlation_kernel, aicpu_plan_loader,
+                aicore_stream.Get(), plan_stream.Get()
+            )) {
+            // A raw capture without a proven clock mapping must never be
+            // published.  Sampling is outside the numeric pipeline window,
+            // but its AICPU/AIV launches warm the runtime.  This is therefore
+            // a calibrated warm structural capture, not a cold-start timing.
+            postprocess_ok = false;
+            break;
+        }
+#endif
+        // pipeline 从 AICPU producer launch 前开始。plan-only 保持原有的
+        // launch -> sync -> D2H 语义。full 路径由编译期 policy 固定：
+        // PlanAheadClosed 先同步 producer，再 launch AICore；
+        // StreamingFuture 则在独立 stream 上立即 launch consumer。
         const auto pipeline_begin = std::chrono::steady_clock::now();
-        if (aicpu_plan_loader.Launch(
-                stream, const_cast<pa_scheduler::aicpu_owner::OwnerKernelArgs *>(
+        const int plan_launch_status = aicpu_plan_loader.Launch(
+                plan_stream.Get(),
+                const_cast<pa_scheduler::aicpu_owner::OwnerKernelArgs *>(
                             &owner_kernel_args),
                 sizeof(owner_kernel_args)
-            ) != 0 ||
-            !CheckAcl(
-                aclrtSynchronizeStream(stream),
-                "aclrtSynchronizeStream(AICPU Plan owner)"
-            )) {
+            );
+        if (plan_launch_status != 0) {
+            // 即使提交 API 报错也闭合该 stream，之后才允许本轮退出并释放
+            // producer 所引用的 request/state/Plan GM。
+            (void)CheckAcl(
+                aclrtSynchronizeStream(plan_stream.Get()),
+                "aclrtSynchronizeStream(AICPU Plan owner after failed launch)"
+            );
             execution_ok = false;
             all_passed = false;
             break;
         }
-        const auto plan_end = std::chrono::steady_clock::now();
-        const double plan_us = std::chrono::duration<double, std::micro>(
-            plan_end - pipeline_begin).count();
 
         if (aicpu_plan_options.plan_only) {
+            if (!CheckAcl(
+                    aclrtSynchronizeStream(plan_stream.Get()),
+                    "aclrtSynchronizeStream(AICPU Plan owner)"
+                )) {
+                execution_ok = false;
+                all_passed = false;
+                break;
+            }
+            const auto plan_end = std::chrono::steady_clock::now();
+            const double plan_us = std::chrono::duration<double, std::micro>(
+                plan_end - pipeline_begin).count();
             pa_scheduler::aicpu_plan::RuntimePlanControl plan_control{};
             std::vector<pa_scheduler::aicpu_plan::RuntimeTaskPlanCell>
                 plan_cells(launch_plan.total_tasks);
@@ -2697,7 +2989,8 @@ int main(int argc, char **argv) {
                 "[AICPU-PLAN] run=%u mode=plan-only tasks=%u "
                 "plan_time_us=%.3f producer_exec_us=%.3f "
                 "aicore_time_us=0.000 "
-                "pipeline_e2e_us=%.3f status=PASS\n",
+                "pipeline_e2e_us=%.3f "
+                "status=PASS\n",
                 run, launch_plan.total_tasks, plan_us, producer_us,
                 plan_us
             );
@@ -2705,24 +2998,76 @@ int main(int argc, char **argv) {
         }
 
         // launch 维度是 32 个物理 mixed block；ELF metadata 让每个 block
-        // 同时产生 1 AIC + 2 AIV，共 96 worker。aicore_time 覆盖 launch、
-        // 完整 FinalDrain 和 stream sync，不包含之后的 D2H/JSON。
+        // 同时产生 1 AIC + 2 AIV，共 96 worker。plan_time 是 producer
+        // launch 前到 plan stream 完成的 wall；aicore_time 是 AICore
+        // launch 前到 aicore stream 完成的 wall；pipeline 在 policy 要求的
+        // 两阶段都完成后结束，均不包含后续 D2H/JSON。
+        bool plan_sync_ok = true;
+        std::chrono::steady_clock::time_point plan_end{};
+        if constexpr (pa_scheduler::kRuntimePlanPipelineIsPlanAheadClosed) {
+            plan_sync_ok = CheckAcl(
+                aclrtSynchronizeStream(plan_stream.Get()),
+                "aclrtSynchronizeStream(AICPU Plan owner before AICore)"
+            );
+            plan_end = std::chrono::steady_clock::now();
+            if (!plan_sync_ok) {
+                execution_ok = false;
+                all_passed = false;
+                break;
+            }
+        }
+
         const auto aicore_begin = std::chrono::steady_clock::now();
-        if (!CheckRt(
-                rtKernelLaunchWithHandleV2(
-                    kernel_handle, 0, pa_scheduler::kAicWorkers, &args_info, nullptr, stream, &task_config
-                ),
-                "rtKernelLaunchWithHandleV2"
-            ) ||
-            !CheckAcl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream")) {
+        const bool aicore_launch_ok = CheckRt(
+            rtKernelLaunchWithHandleV2(
+                kernel_handle, 0, pa_scheduler::kAicWorkers, &args_info, nullptr,
+                aicore_stream.Get(), &task_config
+            ),
+            "rtKernelLaunchWithHandleV2"
+        );
+        // StreamingFuture 中两次 sync 都必须尝试，不能用短路
+        // 表达式：任一路报错时，另一条 stream 仍可能持有对
+        // 本轮 GM 的异步访问，D2H/free 前必须闭合。串行路径则已在
+        // AICore launch 前闭合 plan stream。
+        if constexpr (pa_scheduler::kRuntimePlanPipelineIsStreamingFuture) {
+            plan_sync_ok = CheckAcl(
+                aclrtSynchronizeStream(plan_stream.Get()),
+                "aclrtSynchronizeStream(AICPU Plan owner)"
+            );
+            plan_end = std::chrono::steady_clock::now();
+        }
+        const bool aicore_sync_ok = CheckAcl(
+            aclrtSynchronizeStream(aicore_stream.Get()),
+            "aclrtSynchronizeStream(AICore)"
+        );
+        const auto aicore_end = std::chrono::steady_clock::now();
+        if (!aicore_launch_ok || !plan_sync_ok || !aicore_sync_ok) {
             execution_ok = false;
+            all_passed = false;
             break;
         }
-        const auto aicore_end = std::chrono::steady_clock::now();
+        const double plan_us = std::chrono::duration<double, std::micro>(
+            plan_end - pipeline_begin).count();
         const double aicore_us = std::chrono::duration<double, std::micro>(
             aicore_end - aicore_begin).count();
         const double pipeline_us = std::chrono::duration<double, std::micro>(
             aicore_end - pipeline_begin).count();
+        const auto host_pipeline_duration =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                aicore_end - pipeline_begin
+            ).count();
+        if (host_pipeline_duration <= 0) {
+            std::fprintf(
+                stderr,
+                "Host steady pipeline duration is not positive: %lld ns.\n",
+                static_cast<long long>(host_pipeline_duration)
+            );
+            execution_ok = false;
+            all_passed = false;
+            break;
+        }
+        const uint64_t host_pipeline_e2e_duration_ns =
+            static_cast<uint64_t>(host_pipeline_duration);
         const double host_us = aicore_us;
         if (!CheckAcl(
                 aclrtMemcpy(
@@ -2747,16 +3092,98 @@ int main(int argc, char **argv) {
         const double producer_us = static_cast<double>(
             owner_request.result.end_ns - owner_request.result.begin_ns
         ) / 1000.0;
+#if PA_BUILD_SWIMLANE
+        if (clock_correlation_required) {
+            const bool post_round_ok = RunClockCorrelationRound(
+                1U, clock_correlation_allocation.GetAligned(),
+                &clock_correlation_exchange, &clock_correlation_evidence,
+                clock_correlation_kernel, aicpu_plan_loader,
+                aicore_stream.Get(), plan_stream.Get()
+            );
+            const bool mapping_ok = post_round_ok &&
+                pa_scheduler::aicpu_clock::FinalizeClockCorrelationEvidence(
+                    &clock_correlation_evidence
+                );
+            const bool owner_envelope_ok = mapping_ok &&
+                pa_scheduler::aicpu_clock::
+                    AicpuOwnerIsWithinCorrelationEnvelope(
+                        clock_correlation_evidence,
+                        owner_request.result.begin_ns,
+                        owner_request.result.end_ns
+                    );
+            if (!mapping_ok || !owner_envelope_ok) {
+                std::fprintf(
+                    stderr,
+                    "Clock correlation/device causal envelope failed closed "
+                    "after the measured pipeline: status=%d "
+                    "owner_envelope=%s owner=[%llu,%llu] "
+                    "interval=[%lld,%lld] error_ns=%llu.\n",
+                    clock_correlation_evidence.status,
+                    owner_envelope_ok ? "PASS" : "FAIL",
+                    static_cast<unsigned long long>(
+                        owner_request.result.begin_ns
+                    ),
+                    static_cast<unsigned long long>(
+                        owner_request.result.end_ns
+                    ),
+                    static_cast<long long>(
+                        clock_correlation_evidence.offset_lower_ns
+                    ),
+                    static_cast<long long>(
+                        clock_correlation_evidence.offset_upper_ns
+                    ),
+                    static_cast<unsigned long long>(
+                        clock_correlation_evidence.alignment_error_ns
+                    )
+                );
+                postprocess_ok = false;
+                break;
+            }
+            std::printf(
+                "[CLOCK-CORRELATION] samples=%u pre=%u post=%u "
+                "offset_ns=[%lld,%lld] selected=%lld error_ns=%llu "
+                "max_rtt_ns=%llu max_aicore_service_ticks=%llu "
+                "owner_device_envelope=PASS status=PASS\n",
+                clock_correlation_evidence.sample_count,
+                clock_correlation_evidence.pre_samples,
+                clock_correlation_evidence.post_samples,
+                static_cast<long long>(
+                    clock_correlation_evidence.offset_lower_ns
+                ),
+                static_cast<long long>(
+                    clock_correlation_evidence.offset_upper_ns
+                ),
+                static_cast<long long>(
+                    clock_correlation_evidence.selected_offset_ns
+                ),
+                static_cast<unsigned long long>(
+                    clock_correlation_evidence.alignment_error_ns
+                ),
+                static_cast<unsigned long long>(
+                    clock_correlation_evidence.maximum_round_trip_ns
+                ),
+                static_cast<unsigned long long>(
+                    clock_correlation_evidence.maximum_aicore_service_ticks
+                )
+            );
+        }
+#endif
         plan_times.push_back(plan_us);
         plan_producer_times.push_back(producer_us);
         aicore_times.push_back(aicore_us);
         pipeline_times.push_back(pipeline_us);
         std::printf(
-            "[AICPU-PLAN] run=%u mode=full tasks=%u plan_time_us=%.3f "
+            "[AICPU-PLAN] run=%u mode=full pipeline=%s tasks=%u "
+            "plan_time_us=%.3f "
             "producer_exec_us=%.3f aicore_time_us=%.3f "
-            "pipeline_e2e_us=%.3f status=PASS\n",
-            run, launch_plan.total_tasks, plan_us, producer_us,
-            aicore_us, pipeline_us
+            "pipeline_e2e_us=%.3f host_pipeline_e2e_duration_ns=%llu "
+            "status=PASS\n",
+            run, pa_scheduler::host::RuntimePlanPipelineName(),
+            launch_plan.total_tasks, plan_us, producer_us,
+            aicore_us, pipeline_us,
+            static_cast<unsigned long long>(
+                host_pipeline_e2e_duration_ns
+            )
         );
         // D2H 同样避开约 1 GiB 的 worker arena：共享前缀用于
         // flag/vend/frontier 校验，末尾 results 单独回传；shared sidecar
@@ -3041,7 +3468,12 @@ int main(int argc, char **argv) {
                     options.final_barrier_shape, options.trace_atomics,
                     read_trace_records
 #if PTO_FDWIC_SHARED_MAP
-                    , read_submit_claim_records
+                    , read_submit_claim_records,
+                    owner_request.result.backend.task_count,
+                    true,
+                    owner_request.result.begin_ns,
+                    owner_request.result.end_ns,
+                    clock_correlation_evidence
 #endif
                 )) {
                 postprocess_ok = false;
@@ -3130,18 +3562,34 @@ int main(int argc, char **argv) {
 #endif
     }
 
-    // 后处理失败也统一走设备资源释放、ELF 卸载和 ACL 收尾，避免文件系统错误遗留运行时上下文。
+    // 后处理失败也统一走 stream 闭合、设备资源释放、ELF 卸载和 ACL
+    // 收尾，避免文件系统错误遗留运行时上下文。
     bool cleanup_ok = true;
     bool pmu_owner_restore_ok = true;
-    // 先释放依赖当前 device/context 的大块内存，再卸载 ELF、销毁 stream，最后 reset device 与 finalize ACL。
-    if (trace_device != nullptr) {
-        cleanup_ok &= CheckAcl(aclrtFree(trace_device), "aclrtFree(swimlane trace)");
-    }
+    // PMU owner 复用 aicore_stream；恢复动作会在该 stream 上提交并同步
+    // AICPU 工作，因此必须发生在 stream Destroy 之前。两条业务 stream
+    // 随后先销毁，再释放其异步命令可能引用的 GM。
     if (pmu_registers_device != nullptr) {
         // owner 必须在 MMIO 映射、device context 和 ACL runtime 仍有效时恢复。
         pmu_owner_restore_ok = pmu_owner.Finalize();
         cleanup_ok &= pmu_owner_restore_ok;
         cleanup_ok &= UnmapPmuRegisters(options.device, &pmu_mappings);
+    }
+#if PA_BUILD_SWIMLANE
+    cleanup_ok &= clock_correlation_kernel.Unload();
+#endif
+    cleanup_ok &= aicore_stream.Destroy("aclrtDestroyStream(AICore)");
+    cleanup_ok &= plan_stream.Destroy("aclrtDestroyStream(AICPU Plan)");
+#if PA_BUILD_SWIMLANE
+    if (clock_correlation_allocation.GetAligned() != nullptr) {
+        cleanup_ok &= CheckAcl(
+            aclrtFree(clock_correlation_allocation.ReleaseRaw()),
+            "aclrtFree(clock correlation exchange)"
+        );
+    }
+#endif
+    if (trace_device != nullptr) {
+        cleanup_ok &= CheckAcl(aclrtFree(trace_device), "aclrtFree(swimlane trace)");
     }
     if (workload_device != nullptr) {
         cleanup_ok &= CheckAcl(
@@ -3166,7 +3614,6 @@ int main(int argc, char **argv) {
         registered_all ? rtDevBinaryUnRegister(kernel_handle) : rtBinaryUnLoad(kernel_handle);
     cleanup_ok &= CheckRt(unload_error, "unload mixed AICore ELF");
     cleanup_ok &= aicpu_plan_loader.Finalize() == 0;
-    cleanup_ok &= CheckAcl(aclrtDestroyStream(stream), "aclrtDestroyStream");
     cleanup_ok &= CheckAcl(aclrtResetDevice(options.device), "aclrtResetDevice");
     cleanup_ok &= CheckAcl(aclFinalize(), "aclFinalize");
     if (!pmu_options.json_path.empty()) {

@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-// 该文件只证明“公共 Runtime Plan ABI v2 可以被真实 A5 SIMT VF 直接消费”。
+// 该文件只证明“公共 Runtime Plan ABI v3 可以被真实 A5 SIMT VF 直接消费”。
 // 它不生成 task，不复制第二份 request ABI，也不包含 PA task kind/固定公式。
 
 #include <pto/common/kernel_meta.hpp>
@@ -22,7 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 
-PTO_SYNCALL_MIX_AIC_KERNEL_META(aicpu_plan_simt_v2_probe_0_mix_aiv, 1, 2);
+PTO_SYNCALL_MIX_AIC_KERNEL_META(aicpu_plan_simt_v3_probe_0_mix_aiv, 1, 2);
 
 namespace {
 
@@ -30,14 +30,14 @@ namespace plan = pa_scheduler::aicpu_plan;
 namespace simt_contract = pa_scheduler::aicpu_plan_simt;
 
 constexpr uint32_t kReportWords = 12U;
-constexpr uint64_t kReportMagic = 0x4135504C414E5632ULL;  // "A5PLANV2"
+constexpr uint64_t kReportMagic = 0x4135504C414E5633ULL;  // "A5PLANV3"
 
 constexpr uint64_t kStatusCapacityValid = uint64_t{1} << 0U;
 constexpr uint64_t kStatusPlanClosedPastTask = uint64_t{1} << 1U;
 constexpr uint64_t kStatusFirstControlValid = uint64_t{1} << 2U;
 constexpr uint64_t kStatusSecondControlStable = uint64_t{1} << 3U;
 constexpr uint64_t kStatusHeaderTaskValid = uint64_t{1} << 4U;
-constexpr uint64_t kStatusAbiV2 = uint64_t{1} << 5U;
+constexpr uint64_t kStatusAbiV3 = uint64_t{1} << 5U;
 constexpr uint64_t kStatusPayloadLinesValid = uint64_t{1} << 6U;
 constexpr uint64_t kStatusHeaderFieldsValid = uint64_t{1} << 7U;
 
@@ -47,7 +47,7 @@ static_assert(simt_contract::kBuilderLeaders == 4U, "SIMT Plan probe must retain
 static_assert(sizeof(plan::RuntimeTaskPlanCell) == 4608U, "canonical PlanCell ABI changed");
 static_assert(offsetof(plan::RuntimeTaskPlanCell, payload) == 128U, "canonical payload offset changed");
 static_assert(sizeof(plan::RuntimeTaskPlanHeader) == 64U, "canonical Plan header changed");
-static_assert(plan::kRuntimePlanAbiVersion == 2U, "this probe is for Plan ABI v2");
+static_assert(plan::kRuntimePlanAbiVersion == 3U, "this probe is for Plan ABI v3");
 
 __simt_callee__ __aicore__ __attribute__((always_inline)) inline uint64_t
 SimtAtomicObserve(__gm__ volatile int64_t *address)
@@ -100,7 +100,7 @@ PublishLeaderReport(__gm__ uint64_t *reports, uint32_t leader, uint32_t word, ui
     asc_stcg(reports + leader * kReportWords + word, value);
 }
 
-static __simt_vf__ __aicore__ LAUNCH_BOUND(128) void ConsumeCanonicalPlanV2(
+static __simt_vf__ __aicore__ LAUNCH_BOUND(128) void ConsumeCanonicalPlanV3(
     __gm__ plan::RuntimePlanControl *control,
     __gm__ plan::RuntimeTaskPlanCell *cells,
     uint32_t capacity,
@@ -195,7 +195,7 @@ static __simt_vf__ __aicore__ LAUNCH_BOUND(128) void ConsumeCanonicalPlanV2(
                 status |= kStatusHeaderTaskValid;
             }
             if (abi_version == plan::kRuntimePlanAbiVersion) {
-                status |= kStatusAbiV2;
+                status |= kStatusAbiV3;
             }
             if (expected_lines == published_lines && published_lines >= 1U &&
                 published_lines <= plan::kMaxPlanPayloadLines) {
@@ -255,7 +255,7 @@ static __simd_vf__ __aicore__ void SimdMetadataAnchor(__ubuf__ uint32_t *scratch
 
 }  // namespace
 
-extern "C" __global__ __aicore__ void aicpu_plan_simt_v2_probe_0_mix_aiv(
+extern "C" __global__ __aicore__ void aicpu_plan_simt_v3_probe_0_mix_aiv(
     __gm__ pa_scheduler::aicpu_plan::RuntimePlanControl *control,
     __gm__ pa_scheduler::aicpu_plan::RuntimeTaskPlanCell *cells,
     uint32_t capacity,
@@ -267,7 +267,7 @@ extern "C" __global__ __aicore__ void aicpu_plan_simt_v2_probe_0_mix_aiv(
         SimdMetadataAnchor(reinterpret_cast<__ubuf__ uint32_t *>(0));
     }
 
-    cce::async_invoke<ConsumeCanonicalPlanV2>(
+    cce::async_invoke<ConsumeCanonicalPlanV3>(
         cce::dim3{simt_contract::kBuilderThreads, 1U, 1U},
         control, cells, capacity, first_task_id, leader_reports
     );

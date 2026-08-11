@@ -312,6 +312,15 @@ void TestRawSiteIdNeverBecomesTheEnableMaskBit() {
     );
     Expect(
         TraceAtomicPollBatchIndex(
+            AtomicSite::RuntimePlanCellControlLoad
+        ) == 11 &&
+            TraceAtomicPollBatchMask(
+                AtomicSite::RuntimePlanCellControlLoad
+            ) == (1U << 11),
+        "future-ticket cell 等待必须使用 compact index 11 聚合"
+    );
+    Expect(
+        TraceAtomicPollBatchIndex(
             AtomicSite::SharedInsertTurnPoll
         ) == -1 &&
             TraceAtomicPollBatchMask(

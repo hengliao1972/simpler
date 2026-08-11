@@ -40,6 +40,10 @@ static_assert(pa_scheduler::kRuntimePlanBuildWorkers == 4U);
 static_assert(pa_scheduler::kWorkers == 96U);
 static_assert(simt::kBuilderThreads == 128U);
 static_assert(simt::kBuilderLeaders == 4U);
+static_assert(
+    pa_scheduler::kRuntimePlanPipelineIsStreamingFuture,
+    "ordinary SIMT Build requires StreamingFuture Runtime Plan policy"
+);
 
 struct SimtOps {
     static constexpr bool kAtomicReturnReadyObserved = true;
@@ -237,6 +241,148 @@ PA_DEVICE void PublishFatal(
     );
 }
 
+PA_DEVICE void PublishSchedulerFatal(
+    __gm__ pa_scheduler::SchedulerState *state
+)
+{
+    if (state == nullptr) return;
+    (void)SimtOps::Exchange(&state->fatal.value, int32_t{1});
+}
+
+template <typename Ops>
+PA_DEVICE bool WaitForStreamingPlanReady(
+    const plan::RuntimePlanView &view,
+    uint32_t &final_task_count,
+    bool &final_task_count_known
+)
+{
+    final_task_count = 0U;
+    final_task_count_known = false;
+    const uint64_t wait_begin = Ops::Now();
+    uint32_t wait_polls = 0U;
+    while (true) {
+        // ObservePlanReady 对 NotReady(-2) 和 ReadyFailed(-3) 只读
+        // closed line。AICPU 完成 cell control discard/reset 之前，
+        // VF 不得触碰 frontier/fatal 或任何 cell。
+        const plan::PlanReadyObservation observation =
+            simt::ObservePlanReady<Ops>(view);
+        if (observation.status == plan::PlanReadyStatus::Open) {
+            return true;
+        }
+        if (observation.status == plan::PlanReadyStatus::Closed) {
+            final_task_count = observation.task_count;
+            final_task_count_known = true;
+            return true;
+        }
+        if (observation.status != plan::PlanReadyStatus::NotReady) {
+            return false;
+        }
+        Ops::SpinHint();
+        ++wait_polls;
+        if ((wait_polls & 1023U) == 0U &&
+            Ops::Now() - wait_begin > pa_scheduler::kWatchdogTicks) {
+            return false;
+        }
+    }
+}
+
+enum class StreamingTicketStatus : uint8_t {
+    Published,
+    Closed,
+    Fatal,
+};
+
+template <typename Ops>
+PA_DEVICE StreamingTicketStatus ResolveStreamingBuildTicket(
+    __gm__ pa_scheduler::SchedulerState *state,
+    const plan::RuntimePlanView &view, uint32_t task_id,
+    uint32_t &final_task_count,
+    bool &final_task_count_known
+)
+{
+    if (state == nullptr || view.control == nullptr ||
+        view.cells == nullptr || view.capacity == 0U) {
+        return StreamingTicketStatus::Fatal;
+    }
+    const uint64_t wait_begin = Ops::Now();
+    uint32_t wait_polls = 0U;
+    bool close_observed_after_empty = false;
+    while (true) {
+        if (final_task_count_known && task_id >= final_task_count) {
+            return StreamingTicketStatus::Closed;
+        }
+
+        if (task_id < view.capacity) {
+            const int64_t control = Ops::LoadControl(
+                &view.cells[task_id].control.value
+            );
+            if (control != 0) {
+                const plan::DecodedPlanCellControl decoded =
+                    plan::DecodePlanCellControl(control);
+                return decoded.valid &&
+                               decoded.phase ==
+                                   plan::PlanCellPhase::Published &&
+                               decoded.task_id == task_id
+                    ? StreamingTicketStatus::Published
+                    : StreamingTicketStatus::Fatal;
+            }
+            // Close acquire 之后对 t<N 强制再读一次 cell。
+            // 若仍 Empty，producer 已经遗漏了必须的 PlanCell。
+            if (close_observed_after_empty ||
+                final_task_count_known) {
+                return StreamingTicketStatus::Fatal;
+            }
+        }
+
+        ++wait_polls;
+        // 有 cell 时以 cell control 为主并节流 shared closed line；容量
+        // 外 future ticket 没有可读 cell，只能以 closed 作为终止观察点。
+        const bool check_control =
+            wait_polls == 1U ||
+            (wait_polls & 255U) == 0U ||
+            task_id >= view.capacity;
+        if (check_control) {
+            const int64_t closed = Ops::LoadControl(
+                &view.control->closed_task_count.value
+            );
+            if (closed >= 0) {
+                if (closed > static_cast<int64_t>(view.capacity) ||
+                    Ops::LoadControl(
+                        &view.control->planned_frontier.value
+                    ) != closed) {
+                    return StreamingTicketStatus::Fatal;
+                }
+                if (final_task_count_known &&
+                    final_task_count !=
+                        static_cast<uint32_t>(closed)) {
+                    return StreamingTicketStatus::Fatal;
+                }
+                final_task_count = static_cast<uint32_t>(closed);
+                final_task_count_known = true;
+                if (task_id >= final_task_count) {
+                    return StreamingTicketStatus::Closed;
+                }
+                // 本轮 cell load 发生在 Close acquire 之前；下一轮
+                // 再读同一 control 后才允许报 missing t<N。
+                close_observed_after_empty = true;
+            } else if (closed != plan::kPlanOpenTaskCount) {
+                return StreamingTicketStatus::Fatal;
+            }
+        }
+        if ((wait_polls == 1U ||
+             (wait_polls & 255U) == 0U) &&
+            (Ops::LoadControl(&view.control->fatal.value) != 0 ||
+             Ops::Load(&state->fatal.value) != 0)) {
+            return StreamingTicketStatus::Fatal;
+        }
+        if ((wait_polls & 1023U) == 0U &&
+            Ops::Now() - wait_begin > pa_scheduler::kWatchdogTicks) {
+            return StreamingTicketStatus::Fatal;
+        }
+        Ops::SpinHint();
+    }
+}
+
 PA_DEVICE bool LastInsertCompletionPublished(
     Runtime &runtime, uint32_t task_count
 )
@@ -250,7 +396,7 @@ PA_DEVICE bool LastInsertCompletionPublished(
 }
 
 static __simt_vf__ __aicore__ LAUNCH_BOUND(128) void
-BuildClosedCanonicalPlanVf(
+BuildStreamingCanonicalPlanVf(
     __gm__ pa_scheduler::SchedulerState *state,
     uint32_t identity_preflight_ok
 )
@@ -264,8 +410,9 @@ BuildClosedCanonicalPlanVf(
     const uint32_t build_owner = simt::SimtBuildOwner(leader);
 
     plan::RuntimePlanView view{nullptr, nullptr, 0U};
-    uint32_t attached_task_count = 0U;
-    bool attached = false;
+    uint32_t final_task_count = 0U;
+    bool final_task_count_known = false;
+    bool plan_ready = false;
     if (state != nullptr) {
         // A5 Scalar/VF 间没有 cache coherence。每个 leader 必须独立
         // acquire AICPU 发布的 storage ref，以及其后整个 Build 会复用的
@@ -281,13 +428,21 @@ BuildClosedCanonicalPlanVf(
             &state->heap_base,
             sizeof(state->heap_base) + sizeof(state->heap_size)
         );
-        attached = plan::MakeRuntimePlanView(
-                       &state->runtime_plan_control,
-                       state->runtime_plan_storage, view
-                   ) &&
-                   simt::AttachClosedPlan<SimtOps>(
-                       view, attached_task_count
-                   );
+        plan_ready = plan::MakeRuntimePlanView(
+                         &state->runtime_plan_control,
+                         state->runtime_plan_storage, view
+                     ) &&
+                     WaitForStreamingPlanReady<SimtOps>(
+                         view, final_task_count,
+                         final_task_count_known
+                     );
+    }
+    if (!plan_ready) {
+        // ReadyFailed(-3) 不保证其他 Plan control 已 reset。
+        // 失败路径只发布独立 scheduler fatal，不触碰
+        // build_workers_done/release/runtime-plan fatal。
+        PublishSchedulerFatal(state);
+        return;
     }
 
     Runtime runtime{
@@ -297,17 +452,26 @@ BuildClosedCanonicalPlanVf(
         pa_scheduler::kWatchdogTicks,
         adapter::PaSimtRoutePolicy{},
     };
-    bool local_ok = attached && runtime.Valid() &&
+    bool local_ok = runtime.Valid() &&
                     SimtOps::Load(&state->fatal.value) == 0;
     if (!local_ok) PublishFatal(state);
+    bool reached_terminal = false;
 
     while (local_ok) {
         const plan::BuildReservation reservation =
-            simt::TakeAttachedBuildTicket<SimtOps>(
-                view, attached_task_count
-            );
-        if (reservation.status ==
+            simt::TakeOpenBuildTicket<SimtOps>(view);
+        if (reservation.status !=
             plan::BuildReservationStatus::Reserved) {
+            PublishFatal(state);
+            local_ok = false;
+            break;
+        }
+        const StreamingTicketStatus ticket_status =
+            ResolveStreamingBuildTicket<SimtOps>(
+                state, view, reservation.task_id,
+                final_task_count, final_task_count_known
+            );
+        if (ticket_status == StreamingTicketStatus::Published) {
             simt::SimtTaskBuildScratch scratch{};
             simt::SimtTaskBuildStatus status =
                 simt::SimtTaskBuildStatus::InvalidPlanControl;
@@ -323,28 +487,32 @@ BuildClosedCanonicalPlanVf(
             }
             continue;
         }
-        if (reservation.status !=
-            plan::BuildReservationStatus::Closed) {
+        if (ticket_status == StreamingTicketStatus::Closed) {
+            reached_terminal = true;
+        } else {
             PublishFatal(state);
             local_ok = false;
         }
         break;
     }
 
-    // fatal 也必须让四个真实 leader 各自且仅一次走 arrival。只有最后
-    // arrival、全局无 fatal 且 completion[N-1]==N-1（N=0 例外）时，
-    // 才允许发布 build_release；这证明严格 TensorMap 插入链已封口。
+    // 每个 Ready-success leader 各自且仅一次尝试 arrival；fatal control
+    // 会让公共 arrival gate 拒绝报到。只有最后一次正常 arrival、全局
+    // 无 fatal 且 completion[N-1]==N-1（N=0 例外）时，才允许发布
+    // build_release；这证明严格 TensorMap 插入链已封口。
     simt::BuilderLeaderLocalState arrival_state{};
     const plan::BuildArrivalStatus arrival =
         simt::ArriveBuilderLeaderOnce<SimtOps>(
             view, leader, arrival_state
         );
     if (arrival == plan::BuildArrivalStatus::Last) {
-        if (!LastInsertCompletionPublished(
-                runtime, attached_task_count
+        if (!local_ok || !reached_terminal ||
+            !final_task_count_known ||
+            !LastInsertCompletionPublished(
+                runtime, final_task_count
             ) ||
             !simt::PublishBuildRelease<SimtOps>(
-                view, attached_task_count
+                view, final_task_count
             )) {
             PublishFatal(state);
         }
@@ -428,7 +596,7 @@ pa_scheduler_0_mix_aiv(
     AcquireBuildIdentity(state);
     const bool identity_ok =
         pa_scheduler_simt_runtime_plan_preflight_aiv(state);
-    cce::async_invoke<BuildClosedCanonicalPlanVf>(
+    cce::async_invoke<BuildStreamingCanonicalPlanVf>(
         cce::dim3{simt::kBuilderThreads, 1U, 1U},
         state, identity_ok ? 1U : 0U
     );

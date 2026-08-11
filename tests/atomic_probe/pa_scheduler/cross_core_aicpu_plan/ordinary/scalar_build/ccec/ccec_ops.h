@@ -11,6 +11,42 @@
 #ifndef TESTS_ATOMIC_PROBE_PA_SCHEDULER_CCEC_CCEC_OPS_H
 #define TESTS_ATOMIC_PROBE_PA_SCHEDULER_CCEC_CCEC_OPS_H
 
+#if defined(PA_CCEC_CLOCK_CORRELATION_OPS_ONLY)
+
+// The capture-only AIV ELF deliberately does not include the PA scheduler or
+// its workload types.  Its cache/sys-counter primitives still live in this
+// single ISA adapter file, preserving the repository-wide rule that device
+// business sources never issue raw DCCI/atomic operations.
+namespace pa_scheduler_ccec {
+
+struct ClockCorrelationOps {
+    __aicore__ static inline void InvalidateFirstCacheLine(
+        __gm__ uint8_t *address
+    ) {
+        dcci(address, SINGLE_CACHE_LINE);
+        dsb((mem_dsb_t)0);
+        __asm__ volatile("" ::: "memory");
+    }
+
+    __aicore__ static inline uint64_t Now() {
+        return static_cast<uint64_t>(get_sys_cnt());
+    }
+
+    __aicore__ static inline void PublishWord(
+        __gm__ uint64_t *address, uint64_t value
+    ) {
+        __builtin_cce_st_dev(value, address, 0);
+    }
+
+    __aicore__ static inline void PublishBarrier() {
+        dsb((mem_dsb_t)0);
+    }
+};
+
+}  // namespace pa_scheduler_ccec
+
+#else
+
 // 此私有头在 CCEC/PTO 与公共调度头之后包含。kernel.cpp 每个核型只定义
 // 一次真实负载实体；split finish TU 复用按核型导出的 dispatcher 与同一份
 // inline Ops，避免复制或改写 atomic/cache/计时语义。
@@ -573,5 +609,7 @@ extern "C" __attribute__((noinline, used)) __aicore__ void pa_execute_real_winne
 #endif
 }
 #endif  // PA_CCEC_OPS_DEFINE_REAL_WORKLOAD
+
+#endif  // PA_CCEC_CLOCK_CORRELATION_OPS_ONLY
 
 #endif  // TESTS_ATOMIC_PROBE_PA_SCHEDULER_CCEC_CCEC_OPS_H

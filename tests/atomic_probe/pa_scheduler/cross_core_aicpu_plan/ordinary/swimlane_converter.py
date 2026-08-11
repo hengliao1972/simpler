@@ -20,7 +20,7 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -110,6 +110,21 @@ KERNEL_NAMES = {
 }
 # 一个物理 mixed block 的三条 runtime lane：AIC、AIV0、AIV1。
 LANE_NAMES = {0: "AIC", 1: "AIV0", 2: "AIV1"}
+
+# AICPU producer uses CLOCK_MONOTONIC_RAW while the AICore rows use SYS_CNT.
+# They happen to have the same one-nanosecond rate on A5, but their epochs are
+# different.  A merged lane is therefore legal only after the eight-sample
+# four-timestamp correlation below has closed to at most 50 us.
+AICPU_PROCESS_ID = 1_000_000
+AICPU_THREAD_ID = 1
+AICPU_CORRELATION_SAMPLE_COUNT = 8
+AICPU_CORRELATION_PRE_SAMPLES = 4
+AICPU_CORRELATION_POST_SAMPLES = 4
+AICPU_CORRELATION_VERSION = 2
+AICPU_CLOCK_SCALE_DEN = 1_000_000_000
+AICPU_MAX_ALIGNMENT_ERROR_NS = 50_000
+AICPU_PRODUCER_PHASE_NAME = "RuntimePlanProducer"
+AICPU_PRODUCER_CLOCK = "aicpu_monotonic_raw_ns"
 
 
 def _scalar_thread_id(lane: int) -> int:
@@ -302,6 +317,7 @@ POLL_BATCH_SITE_OP_IDS = {
     55: 0,
     58: 0,
     60: 0,
+    64: 0,
     67: 0,
 }
 SHARED_REGISTER_ATOMIC_SITE_IDS = {19, 20}
@@ -407,6 +423,716 @@ def _integer(value: Any, label: str) -> int:
         return int(value)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{label} is not an integer: {value!r}") from error
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    """Exact mathematical ceil(numerator / denominator), including negatives."""
+    return -((-numerator) // denominator)
+
+
+def _scaled_floor(value: int, scale_num: int, scale_den: int) -> int:
+    return value * scale_num // scale_den
+
+
+def _scaled_ceil(value: int, scale_num: int, scale_den: int) -> int:
+    return _ceil_div(value * scale_num, scale_den)
+
+
+def _scaled_nearest(value: int, scale_num: int, scale_den: int) -> int:
+    # All AICPU timestamps are nonnegative.  Half-up avoids Python's
+    # float/banker's-rounding and keeps the conversion reproducible in C++.
+    return (value * scale_num + scale_den // 2) // scale_den
+
+
+def _validate_aicpu_runtime_plan_producer(
+    data: dict[str, Any],
+    metadata: dict[str, Any],
+    frequency_hz: int,
+    runtime_plan_abi: int,
+    *,
+    allow_host_cpu_functional: bool,
+) -> dict[str, Any] | None:
+    """Validate and map the real AICPU Plan owner into the SYS_CNT domain.
+
+    The Host-computed offset fields are retained as evidence but are not
+    trusted: every per-sample interval and the final intersection are rebuilt
+    from the four causal timestamps using integer arithmetic.
+    """
+
+    forbidden_host_timing_fields = (
+        "runtime_plan_pipeline_clock_bracket",
+        "host_pipeline_e2e",
+        "timing_primary_metric",
+        "aicore_time_scope",
+    )
+    present_host_timing_fields = [
+        field for field in forbidden_host_timing_fields
+        if field in metadata
+    ]
+    if present_host_timing_fields:
+        raise ValueError(
+            "Host-derived timing metadata is forbidden by the joint "
+            "AICPU/AICore profiling ABI: "
+            f"{present_host_timing_fields}; only the AICPU and AICore clock "
+            "domains may participate"
+        )
+
+    producer_domain = metadata.get("runtime_plan_producer_domain")
+    if producer_domain is None:
+        raise ValueError(
+            "metadata.runtime_plan_producer_domain is required for "
+            "joint AICPU/AICore Runtime Plan profiling"
+        )
+    if producer_domain not in ("aicpu", "host-cpu"):
+        raise ValueError(
+            "metadata.runtime_plan_producer_domain must be aicpu or host-cpu"
+        )
+    if producer_domain == "host-cpu" and not allow_host_cpu_functional:
+        raise ValueError(
+            "joint AICPU/AICore profiling requires "
+            "metadata.runtime_plan_producer_domain='aicpu'; host-cpu is "
+            "functional-only and requires explicit --host-cpu-functional"
+        )
+    expected_primary_view = (
+        "joint_aicpu_aicore_structure"
+        if producer_domain == "aicpu"
+        else "host_cpu_functional_structure"
+    )
+    primary_view = metadata.get("profiling_primary_view")
+    if primary_view != expected_primary_view:
+        raise ValueError(
+            "metadata.profiling_primary_view must be "
+            f"{expected_primary_view!r} for producer_domain={producer_domain}"
+        )
+
+    warmup_before_pipeline = metadata.get(
+        "clock_correlation_warmup_before_pipeline"
+    )
+    timing_scope = metadata.get("timing_scope")
+    performance_representative = metadata.get(
+        "performance_representative"
+    )
+    expected_warmup = producer_domain == "aicpu"
+    expected_timing_scope = (
+        "calibrated-structural-capture"
+        if expected_warmup
+        else "host-cpu-functional-capture"
+    )
+    if (
+        type(warmup_before_pipeline) is not bool
+        or warmup_before_pipeline is not expected_warmup
+    ):
+        raise ValueError(
+            "metadata.clock_correlation_warmup_before_pipeline must be "
+            f"{str(expected_warmup).lower()} for producer_domain={producer_domain}"
+        )
+    if timing_scope != expected_timing_scope:
+        raise ValueError(
+            f"metadata.timing_scope must be {expected_timing_scope!r} for "
+            f"producer_domain={producer_domain}"
+        )
+    if type(performance_representative) is not bool or performance_representative:
+        raise ValueError(
+            "metadata.performance_representative must be false for a "
+            "swimlane structural/functional capture"
+        )
+    orchestrator_phases = data.get("aicpu_orchestrator_phases")
+    aicpu_tasks = data.get("aicpu_tasks")
+    scheduler_phases = data.get("aicpu_scheduler_phases")
+    if producer_domain == "host-cpu":
+        for field, value in (
+            ("aicpu_tasks", aicpu_tasks),
+            ("aicpu_scheduler_phases", scheduler_phases),
+            ("aicpu_orchestrator_phases", orchestrator_phases),
+        ):
+            if value not in (None, []):
+                raise ValueError(
+                    f"{field} must be empty for runtime_plan_producer_domain=host-cpu"
+                )
+        if "aicpu_aicore_clock_correlation" in metadata:
+            raise ValueError(
+                "metadata.aicpu_aicore_clock_correlation is only valid for "
+                "runtime_plan_producer_domain=aicpu"
+            )
+        if "aicpu_aicore_causal_capture_bracket" in metadata:
+            raise ValueError(
+                "metadata.aicpu_aicore_causal_capture_bracket is only valid "
+                "for runtime_plan_producer_domain=aicpu"
+            )
+        metadata["profiling_scope"] = "host-cpu-functional-only"
+        metadata["joint_profiling"] = False
+        return None
+
+    if aicpu_tasks != []:
+        raise ValueError("aicpu_tasks must be an empty array for the Plan owner capture")
+    if scheduler_phases != []:
+        raise ValueError(
+            "aicpu_scheduler_phases must be an empty array for the Plan owner capture"
+        )
+    if not isinstance(orchestrator_phases, list):
+        raise ValueError("aicpu_orchestrator_phases must be an array")
+    if len(orchestrator_phases) != 1:
+        raise ValueError(
+            "aicpu_orchestrator_phases must contain exactly one real "
+            "RuntimePlanProducer phase"
+        )
+    phase = orchestrator_phases[0]
+    if not isinstance(phase, dict):
+        raise ValueError("aicpu_orchestrator_phases[0] must be a JSON object")
+    expected_phase_fields = {"name", "clock", "begin_ns", "end_ns"}
+    if set(phase) != expected_phase_fields:
+        raise ValueError(
+            "aicpu_orchestrator_phases[0] must contain exactly "
+            f"{sorted(expected_phase_fields)}; direct AICore-tick splicing is forbidden"
+        )
+    if phase.get("name") != AICPU_PRODUCER_PHASE_NAME:
+        raise ValueError(
+            "aicpu_orchestrator_phases[0].name must be RuntimePlanProducer"
+        )
+    if phase.get("clock") != AICPU_PRODUCER_CLOCK:
+        raise ValueError(
+            "aicpu_orchestrator_phases[0].clock must be "
+            f"{AICPU_PRODUCER_CLOCK!r}"
+        )
+    owner_begin_ns = _integer(
+        phase.get("begin_ns"), "aicpu_orchestrator_phases[0].begin_ns"
+    )
+    owner_end_ns = _integer(
+        phase.get("end_ns"), "aicpu_orchestrator_phases[0].end_ns"
+    )
+    if owner_begin_ns <= 0 or owner_end_ns <= owner_begin_ns:
+        raise ValueError(
+            "aicpu_orchestrator_phases[0] requires a non-empty positive "
+            f"interval: begin_ns={owner_begin_ns} end_ns={owner_end_ns}"
+        )
+
+    correlation = metadata.get("aicpu_aicore_clock_correlation")
+    if not isinstance(correlation, dict):
+        raise ValueError(
+            "metadata.aicpu_aicore_clock_correlation must be a JSON object"
+        )
+    expected_correlation_fields = {
+        "status",
+        "version",
+        "pre_samples",
+        "post_samples",
+        "scale_num",
+        "scale_den",
+        "offset_lower_tick",
+        "offset_upper_tick",
+        "offset_mid_tick",
+        "alignment_error_tick",
+        "maximum_round_trip_ns",
+        "maximum_aicore_service_ticks",
+        "samples",
+    }
+    if set(correlation) != expected_correlation_fields:
+        raise ValueError(
+            "metadata.aicpu_aicore_clock_correlation must contain exactly "
+            f"{sorted(expected_correlation_fields)}"
+        )
+    if correlation.get("status") != "valid":
+        raise ValueError(
+            "metadata.aicpu_aicore_clock_correlation.status must be 'valid'"
+        )
+    version = _integer(
+        correlation.get("version"),
+        "metadata.aicpu_aicore_clock_correlation.version",
+    )
+    pre_samples = _integer(
+        correlation.get("pre_samples"),
+        "metadata.aicpu_aicore_clock_correlation.pre_samples",
+    )
+    post_samples = _integer(
+        correlation.get("post_samples"),
+        "metadata.aicpu_aicore_clock_correlation.post_samples",
+    )
+    if (
+        version != AICPU_CORRELATION_VERSION
+        or pre_samples != AICPU_CORRELATION_PRE_SAMPLES
+        or post_samples != AICPU_CORRELATION_POST_SAMPLES
+    ):
+        raise ValueError(
+            "AICPU/AICore correlation requires version=2 and an exact 4+4 "
+            "pre/post sample population"
+        )
+    scale_num = _integer(
+        correlation.get("scale_num"),
+        "metadata.aicpu_aicore_clock_correlation.scale_num",
+    )
+    scale_den = _integer(
+        correlation.get("scale_den"),
+        "metadata.aicpu_aicore_clock_correlation.scale_den",
+    )
+    if scale_num != frequency_hz or scale_den != AICPU_CLOCK_SCALE_DEN:
+        raise ValueError(
+            "AICPU/AICore correlation scale must be the raw trace frequency "
+            "over 1e9: "
+            f"scale={scale_num}/{scale_den} frequency_hz={frequency_hz}"
+        )
+    samples = correlation.get("samples")
+    if not isinstance(samples, list) or len(samples) != AICPU_CORRELATION_SAMPLE_COUNT:
+        raise ValueError(
+            "metadata.aicpu_aicore_clock_correlation.samples must contain "
+            f"exactly {AICPU_CORRELATION_SAMPLE_COUNT} four-timestamp samples"
+        )
+
+    expected_sample_fields = {
+        "aicpu_send_ns",
+        "aicore_receive_tick",
+        "aicore_send_tick",
+        "aicpu_receive_ns",
+        "offset_lower_tick",
+        "offset_upper_tick",
+        "round_trip_ns",
+        "aicore_service_ticks",
+        "round",
+        "index_in_round",
+        "round_nonce",
+    }
+    normalized_samples: list[dict[str, int]] = []
+    intersection_lower: int | None = None
+    intersection_upper: int | None = None
+    previous_aicpu_receive = 0
+    previous_aicore_send = 0
+    round_nonces: list[int | None] = [None, None]
+    maximum_round_trip = 0
+    maximum_service = 0
+    for index, raw_sample in enumerate(samples):
+        label = f"metadata.aicpu_aicore_clock_correlation.samples[{index}]"
+        if not isinstance(raw_sample, dict):
+            raise ValueError(f"{label} must be a JSON object")
+        if set(raw_sample) != expected_sample_fields:
+            raise ValueError(
+                f"{label} must contain exactly {sorted(expected_sample_fields)}"
+            )
+        sample = {
+            field: _integer(raw_sample.get(field), f"{label}.{field}")
+            for field in expected_sample_fields
+        }
+        aicpu_send = sample["aicpu_send_ns"]
+        aicpu_receive = sample["aicpu_receive_ns"]
+        aicore_receive = sample["aicore_receive_tick"]
+        aicore_send = sample["aicore_send_tick"]
+        if (
+            aicpu_send <= 0
+            or aicore_receive <= 0
+            or aicpu_receive <= aicpu_send
+            or aicore_send < aicore_receive
+        ):
+            raise ValueError(
+                f"{label} violates four-timestamp causal order"
+            )
+        if index != 0 and (
+            aicpu_send < previous_aicpu_receive
+            or aicore_receive < previous_aicore_send
+        ):
+            raise ValueError(
+                f"{label} is not ordered after the previous correlation sample"
+            )
+        previous_aicpu_receive = aicpu_receive
+        previous_aicore_send = aicore_send
+
+        # offset >= AICore.send - scale*AICPU.receive
+        # offset <= AICore.receive - scale*AICPU.send
+        # ceil/floor are intentionally asymmetric to preserve a causal integer
+        # interval at non-1GHz frequencies.
+        computed_lower = aicore_send - _scaled_floor(
+            aicpu_receive, scale_num, scale_den
+        )
+        computed_upper = aicore_receive - _scaled_ceil(
+            aicpu_send, scale_num, scale_den
+        )
+        computed_round_trip = aicpu_receive - aicpu_send
+        computed_service = aicore_send - aicore_receive
+        expected_round = index // AICPU_CORRELATION_PRE_SAMPLES
+        expected_index = index % AICPU_CORRELATION_PRE_SAMPLES
+        if computed_lower > computed_upper:
+            raise ValueError(f"{label} has an empty causal offset interval")
+        if (
+            sample["offset_lower_tick"] != computed_lower
+            or sample["offset_upper_tick"] != computed_upper
+            or sample["round_trip_ns"] != computed_round_trip
+            or sample["aicore_service_ticks"] != computed_service
+            or sample["round"] != expected_round
+            or sample["index_in_round"] != expected_index
+            or sample["round_nonce"] <= 0
+        ):
+            raise ValueError(
+                f"{label} derived fields do not match its raw four timestamps "
+                "or 4+4 round identity"
+            )
+        if round_nonces[expected_round] is None:
+            round_nonces[expected_round] = sample["round_nonce"]
+        elif round_nonces[expected_round] != sample["round_nonce"]:
+            raise ValueError(
+                f"{label} has a different nonce inside correlation round "
+                f"{expected_round}"
+            )
+        intersection_lower = (
+            computed_lower
+            if intersection_lower is None
+            else max(intersection_lower, computed_lower)
+        )
+        intersection_upper = (
+            computed_upper
+            if intersection_upper is None
+            else min(intersection_upper, computed_upper)
+        )
+        normalized_samples.append(sample)
+        maximum_round_trip = max(
+            maximum_round_trip, computed_round_trip
+        )
+        maximum_service = max(maximum_service, computed_service)
+
+    assert intersection_lower is not None and intersection_upper is not None
+    if intersection_lower > intersection_upper:
+        raise ValueError(
+            "metadata.aicpu_aicore_clock_correlation samples have an empty "
+            "offset intersection"
+        )
+    if round_nonces[0] == round_nonces[1]:
+        raise ValueError(
+            "AICPU/AICore pre/post correlation rounds must use different nonces"
+        )
+    pre_samples_raw = normalized_samples[
+        :AICPU_CORRELATION_PRE_SAMPLES
+    ]
+    post_samples_raw = normalized_samples[
+        -AICPU_CORRELATION_POST_SAMPLES:
+    ]
+    computed_causal_bracket = {
+        "aicpu_pre_receive_max_ns": max(
+            sample["aicpu_receive_ns"] for sample in pre_samples_raw
+        ),
+        "aicpu_post_send_min_ns": min(
+            sample["aicpu_send_ns"] for sample in post_samples_raw
+        ),
+        "aicore_pre_send_max_tick": max(
+            sample["aicore_send_tick"] for sample in pre_samples_raw
+        ),
+        "aicore_post_receive_min_tick": min(
+            sample["aicore_receive_tick"] for sample in post_samples_raw
+        ),
+    }
+    causal_bracket = metadata.get(
+        "aicpu_aicore_causal_capture_bracket"
+    )
+    if not isinstance(causal_bracket, dict):
+        raise ValueError(
+            "metadata.aicpu_aicore_causal_capture_bracket must be a JSON object"
+        )
+    expected_bracket_fields = {
+        "derivation",
+        "aicpu_clock",
+        "aicpu_pre_receive_max_ns",
+        "aicpu_post_send_min_ns",
+        "aicore_clock",
+        "aicore_pre_send_max_tick",
+        "aicore_post_receive_min_tick",
+    }
+    if set(causal_bracket) != expected_bracket_fields:
+        raise ValueError(
+            "metadata.aicpu_aicore_causal_capture_bracket must contain "
+            f"exactly {sorted(expected_bracket_fields)}"
+        )
+    if (
+        causal_bracket.get("derivation")
+        != "pre-post-four-timestamp-samples"
+        or causal_bracket.get("aicpu_clock") != AICPU_PRODUCER_CLOCK
+        or causal_bracket.get("aicore_clock") != "aicore_sys_cnt_tick"
+    ):
+        raise ValueError(
+            "metadata.aicpu_aicore_causal_capture_bracket has invalid "
+            "derivation or clock identities"
+        )
+    declared_causal_bracket = {
+        field: _integer(
+            causal_bracket.get(field),
+            f"metadata.aicpu_aicore_causal_capture_bracket.{field}",
+        )
+        for field in computed_causal_bracket
+    }
+    if declared_causal_bracket != computed_causal_bracket:
+        raise ValueError(
+            "metadata.aicpu_aicore_causal_capture_bracket does not match "
+            "the eight raw correlation samples"
+        )
+    if not (
+        computed_causal_bracket["aicpu_pre_receive_max_ns"]
+        < owner_begin_ns
+        < owner_end_ns
+        < computed_causal_bracket["aicpu_post_send_min_ns"]
+    ):
+        raise ValueError(
+            "RuntimePlanProducer is outside the strict AICPU "
+            "pre-receive/post-send causal bracket"
+        )
+
+    computed_mid = (intersection_lower + intersection_upper) // 2
+    computed_error = max(
+        computed_mid - intersection_lower,
+        intersection_upper - computed_mid,
+    )
+    declared = {
+        field: _integer(
+            correlation.get(field),
+            f"metadata.aicpu_aicore_clock_correlation.{field}",
+        )
+        for field in (
+            "offset_lower_tick",
+            "offset_upper_tick",
+            "offset_mid_tick",
+            "alignment_error_tick",
+        )
+    }
+    expected = {
+        "offset_lower_tick": intersection_lower,
+        "offset_upper_tick": intersection_upper,
+        "offset_mid_tick": computed_mid,
+        "alignment_error_tick": computed_error,
+    }
+    if declared != expected:
+        raise ValueError(
+            "metadata.aicpu_aicore_clock_correlation aggregate does not "
+            f"match the raw-sample intersection: declared={declared} expected={expected}"
+        )
+    declared_maximum_round_trip = _integer(
+        correlation.get("maximum_round_trip_ns"),
+        "metadata.aicpu_aicore_clock_correlation.maximum_round_trip_ns",
+    )
+    declared_maximum_service = _integer(
+        correlation.get("maximum_aicore_service_ticks"),
+        "metadata.aicpu_aicore_clock_correlation.maximum_aicore_service_ticks",
+    )
+    if (
+        declared_maximum_round_trip != maximum_round_trip
+        or declared_maximum_service != maximum_service
+    ):
+        raise ValueError(
+            "AICPU/AICore correlation maximum RTT/service aggregates do not "
+            "match the raw samples"
+        )
+    maximum_error_tick = _ceil_div(
+        frequency_hz * AICPU_MAX_ALIGNMENT_ERROR_NS,
+        AICPU_CLOCK_SCALE_DEN,
+    )
+    if computed_error > maximum_error_tick:
+        raise ValueError(
+            "AICPU/AICore clock alignment error exceeds the 50 us limit: "
+            f"error_tick={computed_error} limit_tick={maximum_error_tick}"
+        )
+
+    mapped_begin = (
+        _scaled_nearest(owner_begin_ns, scale_num, scale_den)
+        + computed_mid
+    )
+    mapped_end = (
+        _scaled_nearest(owner_end_ns, scale_num, scale_den)
+        + computed_mid
+    )
+    if mapped_begin <= 0 or mapped_end <= mapped_begin:
+        raise ValueError(
+            "mapped RuntimePlanProducer interval is empty or outside the "
+            "positive AICore tick domain"
+        )
+    mapped_aicpu_pre_receive_max = (
+        _scaled_nearest(
+            computed_causal_bracket["aicpu_pre_receive_max_ns"],
+            scale_num,
+            scale_den,
+        )
+        + computed_mid
+    )
+    mapped_aicpu_post_send_min = (
+        _scaled_nearest(
+            computed_causal_bracket["aicpu_post_send_min_ns"],
+            scale_num,
+            scale_den,
+        )
+        + computed_mid
+    )
+    if not (
+        0 < mapped_aicpu_pre_receive_max
+        < mapped_begin
+        < mapped_end
+        < mapped_aicpu_post_send_min
+    ):
+        raise ValueError(
+            "mapped RuntimePlanProducer does not lie inside the mapped "
+            "AICPU causal calibration window"
+        )
+    normalized = {
+        "name": AICPU_PRODUCER_PHASE_NAME,
+        "raw_clock": AICPU_PRODUCER_CLOCK,
+        "raw_begin_ns": owner_begin_ns,
+        "raw_end_ns": owner_end_ns,
+        "duration_ns": owner_end_ns - owner_begin_ns,
+        "mapped_begin_tick": mapped_begin,
+        "mapped_end_tick": mapped_end,
+        "alignment_error_tick": computed_error,
+        "alignment_error_us": computed_error * 1_000_000 / frequency_hz,
+        "maximum_alignment_error_tick": maximum_error_tick,
+        "mapping": "aicore_tick=round(scale_num*aicpu_ns/scale_den)+offset_mid_tick",
+    }
+    metadata["aicpu_runtime_plan_producer"] = normalized
+    metadata["profiling_scope"] = "aicpu-aicore-joint"
+    metadata["joint_profiling"] = True
+    metadata["aicpu_aicore_causal_capture_window"] = {
+        **computed_causal_bracket,
+        "mapped_aicpu_pre_receive_max_tick":
+            mapped_aicpu_pre_receive_max,
+        "mapped_aicpu_post_send_min_tick":
+            mapped_aicpu_post_send_min,
+        "alignment_error_tick": computed_error,
+    }
+    causal_bracket.update(computed_causal_bracket)
+    # Normalize integer-compatible JSON strings before the merged metadata is
+    # emitted; the original timestamps and every raw sample remain present.
+    correlation.update(expected)
+    correlation["scale_num"] = scale_num
+    correlation["scale_den"] = scale_den
+    correlation["version"] = version
+    correlation["pre_samples"] = pre_samples
+    correlation["post_samples"] = post_samples
+    correlation["maximum_round_trip_ns"] = maximum_round_trip
+    correlation["maximum_aicore_service_ticks"] = maximum_service
+    correlation["samples"] = normalized_samples
+    return normalized
+
+
+RUNTIME_PLAN_PIPELINE_METADATA = {
+    "plan-ahead-closed": {
+        "launch_order": "plan-sync-before-aicore",
+        "producer_ready": "closed",
+        "consumer_admission": "closed-only",
+        "prefill": 0,
+    },
+    "streaming-future": {
+        "launch_order": "dual-stream-overlap",
+        "producer_ready": "prefill",
+        "consumer_admission": "ready-future-ticket",
+    },
+}
+
+
+def _validate_runtime_plan_atomic_closure(
+    pipeline: str,
+    build_backend: str,
+    build_trace_coverage: str,
+    atomic_calls_by_site: dict[int, int],
+    task_count: int,
+    build_workers: int,
+    execute_workers: int,
+) -> None:
+    """Validate only the Runtime Plan atomics covered by the raw trace.
+
+    Scalar Build owns detailed TraceAtomic records.  Formal SIMT Build uses
+    direct VF operations, so its W=4 ticket/arrival closure is proved by the
+    separately validated terminal control snapshot; the raw contains only the
+    96 Scalar continuation Attach/Wait observations.  Do not invent VF rows.
+    """
+
+    if build_backend == "simt":
+        if build_trace_coverage != "simt-coarse-direct-state":
+            raise ValueError(
+                "SIMT Runtime Plan requires "
+                "runtime_plan_build_trace_coverage="
+                "'simt-coarse-direct-state'"
+            )
+        # These sites belong exclusively to the untraced VF Build path.  A
+        # nonzero raw count would contradict the declared coarse coverage.
+        for site in (62, 63, 64, 65, 66, 68, 69):
+            actual_calls = atomic_calls_by_site.get(site, 0)
+            if actual_calls != 0:
+                raise ValueError(
+                    "SIMT coarse Runtime Plan raw must not counterfeit VF "
+                    f"Atomic rows: site={ATOMIC_SITE_NAMES[site]} "
+                    f"actual={actual_calls}"
+                )
+        minimum_continuation_calls = {
+            58: execute_workers,
+            60: execute_workers,
+            61: execute_workers,
+            67: execute_workers,
+        }
+        if pipeline == "streaming-future":
+            # Ready attach and terminal release validation each read the final
+            # Plan identity once per Scalar; pre-ready/release polling may add
+            # timing-dependent calls.
+            minimum_continuation_calls.update({
+                58: 2 * execute_workers,
+                60: 2 * execute_workers,
+                61: 2 * execute_workers,
+            })
+        for site, minimum_calls in minimum_continuation_calls.items():
+            actual_calls = atomic_calls_by_site.get(site, 0)
+            if actual_calls < minimum_calls:
+                raise ValueError(
+                    "SIMT Runtime Plan continuation Atomic closure is "
+                    f"incomplete: pipeline={pipeline} "
+                    f"site={ATOMIC_SITE_NAMES[site]} "
+                    f"actual={actual_calls} minimum={minimum_calls}"
+                )
+        if atomic_calls_by_site.get(59, 0) != 0:
+            raise ValueError(
+                "SIMT Runtime Plan success raw must not publish fatal"
+            )
+        return
+
+    if build_backend != "scalar" or (
+        build_trace_coverage != "scalar-task-detail"
+    ):
+        raise ValueError(
+            "Scalar Runtime Plan requires "
+            "runtime_plan_build_trace_coverage='scalar-task-detail'"
+        )
+
+    exact_plan_atomic_calls = {
+        62: task_count + build_workers,
+        63: 1,
+        65: build_workers,
+        66: 1,
+        68: 1,
+        59: 0,
+        69: 1 if task_count != 0 else 0,
+    }
+    if pipeline == "plan-ahead-closed":
+        exact_plan_atomic_calls.update({
+            61: execute_workers,
+            64: 2 * task_count,
+        })
+    for site, expected_calls in exact_plan_atomic_calls.items():
+        actual_calls = atomic_calls_by_site.get(site, 0)
+        if actual_calls != expected_calls:
+            raise ValueError(
+                "AICPU Plan Atomic call count mismatch: "
+                f"pipeline={pipeline} site={ATOMIC_SITE_NAMES[site]} "
+                f"actual={actual_calls} expected={expected_calls}"
+            )
+
+    minimum_plan_atomic_calls = {
+        # Every worker attaches, and the last arrival repeats the terminal
+        # fatal/closed/release checks before publishing Build release.
+        58: execute_workers + 1,
+        60: execute_workers + 1,
+        67: execute_workers + 1,
+    }
+    if pipeline == "streaming-future":
+        minimum_plan_atomic_calls.update({
+            # Ready attach/release observe frontier, while future tickets can
+            # add timing-dependent cell-control polls before publication.
+            61: execute_workers,
+            64: 2 * task_count,
+        })
+    for site, minimum_calls in minimum_plan_atomic_calls.items():
+        actual_calls = atomic_calls_by_site.get(site, 0)
+        if actual_calls < minimum_calls:
+            raise ValueError(
+                "AICPU Plan Atomic poll closure is incomplete: "
+                f"pipeline={pipeline} site={ATOMIC_SITE_NAMES[site]} "
+                f"actual={actual_calls} minimum={minimum_calls}"
+            )
 
 
 def _derive_v4_task_kinds(  # noqa: PLR0912
@@ -522,9 +1248,100 @@ def _derive_v4_task_kinds(  # noqa: PLR0912
     return task_kind_by_id
 
 
+def _runtime_plan_task_kinds_from_metadata(
+    raw_task_kinds: Any,
+    task_count: int,
+) -> dict[int, int]:
+    """Validate the post-run Runtime Plan identity exported by the Host.
+
+    This metadata is the only per-task identity available for formal SIMT,
+    whose VF intentionally has no Scalar Materialize/Register/Fanin trace.
+    Reuse the PA batch-shape validator, but never turn the result into fake raw
+    owners or child spans.
+    """
+
+    if not isinstance(raw_task_kinds, list):
+        raise ValueError(
+            "metadata.runtime_plan_task_kinds must be an array"
+        )
+    task_kinds = [
+        _integer(
+            kind,
+            f"metadata.runtime_plan_task_kinds[{task_id}]",
+        )
+        for task_id, kind in enumerate(raw_task_kinds)
+    ]
+    if len(task_kinds) != task_count:
+        raise ValueError(
+            "metadata.runtime_plan_task_kinds length must equal "
+            "metadata.runtime_plan_task_count: "
+            f"length={len(task_kinds)} task_count={task_count}"
+        )
+    if any(kind not in range(5) for kind in task_kinds):
+        raise ValueError(
+            "metadata.runtime_plan_task_kinds values must be in [0, 4]"
+        )
+    submit_semantics = {
+        (0, task_id): (True, kind == 0)
+        for task_id, kind in enumerate(task_kinds)
+    }
+    derived = _derive_v4_task_kinds(
+        submit_semantics, 1, "central_ticket"
+    )
+    declared = {
+        task_id: kind for task_id, kind in enumerate(task_kinds)
+    }
+    if declared != derived:
+        raise ValueError(
+            "metadata.runtime_plan_task_kinds does not match the PA "
+            "Alloc + QK/SF/PV/UP batch shape"
+        )
+    return declared
+
+
+def _validate_runtime_plan_terminal_metadata(
+    raw_terminal: Any,
+    task_count: int,
+    build_workers: int,
+) -> dict[str, int]:
+    if not isinstance(raw_terminal, dict):
+        raise ValueError("metadata.runtime_plan_terminal must be an object")
+    expected = {
+        "planned_frontier": task_count,
+        "closed_task_count": task_count,
+        "build_next": task_count + build_workers,
+        "build_workers_done": build_workers,
+        "build_release": task_count,
+        "fatal": 0,
+    }
+    if set(raw_terminal) != set(expected):
+        raise ValueError(
+            "metadata.runtime_plan_terminal must contain exactly "
+            f"{sorted(expected)}"
+        )
+    terminal = {
+        field: _integer(
+            raw_terminal.get(field),
+            f"metadata.runtime_plan_terminal.{field}",
+        )
+        for field in expected
+    }
+    for field, expected_value in expected.items():
+        actual_value = terminal[field]
+        if actual_value != expected_value:
+            raise ValueError(
+                "metadata.runtime_plan_terminal does not close for the "
+                f"declared Build population: field={field} "
+                f"actual={actual_value} expected={expected_value}"
+            )
+    return terminal
+
+
 # 读取 raw JSON，校验十列结构、字段范围与可转整数值，并返回规范化视图。
 def _load_and_validate(  # noqa: PLR0912, PLR0915
     input_path: Path,
+    *,
+    allow_host_cpu_functional: bool = False,
 ) -> tuple[int, int, list[tuple[Any, ...]], dict[tuple[int, int], int], int, dict[str, Any]]:
     # raw 文件沿用真实 l2_swimlane_records.json 的十列 fdwic_events ABI：
     # core、block、lane、task、func、phase、start、end、flags、aux。
@@ -563,6 +1380,14 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
     submit_topology = metadata.get(
         "submit_topology", "all_worker_replay"
     )
+    runtime_plan_build_backend: str | None = None
+    runtime_plan_build_workers = 0
+    runtime_plan_execute_workers = 0
+    runtime_plan_build_trace_coverage: str | None = None
+    runtime_plan_task_count: int | None = None
+    runtime_plan_task_kinds: dict[int, int] | None = None
+    runtime_plan_abi = 0
+    inferred_legacy_runtime_plan_identity = False
     if trace_schema_version == 5:
         if tensormap_mode not in ("private", "shared"):
             raise ValueError(
@@ -586,6 +1411,241 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 "central-build submit_topology requires shared "
                 "TensorMap mode"
             )
+        if submit_topology == "aicpu_plan_central_build":
+            pipeline = metadata.get("pipeline")
+            inferred_legacy_policy = pipeline is None
+            runtime_plan_abi_raw = metadata.get("runtime_plan_abi")
+            runtime_plan_abi = (
+                2
+                if runtime_plan_abi_raw is None
+                else _integer(
+                    runtime_plan_abi_raw,
+                    "metadata.runtime_plan_abi",
+                )
+            )
+            if runtime_plan_abi <= 0:
+                raise ValueError(
+                    "metadata.runtime_plan_abi must be positive"
+                )
+            if runtime_plan_abi_raw is None or runtime_plan_abi < 3:
+                raise ValueError(
+                    "joint AICPU/AICore profiling requires explicit "
+                    "metadata.runtime_plan_abi>=3; legacy ABI2 AICore-only "
+                    "captures are not accepted"
+                )
+            if pipeline is None:
+                # Legacy central-build captures predate the policy field and
+                # came only from the closed Plan-ahead path.  Preserve their
+                # replayability, but never infer a missing field as streaming.
+                if runtime_plan_abi >= 3:
+                    raise ValueError(
+                        "metadata.pipeline is required for Runtime Plan "
+                        "ABI v3 and later"
+                    )
+                policy_fields = (
+                    "launch_order", "producer_ready",
+                    "consumer_admission", "prefill",
+                )
+                partial_fields = [
+                    field for field in policy_fields
+                    if field in metadata
+                ]
+                if partial_fields:
+                    raise ValueError(
+                        "legacy AICPU Plan capture has partial pipeline "
+                        f"metadata without metadata.pipeline: {partial_fields}"
+                    )
+                pipeline = "plan-ahead-closed"
+                metadata["pipeline"] = pipeline
+                metadata.update(
+                    RUNTIME_PLAN_PIPELINE_METADATA[pipeline]
+                )
+                metadata["inferred_legacy_policy"] = True
+            if pipeline not in RUNTIME_PLAN_PIPELINE_METADATA:
+                raise ValueError(
+                    "metadata.pipeline must be plan-ahead-closed or "
+                    "streaming-future for AICPU Plan central build"
+                )
+            if (
+                not inferred_legacy_policy
+                and (
+                    runtime_plan_abi_raw is None
+                    or runtime_plan_abi < 3
+                )
+            ):
+                raise ValueError(
+                    "explicit metadata.pipeline requires "
+                    "metadata.runtime_plan_abi>=3"
+                )
+            metadata["runtime_plan_abi"] = runtime_plan_abi
+            expected_pipeline_metadata = (
+                RUNTIME_PLAN_PIPELINE_METADATA[str(pipeline)]
+            )
+            for field in (
+                "launch_order", "producer_ready",
+                "consumer_admission",
+            ):
+                expected_value = expected_pipeline_metadata[field]
+                actual_value = metadata.get(field)
+                if actual_value != expected_value:
+                    raise ValueError(
+                        f"metadata.{field}={actual_value!r} does not match "
+                        f"pipeline={pipeline!r}; expected {expected_value!r}"
+                    )
+            prefill = _integer(
+                metadata.get("prefill"), "metadata.prefill"
+            )
+            if pipeline == "plan-ahead-closed":
+                if prefill != 0:
+                    raise ValueError(
+                        "metadata.prefill must be 0 for "
+                        "pipeline='plan-ahead-closed'"
+                    )
+            elif prefill <= 0:
+                raise ValueError(
+                    "metadata.prefill must be positive for "
+                    "pipeline='streaming-future'"
+                )
+            metadata["prefill"] = prefill
+
+            identity_fields = (
+                "runtime_plan_build_backend",
+                "runtime_plan_build_workers",
+                "runtime_plan_execute_workers",
+                "runtime_plan_build_trace_coverage",
+                "runtime_plan_producer_task_count",
+                "runtime_plan_task_count",
+                "runtime_plan_task_kinds",
+                "runtime_plan_terminal",
+            )
+            if inferred_legacy_policy:
+                # ABI2 historical captures predate both policy and backend
+                # identity.  They came only from Scalar W=96; reject partial
+                # modern metadata rather than guessing a mixed contract.
+                present_identity_fields = [
+                    field for field in identity_fields
+                    if field in metadata
+                ]
+                if present_identity_fields:
+                    raise ValueError(
+                        "legacy ABI2 AICPU Plan capture has partial modern "
+                        "Runtime Plan identity: "
+                        f"{present_identity_fields}"
+                    )
+                runtime_plan_build_backend = "scalar"
+                runtime_plan_build_workers = 96
+                runtime_plan_execute_workers = 96
+                runtime_plan_build_trace_coverage = (
+                    "scalar-task-detail"
+                )
+                inferred_legacy_runtime_plan_identity = True
+                metadata.update({
+                    "runtime_plan_build_backend": "scalar",
+                    "runtime_plan_build_workers": 96,
+                    "runtime_plan_execute_workers": 96,
+                    "runtime_plan_build_trace_coverage":
+                        "scalar-task-detail",
+                    "inferred_legacy_runtime_plan_identity": True,
+                })
+            else:
+                runtime_plan_build_backend_raw = metadata.get(
+                    "runtime_plan_build_backend"
+                )
+                if runtime_plan_build_backend_raw not in (
+                    "scalar", "simt"
+                ):
+                    raise ValueError(
+                        "metadata.runtime_plan_build_backend must be "
+                        "scalar or simt"
+                    )
+                runtime_plan_build_backend = str(
+                    runtime_plan_build_backend_raw
+                )
+                runtime_plan_build_workers = _integer(
+                    metadata.get("runtime_plan_build_workers"),
+                    "metadata.runtime_plan_build_workers",
+                )
+                expected_build_workers = (
+                    4
+                    if runtime_plan_build_backend == "simt"
+                    else 96
+                )
+                if runtime_plan_build_workers != expected_build_workers:
+                    raise ValueError(
+                        "metadata.runtime_plan_build_workers does not "
+                        "match metadata.runtime_plan_build_backend: "
+                        f"backend={runtime_plan_build_backend} "
+                        f"actual={runtime_plan_build_workers} "
+                        f"expected={expected_build_workers}"
+                    )
+                runtime_plan_execute_workers = _integer(
+                    metadata.get("runtime_plan_execute_workers"),
+                    "metadata.runtime_plan_execute_workers",
+                )
+                if runtime_plan_execute_workers != 96:
+                    raise ValueError(
+                        "metadata.runtime_plan_execute_workers must be 96"
+                    )
+                expected_trace_coverage = (
+                    "simt-coarse-direct-state"
+                    if runtime_plan_build_backend == "simt"
+                    else "scalar-task-detail"
+                )
+                runtime_plan_build_trace_coverage_raw = metadata.get(
+                    "runtime_plan_build_trace_coverage"
+                )
+                if (
+                    runtime_plan_build_trace_coverage_raw
+                    != expected_trace_coverage
+                ):
+                    raise ValueError(
+                        "metadata.runtime_plan_build_trace_coverage does "
+                        "not match metadata.runtime_plan_build_backend: "
+                        f"actual={runtime_plan_build_trace_coverage_raw!r} "
+                        f"expected={expected_trace_coverage!r}"
+                    )
+                runtime_plan_build_trace_coverage = (
+                    expected_trace_coverage
+                )
+                runtime_plan_task_count = _integer(
+                    metadata.get("runtime_plan_task_count"),
+                    "metadata.runtime_plan_task_count",
+                )
+                if runtime_plan_task_count <= 0:
+                    raise ValueError(
+                        "metadata.runtime_plan_task_count must be positive"
+                    )
+                runtime_plan_producer_task_count = _integer(
+                    metadata.get("runtime_plan_producer_task_count"),
+                    "metadata.runtime_plan_producer_task_count",
+                )
+                if (
+                    runtime_plan_producer_task_count
+                    != runtime_plan_task_count
+                ):
+                    raise ValueError(
+                        "metadata.runtime_plan_producer_task_count must "
+                        "equal the direct-state runtime_plan_task_count: "
+                        f"producer={runtime_plan_producer_task_count} "
+                        f"direct_state={runtime_plan_task_count}"
+                    )
+                runtime_plan_task_kinds = (
+                    _runtime_plan_task_kinds_from_metadata(
+                        metadata.get("runtime_plan_task_kinds"),
+                        runtime_plan_task_count,
+                    )
+                )
+                metadata["runtime_plan_task_kinds"] = [
+                    runtime_plan_task_kinds[task_id]
+                    for task_id in range(runtime_plan_task_count)
+                ]
+                metadata["runtime_plan_terminal"] = (
+                    _validate_runtime_plan_terminal_metadata(
+                        metadata.get("runtime_plan_terminal"),
+                        runtime_plan_task_count,
+                        runtime_plan_build_workers,
+                    )
+                )
     elif tensormap_mode is not None:
         raise ValueError(
             "metadata.tensormap_mode is only valid for trace_schema_version=5"
@@ -698,6 +1758,16 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
     num_cores = _integer(metadata.get("num_cores"), "metadata.num_cores")
     if num_cores <= 0:
         raise ValueError("metadata.num_cores must be positive")
+    if (
+        submit_topology == "aicpu_plan_central_build"
+        and num_cores != runtime_plan_execute_workers
+    ):
+        raise ValueError(
+            "metadata.num_cores must equal "
+            "metadata.runtime_plan_execute_workers for AICPU Plan "
+            f"central build: num_cores={num_cores} "
+            f"execute_workers={runtime_plan_execute_workers}"
+        )
     core_types = metadata.get("core_types")
     if not isinstance(core_types, list) or len(core_types) != num_cores:
         raise ValueError("metadata.core_types length must equal metadata.num_cores")
@@ -1346,6 +2416,51 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
         )
 
     assert base_cycle is not None
+    if submit_topology == "aicpu_plan_central_build":
+        aicpu_producer = _validate_aicpu_runtime_plan_producer(
+            data,
+            metadata,
+            frequency_hz,
+            runtime_plan_abi,
+            allow_host_cpu_functional=allow_host_cpu_functional,
+        )
+        if aicpu_producer is not None:
+            causal_window = metadata[
+                "aicpu_aicore_causal_capture_window"
+            ]
+            minimum_fdwic_start = min(int(row[6]) for row in rows)
+            maximum_fdwic_end = max(int(row[7]) for row in rows)
+            if not (
+                int(causal_window["aicore_pre_send_max_tick"])
+                < minimum_fdwic_start
+                <= maximum_fdwic_end
+                < int(causal_window["aicore_post_receive_min_tick"])
+            ):
+                raise ValueError(
+                    "AICore FDWIC events are outside the strict pre-send/"
+                    "post-receive causal calibration window: "
+                    f"events=[{minimum_fdwic_start},{maximum_fdwic_end}] "
+                    "window=("
+                    f"{causal_window['aicore_pre_send_max_tick']},"
+                    f"{causal_window['aicore_post_receive_min_tick']})"
+                )
+            causal_window.update({
+                "minimum_fdwic_start_tick": minimum_fdwic_start,
+                "maximum_fdwic_end_tick": maximum_fdwic_end,
+                "aicore_pre_to_fdwic_gap_tick":
+                    minimum_fdwic_start
+                    - int(causal_window["aicore_pre_send_max_tick"]),
+                "fdwic_to_aicore_post_gap_tick":
+                    int(causal_window["aicore_post_receive_min_tick"])
+                    - maximum_fdwic_end,
+            })
+            # The merged origin includes the producer; subtracting only the
+            # earliest FDWIC cycle would otherwise clip a valid Plan-ahead
+            # lane into negative Perfetto time.
+            base_cycle = min(
+                base_cycle,
+                int(aicpu_producer["mapped_begin_tick"]),
+            )
     if trace_schema_version in (3, 5) and level == 4:
         # 每核两条基线同时证明采集完整性和该后端是否真正应用了
         # atomic 返回值依赖；所有消费返回值的直接记录必须与本核证据一致。
@@ -1401,35 +2516,11 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         f"schema-v5 {phase}: count={count}"
                     )
         if submit_topology == "aicpu_plan_central_build":
-            # Plan-ahead 没有 Submit/Claim raw。Materialize 是每个中央
-            # ticket owner 的第一条 task 身份证据；只在离线校验器
-            # 中归一成“attempted winner”，不伪造设备记录。
             if v4_claims or v4_submits or v4_submit_semantics:
                 raise ValueError(
                     "AICPU Plan central build must not contain legacy "
                     "Submit/Claim records"
                 )
-            owners_by_task: dict[int, int] = {}
-            for task_key, materializes in v4_materializes.items():
-                if len(materializes) != 1:
-                    raise ValueError(
-                        "AICPU Plan task requires exactly one Materialize "
-                        f"owner at {task_key}: count={len(materializes)}"
-                    )
-                core_id, task_id = task_key
-                previous_owner = owners_by_task.setdefault(
-                    task_id, core_id
-                )
-                if previous_owner != core_id:
-                    raise ValueError(
-                        "AICPU Plan task has multiple Build owners: "
-                        f"task={task_id} owners={previous_owner},{core_id}"
-                    )
-                is_alloc = bool(int(materializes[0][9]))
-                v4_claims[task_key] = (True, True, is_alloc)
-                v4_submit_semantics[task_key] = (True, is_alloc)
-                v4_submits.add(task_key)
-
             build_child_phases = {
                 "Materialize", "Register", "Fanin", "WinnerBuild",
                 "AllocComplete", "SharedRegisterPublishMetadata",
@@ -1437,6 +2528,52 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 "SharedMaterializePublishTaskOutputsCopy",
                 "SharedMaterializePublishTaskOutputsFlush",
             }
+            if runtime_plan_build_backend == "scalar":
+                # Scalar Plan-ahead has no Submit/Claim raw. Materialize is
+                # every central-ticket owner's first task identity record;
+                # normalize it to winner semantics only inside validation.
+                owners_by_task: dict[int, int] = {}
+                for task_key, materializes in v4_materializes.items():
+                    if len(materializes) != 1:
+                        raise ValueError(
+                            "AICPU Plan task requires exactly one Materialize "
+                            f"owner at {task_key}: count={len(materializes)}"
+                        )
+                    core_id, task_id = task_key
+                    previous_owner = owners_by_task.setdefault(
+                        task_id, core_id
+                    )
+                    if previous_owner != core_id:
+                        raise ValueError(
+                            "AICPU Plan task has multiple Build owners: "
+                            f"task={task_id} owners={previous_owner},{core_id}"
+                        )
+                    is_alloc = bool(int(materializes[0][9]))
+                    v4_claims[task_key] = (True, True, is_alloc)
+                    v4_submit_semantics[task_key] = (True, is_alloc)
+                    v4_submits.add(task_key)
+            elif runtime_plan_build_backend == "simt":
+                # The formal VF does not call Scalar trace helpers.  Its task
+                # identity comes from validated metadata/direct terminal state;
+                # accepting Scalar children here would silently relabel a mixed
+                # artifact as SIMT.
+                scalar_build_children = [
+                    str(row[5]) for row in rows
+                    if str(row[5]) in build_child_phases
+                ]
+                if scalar_build_children or (
+                    v4_shared_insert_turn_polls
+                    or v4_shared_insert_turn_handoffs
+                ):
+                    raise ValueError(
+                        "SIMT coarse Runtime Plan capture must not contain "
+                        "Scalar Build child or insert-completion trace"
+                    )
+            else:
+                raise AssertionError(
+                    "AICPU Plan central build backend was not normalized"
+                )
+
             for row in rows:
                 core_id = int(row[0])
                 phase = str(row[5])
@@ -1468,59 +2605,67 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     )
         if set(v4_claims) != v4_submits:
             raise ValueError("schema-v5 Claim keys do not match Submit keys")
-        task_kind_by_id = _derive_v4_task_kinds(
-            v4_submit_semantics, num_cores,
-            (
-                "central_ticket"
-                if submit_topology == "aicpu_plan_central_build"
-                else str(submit_topology)
-            ),
-        )
+        if (
+            submit_topology == "aicpu_plan_central_build"
+            and runtime_plan_build_backend == "simt"
+        ):
+            if runtime_plan_task_kinds is None:
+                raise AssertionError(
+                    "SIMT Runtime Plan task metadata was not normalized"
+                )
+            task_kind_by_id = dict(runtime_plan_task_kinds)
+        else:
+            task_kind_by_id = _derive_v4_task_kinds(
+                v4_submit_semantics, num_cores,
+                (
+                    "central_ticket"
+                    if submit_topology == "aicpu_plan_central_build"
+                    else str(submit_topology)
+                ),
+            )
+            if submit_topology == "aicpu_plan_central_build":
+                derived_task_count = len(task_kind_by_id)
+                if inferred_legacy_runtime_plan_identity:
+                    runtime_plan_task_count = derived_task_count
+                    runtime_plan_task_kinds = dict(task_kind_by_id)
+                    metadata["runtime_plan_task_count"] = (
+                        derived_task_count
+                    )
+                    metadata["runtime_plan_task_kinds"] = [
+                        task_kind_by_id[task_id]
+                        for task_id in range(derived_task_count)
+                    ]
+                elif (
+                    runtime_plan_task_count != derived_task_count
+                    or runtime_plan_task_kinds != task_kind_by_id
+                ):
+                    raise ValueError(
+                        "Scalar Build child trace does not match the "
+                        "declared Runtime Plan task count/kinds"
+                    )
         if (
             submit_topology == "aicpu_plan_central_build"
             and level == 4
         ):
             task_count = len(task_kind_by_id)
-            exact_plan_atomic_calls = {
-                61: num_cores,
-                62: task_count + num_cores,
-                63: 1,
-                64: 2 * task_count,
-                65: num_cores,
-                66: 1,
-                68: 1,
-                59: 0,
-                69: 1 if task_count != 0 else 0,
-            }
-            for site, expected_calls in exact_plan_atomic_calls.items():
-                actual_calls = atomic_calls_by_site.get(site, 0)
-                if actual_calls != expected_calls:
-                    raise ValueError(
-                        "AICPU Plan Atomic call count mismatch: "
-                        f"site={ATOMIC_SITE_NAMES[site]} "
-                        f"actual={actual_calls} expected={expected_calls}"
-                    )
-            minimum_plan_atomic_calls = {
-                # 每核 Attach 各有一次终态校验，最后一个
-                # arrival 再对 fatal/closed/release 做一次发布前校验。
-                58: num_cores + 1,
-                60: num_cores + 1,
-                67: num_cores + 1,
-            }
-            for site, minimum_calls in minimum_plan_atomic_calls.items():
-                actual_calls = atomic_calls_by_site.get(site, 0)
-                if actual_calls < minimum_calls:
-                    raise ValueError(
-                        "AICPU Plan Atomic poll closure is incomplete: "
-                        f"site={ATOMIC_SITE_NAMES[site]} "
-                        f"actual={actual_calls} minimum={minimum_calls}"
-                    )
+            assert runtime_plan_build_backend is not None
+            assert runtime_plan_build_trace_coverage is not None
+            _validate_runtime_plan_atomic_closure(
+                str(metadata["pipeline"]),
+                runtime_plan_build_backend,
+                runtime_plan_build_trace_coverage,
+                atomic_calls_by_site, task_count,
+                runtime_plan_build_workers,
+                runtime_plan_execute_workers,
+            )
         writer_task_set = set(shared_metadata_writer_tasks)
         metadata_prefix_task_set = set(
             shared_metadata_prefix_tasks
         )
         handoff_task_set = (
-            metadata_prefix_task_set
+            set()
+            if runtime_plan_build_backend == "simt"
+            else metadata_prefix_task_set
             if submit_topology in STRICT_INSERT_TOPOLOGIES
             else writer_task_set
         )
@@ -1552,15 +2697,19 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
             if (
                 submit_topology in STRICT_INSERT_TOPOLOGIES
                 and metadata_prefix_task_set
-                != {
-                    task_id
-                    for (_core_id, task_id), (
-                        _attempted,
-                        won,
-                        _is_alloc,
-                    ) in v4_claims.items()
-                    if won
-                }
+                != (
+                    set(task_kind_by_id)
+                    if runtime_plan_build_backend == "simt"
+                    else {
+                        task_id
+                        for (_core_id, task_id), (
+                            _attempted,
+                            won,
+                            _is_alloc,
+                        ) in v4_claims.items()
+                        if won
+                    }
+                )
             ):
                 raise ValueError(
                     "all_worker_replay shared metadata prefix must contain "
@@ -2938,7 +4087,10 @@ def _merged_item_sort_key(
 
 # 完成一次 raw 到 merged 的转换，成功时返回事件数、block 数和基准 cycle。
 def convert(  # noqa: PLR0912, PLR0915
-    input_path: Path, output_path: Path
+    input_path: Path,
+    output_path: Path,
+    *,
+    allow_host_cpu_functional: bool = False,
 ) -> tuple[int, int, int]:
     (
         frequency_hz,
@@ -2947,7 +4099,10 @@ def convert(  # noqa: PLR0912, PLR0915
         core_by_block_lane,
         base_cycle,
         capture_metadata,
-    ) = _load_and_validate(input_path)
+    ) = _load_and_validate(
+        input_path,
+        allow_host_cpu_functional=allow_host_cpu_functional,
+    )
     _restore_v5_shared_efdrain(
         rows,
         trace_schema_version,
@@ -3078,6 +4233,83 @@ def convert(  # noqa: PLR0912, PLR0915
                         "tid": 0,
                         "ts": 0,
                         "args": {"winner_workload": winner_workload},
+                    },
+                    first,
+                )
+                emitted += 1
+            aicpu_producer = capture_metadata.get(
+                "aicpu_runtime_plan_producer"
+            )
+            if aicpu_producer is not None:
+                # AICPU is a real independent process/track.  Its raw
+                # CLOCK_MONOTONIC_RAW interval is mapped only after rebuilding
+                # the causal offset intersection; it is never appended as if
+                # it were already in the SYS_CNT domain.
+                for metadata_event in (
+                    {
+                        "ph": "M",
+                        "name": "process_name",
+                        "pid": AICPU_PROCESS_ID,
+                        "args": {"name": "AICPU"},
+                    },
+                    {
+                        "ph": "M",
+                        "name": "process_sort_index",
+                        "pid": AICPU_PROCESS_ID,
+                        "args": {"sort_index": -1},
+                    },
+                    {
+                        "ph": "M",
+                        "name": "thread_name",
+                        "pid": AICPU_PROCESS_ID,
+                        "tid": AICPU_THREAD_ID,
+                        "args": {"name": AICPU_PRODUCER_PHASE_NAME},
+                    },
+                    {
+                        "ph": "M",
+                        "name": "thread_sort_index",
+                        "pid": AICPU_PROCESS_ID,
+                        "tid": AICPU_THREAD_ID,
+                        "args": {"sort_index": AICPU_THREAD_ID},
+                    },
+                ):
+                    first = _emit_event(output, metadata_event, first)
+                producer_begin = int(
+                    aicpu_producer["mapped_begin_tick"]
+                )
+                producer_end = int(
+                    aicpu_producer["mapped_end_tick"]
+                )
+                first = _emit_event(
+                    output,
+                    {
+                        "ph": "X",
+                        "name": AICPU_PRODUCER_PHASE_NAME,
+                        "cat": "aicpu.orchestrator",
+                        "pid": AICPU_PROCESS_ID,
+                        "tid": AICPU_THREAD_ID,
+                        "ts": round(
+                            (producer_begin - base_cycle) * factor, 3
+                        ),
+                        "dur": round(
+                            (producer_end - producer_begin) * factor, 3
+                        ),
+                        "args": {
+                            "raw_clock": aicpu_producer["raw_clock"],
+                            "raw_begin_ns": aicpu_producer[
+                                "raw_begin_ns"
+                            ],
+                            "raw_end_ns": aicpu_producer["raw_end_ns"],
+                            "mapped_begin_tick": producer_begin,
+                            "mapped_end_tick": producer_end,
+                            "alignment_error_tick": aicpu_producer[
+                                "alignment_error_tick"
+                            ],
+                            "alignment_error_us": aicpu_producer[
+                                "alignment_error_us"
+                            ],
+                            "correlation_status": "valid",
+                        },
                     },
                     first,
                 )
@@ -3504,21 +4736,33 @@ def convert(  # noqa: PLR0912, PLR0915
 
 
 # 只解析显式 input/output，不扫描仓库 outputs，也不选择“最新”文件。
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     # 强制 -o 使覆盖目标可审查，避免脱仓后因 cwd 不同写到意外目录。
     parser = argparse.ArgumentParser(
         description="Convert standalone PA fdwic_events JSON to a Chrome/Perfetto swimlane trace."
     )
     parser.add_argument("input", type=Path, help="l2_swimlane_records.json produced by the standalone runner")
     parser.add_argument("-o", "--output", type=Path, required=True, help="merged_swimlane.json output path")
-    return parser.parse_args()
+    parser.add_argument(
+        "--host-cpu-functional",
+        action="store_true",
+        help=(
+            "explicitly accept a host-cpu functional capture; output is "
+            "marked non-joint and is not profiling evidence"
+        ),
+    )
+    return parser.parse_args(argv)
 
 
 # 命令行错误边界：预期的输入、格式和文件系统错误统一返回 1。
-def main() -> int:
-    args = _parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
     try:
-        events, blocks, base_cycle = convert(args.input, args.output)
+        events, blocks, base_cycle = convert(
+            args.input,
+            args.output,
+            allow_host_cpu_functional=args.host_cpu_functional,
+        )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         # 不吞掉错误原因，但也不向普通使用者输出长 traceback；convert 已保证
         # 失败路径不会留下临时 merged 文件。

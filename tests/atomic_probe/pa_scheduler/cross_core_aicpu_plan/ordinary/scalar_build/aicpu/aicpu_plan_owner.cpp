@@ -33,6 +33,116 @@ uint64_t MonotonicNanoseconds()
            static_cast<uint64_t>(timestamp.tv_nsec);
 }
 
+void FullBarrier();
+void InstructionBarrier();
+void InvalidateRegion(const void *address, size_t bytes);
+void CleanRegion(const void *address, size_t bytes);
+bool IsZero(const void *address, size_t bytes);
+
+void PublishClockCompletion(
+    pa_scheduler::aicpu_clock::CompletionLine *completion,
+    pa_scheduler::aicpu_clock::EndpointStatus status,
+    uint32_t completed_samples
+)
+{
+    using namespace pa_scheduler::aicpu_clock;
+    CompletionLine value{};
+    value.magic = kCompletionMagic;
+    value.version = kVersion;
+    value.status = static_cast<int32_t>(status);
+    value.completed_samples = completed_samples;
+    *completion = value;
+    CleanRegion(completion, sizeof(*completion));
+    FullBarrier();
+    InstructionBarrier();
+}
+
+void PublishClockAbort(pa_scheduler::aicpu_clock::Exchange *exchange)
+{
+    exchange->request.sequence = pa_scheduler::aicpu_clock::kAbortSequence;
+    CleanRegion(&exchange->request, sizeof(exchange->request));
+    FullBarrier();
+    InstructionBarrier();
+}
+
+void RunClockCorrelation(pa_scheduler::aicpu_clock::Exchange *exchange)
+{
+    using namespace pa_scheduler::aicpu_clock;
+    InvalidateRegion(&exchange->config, sizeof(exchange->config));
+    const ExchangeConfigLine config = exchange->config;
+    if (config.magic != kExchangeMagic || config.version != kVersion ||
+        config.sample_count != kSamplesPerRound || config.timeout_ns == 0U ||
+        config.round_nonce == 0U ||
+        !IsZero(config.reserved, sizeof(config.reserved))) {
+        PublishClockAbort(exchange);
+        PublishClockCompletion(
+            &exchange->aicpu_completion, EndpointStatus::BadConfig, 0U
+        );
+        return;
+    }
+
+    uint32_t completed = 0U;
+    EndpointStatus status = EndpointStatus::Ok;
+    for (uint32_t sample = 0U; sample < config.sample_count; ++sample) {
+        const uint64_t send_ns = MonotonicNanoseconds();
+        if (send_ns == 0U) {
+            status = EndpointStatus::ClockReadFailed;
+            break;
+        }
+        exchange->aicpu[sample].send_ns = send_ns;
+        exchange->aicpu[sample].receive_ns = 0U;
+        CleanRegion(&exchange->aicpu[sample], sizeof(exchange->aicpu[sample]));
+        FullBarrier();
+
+        const int64_t sequence = static_cast<int64_t>(sample + 1U);
+        exchange->request.sequence = sequence;
+        CleanRegion(&exchange->request, sizeof(exchange->request));
+        FullBarrier();
+        InstructionBarrier();
+
+        bool received = false;
+        while (!received) {
+            InvalidateRegion(&exchange->response, sizeof(exchange->response));
+            const int64_t response = exchange->response.sequence;
+            if (response == sequence) {
+                received = true;
+                break;
+            }
+            if (response < 0) {
+                status = EndpointStatus::PeerFailed;
+                break;
+            }
+            const uint64_t now_ns = MonotonicNanoseconds();
+            if (now_ns == 0U) {
+                status = EndpointStatus::ClockReadFailed;
+                break;
+            }
+            if (now_ns < send_ns) {
+                status = EndpointStatus::ClockReadFailed;
+                break;
+            }
+            if (now_ns - send_ns > config.timeout_ns) {
+                status = EndpointStatus::Timeout;
+                break;
+            }
+        }
+        if (!received) break;
+
+        const uint64_t receive_ns = MonotonicNanoseconds();
+        if (receive_ns == 0U || receive_ns < send_ns) {
+            status = EndpointStatus::ClockReadFailed;
+            break;
+        }
+        exchange->aicpu[sample].receive_ns = receive_ns;
+        CleanRegion(&exchange->aicpu[sample], sizeof(exchange->aicpu[sample]));
+        FullBarrier();
+        ++completed;
+    }
+
+    if (status != EndpointStatus::Ok) PublishClockAbort(exchange);
+    PublishClockCompletion(&exchange->aicpu_completion, status, completed);
+}
+
 void FullBarrier()
 {
 #if defined(__aarch64__)
@@ -191,7 +301,7 @@ Tensor DecodeTensor(const TensorMetadata &metadata)
     return tensor;
 }
 
-void PublishFatalIfAddressable(const OwnerRequestHeader &header)
+void PublishFailureIfAddressable(const OwnerRequestHeader &header)
 {
     using namespace pa_scheduler::aicpu_plan;
     if (header.runtime_plan_control == 0U ||
@@ -205,6 +315,20 @@ void PublishFatalIfAddressable(const OwnerRequestHeader &header)
     CleanRegion(
         const_cast<const int64_t *>(&control->fatal.value),
         sizeof(control->fatal.value));
+    FullBarrier();
+
+    // dual-stream 模式下 AICore 在 producer Ready 前严格只轮询
+    // closed line。BadRequest/BadTensorMetadata 发生在 backend bind
+    // 之前，单独发布 fatal 会让 consumer 永久卡在 NotReady。
+    // 先使 fatal 可见，再用同一条 ready line 发布 -3；对于
+    // backend 已经 Open 后的失败，worker 也会通过 fatal/-3 退出。
+    control->closed_task_count.value =
+        kPlanProducerReadyFailedTaskCount;
+    CleanRegion(
+        const_cast<const int64_t *>(
+            &control->closed_task_count.value
+        ),
+        sizeof(control->closed_task_count.value));
     FullBarrier();
     InstructionBarrier();
 }
@@ -304,10 +428,21 @@ int plan_protocol_aicpu_exec(void *argument)
     if (argument == nullptr) return 0;
     const auto *kernel_args = static_cast<const OwnerKernelArgs *>(argument);
     if (kernel_args->request_device == 0U ||
-        kernel_args->command != kOwnerCommandRun ||
         kernel_args->version != kRequestVersion) {
         return 0;
     }
+
+    if (kernel_args->command == kOwnerCommandClockCorrelation) {
+        if ((kernel_args->request_device &
+             (pa_scheduler::aicpu_owner::kAtomicIsolationBytes - 1U)) == 0U) {
+            auto *exchange = reinterpret_cast<
+                pa_scheduler::aicpu_clock::Exchange *>(
+                    static_cast<uintptr_t>(kernel_args->request_device));
+            RunClockCorrelation(exchange);
+        }
+        return 0;
+    }
+    if (kernel_args->command != kOwnerCommandRun) return 0;
 
     auto *request = reinterpret_cast<OwnerRequest *>(
         static_cast<uintptr_t>(kernel_args->request_device));
@@ -316,7 +451,7 @@ int plan_protocol_aicpu_exec(void *argument)
     AicpuPlanBackendResult backend{};
     const OwnerStatus status = RunOwner(request, backend);
     if (status != OwnerStatus::Ok) {
-        PublishFatalIfAddressable(request->header);
+        PublishFailureIfAddressable(request->header);
     }
     PublishResult(request, status, backend, begin_ns);
     return 0;

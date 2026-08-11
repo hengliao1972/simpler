@@ -20,6 +20,42 @@ fi
 # 运行时选择，避免误把 same-core 或 private 产物放进本目录。
 TENSORMAP_MODE="shared"
 TENSORMAP_MODE_ID=1
+PIPELINE_POLICY_INPUT="${PA_RUNTIME_PLAN_PIPELINE_POLICY:-0}"
+case "$PIPELINE_POLICY_INPUT" in
+    0|plan-ahead-closed)
+        PIPELINE_POLICY_ID=0
+        PIPELINE_NAME="plan-ahead-closed"
+        PIPELINE_KEY="$PIPELINE_NAME"
+        READY_PREFILL_TASKS=0
+        if [[ -n "${PA_AICPU_PLAN_READY_PREFILL_TASKS+x}" ]]; then
+            echo "plan-ahead-closed does not accept PA_AICPU_PLAN_READY_PREFILL_TASKS." >&2
+            exit 1
+        fi
+        ;;
+    1|streaming-future)
+        PIPELINE_POLICY_ID=1
+        PIPELINE_NAME="streaming-future"
+        READY_PREFILL_TASKS="${PA_AICPU_PLAN_READY_PREFILL_TASKS:-128}"
+        if [[ ! "$READY_PREFILL_TASKS" =~ ^[0-9]+$ ]] ||
+           ((READY_PREFILL_TASKS == 0 || READY_PREFILL_TASKS > 32768)); then
+            echo "PA_AICPU_PLAN_READY_PREFILL_TASKS must be an integer in [1, 32768]." >&2
+            exit 1
+        fi
+        PIPELINE_KEY="streaming-future-p${READY_PREFILL_TASKS}"
+        ;;
+    *)
+        echo "PA_RUNTIME_PLAN_PIPELINE_POLICY must be 0|plan-ahead-closed or 1|streaming-future." >&2
+        exit 1
+        ;;
+esac
+PIPELINE_DEFINES=(
+    "-DPA_RUNTIME_PLAN_PIPELINE_POLICY=$PIPELINE_POLICY_ID"
+)
+if [[ "$PIPELINE_POLICY_ID" -eq 1 ]]; then
+    PIPELINE_DEFINES+=(
+        "-DPA_AICPU_PLAN_READY_PREFILL_TASKS=$READY_PREFILL_TASKS"
+    )
+fi
 BUILD_VARIANT="${1:-swimlane}"
 case "$BUILD_VARIANT" in
     swimlane)
@@ -41,7 +77,7 @@ case "$BUILD_VARIANT" in
         exit 1
         ;;
 esac
-BUILD_DIR="$ROOT_DIR/build/cpu/$TENSORMAP_MODE/$BUILD_VARIANT"
+BUILD_DIR="$ROOT_DIR/build/cpu/$TENSORMAP_MODE/$PIPELINE_KEY/$BUILD_VARIANT"
 CXX_BIN="${CXX:-g++}"
 TENSORMAP_RING_CAP=128
 SHARED_INSERT_TURN_GROUPS="${PA_SHARED_INSERT_TURN_GROUPS:-1}"
@@ -87,12 +123,14 @@ PA_ATOMIC_DCCI_COVERAGE_ROOT="$ROOT_DIR" \
 
 echo "[BUILD] CPU scheduler executable"
 echo "[BUILD] shared insert-turn groups=$SHARED_INSERT_TURN_GROUPS"
+echo "[BUILD] pipeline=$PIPELINE_NAME prefill=$READY_PREFILL_TASKS"
 # -pthread 同时提供编译期线程宏和链接期 pthread 支持；严格告警用于防止
 # CPU 等价层因类型或原子接口变化而静默偏离设备端公共协议。这里固定实例化
 # shared TensorMap，不保留第二种模式的构建分支。
 "$CXX_BIN" -O3 -std=c++17 -pthread -Wall -Wextra -Werror \
     "-DPTO_FDWIC_SHARED_MAP=$TENSORMAP_MODE_ID" \
     "-DPTO_FDWIC_TENSORMAP_RING_CAP=$TENSORMAP_RING_CAP" \
+    "${PIPELINE_DEFINES[@]}" \
     "${VARIANT_DEFINES[@]}" \
     -I"$ROOT_DIR/common" \
     "$SCRIPT_DIR/main.cpp" \

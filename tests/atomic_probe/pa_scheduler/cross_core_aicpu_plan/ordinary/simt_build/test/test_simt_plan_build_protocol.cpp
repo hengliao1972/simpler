@@ -20,6 +20,7 @@
 #include <iostream>
 #include <memory>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -227,6 +228,27 @@ bool PublishSyntheticPlan(PlanFixture &fixture, uint32_t task_count)
         }
     }
     return CloseRuntimePlan<CpuPlanOps>(fixture.view, task_count);
+}
+
+bool PublishSyntheticCell(PlanFixture &fixture, uint32_t task_id) {
+    if (!fixture.Valid() || task_id >= fixture.capacity) return false;
+    const SyntheticPlanSource source{task_id};
+    const RuntimeTaskPlanSpec spec{
+        task_id,
+        FunctionForTask(task_id),
+        kSyntheticTensorCount,
+        kSyntheticScalarCount,
+        kSyntheticDependencyCount,
+        /*output_count=*/1U,
+        EngineForTask(task_id),
+        AdapterFlagsForTask(task_id),
+        CoreNumForTask(task_id),
+        RequireSyncForTask(task_id),
+        /*reserved=*/0U,
+        AdapterDataForTask(task_id),
+        /*tensor_reference_mask=*/0U,
+    };
+    return PublishRuntimeTaskPlan<CpuPlanOps>(fixture.view, spec, source) == PlanPublishResult::Published;
 }
 
 bool ValidateCanonicalPlanFields(
@@ -688,10 +710,506 @@ bool RunFourLeaderBuild(
     return true;
 }
 
+void PrepareProducerNotReady(PlanFixture &fixture) {
+    CpuPlanOps::PublishControl(&fixture.control.closed_task_count.value, kPlanProducerNotReadyTaskCount);
+    CpuPlanOps::PublishControl(&fixture.control.planned_frontier.value, 0);
+    CpuPlanOps::PublishControl(&fixture.control.build_next.value, 0);
+    CpuPlanOps::PublishControl(&fixture.control.build_workers_done.value, 0);
+    CpuPlanOps::PublishControl(&fixture.control.build_release.value, kBuildReleasePending);
+    CpuPlanOps::PublishControl(&fixture.control.fatal.value, 0);
+    for (uint32_t task = 0U; task < fixture.capacity; ++task) {
+        CpuPlanOps::PublishControl(&fixture.cells.get()[task].control.value, 0);
+    }
+}
+
+struct ReadyReadTraceOps {
+    static volatile int64_t *closed_address;
+    static std::atomic<uint32_t> closed_reads;
+    static std::atomic<uint32_t> other_reads;
+
+    static int64_t LoadControl(const volatile int64_t *address) {
+        if (address == closed_address) {
+            closed_reads.fetch_add(1U, std::memory_order_relaxed);
+        } else {
+            other_reads.fetch_add(1U, std::memory_order_relaxed);
+        }
+        return CpuPlanOps::LoadControl(address);
+    }
+};
+
+volatile int64_t *ReadyReadTraceOps::closed_address = nullptr;
+std::atomic<uint32_t> ReadyReadTraceOps::closed_reads{0U};
+std::atomic<uint32_t> ReadyReadTraceOps::other_reads{0U};
+
+bool TestReadyFailureWakeup() {
+    PlanFixture fixture(1U);
+    if (!fixture.Valid()) return false;
+    PrepareProducerNotReady(fixture);
+    fixture.control.planned_frontier.value = 11;
+    fixture.control.build_next.value = 17;
+    fixture.control.build_workers_done.value = 23;
+    fixture.control.build_release.value = 29;
+    fixture.control.fatal.value = 31;
+
+    std::atomic<bool> consumer_started{false};
+    std::atomic<bool> observed_not_ready{false};
+    std::atomic<bool> observed_fatal{false};
+    const auto deadline = std::chrono::steady_clock::now() + kTestTimeout;
+    std::thread consumer([&] {
+        consumer_started.store(true, std::memory_order_release);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const PlanReadyObservation ready = ObservePlanReady<CpuPlanOps>(fixture.view);
+            if (ready.status == PlanReadyStatus::NotReady) {
+                observed_not_ready.store(true, std::memory_order_release);
+                std::this_thread::yield();
+                continue;
+            }
+            if (ready.status == PlanReadyStatus::Fatal) {
+                observed_fatal.store(true, std::memory_order_release);
+            }
+            return;
+        }
+    });
+
+    const bool entered_wait = WaitUntil(deadline, [&] {
+        return consumer_started.load(std::memory_order_acquire) &&
+               observed_not_ready.load(std::memory_order_acquire);
+    });
+    const bool published = PublishRuntimePlanReadyFailed<CpuPlanOps>(fixture.view);
+    const bool woke = WaitUntil(deadline, [&] {
+        return observed_fatal.load(std::memory_order_acquire);
+    });
+    consumer.join();
+
+    ReadyReadTraceOps::closed_address = &fixture.control.closed_task_count.value;
+    ReadyReadTraceOps::closed_reads.store(0U, std::memory_order_relaxed);
+    ReadyReadTraceOps::other_reads.store(0U, std::memory_order_relaxed);
+    const PlanReadyObservation failed = ObservePlanReady<ReadyReadTraceOps>(fixture.view);
+    return entered_wait && published && woke && failed.status == PlanReadyStatus::Fatal &&
+           fixture.control.closed_task_count.value == kPlanProducerReadyFailedTaskCount &&
+           ReadyReadTraceOps::closed_reads.load(std::memory_order_relaxed) == 1U &&
+           ReadyReadTraceOps::other_reads.load(std::memory_order_relaxed) == 0U;
+}
+
+bool TestReadyHandshakeAndBatchFrontier() {
+    static_assert(kRuntimePlanAbiVersion == 3U, "streaming ready/open semantics require Plan ABI v3");
+    static_assert(
+        kRuntimePlanReadyPrefillTasks > 0U &&
+            kRuntimePlanReadyPrefillTasks <= kMaxRuntimeTasks,
+        "producer Ready prefill compile-time override is invalid"
+    );
+    PlanFixture fixture(4U);
+    if (!fixture.Valid()) return false;
+    PrepareProducerNotReady(fixture);
+
+    // ready 前的其他行仍可保存上一轮值；consumer 必须只碰 closed。
+    fixture.control.planned_frontier.value = 3;
+    fixture.control.build_next.value = 9;
+    fixture.control.build_workers_done.value = 2;
+    fixture.control.build_release.value = 4;
+    fixture.control.fatal.value = 7;
+    ReadyReadTraceOps::closed_address = &fixture.control.closed_task_count.value;
+    ReadyReadTraceOps::closed_reads.store(0U, std::memory_order_relaxed);
+    ReadyReadTraceOps::other_reads.store(0U, std::memory_order_relaxed);
+    const PlanReadyObservation not_ready = ObservePlanReady<ReadyReadTraceOps>(fixture.view);
+    if (not_ready.status != PlanReadyStatus::NotReady ||
+        ReadyReadTraceOps::closed_reads.load(std::memory_order_relaxed) != 1U ||
+        ReadyReadTraceOps::other_reads.load(std::memory_order_relaxed) != 0U ||
+        PublishRuntimePlanReady<CpuPlanOps>(fixture.view)) {
+        return false;
+    }
+
+    PrepareProducerNotReady(fixture);
+    // producer 可以在 NotReady 下连续发布 cell 并按 batch 推进
+    // frontier；consumer 在 Ready/Open 前仍只能观察 closed=-2。
+    if (!PublishSyntheticCell(fixture, 0U) ||
+        AdvancePlannedFrontierTo<CpuPlanOps>(fixture.view, 0U, 2U) ||
+        !PublishSyntheticCell(fixture, 1U) ||
+        !AdvancePlannedFrontierTo<CpuPlanOps>(fixture.view, 0U, 2U) ||
+        fixture.control.planned_frontier.value != 2 ||
+        ObservePlanReady<CpuPlanOps>(fixture.view).status !=
+            PlanReadyStatus::NotReady ||
+        !RuntimePlanCanPublishReady<CpuPlanOps>(fixture.view) ||
+        !PublishRuntimePlanReady<CpuPlanOps>(fixture.view) ||
+        ObservePlanReady<CpuPlanOps>(fixture.view).status !=
+            PlanReadyStatus::Open) {
+        return false;
+    }
+    const BuildReservation ticket = TakeOpenBuildTicket<CpuPlanOps>(fixture.view);
+    RuntimeTaskPlanHeader header{};
+    RuntimeTaskPlanLayout layout{};
+    if (ticket.status != BuildReservationStatus::Reserved || ticket.task_id != 0U ||
+        ResolveOpenBuildTicket<CpuPlanOps>(fixture.view, ticket.task_id, header, layout) !=
+            BuildTicketResolveStatus::Acquired ||
+        fixture.control.planned_frontier.value != 2 ||
+        !ValidateCanonicalPlanFields(fixture, ticket.task_id, header, layout) ||
+        AdvancePlannedFrontierTo<CpuPlanOps>(fixture.view, 2U, 2U)) {
+        return false;
+    }
+
+    // Close 不得再假定 Build 尚未开始；streaming ticket 和 arrival 可以
+    // 在 producer 执行 Close 的同时推进。
+    CpuPlanOps::PublishControl(&fixture.control.build_next.value, 7);
+    CpuPlanOps::PublishControl(&fixture.control.build_workers_done.value, 2);
+    if (!CloseRuntimePlan<CpuPlanOps>(fixture.view, 2U)) return false;
+    const PlanReadyObservation closed = ObservePlanReady<CpuPlanOps>(fixture.view);
+    return closed.status == PlanReadyStatus::Closed && closed.task_count == 2U;
+}
+
+enum class StreamingStartMode : uint8_t {
+    CloseBeforeTickets,
+    FutureTicketsFirst,
+    ConcurrentProducer,
+};
+
+bool RunStreamingPlan(uint32_t task_count, StreamingStartMode mode) {
+    PlanFixture fixture(task_count == 0U ? 1U : task_count);
+    if (!fixture.Valid()) return false;
+    PrepareProducerNotReady(fixture);
+
+    std::vector<std::atomic<uint32_t>> visits(task_count);
+    for (std::atomic<uint32_t> &visit : visits) {
+        visit.store(0U, std::memory_order_relaxed);
+    }
+    std::array<BuilderLeaderLocalState, kBuilderLeaders> local_states{};
+    std::array<std::atomic<uint32_t>, kBuilderLeaders> tickets_in_flight{};
+    std::atomic<bool> protocol_ok{true};
+    std::atomic<bool> allow_tickets{false};
+    std::atomic<uint32_t> leaders_started{0U};
+    std::atomic<uint32_t> leaders_attached{0U};
+    std::atomic<uint32_t> last_arrivals{0U};
+    std::atomic<uint32_t> acquired_before_frontier{0U};
+    const auto deadline = std::chrono::steady_clock::now() + kTestTimeout;
+
+    const auto fail_protocol = [&] {
+        protocol_ok.store(false, std::memory_order_release);
+        PublishFatal(fixture);
+        allow_tickets.store(true, std::memory_order_release);
+    };
+
+    std::array<std::thread, kBuilderLeaders> leaders;
+    for (uint32_t leader = 0U; leader < kBuilderLeaders; ++leader) {
+        leaders[leader] = std::thread([&, leader] {
+            leaders_started.fetch_add(1U, std::memory_order_release);
+            while (protocol_ok.load(std::memory_order_acquire)) {
+                const PlanReadyObservation ready = ObservePlanReady<CpuPlanOps>(fixture.view);
+                if (ready.status == PlanReadyStatus::NotReady) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        fail_protocol();
+                        return;
+                    }
+                    std::this_thread::yield();
+                    continue;
+                }
+                if (ready.status != PlanReadyStatus::Open && ready.status != PlanReadyStatus::Closed) {
+                    fail_protocol();
+                    return;
+                }
+                break;
+            }
+            leaders_attached.fetch_add(1U, std::memory_order_release);
+            if (!WaitUntil(deadline, [&] {
+                    return allow_tickets.load(std::memory_order_acquire) ||
+                           !protocol_ok.load(std::memory_order_acquire);
+                })) {
+                fail_protocol();
+                return;
+            }
+
+            while (protocol_ok.load(std::memory_order_acquire)) {
+                if (tickets_in_flight[leader].fetch_add(1U, std::memory_order_acq_rel) != 0U) {
+                    fail_protocol();
+                    return;
+                }
+                const BuildReservation ticket = TakeOpenBuildTicket<CpuPlanOps>(fixture.view);
+                if (ticket.status != BuildReservationStatus::Reserved) {
+                    fail_protocol();
+                    return;
+                }
+
+                while (protocol_ok.load(std::memory_order_acquire)) {
+                    RuntimeTaskPlanHeader header{};
+                    RuntimeTaskPlanLayout layout{};
+                    const BuildTicketResolveStatus resolved =
+                        ResolveOpenBuildTicket<CpuPlanOps>(fixture.view, ticket.task_id, header, layout);
+                    if (resolved == BuildTicketResolveStatus::Pending) {
+                        if (std::chrono::steady_clock::now() >= deadline) {
+                            fail_protocol();
+                            return;
+                        }
+                        std::this_thread::yield();
+                        continue;
+                    }
+                    if (resolved == BuildTicketResolveStatus::Acquired) {
+                        if (ticket.task_id >= task_count ||
+                            !ValidateCanonicalPlanFields(fixture, ticket.task_id, header, layout) ||
+                            visits[ticket.task_id].fetch_add(1U, std::memory_order_acq_rel) != 0U) {
+                            fail_protocol();
+                            return;
+                        }
+                        const int64_t frontier = CpuPlanOps::LoadControl(&fixture.control.planned_frontier.value);
+                        const int64_t closed = CpuPlanOps::LoadControl(&fixture.control.closed_task_count.value);
+                        if (closed == kPlanOpenTaskCount && frontier <= static_cast<int64_t>(ticket.task_id)) {
+                            acquired_before_frontier.fetch_add(1U, std::memory_order_relaxed);
+                        }
+                        tickets_in_flight[leader].store(0U, std::memory_order_release);
+                        break;
+                    }
+                    if (resolved == BuildTicketResolveStatus::Closed) {
+                        tickets_in_flight[leader].store(0U, std::memory_order_release);
+                        const PlanReadyObservation closed = ObservePlanReady<CpuPlanOps>(fixture.view);
+                        if (closed.status != PlanReadyStatus::Closed || closed.task_count != task_count) {
+                            fail_protocol();
+                            return;
+                        }
+                        const BuildArrivalStatus arrival =
+                            ArriveBuilderLeaderOnce<CpuPlanOps>(fixture.view, leader, local_states[leader]);
+                        if (arrival == BuildArrivalStatus::Last) {
+                            last_arrivals.fetch_add(1U, std::memory_order_relaxed);
+                            if (!PublishBuildRelease<CpuPlanOps>(fixture.view, task_count)) {
+                                fail_protocol();
+                            }
+                        } else if (arrival != BuildArrivalStatus::Arrived) {
+                            fail_protocol();
+                        }
+                        return;
+                    }
+                    fail_protocol();
+                    return;
+                }
+            }
+        });
+    }
+
+    if (!WaitUntil(
+            deadline,
+            [&] {
+                return leaders_started.load(std::memory_order_acquire) == kBuilderLeaders;
+            }
+        ) ||
+        !PublishRuntimePlanReady<CpuPlanOps>(fixture.view) || !WaitUntil(deadline, [&] {
+            return leaders_attached.load(std::memory_order_acquire) == kBuilderLeaders;
+        })) {
+        fail_protocol();
+    }
+
+    if (mode == StreamingStartMode::CloseBeforeTickets) {
+        for (uint32_t task = 0U; task < task_count; ++task) {
+            if (!PublishSyntheticCell(fixture, task)) fail_protocol();
+        }
+        if (task_count != 0U && !AdvancePlannedFrontierTo<CpuPlanOps>(fixture.view, 0U, task_count)) {
+            fail_protocol();
+        }
+        if (!CloseRuntimePlan<CpuPlanOps>(fixture.view, task_count) || fixture.control.build_next.value != 0) {
+            fail_protocol();
+        }
+        allow_tickets.store(true, std::memory_order_release);
+    } else {
+        allow_tickets.store(true, std::memory_order_release);
+        if (mode == StreamingStartMode::FutureTicketsFirst && !WaitUntil(deadline, [&] {
+                return CpuPlanOps::LoadControl(&fixture.control.build_next.value) ==
+                       static_cast<int64_t>(kBuilderLeaders);
+            })) {
+            fail_protocol();
+        }
+
+        if (mode == StreamingStartMode::FutureTicketsFirst && task_count == 0U) {
+            if (!CloseRuntimePlan<CpuPlanOps>(fixture.view, 0U)) {
+                fail_protocol();
+            }
+        } else if (mode == StreamingStartMode::FutureTicketsFirst && task_count == 1U) {
+            if (!PublishSyntheticCell(fixture, 0U) ||
+                !WaitUntil(
+                    deadline,
+                    [&] {
+                        return visits[0U].load(std::memory_order_acquire) == 1U;
+                    }
+                ) ||
+                fixture.control.planned_frontier.value != 0 ||
+                !AdvancePlannedFrontierTo<CpuPlanOps>(fixture.view, 0U, 1U) ||
+                !CloseRuntimePlan<CpuPlanOps>(fixture.view, 1U)) {
+                fail_protocol();
+            }
+        } else {
+            uint32_t frontier = 0U;
+            constexpr uint32_t kFrontierBatch = 53U;
+            for (uint32_t task = 0U; task < task_count; ++task) {
+                if (!PublishSyntheticCell(fixture, task)) {
+                    fail_protocol();
+                    break;
+                }
+                const uint32_t next = task + 1U;
+                if (next - frontier == kFrontierBatch || next == task_count) {
+                    if (!AdvancePlannedFrontierTo<CpuPlanOps>(fixture.view, frontier, next)) {
+                        fail_protocol();
+                        break;
+                    }
+                    frontier = next;
+                }
+                if ((task & 31U) == 0U) std::this_thread::yield();
+            }
+            if (protocol_ok.load(std::memory_order_acquire) &&
+                !CloseRuntimePlan<CpuPlanOps>(fixture.view, task_count)) {
+                fail_protocol();
+            }
+        }
+    }
+
+    for (std::thread &leader : leaders)
+        leader.join();
+    if (!protocol_ok.load(std::memory_order_relaxed) || fixture.control.fatal.value != 0 ||
+        fixture.control.build_next.value != static_cast<int64_t>(ExpectedBuildTicketCount(task_count)) ||
+        fixture.control.build_workers_done.value != static_cast<int64_t>(kBuilderLeaders) ||
+        fixture.control.build_release.value != static_cast<int64_t>(task_count) ||
+        last_arrivals.load(std::memory_order_relaxed) != 1U) {
+        return false;
+    }
+    for (uint32_t leader = 0U; leader < kBuilderLeaders; ++leader) {
+        if (tickets_in_flight[leader].load(std::memory_order_relaxed) != 0U || !local_states[leader].arrival_recorded) {
+            return false;
+        }
+    }
+    for (const std::atomic<uint32_t> &visit : visits) {
+        if (visit.load(std::memory_order_relaxed) != 1U) return false;
+    }
+    return mode != StreamingStartMode::FutureTicketsFirst || task_count == 0U ||
+           acquired_before_frontier.load(std::memory_order_relaxed) != 0U;
+}
+
+bool PrepareSingleClosedCell(PlanFixture &fixture) {
+    PrepareProducerNotReady(fixture);
+    return PublishRuntimePlanReady<CpuPlanOps>(fixture.view) && PublishSyntheticCell(fixture, 0U) &&
+           AdvancePlannedFrontierTo<CpuPlanOps>(fixture.view, 0U, 1U) && CloseRuntimePlan<CpuPlanOps>(fixture.view, 1U);
+}
+
+bool TestStreamingFailureClassification() {
+    for (CorruptionKind corruption : {CorruptionKind::Control, CorruptionKind::Payload}) {
+        PlanFixture fixture(1U);
+        if (!PrepareSingleClosedCell(fixture)) return false;
+        if (corruption == CorruptionKind::Control) {
+            fixture.cells.get()[0U].control.value = static_cast<int64_t>(
+                static_cast<uint64_t>(fixture.cells.get()[0U].control.value) | (uint64_t{1} << 63U)
+            );
+        } else {
+            volatile uint64_t &word = fixture.cells.get()[0U].payload.words[2];
+            word = (word & ~uint64_t{0xFFU}) | uint64_t{0xFFU};
+        }
+        const BuildReservation ticket = TakeOpenBuildTicket<CpuPlanOps>(fixture.view);
+        RuntimeTaskPlanHeader header{};
+        RuntimeTaskPlanLayout layout{};
+        const BuildTicketResolveStatus resolved =
+            ResolveOpenBuildTicket<CpuPlanOps>(fixture.view, ticket.task_id, header, layout);
+        const BuildTicketResolveStatus expected = corruption == CorruptionKind::Control ?
+                                                      BuildTicketResolveStatus::InvalidControl :
+                                                      BuildTicketResolveStatus::InvalidPayload;
+        if (ticket.status != BuildReservationStatus::Reserved || resolved != expected) {
+            return false;
+        }
+    }
+
+    {
+        PlanFixture fixture(1U);
+        if (!PrepareSingleClosedCell(fixture)) return false;
+        fixture.cells.get()[0U].control.value = 0;
+        const BuildReservation ticket = TakeOpenBuildTicket<CpuPlanOps>(fixture.view);
+        RuntimeTaskPlanHeader header{};
+        RuntimeTaskPlanLayout layout{};
+        if (ResolveOpenBuildTicket<CpuPlanOps>(fixture.view, ticket.task_id, header, layout) !=
+            BuildTicketResolveStatus::MissingPlanCell) {
+            return false;
+        }
+    }
+
+    {
+        PlanFixture fixture(1U);
+        PrepareProducerNotReady(fixture);
+        if (!PublishRuntimePlanReady<CpuPlanOps>(fixture.view)) return false;
+        const BuildReservation ticket = TakeOpenBuildTicket<CpuPlanOps>(fixture.view);
+        RuntimeTaskPlanHeader header{};
+        RuntimeTaskPlanLayout layout{};
+        if (ResolveOpenBuildTicket<CpuPlanOps>(fixture.view, ticket.task_id, header, layout) !=
+            BuildTicketResolveStatus::Pending) {
+            return false;
+        }
+        PublishFatal(fixture);
+        if (ResolveOpenBuildTicket<CpuPlanOps>(fixture.view, ticket.task_id, header, layout) !=
+            BuildTicketResolveStatus::Fatal) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool TestSameAddressReuse() {
+    PlanFixture fixture(1U);
+    if (!PrepareSingleClosedCell(fixture)) return false;
+    RuntimeTaskPlanCell *const original_address = fixture.cells.get();
+
+    CpuPlanOps::PublishControl(&fixture.control.closed_task_count.value, kPlanProducerNotReadyTaskCount);
+    if (ObservePlanReady<CpuPlanOps>(fixture.view).status != PlanReadyStatus::NotReady ||
+        fixture.cells.get()[0U].control.value == 0) {
+        return false;
+    }
+
+    // 模拟 AICPU 对复用地址执行 discard/Empty 校验，然后重置其他 control。
+    PrepareProducerNotReady(fixture);
+    fixture.cells.get()[0U].payload.words[0U] = UINT64_C(0xDEADBEEF);
+    if (!PublishRuntimePlanReady<CpuPlanOps>(fixture.view) || !PublishSyntheticCell(fixture, 0U) ||
+        !AdvancePlannedFrontierTo<CpuPlanOps>(fixture.view, 0U, 1U) ||
+        !CloseRuntimePlan<CpuPlanOps>(fixture.view, 1U) || fixture.cells.get() != original_address) {
+        return false;
+    }
+    const BuildReservation ticket = TakeOpenBuildTicket<CpuPlanOps>(fixture.view);
+    RuntimeTaskPlanHeader header{};
+    RuntimeTaskPlanLayout layout{};
+    return ticket.status == BuildReservationStatus::Reserved && ticket.task_id == 0U &&
+           ResolveOpenBuildTicket<CpuPlanOps>(fixture.view, ticket.task_id, header, layout) ==
+               BuildTicketResolveStatus::Acquired &&
+           ValidateCanonicalPlanFields(fixture, ticket.task_id, header, layout);
+}
+
 }  // namespace
 
 int main()
 {
+    if (!TestReadyFailureWakeup()) {
+        std::cerr << "FAIL producer-ready failure wakeup\n";
+        return 1;
+    }
+    std::cout << "PASS producer-ready failure wakeup\n";
+
+    if (!TestReadyHandshakeAndBatchFrontier()) {
+        std::cerr << "FAIL producer-ready/batched-frontier contract\n";
+        return 1;
+    }
+    std::cout << "PASS producer-ready/batched-frontier contract\n";
+
+    for (const auto &test : {
+             std::pair<uint32_t, StreamingStartMode>{0U, StreamingStartMode::FutureTicketsFirst},
+             std::pair<uint32_t, StreamingStartMode>{1U, StreamingStartMode::FutureTicketsFirst},
+             std::pair<uint32_t, StreamingStartMode>{17U, StreamingStartMode::CloseBeforeTickets},
+             std::pair<uint32_t, StreamingStartMode>{1280U, StreamingStartMode::ConcurrentProducer},
+         }) {
+        if (!RunStreamingPlan(test.first, test.second)) {
+            std::cerr << "FAIL streaming Plan: N=" << test.first << '\n';
+            return 1;
+        }
+        std::cout << "PASS streaming Plan: N=" << test.first << " tickets=" << ExpectedBuildTicketCount(test.first)
+                  << '\n';
+    }
+
+    if (!TestStreamingFailureClassification()) {
+        std::cerr << "FAIL streaming missing/corrupt/fatal classification\n";
+        return 1;
+    }
+    std::cout << "PASS streaming missing/corrupt/fatal classification\n";
+
+    if (!TestSameAddressReuse()) {
+        std::cerr << "FAIL same-address producer-ready reuse\n";
+        return 1;
+    }
+    std::cout << "PASS same-address producer-ready reuse\n";
+
     if (!TestLocalLeaderIdentityContract()) {
         std::cerr << "FAIL local leader identity/once contract\n";
         return 1;

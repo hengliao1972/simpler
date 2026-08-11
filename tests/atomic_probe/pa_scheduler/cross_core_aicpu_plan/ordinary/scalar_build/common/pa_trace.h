@@ -180,6 +180,8 @@ PA_DEVICE int32_t TraceAtomicPollBatchIndex(AtomicSite site) {
             return 9;
         case AtomicSite::RuntimePlanFatalLoad:
             return 10;
+        case AtomicSite::RuntimePlanCellControlLoad:
+            return 11;
         default:
             return -1;
     }
@@ -209,6 +211,8 @@ PA_DEVICE AtomicSite TraceAtomicPollBatchSite(uint32_t index) {
             return AtomicSite::RuntimePlanBuildReleaseLoad;
         case 10:
             return AtomicSite::RuntimePlanFatalLoad;
+        case 11:
+            return AtomicSite::RuntimePlanCellControlLoad;
         default:
             return AtomicSite::Count;
     }
