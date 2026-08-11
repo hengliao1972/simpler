@@ -23,8 +23,9 @@ canonical TaskPlan；AICore 不再 96 路重放 callback，而是按 task id 领
 orchestration callback 生成 canonical Plan，96 个 Scalar 使用中央 ticket
 完成 Build，ordinary TensorMap 仍严格按 task id 插入，随后 AIC/AIV
 执行并由 FinalDrain 收口。当前 B1 warm pipeline 已低于 1ms，但 B256
-仍为多毫秒，所以完整目标尚未达成。ordinary SIMT 和两种 DAG 模式
-尚未实现。
+仍为多毫秒，所以完整目标尚未达成。ordinary SIMT 已完成四 leader 协议、
+通用 ordinary writer、窄完整 Build 的 CPU 与 CCEC machine-code 门槛，
+正式 runtime/A5 尚未接通；两种 DAG 模式尚未实现。
 
 ### 1.1 目录与两个正交维度
 
@@ -331,6 +332,49 @@ Case1 的零 ordinary writer 结果宣称泛化完成。
 “metadata-only terminal”的显式区分，不能让 Execute 扫描把暂时 Empty
 静默跳过。
 
+正式 CCEC 使用双 TU，而不是把 Scalar 调度头整体重定义成
+`__simt_callee__`：
+
+```text
+AIV0 mixed entry / VF TU
+  -> 校验 closed Plan 与运行身份
+  -> async_invoke 128-thread VF
+  -> 4 个 lane0 leader 执行窄 canonical Build
+  -> V/S join（失败时也必须 join）
+  -> 调用 Scalar scheduler continuation TU
+
+其他 95 个 Scalar
+  -> 初始化自身 Execute token/stats
+  -> 在 startup/release 边界等待 AIV0
+
+AIV0 continuation
+  -> 作为第 96 个 Scalar 到达 startup
+  -> 全员观察 build_release
+  -> 32 AIC + 64 AIV Execute/FinalDrain
+```
+
+VF 前的入口必须先取得 config/Plan 身份；VF fatal 后也必须进入 continuation，
+否则其余 95 核会永久卡在 startup。perf-clock 起点与 Build trace 起点必须在
+VF 之前记录，并经独立 GM report 交给 continuation；不能从 join 后开始计时
+而隐藏 SIMT Build。现有 Exec/Host policy 要求 `build_owner < 96`，所以四个
+leader 的 Build owner 固定为 `0..3`；Build owner 与 Execute owner 是两个
+独立字段，不表示同一物理角色。统计/trace 使用独占 cacheline，join 后由
+AIV0 invalidate 后归并，不能写入 worker 0..3 的 Scalar `WorkerResult`。
+
+writer publication 的 A5 合同固定为：
+
+```text
+writer: asc_stcg(payload words) -> asc_threadfence -> atomic control publish
+reader: return-ready atomic observe -> asc_dcci_single(each line)
+        -> asc_threadfence -> ordinary payload read -> control recheck
+```
+
+writer 侧禁止用 `asc_dcci_single` 代替 clean-out。completion 交棒前的失败
+先撤销本 task 独占的 fresh-output published/last-writer 控制字，然后发布
+全局 fatal；heap cursor、writer history 或 ordinary ring 的已提交前缀不做
+并发局部回滚，整轮不得继续 Execute，下一轮必须完整清零 sidecar。该
+fail-stop 合同与正常热路径分开，不能为了错误恢复给每个 task 增加额外原子。
+
 ### 4.4 尚未实现的公共边界
 
 下列能力不在首版声明范围内：
@@ -356,7 +400,7 @@ PA 首例只能使用已有 symbolic `SharedTaskOutputs/FdwicOutputRef` deferred
 | S0 | 固定 Plan ABI、AICPU/AICore 发布合同和正确性门槛 | 已闭合 |
 | S1 | 接通真实 AICPU orchestration SO 和 Plan backend | 已闭合，正式 A5 owner/dispatcher 已通过 |
 | S2 | ordinary Scalar Build，CPU 后 A5 B1/B256 | 已闭合，Plan-only B1 与 full B1/B256 均通过 |
-| S3 | 在同一 Plan ABI 上替换为 ordinary SIMT Build | 已闭合四 leader CPU 协议与 CCEC Plan-v2 compile gate；A5 完整 Build 尚未实现 |
+| S3 | 在同一 Plan ABI 上替换为 ordinary SIMT Build | 已闭合四 leader/通用 writer/窄完整 Build 的 CPU 与 CCEC machine-code 门槛；正式 runtime/A5 尚未实现 |
 | S4 | 证明 ordinary 闭合后迁移 DAG Scalar Build | 未实现 |
 | S5 | 在 DAG 上替换为 SIMT Build | 未实现 |
 | S6 | 在正确性与观测闭合后做性能收敛 | ordinary Scalar 已有首组无泳道样本，尚未收敛 |

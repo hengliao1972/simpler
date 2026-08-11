@@ -22,7 +22,7 @@
 | S0 | Plan ABI、动态存储和 AICPU/AICore 发布合同 | 已闭合 |
 | S1 | 真实 AICPU orchestration SO 与 Plan backend | 已闭合，已通过正式 A5 AICPU launch 验证 |
 | S2 | ordinary Scalar Build 端到端 | 已闭合，CPU 与 A5 B1/B256 均已通过 |
-| S3 | ordinary SIMT Build 端到端 | 已闭合四 leader CPU 协议与 CCEC Plan-v2 compile gate；A5 完整 Build 尚未实现 |
+| S3 | ordinary SIMT Build 端到端 | 已闭合四 leader 协议、通用 writer、窄完整 Build 的 CPU 与 CCEC machine-code 门槛；正式 runtime/A5 尚未接通 |
 | S4 | DAG Scalar Build | 未开始 |
 | S5 | DAG SIMT Build | 未开始 |
 | S6 | 观测闭合后的性能收敛 | 已有首组无泳道样本，尚未收敛 |
@@ -454,3 +454,86 @@ SIMT 构建会显式配置为 4，而 Execute/FinalDrain population 继续保持
 release 等待已从 Scalar arrival 中抽成独立 helper，后续 95 个非 builder
 Scalar 可以只等待 SIMT 的 N+4/4-arrival 收口，不会误增
 `build_workers_done`。
+
+### 7.5 为什么不能直接把 Scalar Build 编译成 VF
+
+本阶段先尝试了最小改造：把现有完整
+`BuildRuntimePlanTask<SimtOps, false>` 以 `__simt_callee__` 身份重新实例化，
+而不改业务流程。结果证明这条路不能作为正式实现：
+
+1. 公共头内 callback lambda 硬编码为 Scalar `__aicore__` 身份，直接调用
+   SIMT helper 会被 CCEC 前端拒绝；
+2. 探针内临时提升 lambda 身份后，完整调用图可以生成优化 LLVM bitcode，
+   但 `TaskArgs::TensorPointer` 的 local/GM runtime union 在 machine-code
+   后端触发 `error pointer address space cast`；
+3. 即使隔离 writer-delta，exec payload 的 local/GM descriptor union 仍会
+   独立触发相同错误。固定成单一 GM 分支可越过部分错误，说明阻塞来自
+   runtime 地址空间选择，而不是 PlanCell 或最外层 mixed VF 壳。
+
+负向探针同时证明：canonical Plan acquire/decode、真实
+`ordinary_count=1` metadata publication，以及 static VF + mixed AIV
+`async_invoke/wait` 壳都能单独生成 object。问题的精确边界是“把带
+Scalar pointer union 的完整调用图整体搬入 VF”，不能由此得出 SIMT
+TensorMap 或 Plan 协议本身不可用。
+
+### 7.6 窄 canonical Build 与双 TU 身份隔离
+
+新增 `ordinary/simt_build/common/simt_plan_task_builder.h`。它不构造
+`TaskArgs`，而是把 canonical Plan v2 解码到仅含值语义的
+descriptor/create-info/reference/scalar scratch，并依次执行：
+
+```text
+Plan acquire + canonical validation
+  -> fresh output Materialize/publish
+  -> ordinary/symbol writer delta
+  -> completion[N-1] wait
+  -> generic ordinary/symbol metadata publication
+  -> completion[N] handoff
+  -> ordinary/symbol/explicit fanin
+  -> metadata vend/flag 或 SharedExecCell BUILT
+```
+
+该实现没有 `task_id % 5`、`FullPaTaskPlan` 或 Host task table。PA 的
+kind、engine 与 batch provenance 仍只来自 Plan v2 header；Build 主链本身
+只依赖通用 tensor tag/reference/metadata/exec 合同。
+
+CCEC 正向门槛采用两个 TU：AIV/VF TU 只以 SIMT 身份包含窄 Build，VF
+join 后调用另一个以 Scalar 身份编译的 scheduler continuation。这样避免
+include guard 把同一 helper 永久锁成错误 device identity。严格
+`dav-c310-vec -O3 -Wall -Werror` 已生成并静态链接完整
+`BuildCanonicalPlanTask` machine object；最终产物含一个约 67.9KiB 的
+LOCAL VF、一个 GLOBAL mixed entry，Scalar continuation 已解析且没有
+undefined GLOBAL。这个门槛证明完整 Build 模板已经进入真实机器码，不是
+只 include 头或只生成 LLVM IR。
+
+对应 CPU 门槛把 Runtime 直接映射到真实 `SchedulerState`、
+`SharedTensorMapSidecar`、per-task insert completion、`TaskCell` 和
+`SharedExecCell`，覆盖非周期 task 序列、fresh output、
+`ordinary_count>0`、symbol history、future writer 过滤、strict
+completion、三类 fanin、metadata/AIC/AIV route，以及四 leader 的
+`N+4` 收口。普通 `-Werror` 与 ASan+UBSan 均 PASS。
+
+### 7.7 A5 writer 发布与失败收口边界
+
+窄 VF 不把 reader invalidate 冒充 writer clean-out。跨核 ordinary payload
+固定逐 64-bit 使用 `asc_stcg` bypass store，随后 `asc_threadfence`，最后
+才发布对应 atomic control；这覆盖 output descriptor、writer history、
+ordinary region、metadata vend 和 exec payload。`asc_dcci_single` 只用于
+reader 在观察到 control 后逐 cacheline invalidate。当前 CCEC source/IR
+门槛已经锁定 `stcg -> fence -> atomic`，并拒绝 writer 侧 DCCI。
+
+失败路径也不能伪装成可恢复事务。completion 交棒前若 output 预留、
+descriptor、published 或后续 metadata 失败，必须撤销本 task 已预留/已发布
+的 fresh output 控制字；heap FetchAdd 和可能已提交的 metadata 前缀不做
+局部倒退，而是发布全局 fatal，禁止 Execute，并由下一轮 Host 完整重置
+SchedulerState、sidecar 与 heap control。也就是说当前合同是“尽力撤销独占
+output + 整轮 fail-stop”，不是在并发副作用后继续本轮或复用半发布状态。
+
+上述仍然只是生产接线前门槛。compile harness 的紧密 atomic 数组、单 heap
+cursor 和简化 metadata cell 不能作为 A5 正确性证据；正式 runtime 必须直接
+映射现有 128B 隔离控制字、8-shard heap、真实 ordinary ring/history、
+TaskCell vend/flag 与 SharedExecCell。现有 Exec policy 要求
+`build_owner < 96`，所以四个 leader 的 Build owner 固定为 `0..3`；它与
+独立的 Execute owner 字段不绑定。leader 身份与 Build 统计通过独占 GM
+sidecar 在 VF join 后归并，不能覆盖后续 96 个 Scalar Execute worker 的
+结果，也不能通过扩大 owner 取值范围绕过现有 Host/device 校验。
