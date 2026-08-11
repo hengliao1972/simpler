@@ -15,6 +15,7 @@
 #include <initializer_list>
 #include <new>
 #include <sys/mman.h>
+#include <utility>
 
 #ifndef PTO_FDWIC_SHARED_MAP
 #define PTO_FDWIC_SHARED_MAP 1
@@ -33,6 +34,8 @@ using namespace pa_scheduler::cross_core;
 
 int g_failures = 0;
 
+constexpr uint32_t kAivBuildOwner = 34;
+
 void Check(bool condition, const char *test, const char *message) {
     if (condition) {
         return;
@@ -47,10 +50,56 @@ struct ExecScanTestOps {
     static constexpr bool kAtomicReturnReadyObserved = false;
     static inline uint32_t execute_calls = 0;
     static inline std::array<uint32_t, 8> executed_tasks{};
+    static inline volatile int64_t *watched_control = nullptr;
+    static inline uint32_t watched_control_loads = 0;
+    static inline uint32_t watched_control_cas_calls = 0;
+    static inline uint32_t payload_loads = 0;
+    static inline uint32_t invalidate_calls = 0;
+    static inline volatile int64_t *claim_loss_address = nullptr;
+    static inline int64_t injected_claimed_state = 0;
+    static inline volatile int64_t *fatal_after_load_address = nullptr;
+    static inline volatile int32_t *injected_global_fatal = nullptr;
+    static inline volatile int32_t *fatal_after_execute = nullptr;
 
     static void ResetObservations() {
         execute_calls = 0;
         executed_tasks.fill(UINT32_MAX);
+        watched_control = nullptr;
+        watched_control_loads = 0;
+        watched_control_cas_calls = 0;
+        payload_loads = 0;
+        invalidate_calls = 0;
+        claim_loss_address = nullptr;
+        injected_claimed_state = 0;
+        fatal_after_load_address = nullptr;
+        injected_global_fatal = nullptr;
+        fatal_after_execute = nullptr;
+    }
+
+    static void WatchControl(volatile int64_t *control) {
+        watched_control = control;
+        watched_control_loads = 0;
+        watched_control_cas_calls = 0;
+    }
+
+    static void InjectGlobalFatalAfterLoad(
+        volatile int64_t *address, volatile int32_t *fatal
+    ) {
+        fatal_after_load_address = address;
+        injected_global_fatal = fatal;
+    }
+
+    static void InjectGlobalFatalAfterExecute(
+        volatile int32_t *fatal
+    ) {
+        fatal_after_execute = fatal;
+    }
+
+    static void InjectClaimLoss(
+        volatile int64_t *address, int64_t claimed_state
+    ) {
+        claim_loss_address = address;
+        injected_claimed_state = claimed_state;
     }
 
     static int32_t Load(volatile int32_t *address) {
@@ -60,9 +109,22 @@ struct ExecScanTestOps {
     }
 
     static int64_t Load(volatile int64_t *address) {
-        return __atomic_fetch_add(
+        if (address == watched_control) {
+            ++watched_control_loads;
+        }
+        const int64_t value = __atomic_fetch_add(
             address, int64_t{0}, __ATOMIC_ACQUIRE
         );
+        if (address == fatal_after_load_address &&
+            injected_global_fatal != nullptr) {
+            volatile int32_t *fatal = injected_global_fatal;
+            // 单次注入必须先撤销触发器，避免被后续同地址 Load 重复解释
+            // 为多个并发故障窗口。
+            fatal_after_load_address = nullptr;
+            injected_global_fatal = nullptr;
+            __atomic_store_n(fatal, int32_t{1}, __ATOMIC_RELEASE);
+        }
+        return value;
     }
 
     static uint64_t Load(volatile uint64_t *address) {
@@ -99,6 +161,20 @@ struct ExecScanTestOps {
         volatile int64_t *address, int64_t expected,
         int64_t desired
     ) {
+        if (address == watched_control) {
+            ++watched_control_cas_calls;
+        }
+        if (address == claim_loss_address) {
+            // 确定性模拟另一个合法候选恰好先完成 BUILT -> CLAIMED。
+            // 撤销触发器后再执行被测 CAS，使本 observer 稳定取得 Lost，
+            // 不依赖 host 线程竞争时序。
+            const int64_t claimed_state = injected_claimed_state;
+            claim_loss_address = nullptr;
+            injected_claimed_state = 0;
+            __atomic_store_n(
+                address, claimed_state, __ATOMIC_RELEASE
+            );
+        }
         int64_t observed = expected;
         (void)__atomic_compare_exchange_n(
             address, &observed, desired, false,
@@ -142,6 +218,7 @@ struct ExecScanTestOps {
     static uint64_t LoadPayloadWord(
         const volatile uint64_t *address
     ) {
+        ++payload_loads;
         return *address;
     }
 
@@ -160,6 +237,7 @@ struct ExecScanTestOps {
     }
 
     static void InvalidateRegion(const void *, uint64_t) {
+        ++invalidate_calls;
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
     }
 
@@ -172,6 +250,11 @@ struct ExecScanTestOps {
         }
         executed_tasks[execute_calls++] =
             ExecutionTokenHeader(token).task_id;
+        if (fatal_after_execute != nullptr) {
+            volatile int32_t *fatal = fatal_after_execute;
+            fatal_after_execute = nullptr;
+            __atomic_store_n(fatal, int32_t{1}, __ATOMIC_RELEASE);
+        }
         return true;
     }
 };
@@ -184,6 +267,7 @@ struct ScanPayloadSource {
     uint64_t TensorWord(uint32_t, uint32_t) const {
         return 0;
     }
+
 
     uint64_t TensorReference(uint32_t) const {
         return 0;
@@ -237,9 +321,96 @@ private:
     SchedulerState *state_ = nullptr;
 };
 
+uint8_t ExecRouteForTaskKind(TaskKind kind) {
+    switch (kind) {
+        case TaskKind::Alloc:
+            return EncodeExecDispatchRoute(
+                false, ExecEngineClass::None
+            );
+        case TaskKind::Qk:
+        case TaskKind::Pv:
+            return EncodeExecDispatchRoute(
+                true, ExecEngineClass::Aic
+            );
+        case TaskKind::Sf:
+        case TaskKind::Up:
+            return EncodeExecDispatchRoute(
+                true, ExecEngineClass::Aiv
+            );
+        case TaskKind::Count:
+            return 0;
+    }
+    return 0;
+}
+
+void EnsureDefaultDispatchPlan(SchedulerState &state) {
+    if (state.build_dispatch.task_count != 0) {
+        return;
+    }
+    constexpr uint32_t kPlanTasks =
+        kMaxBatches * kTasksPerBatch;
+    state.build_dispatch.task_count = kPlanTasks;
+    state.build_dispatch.batch_count = kMaxBatches;
+    uint32_t executable_tasks = 0;
+    for (uint32_t task_id = 0;
+         task_id < kPlanTasks; ++task_id) {
+        const uint32_t task_offset = task_id % kTasksPerBatch;
+        const TaskKind kind = task_offset == 0
+            ? TaskKind::Alloc
+            : static_cast<TaskKind>(task_offset);
+        SharedBuildDispatchTaskIdentity &identity =
+            state.build_dispatch.tasks[task_id];
+        identity.batch = static_cast<uint16_t>(
+            task_id / kTasksPerBatch
+        );
+        identity.encoded_meta = EncodeSharedPaTaskMeta(
+            kind, 0, false,
+            task_id + 1U == kPlanTasks
+        );
+        identity.exec_route = ExecRouteForTaskKind(kind);
+        executable_tasks += kind == TaskKind::Alloc ? 0U : 1U;
+        if (kind == TaskKind::Qk || kind == TaskKind::Pv) {
+            state.exec_dispatch.aic_task_ids[
+                state.exec_dispatch.aic_task_count++
+            ] = task_id;
+        } else if (kind == TaskKind::Sf ||
+                   kind == TaskKind::Up) {
+            state.exec_dispatch.aiv_task_ids[
+                state.exec_dispatch.aiv_task_count++
+            ] = task_id;
+        }
+    }
+    state.build_dispatch.executable_task_count = executable_tasks;
+}
+
+bool SetDispatchTaskKind(
+    SchedulerState &state, uint32_t task_id, TaskKind kind
+) {
+    EnsureDefaultDispatchPlan(state);
+    if (task_id >= state.build_dispatch.task_count ||
+        kind >= TaskKind::Count) {
+        return false;
+    }
+    const uint32_t task_offset =
+        SharedPaTaskOffset(kind, 0);
+    if (task_id < task_offset) {
+        return false;
+    }
+    SharedBuildDispatchTaskIdentity &identity =
+        state.build_dispatch.tasks[task_id];
+    identity.encoded_meta = EncodeSharedPaTaskMeta(
+        kind, 0, false,
+        task_id + 1U == state.build_dispatch.task_count
+    );
+    identity.exec_route = ExecRouteForTaskKind(kind);
+    return identity.encoded_meta != 0 &&
+           identity.exec_route != 0;
+}
+
 WorkerState &PrepareWorker(
     SchedulerState &state, uint32_t worker_id, CoreRole role
 ) {
+    EnsureDefaultDispatchPlan(state);
     WorkerState &worker = state.workers[worker_id];
     worker.core_idx = static_cast<int32_t>(worker_id);
     worker.role = role;
@@ -266,7 +437,7 @@ bool PublishKernelCell(
     uint32_t build_owner, TaskKind kind,
     std::initializer_list<int32_t> fanin = {}
 ) {
-    if (task_id >= kMaxTasks || kind >= TaskKind::Count) {
+    if (!SetDispatchTaskKind(state, task_id, kind)) {
         return false;
     }
     PaExecRoute route{};
@@ -314,43 +485,6 @@ void SetCellState(
         ));
 }
 
-void SetTerminalCells(
-    SchedulerState &state, uint32_t task_count
-) {
-    for (uint32_t task_id = 0;
-         task_id < task_count; ++task_id) {
-        state.tasks[task_id].flag = 1;
-    }
-    // task 0/2/4 保持 raw-zero EMPTY，代表已经封口的 metadata-only
-    // task；task 1/3 分别代表 AIC/AIV 已完成的 runtime payload。
-    SetCellState(
-        state, 1, ExecPhase::Done,
-        /*build_owner=*/34, /*execute_owner=*/0,
-        ExecEngineClass::Aic, /*payload_lines=*/1
-    );
-    SetCellState(
-        state, 3, ExecPhase::Done,
-        /*build_owner=*/0, /*execute_owner=*/32,
-        ExecEngineClass::Aiv, /*payload_lines=*/1
-    );
-}
-
-void SetDrainArrivals(
-    SchedulerState &state, uint64_t completed_tasks
-) {
-    for (uint32_t group = 0;
-         group < kExecDrainArrivalGroups; ++group) {
-        const uint64_t group_completions =
-            group == 0 ? completed_tasks : 0U;
-        state.exec_drain.arrivals[group].state =
-            static_cast<int64_t>(
-                6U +
-                (group_completions <<
-                 kExecDrainArrivalCountBits)
-            );
-    }
-}
-
 bool NoFatal(const SchedulerState &state) {
     return state.fatal.value == 0 &&
            state.exec_fatal.state == 0;
@@ -375,338 +509,82 @@ void InitLocalStats(
     stats.result.role = static_cast<uint32_t>(role);
 }
 
-void TestBothRolesScanWholeTaskRange() {
+void TestDrainCompletionCountMismatchFailsClosed() {
     constexpr const char *kTest =
-        "both-roles-scan-whole-runtime-range";
+        "drain-completion-count-mismatch-fail-closed";
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, kTest, "state mapping");
     if (state == nullptr) return;
 
-    std::array<LocalStats, 6> stats{};
-    const std::array<uint32_t, 3> aic_workers{0, 7, 31};
-    const std::array<uint32_t, 3> aiv_workers{32, 47, 95};
-    const std::array<std::array<uint32_t, 2>, 3> expected{
-        std::array<uint32_t, 2>{0, 1},
-        std::array<uint32_t, 2>{2, 3},
-        std::array<uint32_t, 2>{4, UINT32_MAX},
-    };
-
-    bool exact = true;
-    for (uint32_t index = 0; index < 3; ++index) {
-        InitLocalStats(
-            stats[index], aic_workers[index], CoreRole::Aic
-        );
-        const SharedExecTicketResult aic =
-            TakeSharedExecTicket<ExecScanTestOps>(
-                state, aic_workers[index], CoreRole::Aic,
-                /*task_count=*/5, stats[index]
+    state->config.batches = 1;
+    state->context_lens[0] = 1;
+    // B1 的五个 task 中只有四个 kernel。这里伪造 96 个 worker 已经全部
+    // 到达，但分组完成数合计只有 3；root 必须在 device 内拒绝收口，
+    // 不能依赖 kernel 返回后的 host 扫描才发现缺失。
+    for (uint32_t group = 0;
+         group < cross_core::kExecDrainArrivalGroups;
+         ++group) {
+        const uint64_t completions = group == 0 ? 3U : 0U;
+        state->exec_drain.arrivals[group].state =
+            static_cast<int64_t>(
+                6U +
+                (completions <<
+                 cross_core::kExecDrainArrivalCountBits)
             );
-        exact &=
-            aic.status == SharedExecTicketStatus::Acquired &&
-            aic.task_count == (index == 2 ? 1U : 2U) &&
-            aic.task_ids[0] == expected[index][0] &&
-            aic.task_ids[1] == expected[index][1] &&
-            stats[index].exec_dispatch_exhausted ==
-                (index == 2 ? 1U : 0U);
-
-        InitLocalStats(
-            stats[3 + index], aiv_workers[index], CoreRole::Aiv
-        );
-        const SharedExecTicketResult aiv =
-            TakeSharedExecTicket<ExecScanTestOps>(
-                state, aiv_workers[index], CoreRole::Aiv,
-                /*task_count=*/5, stats[3 + index]
-            );
-        exact &=
-            aiv.status == SharedExecTicketStatus::Acquired &&
-            aiv.task_count == (index == 2 ? 1U : 2U) &&
-            aiv.task_ids[0] == expected[index][0] &&
-            aiv.task_ids[1] == expected[index][1] &&
-            stats[3 + index].exec_dispatch_exhausted ==
-                (index == 2 ? 1U : 0U);
     }
-    exact &= state->exec_scan_cursors.aic_next.value ==
-            ExecTicketTerminalCursor(5, 1) &&
-        state->exec_scan_cursors.aiv_next.value ==
-            ExecTicketTerminalCursor(5, 1) &&
-        NoFatal(*state);
-    Check(
-        exact, kTest,
-        "AIC/AIV independently cover [0,5) with exact disjoint tails"
-    );
-    std::printf("[PASS] %s\n", kTest);
-}
-
-void TestZeroTaskRange() {
-    constexpr const char *kTest = "zero-task-runtime-range";
-    MappedSchedulerState mapping;
-    SchedulerState *state = mapping.Get();
-    Check(state != nullptr, kTest, "state mapping");
-    if (state == nullptr) return;
-
-    LocalStats aic_stats{};
-    LocalStats aiv_stats{};
-    InitLocalStats(aic_stats, 0, CoreRole::Aic);
-    InitLocalStats(aiv_stats, 32, CoreRole::Aiv);
-    const SharedExecTicketResult aic =
-        TakeSharedExecTicket<ExecScanTestOps>(
-            state, 0, CoreRole::Aic, 0, aic_stats
-        );
-    const SharedExecTicketResult aiv =
-        TakeSharedExecTicket<ExecScanTestOps>(
-            state, 32, CoreRole::Aiv, 0, aiv_stats
-        );
-    Check(
-        aic.status == SharedExecTicketStatus::Exhausted &&
-            aiv.status == SharedExecTicketStatus::Exhausted &&
-            aic.task_count == 0 && aiv.task_count == 0 &&
-            aic_stats.exec_dispatch_exhausted == 1 &&
-            aiv_stats.exec_dispatch_exhausted == 1 &&
-            state->exec_scan_cursors.aic_next.value ==
-                ExecTicketTerminalCursor(0, 1) &&
-            state->exec_scan_cursors.aiv_next.value ==
-                ExecTicketTerminalCursor(0, 1) &&
-            NoFatal(*state),
-        kTest,
-        "zero task closes each role with one terminal ticket"
-    );
-    std::printf("[PASS] %s\n", kTest);
-}
-
-void TestAllWorkersReachExactTerminalCursors() {
-    constexpr const char *kTest =
-        "all-workers-reach-exact-terminal-cursors";
-    constexpr uint32_t kTaskCount = 5;
-    MappedSchedulerState mapping;
-    SchedulerState *state = mapping.Get();
-    Check(state != nullptr, kTest, "state mapping");
-    if (state == nullptr) return;
-
-    const auto drain_role = [&](
-        CoreRole role, uint32_t first_worker,
-        uint32_t worker_count
-    ) {
-        bool exact = true;
-        for (uint32_t offset = 0; offset < worker_count; ++offset) {
-            const uint32_t worker_id = first_worker + offset;
-            LocalStats stats{};
-            InitLocalStats(stats, worker_id, role);
-            uint32_t calls = 0;
-            while (stats.exec_dispatch_exhausted == 0 &&
-                   calls <= kTaskCount + 1U) {
-                const SharedExecTicketResult ticket =
-                    TakeSharedExecTicket<ExecScanTestOps>(
-                        state, worker_id, role,
-                        kTaskCount, stats
-                    );
-                exact &= ticket.status !=
-                    SharedExecTicketStatus::Invalid;
-                ++calls;
-            }
-            exact &= stats.exec_dispatch_exhausted == 1;
-        }
-        return exact;
-    };
-
-    const bool exact =
-        drain_role(CoreRole::Aic, 0, kAicWorkers) &&
-        drain_role(CoreRole::Aiv, kAicWorkers, kAivWorkers) &&
-        state->exec_scan_cursors.aic_next.value ==
-            ExecTicketTerminalCursor(kTaskCount, kAicWorkers) &&
-        state->exec_scan_cursors.aiv_next.value ==
-            ExecTicketTerminalCursor(kTaskCount, kAivWorkers) &&
-        NoFatal(*state);
-    Check(
-        exact, kTest,
-        "all AIC/AIV workers close their runtime scan at exact cursors"
-    );
-    std::printf("[PASS] %s\n", kTest);
-}
-
-void TestRuntimeCellRoutesAndConsumesOnce() {
-    constexpr const char *kTest =
-        "runtime-cell-routes-and-consumes-once";
-    MappedSchedulerState mapping;
-    SchedulerState *state = mapping.Get();
-    Check(state != nullptr, kTest, "state mapping");
-    if (state == nullptr) return;
-
-    // task 0 是已经封口的 metadata-only task。其余 task 的 engine 只由
-    // Build winner 发布的 runtime cell 决定；没有 Host role task-id 表。
-    state->tasks[0].flag = 1;
-    Check(
-        PublishKernelCell(
-            *state, 1, /*build_owner=*/34, TaskKind::Qk
-        ),
-        kTest, "publish AIC QK runtime cell"
-    );
-    Check(
-        PublishKernelCell(
-            *state, 2, /*build_owner=*/0, TaskKind::Sf, {0}
-        ),
-        kTest, "publish AIV SF runtime cell"
-    );
-    Check(
-        PublishKernelCell(
-            *state, 3, /*build_owner=*/34, TaskKind::Pv, {1}
-        ),
-        kTest, "publish AIC PV runtime cell"
-    );
-    Check(
-        PublishKernelCell(
-            *state, 4, /*build_owner=*/0,
-            TaskKind::Up, {1, 2, 3}
-        ),
-        kTest, "publish AIV UP runtime cell"
-    );
-    if (!NoFatal(*state)) return;
-
-    WorkerState &aic_worker = PrepareWorker(
-        *state, 0, CoreRole::Aic
-    );
-    WorkerState &aiv_worker = PrepareWorker(
-        *state, 32, CoreRole::Aiv
-    );
-    LocalStats aic_stats{};
-    LocalStats aiv_stats{};
-    InitLocalStats(aic_stats, 0, CoreRole::Aic);
-    InitLocalStats(aiv_stats, 32, CoreRole::Aiv);
-    ExecScanTestOps::ResetObservations();
-
-    const uint32_t aic_completed =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, aic_worker, 5,
-            /*production_closed=*/true,
-            DrainPlace::FinalDrain, aic_stats
-        );
-    const DecodedExecState sf_after_aic =
-        DecodeExecState(state->exec_cells[2].control.state);
-    const DecodedExecState up_after_aic =
-        DecodeExecState(state->exec_cells[4].control.state);
-    Check(
-        aic_completed == 2 &&
-            ExecScanTestOps::execute_calls == 2 &&
-            ExecScanTestOps::executed_tasks[0] == 1 &&
-            ExecScanTestOps::executed_tasks[1] == 3 &&
-            sf_after_aic.valid &&
-            sf_after_aic.phase == ExecPhase::Built &&
-            up_after_aic.valid &&
-            up_after_aic.phase == ExecPhase::Built &&
-            aic_stats.exec_dispatch_exhausted == 1 &&
-            state->exec_scan_cursors.aic_next.value ==
-                ExecTicketTerminalCursor(5, 1) &&
-            NoFatal(*state),
-        kTest,
-        "AIC consumes matching cells and skips Empty/AIV cells"
-    );
-
-    const uint32_t aiv_completed =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, aiv_worker, 5,
-            /*production_closed=*/true,
-            DrainPlace::FinalDrain, aiv_stats
-        );
-    Check(
-        aiv_completed == 2 &&
-            ExecScanTestOps::execute_calls == 4 &&
-            ExecScanTestOps::executed_tasks[2] == 2 &&
-            ExecScanTestOps::executed_tasks[3] == 4 &&
-            aiv_stats.exec_dispatch_exhausted == 1 &&
-            state->exec_scan_cursors.aiv_next.value ==
-                ExecTicketTerminalCursor(5, 1) &&
-            NoFatal(*state),
-        kTest,
-        "AIV consumes matching cells and skips Empty/AIC cells"
-    );
-
-    const uint32_t aic_repeat =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, aic_worker, 5, true,
-            DrainPlace::FinalDrain, aic_stats
-        );
-    const uint32_t aiv_repeat =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, aiv_worker, 5, true,
-            DrainPlace::FinalDrain, aiv_stats
-        );
-    uint32_t first_bad_task = 5;
-    Check(
-        aic_repeat == 0 && aiv_repeat == 0 &&
-            ExecScanTestOps::execute_calls == 4 &&
-            CrossCoreExecWorkerDrained(
-                state, aic_worker, 5, aic_stats
-            ) &&
-            CrossCoreExecWorkerDrained(
-                state, aiv_worker, 5, aiv_stats
-            ) &&
-            CrossCoreExecAllTokensFullyReset(state, 0) &&
-            CrossCoreExecAllTokensFullyReset(state, 32) &&
-            ValidateCrossCoreExecTerminalCells<ExecScanTestOps>(
-                state, 5, first_bad_task
-            ) &&
-            first_bad_task == 5 && NoFatal(*state),
-        kTest,
-        "each matching runtime cell executes exactly once and reaches DONE"
-    );
-    std::printf("[PASS] %s\n", kTest);
-}
-
-void TestClosedBuildingCellFailsClosed() {
-    constexpr const char *kTest =
-        "closed-building-cell-fails-closed";
-    MappedSchedulerState mapping;
-    SchedulerState *state = mapping.Get();
-    Check(state != nullptr, kTest, "state mapping");
-    if (state == nullptr) return;
-
-    SetCellState(
-        *state, 0, ExecPhase::Building,
-        /*build_owner=*/0,
-        /*execute_owner=*/kExecUnboundOwner,
-        ExecEngineClass::None, /*payload_lines=*/0
-    );
-    WorkerState &worker = PrepareWorker(
-        *state, 0, CoreRole::Aic
-    );
+    WorkerState &root = PrepareWorker(*state, 0, CoreRole::Aic);
+    state->build_dispatch.task_count = 5;
+    state->build_dispatch.batch_count = 1;
+    state->build_dispatch.executable_task_count = 4;
     LocalStats stats{};
     InitLocalStats(stats, 0, CoreRole::Aic);
-    ExecScanTestOps::ResetObservations();
-
-    const uint32_t completed =
-        ProgressCrossCoreExec<ExecScanTestOps>(
-            state, worker, 1,
-            /*production_closed=*/true,
-            DrainPlace::FinalDrain, stats
+    bool arrived = true;
+    bool closed = false;
+    const bool closure_ok =
+        ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
+            state, root, 5, stats, arrived, closed
         );
+    const DecodedExecFatal fatal =
+        DecodeExecFatal(state->exec_fatal.state);
     Check(
-        completed == 0 && ExecScanTestOps::execute_calls == 0 &&
-            FatalMatches(
-                *state, ExecFatalReason::InvalidBuiltControl,
-                0, 0
-            ) &&
-            CrossCoreExecAllTokensFullyReset(state, 0),
+        !closure_ok && arrived && !closed &&
+            state->fatal.value == 1 && fatal.valid &&
+            fatal.reason ==
+                ExecFatalReason::CompletionStateConflict,
         kTest,
-        "BUILDING is impossible after replay_done and must be fatal"
+        "root rejects an all-arrived drain with one missing completion"
     );
     std::printf("[PASS] %s\n", kTest);
 }
 
-void TestDrainDerivesExecutableCountFromTerminalCells() {
+void TestDrainUsesPublishedExecutableTaskCount() {
     constexpr const char *kTest =
-        "drain-derives-count-from-terminal-cells";
+        "drain-uses-published-executable-task-count";
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, kTest, "state mapping");
     if (state == nullptr) return;
 
-    SetTerminalCells(*state, /*task_count=*/5);
-    SetDrainArrivals(*state, /*completed_tasks=*/2);
-    // root 只从 runtime terminal cells 动态得到两个 executable task，
-    // 不再存在 Host 可写的 executable-task 摘要。
-    WorkerState &root = PrepareWorker(
-        *state, 0, CoreRole::Aic
-    );
+    // 模拟一个与 PA 不同的计划：五个逻辑 task 中只有两个需要 engine
+    // 执行。config.batches 仍为 1；旧 task_count-batches 推导会错误期待
+    // 四个 completion，新协议必须只接受计划发布的精确值 2。
+    state->config.batches = 1;
+    for (uint32_t group = 0;
+         group < cross_core::kExecDrainArrivalGroups;
+         ++group) {
+        const uint64_t completions = group == 0 ? 2U : 0U;
+        state->exec_drain.arrivals[group].state =
+            static_cast<int64_t>(
+                6U +
+                (completions <<
+                 cross_core::kExecDrainArrivalCountBits)
+            );
+    }
+    WorkerState &root = PrepareWorker(*state, 0, CoreRole::Aic);
+    state->build_dispatch.task_count = 5;
+    state->build_dispatch.batch_count = 1;
+    state->build_dispatch.executable_task_count = 2;
     LocalStats stats{};
     InitLocalStats(stats, 0, CoreRole::Aic);
     bool arrived = true;
@@ -718,42 +596,526 @@ void TestDrainDerivesExecutableCountFromTerminalCells() {
     Check(
         closure_ok && arrived && closed && NoFatal(*state),
         kTest,
-        "two DONE cells close from the runtime terminal-cell count"
+        "root closes against the explicit operator-independent count"
     );
     std::printf("[PASS] %s\n", kTest);
 }
 
-void TestDrainCompletionMismatchFailsClosed() {
-    constexpr const char *kTest =
-        "drain-runtime-completion-mismatch-fails-closed";
+void LimitDefaultPlanToBatches(
+    SchedulerState &state, uint32_t batches
+) {
+    EnsureDefaultDispatchPlan(state);
+    const uint32_t task_count = batches * kTasksPerBatch;
+    state.build_dispatch.task_count = task_count;
+    state.build_dispatch.batch_count = batches;
+    state.build_dispatch.executable_task_count = batches * 4U;
+    state.build_dispatch.next_task.value = 0;
+    state.exec_dispatch.aic_next.value = 0;
+    state.exec_dispatch.aiv_next.value = 0;
+    state.exec_dispatch.aic_task_count = batches * 2U;
+    state.exec_dispatch.aiv_task_count = batches * 2U;
+}
+
+void TestDualTicketOddTailAndEmptyPlan() {
+    constexpr const char *kOddTailTest =
+        "dual-ticket-odd-tail";
+    MappedSchedulerState odd_tail_mapping;
+    SchedulerState *odd_tail_state = odd_tail_mapping.Get();
+    Check(
+        odd_tail_state != nullptr, kOddTailTest,
+        "state mapping"
+    );
+    if (odd_tail_state == nullptr) return;
+
+    // 使用与 PA 五任务分组无关的稀疏 task-id，直接验证通用执行计划
+    // 为奇数长度时：首批取得两项，尾批只取得一项且尾批 owner 当场
+    // 得到 exhaustion；其他 worker 只需再做一次越界领取。
+    odd_tail_state->build_dispatch.task_count = 7;
+    odd_tail_state->build_dispatch.executable_task_count = 3;
+    odd_tail_state->exec_dispatch.aic_task_count = 3;
+    odd_tail_state->exec_dispatch.aic_task_ids[0] = 1;
+    odd_tail_state->exec_dispatch.aic_task_ids[1] = 4;
+    odd_tail_state->exec_dispatch.aic_task_ids[2] = 6;
+    constexpr uint32_t kFirstWorker = 7;
+    constexpr uint32_t kTailWorker = 1;
+    LocalStats first_stats{};
+    LocalStats tail_stats{};
+    InitLocalStats(first_stats, kFirstWorker, CoreRole::Aic);
+    InitLocalStats(tail_stats, kTailWorker, CoreRole::Aic);
+    const SharedExecTicketResult first =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            odd_tail_state, kFirstWorker, CoreRole::Aic,
+            7, first_stats
+        );
+    const SharedExecTicketResult tail =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            odd_tail_state, kTailWorker, CoreRole::Aic,
+            7, tail_stats
+        );
+    const SharedExecTicketResult terminal =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            odd_tail_state, kFirstWorker, CoreRole::Aic,
+            7, first_stats
+        );
+    Check(
+        first.status == SharedExecTicketStatus::Acquired &&
+            first.task_count == 2 && first.task_ids[0] == 1 &&
+            first.task_ids[1] == 4 &&
+            tail.status == SharedExecTicketStatus::Acquired &&
+            tail.task_count == 1 && tail.task_ids[0] == 6 &&
+            tail.task_ids[1] == UINT32_MAX &&
+            terminal.status == SharedExecTicketStatus::Exhausted &&
+            first_stats.exec_dispatch_exhausted == 1 &&
+            tail_stats.exec_dispatch_exhausted == 1 &&
+            odd_tail_state->exec_dispatch.aic_next.value ==
+                ExecTicketTerminalCursor(3, 2) &&
+            ExecTicketBatchFetchCalls(3, 2) == 3 &&
+            NoFatal(*odd_tail_state),
+        kOddTailTest,
+        "odd generic plan returns a one-item tail and exact terminal cursor"
+    );
+    std::printf("[PASS] %s\n", kOddTailTest);
+
+    constexpr const char *kEmptyPlanTest =
+        "dual-ticket-empty-plan";
+    MappedSchedulerState empty_mapping;
+    SchedulerState *empty_state = empty_mapping.Get();
+    Check(
+        empty_state != nullptr, kEmptyPlanTest,
+        "state mapping"
+    );
+    if (empty_state == nullptr) return;
+    // task_count 表示算子逻辑任务总数，可以非零；该 engine 的执行计划
+    // 允许为空。此时没有尾批 owner，每个参与 worker 各观察一次越界。
+    empty_state->build_dispatch.task_count = 4;
+    empty_state->build_dispatch.executable_task_count = 0;
+    LocalStats empty_first_stats{};
+    LocalStats empty_second_stats{};
+    InitLocalStats(
+        empty_first_stats, kFirstWorker, CoreRole::Aic
+    );
+    InitLocalStats(
+        empty_second_stats, kTailWorker, CoreRole::Aic
+    );
+    const SharedExecTicketResult empty_first =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            empty_state, kFirstWorker, CoreRole::Aic,
+            4, empty_first_stats
+        );
+    const SharedExecTicketResult empty_second =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            empty_state, kTailWorker, CoreRole::Aic,
+            4, empty_second_stats
+        );
+    Check(
+        empty_first.status == SharedExecTicketStatus::Exhausted &&
+            empty_second.status == SharedExecTicketStatus::Exhausted &&
+            empty_first.task_count == 0 &&
+            empty_second.task_count == 0 &&
+            empty_first_stats.exec_dispatch_exhausted == 1 &&
+            empty_second_stats.exec_dispatch_exhausted == 1 &&
+            empty_state->exec_dispatch.aic_next.value ==
+                ExecTicketTerminalCursor(0, 2) &&
+            ExecTicketBatchFetchCalls(0, 2) == 2 &&
+            NoFatal(*empty_state),
+        kEmptyPlanTest,
+        "empty engine plan performs one terminal fetch per worker"
+    );
+    std::printf("[PASS] %s\n", kEmptyPlanTest);
+}
+
+void TestDualTicketRoleDistribution() {
+    constexpr const char *kTest = "dual-ticket-role-distribution";
     MappedSchedulerState mapping;
     SchedulerState *state = mapping.Get();
     Check(state != nullptr, kTest, "state mapping");
     if (state == nullptr) return;
+    LimitDefaultPlanToBatches(*state, 2);
 
-    SetTerminalCells(*state, /*task_count=*/5);
-    // terminal cells 动态证明应有两个 kernel completion，但 arrival
-    // 汇总只有一个；root 必须在 device 内拒绝收口。
-    SetDrainArrivals(*state, /*completed_tasks=*/1);
-    WorkerState &root = PrepareWorker(
-        *state, 0, CoreRole::Aic
+    const std::array<uint32_t, 4> aic_workers{7, 1, 31, 12};
+    const std::array<uint32_t, 4> aiv_workers{63, 32, 95, 47};
+    const std::array<std::array<uint32_t, 2>, 2> expected_aic{
+        std::array<uint32_t, 2>{1, 3},
+        std::array<uint32_t, 2>{6, 8},
+    };
+    const std::array<std::array<uint32_t, 2>, 2> expected_aiv{
+        std::array<uint32_t, 2>{2, 4},
+        std::array<uint32_t, 2>{7, 9},
+    };
+    std::array<LocalStats, 8> stats{};
+    bool exact = true;
+    for (uint32_t index = 0; index < 2; ++index) {
+        InitLocalStats(
+            stats[index], aic_workers[index], CoreRole::Aic
+        );
+        const SharedExecTicketResult ticket =
+            TakeSharedExecTicket<ExecScanTestOps>(
+                state, aic_workers[index], CoreRole::Aic,
+                10, stats[index]
+        );
+        exact &= ticket.status == SharedExecTicketStatus::Acquired &&
+            ticket.task_count == 2 &&
+            ticket.task_ids[0] == expected_aic[index][0] &&
+            ticket.task_ids[1] == expected_aic[index][1] &&
+            stats[index].exec_dispatch_exhausted ==
+                (index == 1 ? 1 : 0);
+
+        InitLocalStats(
+            stats[4 + index], aiv_workers[index], CoreRole::Aiv
+        );
+        const SharedExecTicketResult aiv_ticket =
+            TakeSharedExecTicket<ExecScanTestOps>(
+                state, aiv_workers[index], CoreRole::Aiv,
+                10, stats[4 + index]
+        );
+        exact &=
+            aiv_ticket.status == SharedExecTicketStatus::Acquired &&
+            aiv_ticket.task_count == 2 &&
+            aiv_ticket.task_ids[0] == expected_aiv[index][0] &&
+            aiv_ticket.task_ids[1] == expected_aiv[index][1] &&
+            stats[4 + index].exec_dispatch_exhausted ==
+                (index == 1 ? 1 : 0);
+    }
+    for (uint32_t index = 2; index < 4; ++index) {
+        InitLocalStats(
+            stats[index], aic_workers[index], CoreRole::Aic
+        );
+        InitLocalStats(
+            stats[4 + index], aiv_workers[index], CoreRole::Aiv
+        );
+        const SharedExecTicketResult aic_end =
+            TakeSharedExecTicket<ExecScanTestOps>(
+                state, aic_workers[index], CoreRole::Aic,
+                10, stats[index]
+            );
+        const SharedExecTicketResult aiv_end =
+            TakeSharedExecTicket<ExecScanTestOps>(
+                state, aiv_workers[index], CoreRole::Aiv,
+                10, stats[4 + index]
+            );
+        exact &= aic_end.status == SharedExecTicketStatus::Exhausted &&
+            aiv_end.status == SharedExecTicketStatus::Exhausted &&
+            stats[index].exec_dispatch_exhausted == 1 &&
+            stats[4 + index].exec_dispatch_exhausted == 1;
+    }
+    const SharedExecTicketResult first_aic_end =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            state, aic_workers[0], CoreRole::Aic,
+            10, stats[0]
+        );
+    const SharedExecTicketResult first_aiv_end =
+        TakeSharedExecTicket<ExecScanTestOps>(
+            state, aiv_workers[0], CoreRole::Aiv,
+            10, stats[4]
+        );
+    exact &=
+        first_aic_end.status == SharedExecTicketStatus::Exhausted &&
+        first_aiv_end.status == SharedExecTicketStatus::Exhausted &&
+        stats[0].exec_dispatch_exhausted == 1 &&
+        stats[4].exec_dispatch_exhausted == 1;
+    exact &= state->exec_dispatch.aic_next.value == 10 &&
+        state->exec_dispatch.aiv_next.value == 10 && NoFatal(*state);
+    Check(
+        exact, kTest,
+        "same-role workers consume disjoint two-task plan stripes and exact tails"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestDualTicketWaitingBuiltAndOwnerIndependence() {
+    constexpr const char *kTest =
+        "dual-ticket-waiting-built-owner-independence";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+    LimitDefaultPlanToBatches(*state, 1);
+    state->tasks[0].flag = 1;
+
+    constexpr uint32_t kExecutor = 0;
+    WorkerState &worker = PrepareWorker(
+        *state, kExecutor, CoreRole::Aic
     );
     LocalStats stats{};
-    InitLocalStats(stats, 0, CoreRole::Aic);
-    bool arrived = true;
-    bool closed = false;
-    const bool closure_ok =
-        ProgressCrossCoreExecDrainClosure<ExecScanTestOps>(
-            state, root, 5, stats, arrived, closed
+    InitLocalStats(stats, kExecutor, CoreRole::Aic);
+    ExecScanTestOps::ResetObservations();
+
+    const uint32_t empty_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 5, false,
+            DrainPlace::EfDrain, stats
         );
     Check(
-        !closure_ok && arrived && !closed &&
-            FatalMatches(
-                *state, ExecFatalReason::CompletionStateConflict,
-                5, 0
-            ),
+        empty_progress == 0 &&
+            state->exec_dispatch.aic_next.value == 2 &&
+            state->exec_tokens[kExecutor][0].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][0].control.task_id == 1 &&
+            state->exec_tokens[kExecutor][1].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][1].control.task_id == 3 &&
+            stats.max_occupied == 2 &&
+            stats.exec_dispatch_exhausted == 1 && NoFatal(*state),
         kTest,
-        "arrival count must equal executable DONE cells derived at runtime"
+        "one boundary retains one generic two-task ticket batch"
+    );
+
+    const uint32_t second_empty_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 5, false,
+            DrainPlace::EfDrain, stats
+        );
+    const uint32_t exhaust_probe_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 5, false,
+            DrainPlace::EfDrain, stats
+        );
+    const ExecutionTokenControl &first_wait =
+        state->exec_tokens[kExecutor][0].control;
+    const ExecutionTokenControl &second_wait =
+        state->exec_tokens[kExecutor][1].control;
+    Check(
+        second_empty_progress == 0 &&
+            exhaust_probe_progress == 0 &&
+            state->exec_dispatch.aic_next.value == 2 &&
+            first_wait.phase == ExecTokenPhase::WaitingBuilt &&
+            first_wait.task_id == 1 &&
+            second_wait.phase == ExecTokenPhase::WaitingBuilt &&
+            second_wait.task_id == 3 &&
+            stats.max_occupied == 2 &&
+            stats.exec_dispatch_exhausted == 1 && NoFatal(*state),
+        kTest,
+        "tail batch proves exhaustion without another cursor operation"
+    );
+
+    Check(
+        PublishKernelCell(
+            *state, 1, kExecutor, TaskKind::Qk
+        ),
+        kTest, "publish same-owner QK payload"
+    );
+    const uint32_t same_owner_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 5, false,
+            DrainPlace::EfDrain, stats
+        );
+    const DecodedExecState qk_done = DecodeExecState(
+        state->exec_cells[1].control.state
+    );
+    Check(
+        same_owner_progress == 1 && qk_done.valid &&
+            qk_done.phase == ExecPhase::Done &&
+            qk_done.build_owner == kExecutor &&
+            qk_done.execute_owner == kExecutor &&
+            state->tasks[1].flag == 1 &&
+            stats.exec_dispatch_exhausted == 1 &&
+            state->exec_dispatch.aic_next.value == 2 &&
+            NoFatal(*state),
+        kTest,
+        "same Scalar may independently own Build and Execute"
+    );
+
+    Check(
+        PublishKernelCell(
+            *state, 3, kAivBuildOwner,
+            TaskKind::Pv, {1}
+        ),
+        kTest, "publish cross-role-built PV payload"
+    );
+    const uint32_t cross_owner_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 5, true,
+            DrainPlace::FinalDrain, stats
+        );
+    const DecodedExecState pv_done = DecodeExecState(
+        state->exec_cells[3].control.state
+    );
+    Check(
+        cross_owner_progress == 1 && pv_done.valid &&
+            pv_done.phase == ExecPhase::Done &&
+            pv_done.build_owner == kAivBuildOwner &&
+            pv_done.execute_owner == kExecutor &&
+            CrossCoreExecWorkerDrained(
+                state, worker, 5, stats
+            ) &&
+            CrossCoreExecAllTokensFullyReset(
+                state, kExecutor
+            ) && NoFatal(*state),
+        kTest,
+        "cross-owner payload uses the same ticket and completion protocol"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestBlockedTokenStopsSameBoundaryLookahead() {
+    constexpr const char *kTest =
+        "blocked-token-stops-same-boundary-lookahead";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+    LimitDefaultPlanToBatches(*state, 2);
+
+    constexpr uint32_t kExecutor = 0;
+    WorkerState &worker = PrepareWorker(
+        *state, kExecutor, CoreRole::Aic
+    );
+    LocalStats stats{};
+    InitLocalStats(stats, kExecutor, CoreRole::Aic);
+    ExecScanTestOps::ResetObservations();
+
+    const uint32_t first_progress =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 10, false,
+            DrainPlace::EfDrain, stats
+        );
+    Check(
+        first_progress == 0 &&
+            state->exec_dispatch.aic_next.value == 2 &&
+            stats.max_occupied == 2 &&
+            stats.exec_dispatch_exhausted == 0 &&
+            state->exec_tokens[kExecutor][0].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][0].control.task_id == 1 &&
+            state->exec_tokens[kExecutor][1].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][1].control.task_id == 3 &&
+            state->exec_tokens[kExecutor][2].control.phase ==
+                ExecTokenPhase::Idle &&
+            state->exec_tokens[kExecutor][3].control.phase ==
+                ExecTokenPhase::Idle &&
+            NoFatal(*state),
+        kTest,
+        "one boundary takes one pair and stops when either task is unpublished"
+    );
+
+    uint32_t later_progress = 0;
+    for (uint32_t boundary = 0; boundary < 3; ++boundary) {
+        later_progress += ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 10, false,
+            DrainPlace::EfDrain, stats
+        );
+    }
+    Check(
+        later_progress == 0 &&
+            state->exec_dispatch.aic_next.value == 4 &&
+            stats.max_occupied == 4 &&
+            stats.exec_dispatch_exhausted == 1 &&
+            state->exec_tokens[kExecutor][0].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][0].control.task_id == 1 &&
+            state->exec_tokens[kExecutor][1].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][1].control.task_id == 3 &&
+            state->exec_tokens[kExecutor][2].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][2].control.task_id == 6 &&
+            state->exec_tokens[kExecutor][3].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][3].control.task_id == 8 &&
+            !CrossCoreExecWorkerDrained(
+                state, worker, 10, stats
+            ) && NoFatal(*state),
+        kTest,
+        "separate progress boundaries fill two disjoint pairs and prove the tail"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestFaninWaitStillAllowsBoundedLookahead() {
+    constexpr const char *kTest =
+        "fanin-wait-allows-bounded-lookahead";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+    LimitDefaultPlanToBatches(*state, 2);
+
+    constexpr uint32_t kExecutor = 0;
+    WorkerState &worker = PrepareWorker(
+        *state, kExecutor, CoreRole::Aic
+    );
+    LocalStats stats{};
+    InitLocalStats(stats, kExecutor, CoreRole::Aic);
+    ExecScanTestOps::ResetObservations();
+    // 跳过无 fanin 的 QK#1，从真实依赖 QK#1 的 PV#3 开始领取。
+    state->exec_dispatch.aic_next.value = 1;
+    Check(
+        PublishKernelCell(
+            *state, 3, kAivBuildOwner,
+            TaskKind::Pv, {1}
+        ),
+        kTest, "publish PV payload with an unready QK fanin"
+    );
+
+    const uint32_t progressed =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 10, false,
+            DrainPlace::EfDrain, stats
+        );
+    Check(
+        progressed == 0 &&
+            state->exec_dispatch.aic_next.value == 3 &&
+            state->exec_tokens[kExecutor][0].control.phase ==
+                ExecTokenPhase::WaitingFanin &&
+            state->exec_tokens[kExecutor][0].control.task_id == 3 &&
+            state->exec_tokens[kExecutor][1].control.phase ==
+                ExecTokenPhase::WaitingBuilt &&
+            state->exec_tokens[kExecutor][1].control.task_id == 6 &&
+            stats.max_occupied == 2 && NoFatal(*state),
+        kTest,
+        "claimed fanin wait permits one more ticket before an unpublished task stops the boundary"
+    );
+    std::printf("[PASS] %s\n", kTest);
+}
+
+void TestDualTicketDuplicateConsumerFailsClosed() {
+    constexpr const char *kTest =
+        "dual-ticket-duplicate-consumer-fails-closed";
+    MappedSchedulerState mapping;
+    SchedulerState *state = mapping.Get();
+    Check(state != nullptr, kTest, "state mapping");
+    if (state == nullptr) return;
+    LimitDefaultPlanToBatches(*state, 1);
+
+    constexpr uint32_t kTicketOwner = 0;
+    WorkerState &worker = PrepareWorker(
+        *state, kTicketOwner, CoreRole::Aic
+    );
+    LocalStats stats{};
+    InitLocalStats(stats, kTicketOwner, CoreRole::Aic);
+    ExecScanTestOps::ResetObservations();
+    (void)ProgressCrossCoreExec<ExecScanTestOps>(
+        state, worker, 5, false,
+        DrainPlace::EfDrain, stats
+    );
+    Check(
+        PublishKernelCell(*state, 1, 7, TaskKind::Qk),
+        kTest, "publish claimed-conflict source"
+    );
+    const DecodedExecState built = DecodeExecState(
+        state->exec_cells[1].control.state
+    );
+    SetCellState(
+        *state, 1, ExecPhase::Claimed,
+        built.build_owner, 1,
+        built.engine_class, built.payload_lines
+    );
+    const uint32_t progressed =
+        ProgressCrossCoreExec<ExecScanTestOps>(
+            state, worker, 5, false,
+            DrainPlace::EfDrain, stats
+        );
+    Check(
+        progressed == 0 &&
+            FatalMatches(
+                *state, ExecFatalReason::InvalidBuiltControl,
+                1, kTicketOwner
+            ) &&
+            state->exec_tokens[kTicketOwner][0].control.phase ==
+                ExecTokenPhase::Faulted,
+        kTest,
+        "a unique ticket never treats an existing CLAIMED owner as a loser"
     );
     std::printf("[PASS] %s\n", kTest);
 }
@@ -761,24 +1123,22 @@ void TestDrainCompletionMismatchFailsClosed() {
 }  // namespace
 
 int main() {
-    TestBothRolesScanWholeTaskRange();
-    TestZeroTaskRange();
-    TestAllWorkersReachExactTerminalCursors();
-    TestRuntimeCellRoutesAndConsumesOnce();
-    TestClosedBuildingCellFailsClosed();
-    TestDrainDerivesExecutableCountFromTerminalCells();
-    TestDrainCompletionMismatchFailsClosed();
+    TestDualTicketOddTailAndEmptyPlan();
+    TestDualTicketRoleDistribution();
+    TestDualTicketWaitingBuiltAndOwnerIndependence();
+    TestBlockedTokenStopsSameBoundaryLookahead();
+    TestFaninWaitStillAllowsBoundedLookahead();
+    TestDualTicketDuplicateConsumerFailsClosed();
+    TestDrainCompletionCountMismatchFailsClosed();
+    TestDrainUsesPublishedExecutableTaskCount();
 
     if (g_failures != 0) {
         std::fprintf(
-            stderr,
-            "[FAIL] cross-core runtime Execute scan: %d checks failed\n",
+            stderr, "[FAIL] cross-core Execute ticket: %d checks failed\n",
             g_failures
         );
         return 1;
     }
-    std::printf(
-        "[PASS] cross-core runtime Execute scan and drain closure\n"
-    );
+    std::printf("[PASS] cross-core Execute ticket and drain closure\n");
     return 0;
 }

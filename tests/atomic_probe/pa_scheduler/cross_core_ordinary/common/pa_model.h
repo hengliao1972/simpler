@@ -150,7 +150,7 @@ constexpr uint32_t kBuildIdentityMagic = 0x50414249U;  // "PABI"
 constexpr uint32_t kBuildIdentityCompactGenericTraceBit =
     1U << 31U;
 #if PTO_FDWIC_SHARED_MAP
-constexpr uint32_t kBuildIdentityAbiGeneration = 16;
+constexpr uint32_t kBuildIdentityAbiGeneration = 15;
 #else
 constexpr uint32_t kBuildIdentityAbiGeneration = 4;
 #endif
@@ -758,7 +758,7 @@ enum class AtomicSite : uint32_t {
     SharedHeapCursorReserve = 17,
     SharedHeapVendAdvance = 18,
     // shared Register 的 insert-turn 等待只按一次 Wait episode 聚合，
-    // 不为循环内每次 Load 写 raw；handoff 使用返回型 CAS 精确证明唯一发布。
+    // 不为循环内每次 Load 写 raw；handoff FetchAdd 只保留 source-issue。
     SharedInsertTurnPoll = 19,
     SharedInsertTurnHandoff = 20,
     // shared 正式 Submit 中原先绕过 TraceAtomic* 的固定调用点。读取类按
@@ -792,8 +792,8 @@ enum class AtomicSite : uint32_t {
     // 都参与胜负判断，必须按 return-ready 边界观察。
     SharedClaimTournamentLocal = 40,
     SharedClaimTournamentRoot = 41,
-    // 旧 central Build ticket 编号作为 append-only raw ABI 保留；新的
-    // 全员 replay 正式入口不再发射该站点。
+    // shared Build 中央发放器的单调 ticket。FetchAdd 返回旧值直接决定
+    // 本核取得的 task id；超过 task_count 的返回值表示该 worker 完成退场。
     SharedBuildDispatchTicket = 42,
     // cross-core execution package 的共享协议原语。原先这些调用直接落到
     // Ops，导致 WinnerBuild、EfDrain/FinalDrain 中存在无法解释的大段空白；
@@ -816,11 +816,7 @@ enum class AtomicSite : uint32_t {
     // AIC/AIV 各自中央 Execute 发放器的返回型 ticket。两种角色使用
     // 不同 cache line，但共享同一个语义站点；role 由泳道归属区分。
     SharedExecDispatchTicket = 56,
-    // 96 个 Scalar 完成真实 replay 后，用同一条 CAS seal 对照本核实际
-    // 回放得到的 task_count 与顺序身份摘要。它只做一致性封口，不发布
-    // task 身份，也不参与 Build owner 决策。
-    SharedReplayIdentitySeal = 57,
-    Count = 58,
+    Count = 57,
 };
 
 // Atomic 记录 flags 的低四位保存操作种类；bit4 表示返回值参与后续判断，
@@ -878,10 +874,7 @@ enum class DcciSite : uint32_t {
     SharedExecPayloadFlush = 11,
     SharedExecPayloadInvalidate = 12,
     SharedExecTokenDescriptorInvalidate = 13,
-    // 每核真实 replay 会直接读取 Host 写入的 context_lens。A5 Scalar
-    // 无 cache coherence，必须在第一次读取前显式失效活动输入区。
-    StartupContextLensInvalidate = 14,
-    Count = 15,
+    Count = 14,
 };
 
 constexpr uint32_t kDcciOpMask = 0x03U;
@@ -909,6 +902,7 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedHeapVendAdvance:
         case AtomicSite::SharedBuildDispatchTicket:
         case AtomicSite::SharedExecDispatchTicket:
+        case AtomicSite::SharedInsertTurnHandoff:
         case AtomicSite::SharedExecDrainArrive:
             return AtomicOp::FetchAdd;
         case AtomicSite::FatalSet:
@@ -922,8 +916,6 @@ PA_MODEL_INLINE constexpr AtomicOp AtomicSiteExpectedOp(AtomicSite site) {
         case AtomicSite::SharedMetadataLastWriterCommit:
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
-        case AtomicSite::SharedInsertTurnHandoff:
-        case AtomicSite::SharedReplayIdentitySeal:
         case AtomicSite::SharedExecFatalSet:
         case AtomicSite::SharedExecBuildReserve:
         case AtomicSite::SharedExecBuiltPublish:
@@ -955,6 +947,7 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedOutputRollbackExchange:
         case AtomicSite::SharedExecCompletionVendPublish:
         case AtomicSite::SharedExecDrainReleasePublish:
+        case AtomicSite::SharedInsertTurnHandoff:
             return false;
         case AtomicSite::StartupPoll:
         case AtomicSite::FatalPoll:
@@ -991,8 +984,6 @@ PA_MODEL_INLINE constexpr bool AtomicSiteResultUsed(AtomicSite site) {
         case AtomicSite::SharedMapAppendTailExchange:
         case AtomicSite::SharedClaimTournamentLocal:
         case AtomicSite::SharedClaimTournamentRoot:
-        case AtomicSite::SharedInsertTurnHandoff:
-        case AtomicSite::SharedReplayIdentitySeal:
         case AtomicSite::SharedBuildDispatchTicket:
         case AtomicSite::SharedExecDispatchTicket:
         case AtomicSite::SharedExecFatalLoad:
@@ -1105,9 +1096,9 @@ PA_MODEL_INLINE constexpr bool DcciSiteIsSharedOnly(DcciSite site) {
 }
 
 #if PTO_FDWIC_SHARED_MAP
-// task-specific 初值让唯一 owner 以返回型 CAS 发布完成并同步证明没有
-// 重复发布：合法旧值严格为 task_id-1，合法终值严格为 task_id。
-// 该值只用于 atomic-only completion line，不参与普通 store/DCCI。
+// task-specific 初值让唯一 owner 可以用非返回型 FetchAdd(+1) 发布完成，
+// 同时保留重复发布可检错性：合法终值严格等于 task_id，重复一次则为
+// task_id+1。该值只用于 atomic-only TaskCell，不参与普通 store/DCCI。
 PA_MODEL_INLINE constexpr int64_t SharedInsertCompletionInitialValue(
     uint32_t task_id
 ) {
@@ -1129,10 +1120,6 @@ static_assert(
 static_assert(
     !DcciSiteIsSharedOnly(DcciSite::StartupConfigInvalidate),
     "startup config invalidate must remain available in both TensorMap modes"
-);
-static_assert(
-    DcciSiteIsSharedOnly(DcciSite::StartupContextLensInvalidate),
-    "shared replay context-lens invalidate must remain shared-only"
 );
 
 #undef PA_MODEL_INLINE
@@ -1408,9 +1395,9 @@ static_assert(
     "shared Claim Tournament owner must start its node"
 );
 
-// S7 真实 replay 中，root owner 与全部 local owner 正式承担每 task 两级
-// CAS Tournament。root 的第二条 cache line 独立保存严格 TensorMap 插入
-// 完成字；它不增加 sidecar 字节数，也不与 owner 或 payload/DCCI 共线。
+// 中央 Build ticket 启用后，root owner 与全部 local owner 都只作为旧 Claim
+// canary 保留。root 原本未使用的第二条 cache line 复用为严格 TensorMap
+// 插入完成字；它不增加 sidecar 字节数，也不与普通 payload/DCCI 共线。
 struct alignas(64) SharedClaimTournamentRoot {
     AtomicLine owner;
     AtomicLine insert_completion;
@@ -1446,34 +1433,115 @@ static_assert(
     "shared Claim local nodes must follow the root"
 );
 
-// 真实 replay 只需要一条原子线保存 (identity_hash, task_count) 封口。
-// 第二条 64B 只做地址隔离；不读、不写，也绝不能对它执行 DCCI。
-// 总跨度固定为 128B，避免改变 A5 的原子冲突单元拓扑。
-struct alignas(64) SharedReplayIdentitySealState {
-    AtomicLine line;
-    uint8_t isolation_padding[64];
+struct SharedBuildDispatchTaskIdentity {
+    // task_id 由数组下标给出；batch/encoded_meta 属于 PA 前端身份。
+    // exec_route 则是公共执行器唯一允许消费的算子无关路由：是否执行及
+    // engine class。不得再由 TaskKind 或 batch 数反推。
+    uint16_t batch;
+    uint8_t encoded_meta;
+    uint8_t exec_route;
 };
 static_assert(
-    alignof(SharedReplayIdentitySealState) == 64 &&
-        offsetof(SharedReplayIdentitySealState, line) == 0 &&
-        sizeof(SharedReplayIdentitySealState) == 128,
-    "shared replay identity seal must occupy one isolated 128B slot"
+    sizeof(SharedBuildDispatchTaskIdentity) == 4,
+    "shared Build dispatch task identity must remain compact"
 );
 
-// AIC/AIV 分别扫描完整的运行时 exec cell 空间。两条返回型 FetchAdd
-// cursor 各自占一个 128B 槽；其中 padding 只用作越界写 canary。
-struct alignas(64) SharedExecScanCursorState {
-    AtomicLine aic_next;
-    uint8_t aic_isolation_padding[64];
-    AtomicLine aiv_next;
-    uint8_t aiv_isolation_padding[64];
+// operator/host 在 launch 前明确标注哪些 task 会产生
+// TensorMap ordinary/symbol writer metadata。这是算子无关的只读
+// 计划：公共调度器只消费 task-id bit，不解码 PA kind。
+constexpr uint32_t kSharedMetadataWriterWordCount =
+    (kMaxTasks + 63U) / 64U;
+constexpr uint32_t kSharedBuildDispatchTailPadding =
+    64U - static_cast<uint32_t>(
+        (sizeof(SharedBuildDispatchTaskIdentity) * kMaxTasks +
+         sizeof(uint64_t) * kSharedMetadataWriterWordCount) % 64U
+    );
+static_assert(
+    kSharedMetadataWriterWordCount != 0 &&
+        kSharedBuildDispatchTailPadding >= 1U &&
+        kSharedBuildDispatchTailPadding <= 64U,
+    "shared metadata-writer plan sizing is invalid"
+);
+
+struct alignas(64) SharedBuildDispatchState {
+    // next_task 是本结构唯一的 device 可写字段，并独占第一条 cache line。
+    // 后续 header/plan 均由 host 在 launch 前一次写定，device 只读。
+    AtomicLine next_task;
+    uint32_t task_count;
+    uint32_t batch_count;
+    // 由 host 计划逐 task 统计，不允许 FinalDrain 用 PA 的
+    // task_count-batches 形状反推。0 是合法值，可覆盖纯 metadata 计划。
+    uint32_t executable_task_count;
+    // host/operator 在 launch 前发布 metadata writer 分类计数。当前热路
+    // 只消费 ordinary==0 的通用快路径：若全计划没有 ordinary writer，
+    // Gm/LocalTensor lookup 不必等待无关的 symbol-writer 前缀。总 writer
+    // 的 bitset 及逐 task delta 交叉校验仍决定严格插入链，计数不授予
+    // writer 资格。
+    uint32_t metadata_writer_count;
+    uint32_t ordinary_metadata_writer_count;
+    uint32_t symbol_metadata_writer_count;
+    uint8_t header_padding[64 - 6 * sizeof(uint32_t)];
+    SharedBuildDispatchTaskIdentity tasks[kMaxTasks];
+    uint64_t metadata_writer_bits[
+        kSharedMetadataWriterWordCount
+    ];
+    uint8_t plan_tail_padding[
+        kSharedBuildDispatchTailPadding
+    ];
 };
 static_assert(
-    alignof(SharedExecScanCursorState) == 64 &&
-        offsetof(SharedExecScanCursorState, aic_next) == 0 &&
-        offsetof(SharedExecScanCursorState, aiv_next) == 128 &&
-        sizeof(SharedExecScanCursorState) == 256,
-    "shared Execute scan cursors must occupy two isolated 128B slots"
+    offsetof(SharedBuildDispatchState, tasks) == 128,
+    "shared Build dispatch plan must start on its own cache line"
+);
+static_assert(
+    offsetof(SharedBuildDispatchState, executable_task_count) == 72,
+    "shared Build dispatch executable count offset changed"
+);
+static_assert(
+    offsetof(
+        SharedBuildDispatchState,
+        ordinary_metadata_writer_count
+    ) == 80,
+    "shared Build dispatch ordinary-writer count offset changed"
+);
+static_assert(
+    sizeof(SharedBuildDispatchState) ==
+        128 + sizeof(SharedBuildDispatchTaskIdentity) * kMaxTasks +
+        sizeof(uint64_t) * kSharedMetadataWriterWordCount +
+        kSharedBuildDispatchTailPadding,
+    "shared Build dispatch state size changed"
+);
+static_assert(
+    sizeof(SharedBuildDispatchState) % 64 == 0,
+    "shared Build dispatch state must occupy whole cache lines"
+);
+
+// Execute 与 Build 使用两套独立 owner 决策。host 只按公共 exec_route
+// 生成两份 task-id 表；device 侧 32 个 AIC 与 64 个 AIV 分别竞争自己的
+// 单调 cursor。cursor 各自独占 cache line，静态计划也从独立行开始，避免
+// AIC/AIV ticket 以及只读 header 之间发生伪共享。
+struct alignas(64) SharedExecDispatchState {
+    AtomicLine aic_next;
+    AtomicLine aiv_next;
+    uint32_t aic_task_count;
+    uint32_t aiv_task_count;
+    uint8_t header_padding[64 - 2 * sizeof(uint32_t)];
+    uint32_t aic_task_ids[kMaxTasks];
+    uint32_t aiv_task_ids[kMaxTasks];
+};
+static_assert(
+    offsetof(SharedExecDispatchState, aic_task_ids) == 192,
+    "shared Execute AIC plan must start on its own cache line"
+);
+static_assert(
+    offsetof(SharedExecDispatchState, aiv_task_ids) ==
+        192 + sizeof(uint32_t) * kMaxTasks,
+    "shared Execute AIV plan offset changed"
+);
+static_assert(
+    offsetof(SharedExecDispatchState, aiv_task_ids) % 64 == 0 &&
+        sizeof(SharedExecDispatchState) % 64 == 0,
+    "shared Execute dispatch state must occupy whole cache lines"
 );
 #endif
 
@@ -2201,11 +2269,12 @@ struct alignas(64) SchedulerState {
     cross_core::SharedExecCell exec_cells[kMaxTasks];
     cross_core::ExecutionToken
         exec_tokens[kWorkers][cross_core::kExecTokensPerWorker];
-    // 真实 replay 的身份封口与 AIC/AIV 运行时扫描游标是仅剩的三条
-    // 调度原子线。它们各自占一个 128B 冲突单元，不携带任何 Host 预制
-    // task identity、writer bitset 或 Execute task-id 表。
-    SharedReplayIdentitySealState replay_identity_seal;
-    SharedExecScanCursorState exec_scan_cursors;
+    // 低原子 Build 发放状态继续追加在 standalone sidecar 尾部，不移动
+    // production prefix、TensorMap、Claim Tournament 或执行 cell。
+    SharedBuildDispatchState build_dispatch;
+    // AIC/AIV 双中央 Execute ticket 继续追加，不移动已经验证的 Build
+    // 发放 ABI。task 表由 host 写定，device 只更新两条 cursor line。
+    SharedExecDispatchState exec_dispatch;
 #endif
 };
 static_assert(offsetof(SchedulerState, cube_cursor) == 0, "cube cursor offset must match PA DistGlobal");
@@ -2287,17 +2356,17 @@ static_assert(
     "executor tokens must follow all task-indexed cells"
 );
 static_assert(
-    offsetof(SchedulerState, replay_identity_seal) ==
+    offsetof(SchedulerState, build_dispatch) ==
         offsetof(SchedulerState, exec_tokens) +
             sizeof(cross_core::ExecutionToken) * kWorkers *
                 cross_core::kExecTokensPerWorker,
-    "shared replay identity seal must follow executor tokens"
+    "shared Build dispatch state must follow executor tokens"
 );
 static_assert(
-    offsetof(SchedulerState, exec_scan_cursors) ==
-        offsetof(SchedulerState, replay_identity_seal) +
-            sizeof(SharedReplayIdentitySealState),
-    "shared Execute scan cursors must follow replay identity seal"
+    offsetof(SchedulerState, exec_dispatch) ==
+        offsetof(SchedulerState, build_dispatch) +
+            sizeof(SharedBuildDispatchState),
+    "shared Execute dispatch state must follow Build dispatch"
 );
 static_assert(
         offsetof(SchedulerState, exec_fatal) %
@@ -2308,22 +2377,11 @@ static_assert(
                 cross_core::kExecCacheLineBytes == 0 &&
         offsetof(SchedulerState, exec_tokens) %
                 cross_core::kExecCacheLineBytes == 0 &&
-        offsetof(SchedulerState, replay_identity_seal) %
+        offsetof(SchedulerState, build_dispatch) %
                 cross_core::kExecCacheLineBytes == 0 &&
-        offsetof(SchedulerState, exec_scan_cursors) %
+        offsetof(SchedulerState, exec_dispatch) %
                 cross_core::kExecCacheLineBytes == 0,
     "cross-core execution sidecars must remain cache-line aligned"
-);
-static_assert(
-    offsetof(SchedulerState, exec_scan_cursors) +
-            offsetof(SharedExecScanCursorState, aic_next) -
-            (offsetof(SchedulerState, replay_identity_seal) +
-             offsetof(SharedReplayIdentitySealState, line)) == 128 &&
-        offsetof(SchedulerState, exec_scan_cursors) +
-            offsetof(SharedExecScanCursorState, aiv_next) -
-            (offsetof(SchedulerState, exec_scan_cursors) +
-             offsetof(SharedExecScanCursorState, aic_next)) == 128,
-    "replay seal and Execute cursors must occupy distinct 128B conflict units"
 );
 constexpr uint64_t kCrossCoreExecStateBytes =
     sizeof(cross_core::SharedExecFatalControl) +
@@ -2331,8 +2389,8 @@ constexpr uint64_t kCrossCoreExecStateBytes =
     sizeof(cross_core::SharedExecCell) * kMaxTasks +
     sizeof(cross_core::ExecutionToken) * kWorkers *
         cross_core::kExecTokensPerWorker +
-    sizeof(SharedReplayIdentitySealState) +
-    sizeof(SharedExecScanCursorState);
+    sizeof(SharedBuildDispatchState) +
+    sizeof(SharedExecDispatchState);
 #if PTO_FDWIC_TENSORMAP_RING_CAP == 128
 #if defined(PA_COMPETE_FIRST_SPLIT_FINISH)
 static_assert(

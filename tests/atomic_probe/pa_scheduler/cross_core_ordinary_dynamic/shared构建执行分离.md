@@ -1,5 +1,9 @@
 # Shared TensorMap 构建与执行分离设计记录
 
+本文只描述 `cross_core_ordinary_dynamic/` 的无 Host 预制计划路径。Host 在
+launch 前预制 `SharedHostTaskPlan` 的原始实现已恢复到
+`cross_core_ordinary/`，作为独立性能基线；两者不共享行为开关。
+
 ## 0. 当前状态
 
 | 项目 | 状态 |

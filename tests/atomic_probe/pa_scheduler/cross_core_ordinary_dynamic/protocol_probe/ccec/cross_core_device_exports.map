@@ -1,0 +1,7 @@
+{
+    global:
+        cross_core_payload_probe_0_mix_aic;
+        cross_core_payload_probe_0_mix_aiv;
+    local:
+        *;
+};

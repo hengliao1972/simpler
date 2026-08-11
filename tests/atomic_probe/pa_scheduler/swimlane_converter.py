@@ -193,8 +193,9 @@ ATOMIC_OP_NAMES = {
 
 # schema-v3/4 的校验表必须与 standalone C++ 的稳定 AtomicSite 编号一致。
 # 0..14 是既有 common/private 站点，15..18 是 shared heap，19/20 是
-# shared Register 插入轮次的等待 Load 与返回型 CompareExchange 发布；真实 PA 的 BlockWon
-# 不属于本用例，不能为了兼容生产 converter 凭空放宽。
+# shared Register 插入轮次的等待 Load 与当前返回型 CAS 发布。Host 预制
+# 基线曾用同一 append-only site 20 表示 FetchAdd，由 schema-v5 元数据分支
+# 显式兼容。真实 PA 的 BlockWon 不属于本用例，不能凭空放宽。
 ATOMIC_SITE_OP_IDS = {
     0: 2,
     1: 0,
@@ -515,6 +516,9 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
     submit_topology = metadata.get(
         "submit_topology", "all_worker_replay"
     )
+    shared_insert_completion_atomic = metadata.get(
+        "shared_insert_completion_atomic"
+    )
     if trace_schema_version == 5:
         if tensormap_mode not in ("private", "shared"):
             raise ValueError(
@@ -536,14 +540,35 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                 "metadata.submit_topology=central_ticket requires shared "
                 "TensorMap mode"
             )
-    elif tensormap_mode is not None:
-        raise ValueError(
-            "metadata.tensormap_mode is only valid for trace_schema_version=5"
-        )
-    elif "submit_topology" in metadata:
-        raise ValueError(
-            "metadata.submit_topology is only valid for trace_schema_version=5"
-        )
+        if shared_insert_completion_atomic is not None:
+            if tensormap_mode != "shared":
+                raise ValueError(
+                    "metadata.shared_insert_completion_atomic is only valid "
+                    "for shared TensorMap"
+                )
+            if shared_insert_completion_atomic not in (
+                "fetch_add", "compare_exchange"
+            ):
+                raise ValueError(
+                    "metadata.shared_insert_completion_atomic must be "
+                    "fetch_add or compare_exchange"
+                )
+    else:
+        if tensormap_mode is not None:
+            raise ValueError(
+                "metadata.tensormap_mode is only valid for "
+                "trace_schema_version=5"
+            )
+        if "submit_topology" in metadata:
+            raise ValueError(
+                "metadata.submit_topology is only valid for "
+                "trace_schema_version=5"
+            )
+        if "shared_insert_completion_atomic" in metadata:
+            raise ValueError(
+                "metadata.shared_insert_completion_atomic is only valid for "
+                "trace_schema_version=5"
+            )
     metadata_writer_tasks_raw = metadata.get(
         "shared_metadata_writer_tasks"
     )
@@ -776,6 +801,7 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
     v4_shared_insert_turn_handoffs: dict[
         tuple[int, int], list[tuple[Any, ...]]
     ] = {}
+    historical_shared_insert_completion_atomic_ops: set[int] = set()
     # 逐行在写输出前检查列数、范围和可转整数的字段。任一行不满足这些约束
     # 都会整体拒绝输入，不生成缺少关键阶段的“部分可看”泳道。
     for index, row in enumerate(rows):
@@ -903,16 +929,27 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                     auxiliary in ATOMIC_SITE_OP_IDS
                     and auxiliary not in ATOMIC_RESULT_UNUSED_SITE_IDS
                 )
-                if (
-                    auxiliary == SHARED_INSERT_TURN_HANDOFF_SITE_ID
-                    and submit_topology == "all_worker_replay"
-                ):
-                    # Scalar cross-core 的全员真实 replay 让每个 task（包括
-                    # 空 writer）用返回型 CAS 发布独立 insert completion。
-                    # 旧稀疏 writer FetchAdd 已退出正式协议；稳定 site 编号
-                    # 保持不变，schema-v5 按当前拓扑要求 CAS/return-ready。
-                    expected_atomic_op = 4
-                    expected_result_used = True
+                if auxiliary == SHARED_INSERT_TURN_HANDOFF_SITE_ID:
+                    # append-only site 20 同时覆盖两套已落盘协议：Host 预制
+                    # central-ticket 用不消费返回值的 FetchAdd；动态逐 task
+                    # completion 用返回型 CAS。新 raw 由 metadata 显式定版；
+                    # 缺少该字段的历史 central-ticket raw 继续按实际 FetchAdd
+                    # 兼容，既有 CAS fixture 与 all-worker raw 仍严格按 CAS。
+                    if shared_insert_completion_atomic == "fetch_add":
+                        expected_atomic_op = 2
+                        expected_result_used = False
+                    elif (
+                        shared_insert_completion_atomic == "compare_exchange"
+                        or submit_topology == "all_worker_replay"
+                    ):
+                        expected_atomic_op = 4
+                        expected_result_used = True
+                    elif atomic_op == 2:
+                        expected_atomic_op = 2
+                        expected_result_used = False
+                    else:
+                        expected_atomic_op = 4
+                        expected_result_used = True
                 if (
                     expected_atomic_op != atomic_op
                     or result_used != expected_result_used
@@ -932,6 +969,21 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         f"fdwic_events[{index}] has invalid direct Atomic "
                         f"site={auxiliary} flags=0x{flags:x}"
                     )
+                if (
+                    auxiliary == SHARED_INSERT_TURN_HANDOFF_SITE_ID
+                    and submit_topology == "central_ticket"
+                    and shared_insert_completion_atomic is None
+                ):
+                    historical_shared_insert_completion_atomic_ops.add(
+                        atomic_op
+                    )
+                    if len(
+                        historical_shared_insert_completion_atomic_ops
+                    ) > 1:
+                        raise ValueError(
+                            "historical central-ticket raw mixes FetchAdd and "
+                            "CompareExchange SharedInsertTurnHandoff records"
+                        )
                 if result_used:
                     v3_result_used_direct_rows.append((index, core_id, return_ready))
             observed_summary["atomic_records"] += 1
@@ -1619,10 +1671,15 @@ def _load_and_validate(  # noqa: PLR0912, PLR0915
                         1 if task_key[1] in handoff_task_set else 0
                     )
                     if len(handoffs) != expected_handoff_count:
+                        handoff_atomic_name = (
+                            "FetchAdd"
+                            if shared_insert_completion_atomic == "fetch_add"
+                            else "CompareExchange"
+                        )
                         raise ValueError(
                             "shared schema-v5 level4 requires exactly one "
                             "SharedInsertTurnHandoff direct "
-                            "CompareExchange per "
+                            f"{handoff_atomic_name} per "
                             "required insert completion and none otherwise at "
                             f"{task_key}: count={len(handoffs)} "
                             f"expected={expected_handoff_count}"

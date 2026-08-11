@@ -102,10 +102,11 @@ echo "[TEST] atomic PollBatch boundary self-test"
 # shared ring 是当前 ordered writer-delta 的 ordinary-region 原语，隔离
 # 覆盖 seq/ABA、回收与容量预检。PA Case1 当前 ordinary entry 为零，
 # 因此这些门槛仍不能代替后面的完整 96-worker Submit 测试。
-    # 独占 128B completion 覆盖正式的逐 task 严格链：无论是否产生
-    # metadata，每个 Build winner 都必须按 N-1 -> N 发布完成字。
-    # 另覆盖 pending、损坏值与重复发布。
-    echo "[BUILD] shared strict per-task completion self-test"
+    # 独占 128B completion 既覆盖旧的逐 task 链，也覆盖正式热路
+    # 只串行实际 metadata writer 的稀疏链：空 writer 只等最近
+    # writer，不发布自己的 completion。旧 TaskCell 和 sidecar turn
+    # 均作为 canary，另覆盖 pending、损坏值与重复发布。
+    echo "[BUILD] shared sparse metadata-writer completion self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         "-DPTO_FDWIC_SHARED_INSERT_TURN_GROUPS=$SHARED_INSERT_TURN_GROUPS" \
@@ -114,14 +115,14 @@ echo "[TEST] atomic PollBatch boundary self-test"
         "$ROOT_DIR/test/test_shared_insert_turn.cpp" \
         -o "$BUILD_DIR/test_shared_insert_completion"
 
-    echo "[TEST] shared strict per-task completion self-test"
+    echo "[TEST] shared sparse metadata-writer completion self-test"
     "$BUILD_DIR/test_shared_insert_completion"
 
-    # host 只从最终 SchedulerState.context_lens 独立重建结果 oracle，不能
-    # 复用 device helper 形成同错，也不能把 task 身份写回设备状态。该测试覆盖 G0/G1/G2/G4、
+    # host 必须从最终 SchedulerState.context_lens 独立重建 shared task
+    # plan，不能复用 device helper 形成同错 oracle。该测试覆盖 G0/G1/G2/G4、
     # mixed 累计 batch_start、TaskAt 元数据、partial group 输出字节、writer
     # dependency chain，以及测试专用 CLI 的广播/逐 batch 形式。
-    echo "[BUILD] shared independent host-oracle self-test"
+    echo "[BUILD] shared authoritative host task-plan self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
@@ -129,13 +130,13 @@ echo "[TEST] atomic PollBatch boundary self-test"
         "$ROOT_DIR/test/test_shared_host_task_plan.cpp" \
         -o "$BUILD_DIR/test_shared_host_task_plan"
 
-    echo "[TEST] shared independent host-oracle self-test"
+    echo "[TEST] shared authoritative host task-plan self-test"
     "$BUILD_DIR/test_shared_host_task_plan"
 
-    # 96 个 Scalar 都从运行时 context 独立回放真实 callback 参数；该门槛
-    # 覆盖混合 G0/G1/G2/G4、全部五种 task、动态 shape/view/scalar 和
-    # SharedOutputRef 前驱过滤，并拒绝 Host 预制 task 身份。
-    echo "[BUILD] shared independent replay args self-test"
+    # 任意 Scalar 若不再全量 replay，必须能从不可变 task 身份恢复与顺序
+    # callback 完全相同的参数。该门槛覆盖混合 G0/G1/G2/G4、全部五种
+    # task、动态 shape/view/scalar 和 SharedOutputRef 前驱过滤。
+    echo "[BUILD] shared random-access PA args self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
@@ -143,13 +144,13 @@ echo "[TEST] atomic PollBatch boundary self-test"
         "$ROOT_DIR/test/test_shared_random_access_args.cpp" \
         -o "$BUILD_DIR/test_shared_random_access_args"
 
-    echo "[TEST] shared independent replay args self-test"
+    echo "[TEST] shared random-access PA args self-test"
     "$BUILD_DIR/test_shared_random_access_args"
 
-    # 独立 96-thread 门槛证明无预制计划时，每核完整 replay 仍能通过
-    # per-task Tournament 产生唯一 Build owner；即使 worker0 延迟，其他
-    # worker 也能完成全部 task。CPU 结果只证明协议，不冒充 A5 性能。
-    echo "[BUILD] shared no-prebuilt-plan Build protocol self-test"
+    # 独立 96-thread 门槛证明中央 ticket exactly-once 发放、乱序
+    # 构参/Build、稀疏 metadata writer 严格顺序和最终停产闭合；
+    # CPU 结果只是协议正确性证据，不冒充 A5 atomic 性能。
+    echo "[BUILD] shared dynamic Build dispatch protocol self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -DPA_BUILD_SWIMLANE=1 \
@@ -157,7 +158,7 @@ echo "[TEST] atomic PollBatch boundary self-test"
         "$ROOT_DIR/test/test_shared_build_dispatch.cpp" \
         -o "$BUILD_DIR/test_shared_build_dispatch"
 
-    echo "[TEST] shared no-prebuilt-plan Build protocol self-test"
+    echo "[TEST] shared dynamic Build dispatch protocol self-test"
     "$BUILD_DIR/test_shared_build_dispatch"
 
     for cap in 32 64 128 256 16384; do
@@ -175,16 +176,16 @@ echo "[TEST] atomic PollBatch boundary self-test"
         "$binary"
     done
 
-    # shared raw 必须呈现每个 worker 连续的 0..N-1 Submit/Claim；每 task
-    # 全局恰有一个 winner 子区间，loser 不产生 winner 业务子区间。
-    echo "[BUILD] shared all-worker-replay raw-trace self-test"
+    # shared raw 只保留真实稀疏边界：所有 task 有连续 EfDrain+Claim
+    # 和 Submit 父区间，loser 没有业务子区间；PrepareMap 必须彻底缺席。
+    echo "[BUILD] shared sparse raw-trace self-test"
     "$CXX_BIN" -O2 -std=c++17 -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \
         -I"$ROOT_DIR/common" \
         "$ROOT_DIR/test/test_shared_sparse_trace.cpp" \
         -o "$BUILD_DIR/test_shared_sparse_trace"
 
-    echo "[TEST] shared all-worker-replay raw-trace self-test"
+    echo "[TEST] shared sparse raw-trace self-test"
     "$BUILD_DIR/test_shared_sparse_trace"
 
     # CCEC full-swimlane 的 16B generic raw 仍由 host 恢复成既有 32B
@@ -308,9 +309,9 @@ echo "[TEST] atomic PollBatch boundary self-test"
     echo "[TEST] PA cross-core execution scan/drain self-test"
     "$BUILD_DIR/test_cross_core_exec_scan"
 
-    # 完整 96-worker Submit 精确校验逐 task completion（包括空 writer）、
-    # replay identity seal、loser 零 TensorMap 访问，以及 Build/Execute
-    # owner 跨核分离后直到 FinalDrain 的完整闭合。
+    # 完整 96-worker Submit 精确校验稀疏 writer completion、空 task
+    # pending canary 与 direct-output wait；同时锁定 loser 零 map 访问、
+    # 旧 sidecar turn 零触碰，以及 lookup/Build/执行仍可跨前任 Build。
     echo "[BUILD] shared ordered-insert Submit self-test"
     "$CXX_BIN" -O2 -std=c++17 -pthread -Wall -Wextra -Werror \
         -DPTO_FDWIC_SHARED_MAP=1 \

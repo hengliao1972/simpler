@@ -431,21 +431,19 @@ PA_DEVICE bool PublishSharedTaskWriterMetadata(
 PA_DEVICE void RecordCommittedSharedTaskWriterStats(
     const SharedTaskWriterDelta &delta, LocalStats &stats
 ) {
-    // 这两个字段只统计已经越过 task-level completion CAS 的完整事务。
-    // metadata 已写入但 CAS 失败的 terminal task 不计入成功统计；故障现场
-    // 仍由 fatal、共享元数据与 CAS observed value 保留。
+    // 这两个字段只在 task-level completion FetchAdd 已发射后更新。
+    // 发布端不等待返回值；严格完成与顺序由 N+1 的返回型 Load、最终 task
+    // 的 host 精确终态共同闭合。
     stats.result.map_inserts += delta.ordinary_count;
     stats.result.shared_symbol_inout_commits += delta.symbol_count;
 }
 
 template <typename Ops>
 PA_DEVICE bool HandoffSharedTaskInsertTurn(
-    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats,
-    int64_t &cas_observed
+    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats
 ) {
     if (state == nullptr || task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks)) {
-        cas_observed = INT64_MIN;
         return false;
     }
     // ordinary payload 的 DCCI、symbol history/latest 与 fresh descriptor
@@ -453,68 +451,38 @@ PA_DEVICE bool HandoffSharedTaskInsertTurn(
     // 自己的 128B-isolated sidecar completion，不再与相邻 TaskCell atomic
     // 共用冲突单元，也不把一枚 baton 在 G 条线上轮换。
     Ops::StoreBarrier();
-    // 返回型 CAS 同时证明本 task 是唯一发布者。cross-core 的 completion
-    // 初值仍是 task_id-1，合法终值严格等于 task_id；不再依赖 Host writer
-    // 位图跳过空 writer，也不靠运行后检查发现重复发布。
-    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - swimlane 构建走统一捕获 helper
-    cas_observed = Ops::CompareExchange(
+    // swimlane 构建走 CaptureAtomicFetchAddIssue；这里是无泳道构建和
+    // 隔离测试共用的 trace-free helper。
+    // PA_ATOMIC_DCCI_SOURCE_EXEMPT: trace-free - swimlane 使用统一捕获 helper
+    (void)Ops::FetchAdd(
         &state->claim_tournament[static_cast<uint32_t>(task_id)]
              .root.insert_completion.value,
-        SharedInsertCompletionInitialValue(
-            static_cast<uint32_t>(task_id)
-        ),
-        static_cast<int64_t>(task_id)
+        static_cast<int64_t>(1)
     );
-    if (cas_observed != SharedInsertCompletionInitialValue(
-            static_cast<uint32_t>(task_id)
-        )) {
-        SetFatal<Ops>(state, stats, task_id);
-        return false;
-    }
+    (void)stats;
     return true;
-}
-
-template <typename Ops>
-PA_DEVICE bool HandoffSharedTaskInsertTurn(
-    PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats
-) {
-    int64_t ignored_cas_observed = INT64_MIN;
-    return HandoffSharedTaskInsertTurn<Ops>(
-        state, task_id, stats, ignored_cas_observed
-    );
 }
 
 #if !PA_BUILD_TRACE_FREE
 template <typename Ops>
 PA_DEVICE bool TraceHandoffSharedTaskInsertTurn(
     PA_GM SchedulerState *state, int32_t task_id, LocalStats &stats,
-    int64_t &cas_observed, uint64_t &cas_trace_begin,
-    uint64_t &cas_trace_end
+    uint64_t &publish_trace_begin, uint64_t &publish_trace_end
 ) {
-    cas_trace_begin = 0;
-    cas_trace_end = 0;
+    publish_trace_begin = 0;
+    publish_trace_end = 0;
     if (state == nullptr || task_id < 0 ||
         task_id >= static_cast<int32_t>(kMaxTasks)) {
-        cas_observed = INT64_MIN;
         return false;
     }
     Ops::StoreBarrier();
-    cas_observed = CaptureAtomicCompareExchange<Ops>(
+    CaptureAtomicFetchAddIssue<Ops>(
         stats.trace,
         &state->claim_tournament[static_cast<uint32_t>(task_id)]
              .root.insert_completion.value,
-        SharedInsertCompletionInitialValue(
-            static_cast<uint32_t>(task_id)
-        ),
-        static_cast<int64_t>(task_id),
-        cas_trace_begin, cas_trace_end
+        static_cast<int64_t>(1),
+        publish_trace_begin, publish_trace_end
     );
-    if (cas_observed != SharedInsertCompletionInitialValue(
-            static_cast<uint32_t>(task_id)
-        )) {
-        SetFatal<Ops>(state, stats, task_id);
-        return false;
-    }
     return true;
 }
 #endif
@@ -536,7 +504,7 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
     // 两类发布。
     if (state == nullptr || !context.won || context.task_id < 0 ||
         context.task_id >= static_cast<int32_t>(kMaxTasks) ||
-        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic 组合入口只供隔离测试；正式 replay 路径在 Submit 边界观察 scheduler fatal，已取得的合法 task 允许闭合
+        // PA_ATOMIC_DCCI_SOURCE_EXEMPT: test-only - generic 组合入口只供隔离测试；正式 dispatched 路径在领取新 Build ticket 前统一观察 scheduler fatal，已取得的合法工作单元允许闭合
         Ops::Load(&state->fatal.value) != 0 ||
         !PublishSharedTaskOutputs<Ops>(
             state->shared_map, context,
@@ -574,9 +542,8 @@ PA_DEVICE bool PublishSharedTaskWriterDelta(
         );
         return false;
     }
-    int64_t ignored_cas_observed = INT64_MIN;
     const bool inserted = HandoffSharedTaskInsertTurn<Ops>(
-        state, context.task_id, stats, ignored_cas_observed
+        state, context.task_id, stats
     );
     if (!inserted) {
         RollbackSharedTaskOutputs<Ops>(
@@ -697,6 +664,79 @@ PA_DEVICE bool WaitForSharedTaskInsertTurn(
     );
 }
 
+PA_DEVICE bool DecodeSharedMetadataWriterPlan(
+    PA_GM const SharedBuildDispatchState &dispatch,
+    uint32_t task_id, bool &publishes_metadata,
+    int32_t &previous_metadata_writer
+) {
+    publishes_metadata = false;
+    previous_metadata_writer = -1;
+    if (dispatch.task_count == 0 ||
+        dispatch.task_count > kMaxTasks ||
+        task_id >= dispatch.task_count) {
+        return false;
+    }
+    const uint32_t word_index = task_id / 64U;
+    const uint32_t bit_index = task_id % 64U;
+    const uint64_t word =
+        dispatch.metadata_writer_bits[word_index];
+    publishes_metadata =
+        ((word >> bit_index) & static_cast<uint64_t>(1)) != 0;
+
+    // 当前 word 只保留 task_id 之前的 writer。不依赖平台
+    // CLZ intrinsic；最多 64 次寄存器位移，跨 word 才再读
+    // 一个只读 GM word。
+    uint64_t candidates = bit_index == 0
+        ? static_cast<uint64_t>(0)
+        : word &
+              ((static_cast<uint64_t>(1) << bit_index) - 1U);
+    int32_t scan_word = static_cast<int32_t>(word_index);
+    while (true) {
+        if (candidates != 0) {
+            uint32_t highest = 0;
+            while ((candidates >>= 1U) != 0) {
+                ++highest;
+            }
+            previous_metadata_writer =
+                scan_word * 64 + static_cast<int32_t>(highest);
+            return previous_metadata_writer <
+                static_cast<int32_t>(task_id);
+        }
+        --scan_word;
+        if (scan_word < 0) {
+            return true;
+        }
+        candidates = dispatch.metadata_writer_bits[
+            static_cast<uint32_t>(scan_word)
+        ];
+    }
+}
+
+PA_DEVICE bool ValidateSharedMetadataWriterSummary(
+    PA_GM const SharedBuildDispatchState &dispatch
+) {
+    if (dispatch.task_count == 0 ||
+        dispatch.task_count > kMaxTasks ||
+        dispatch.metadata_writer_count > dispatch.task_count ||
+        dispatch.ordinary_metadata_writer_count >
+            dispatch.task_count ||
+        dispatch.symbol_metadata_writer_count >
+            dispatch.task_count) {
+        return false;
+    }
+    // 一个 task 可以同时发布 ordinary 与 symbol metadata，所以 union
+    // writer 数必须落在 max(class_count) 与两类之和之间。
+    const uint32_t class_max =
+        dispatch.ordinary_metadata_writer_count >
+                dispatch.symbol_metadata_writer_count
+            ? dispatch.ordinary_metadata_writer_count
+            : dispatch.symbol_metadata_writer_count;
+    return dispatch.metadata_writer_count >= class_max &&
+        dispatch.metadata_writer_count <=
+            dispatch.ordinary_metadata_writer_count +
+                dispatch.symbol_metadata_writer_count;
+}
+
 // 判断 task N 的 Fanin 查询是否必须等待全部 metadata writer 前缀。
 //
 // 严格顺序只约束真正发布 metadata 的 task；非 writer 不应仅仅因为计划中
@@ -786,7 +826,8 @@ PA_DEVICE bool WaitForPreparedSharedWriterOutputs(
     return true;
 }
 
-template <typename Ops, bool Profile, typename PmuContext>
+template <typename Ops, bool Profile, bool Dispatched,
+          typename PmuContext>
 PA_DEVICE bool FinishSharedWinnerSubmitBody(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     const TaskArgs &args, SubmitContext &context, LocalStats &stats,
@@ -809,9 +850,17 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     const TaskKind kind = task_meta.kind;
     const int32_t function_id =
         static_cast<int32_t>(ticket.function_id);
-    // expected_previous 只校验 PA adapter 实际构造出的三个 INOUT symbol
-    // writer，不参与 TensorMap 全局顺序。严格顺序统一由 task[N-1]
-    // completion 建立，不再读取 Host 预制 writer 位图。
+    bool publishes_metadata = false;
+    int32_t previous_metadata_writer = -1;
+    if (!DecodeSharedMetadataWriterPlan(
+            state->build_dispatch, task_id,
+            publishes_metadata, previous_metadata_writer
+        )) {
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    // 在进入 Materialize/Register 之前从 PA 计划推导 previous writer，
+    // 避免把这段确定性标量计算放进全局有序插入区。
     const int32_t expected_previous =
         kind == TaskKind::Up
         ? (task_meta.group_index == 0
@@ -863,13 +912,19 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     }
     SharedTaskWriterDelta writer_delta{};
     if (!PrepareSharedTaskWriterDelta(
-            args, context, writer_delta
+            args, context, writer_delta,
+            previous_metadata_writer,
+            state->build_dispatch
+                    .ordinary_metadata_writer_count != 0,
+            true
         ) ||
         !ValidatePreparedPaWriterShape(
             writer_delta, kind, static_cast<int32_t>(task_id),
             expected_previous,
             static_cast<int32_t>(task_meta.batch_start)
-        )) {
+        ) ||
+        writer_delta.writer_intent_required !=
+            publishes_metadata) {
         RollbackSharedTaskOutputs<Ops>(
             state->shared_map.shared_outputs[task_id],
             expected_output_count,
@@ -881,6 +936,30 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
+    // count 只开启“该类 writer 全局为零”的快路径，不能授予 writer
+    // 资格。实际 delta 若推翻 host 的零计数，必须在任何 metadata lookup
+    // 前终止；非零但偏保守的计数最多增加等待，不会跳过依赖。
+    if ((writer_delta.ordinary_count != 0 &&
+         state->build_dispatch
+                 .ordinary_metadata_writer_count == 0) ||
+        (writer_delta.symbol_count != 0 &&
+         state->build_dispatch
+                 .symbol_metadata_writer_count == 0) ||
+        (publishes_metadata &&
+         state->build_dispatch.metadata_writer_count == 0)) {
+        RollbackSharedTaskOutputs<Ops>(
+            state->shared_map.shared_outputs[task_id],
+            expected_output_count,
+            static_cast<int32_t>(task_id), &stats
+        );
+        EndSubmitPmuPhase<SubmitPmuPhase::Materialize, Ops>(
+            pmu_context
+        );
+        SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
+        return false;
+    }
+    const bool metadata_prefix_required =
+        writer_delta.metadata_prefix_required;
 #if PA_BUILD_TRACE_FREE
     const bool task_outputs_published =
         PublishSharedTaskOutputs<Ops, true, true, true>(
@@ -914,10 +993,11 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         SetFatal<Ops>(state, stats, static_cast<int32_t>(task_id));
         return false;
     }
-    // 正式 completion 链会在 Register 中证明所有前序 task 已完成，
-    // 这里仍把 symbol writer 对实际 output 目标的等待提前到串行区外：
-    // producer 尚在并行 Materialize 时可以先就地等待，之后取得 task
-    // turn 即可直接提交 metadata，不把目标等待时间塞进全局串行链。
+    // 稀疏 writer 链只证明 metadata writer 之间的顺序，
+    // 不再间接证明任意更早 task 的 fresh output 已发布。
+    // symbol writer 在进入严格串行区前直接等待自己实际要
+    // 改写的 output 目标；这样既不会抢占 metadata 顺序链，
+    // 也不会让首个 writer 在 producer Materialize 前提交 CAS。
     if (!WaitForPreparedSharedWriterOutputs<Ops>(
             state, writer_delta,
             static_cast<int32_t>(task_id), stats
@@ -973,19 +1053,23 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
     const uint64_t materialize_end =
         TraceTimestamp<Ops>(stats.trace, stats.result);
 
-    // 仅这一段全局串行：N>0 只等待 task[N-1]。当前
-    // task 发布自己的 ordinary/symbol metadata 后，无论 writer
-    // 集合是否为空，都必须以 completion CAS 推进 N。这使
-    // TensorMap 顺序完全来自设备实际 replay，不再消费 Host
-    // 预制的 sparse writer 答案。
+    // 仅这一段全局串行：等待 host/operator 只读计划中
+    // 严格早于 N 的最后一个 metadata writer。当前 task 有实际
+    // writer delta 时才发布自己的 completion；空 writer task 不再
+    // 人为充当 baton。fresh output descriptor 已在 Materialize 尾部
+    // 独立发布，后续 Fanin 必须直接观察实际 producer。
     const uint64_t register_begin = materialize_end;
     BeginSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(
         pmu_context
     );
     int64_t ready_observed = -1;
     uint64_t insert_turn_load_count = 0;
-    const bool turn_ready = WaitForSharedTaskInsertTurn<Ops>(
-        state, static_cast<int32_t>(task_id), stats,
+    const bool turn_ready = WaitForSharedMetadataPredecessor<Ops>(
+        state, static_cast<int32_t>(task_id),
+        metadata_prefix_required
+            ? previous_metadata_writer
+            : -1,
+        stats,
         ready_observed, insert_turn_load_count
     );
     // wait_end 对最后一次返回 Ready 的 atomic Load 建立数据依赖。只在
@@ -1025,38 +1109,35 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         : metadata_begin;
 
 #if PA_BUILD_TRACE_FREE
-    int64_t cas_observed = INT64_MIN;
     const bool inserted =
         metadata_published &&
-        HandoffSharedTaskInsertTurn<Ops>(
-            state, static_cast<int32_t>(task_id), stats,
-            cas_observed
-        );
+        (!publishes_metadata ||
+         HandoffSharedTaskInsertTurn<Ops>(
+             state, static_cast<int32_t>(task_id), stats
+         ));
 #else
-    int64_t cas_observed = INT64_MIN;
-    uint64_t cas_trace_begin = 0;
-    uint64_t cas_trace_end = 0;
+    uint64_t publish_trace_begin = 0;
+    uint64_t publish_trace_end = 0;
     const bool inserted =
         metadata_published &&
-        TraceHandoffSharedTaskInsertTurn<Ops>(
-            state, static_cast<int32_t>(task_id), stats,
-            cas_observed, cas_trace_begin, cas_trace_end
-        );
+        (!publishes_metadata ||
+         TraceHandoffSharedTaskInsertTurn<Ops>(
+             state, static_cast<int32_t>(task_id), stats,
+             publish_trace_begin, publish_trace_end
+         ));
 #endif
-    // 父区间终点对 CAS 返回值建立数据依赖：它证明本核
-    // 已取得 task[N] completion 的发布结果，但不宣称 N+1
-    // 已经读取。
+    // writer 发布端只记录 FetchAdd 的 source-issue 边界，不等待
+    // 返回值；真正完成由下一个 metadata consumer/writer 的返回型
+    // predecessor Load 建立。空 writer 不触碰自己的 completion word。
     const uint64_t register_end = metadata_published
-        ? TraceTimestampAfterAtomicResult<Ops>(
-              stats.trace, stats.result, cas_observed
-          )
+        ? TraceTimestamp<Ops>(stats.trace, stats.result)
         : metadata_end;
     EndSubmitPmuPhase<SubmitPmuPhase::Register, Ops>(
         pmu_context
     );
 #if !PA_BUILD_TRACE_FREE
-    // task[N] 的 completion CAS 已经返回；下一 owner 的返回型 Load
-    // 会在新值可见后推进。现在才落 history DCCI 和 writer CAS 的
+    // task[N] 的 completion FetchAdd 已经发射；下一 owner 的返回型 Load
+    // 会在新值真正可见后推进。现在才落 history DCCI 和 writer CAS 的
     // raw，既保留端点与事件数量，也不再让 16B 记录写入延长全局有序发布链。
     if (writer_metadata_trace.history_dcci_lines != 0) {
         (void)WriteDcciTrace(
@@ -1145,14 +1226,15 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
             Ops::kAtomicReturnReadyObserved
         );
     }
-    if (metadata_published && AtomicSwimlaneEnabled(stats.trace)) {
+    if (metadata_published && publishes_metadata &&
+        AtomicSwimlaneEnabled(stats.trace)) {
         WriteAtomicTrace<Ops>(
             stats.trace, stats.result,
             static_cast<int32_t>(task_id),
             AtomicSite::SharedInsertTurnHandoff,
-            AtomicOp::CompareExchange,
-            cas_trace_begin, cas_trace_end,
-            true, Ops::kAtomicReturnReadyObserved
+            AtomicOp::FetchAdd,
+            publish_trace_begin, publish_trace_end,
+            false, false
         );
     }
 #endif
@@ -1253,6 +1335,12 @@ PA_DEVICE bool FinishSharedWinnerSubmitBody(
         ProfilePhase::ReplayTail, build_begin, build_end
     );
 
+    if constexpr (Dispatched) {
+        return CloseSharedDispatchedSubmit<Ops, Profile>(
+            state, stats, ticket.task_id, kind,
+            ticket.submit_begin
+        );
+    }
     return CloseSharedCallbackSubmit<Ops, Profile>(
         state, stats, ticket, task_meta, kind
     );

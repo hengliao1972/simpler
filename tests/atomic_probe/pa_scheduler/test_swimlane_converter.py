@@ -2691,6 +2691,82 @@ class SwimlaneConverterLayoutTest(unittest.TestCase):
                     convert(input_path, output_path)
                 self.assertFalse(output_path.exists())
 
+    def test_v5_host_prebuilt_fetch_add_handoff_is_explicitly_supported(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capture = _v5_shared_register_atomic_capture()
+            metadata = capture["metadata"]
+            rows = capture["fdwic_events"]
+            assert isinstance(metadata, dict)
+            assert isinstance(rows, list)
+            metadata["shared_insert_completion_atomic"] = "fetch_add"
+            for row in rows:
+                if row[5] == "Atomic" and row[9] == 20:
+                    # op=FetchAdd(2)，不消费返回值，也没有 return-ready bit。
+                    row[8] = 0x02
+            _refresh_summary(capture)
+            input_path = Path(directory) / "host_prebuilt.raw.json"
+            output_path = Path(directory) / "host_prebuilt.merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+
+            convert(input_path, output_path)
+
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                merged["metadata"]["shared_insert_completion_atomic"],
+                "fetch_add",
+            )
+            names = {
+                str(event.get("name", ""))
+                for event in merged["traceEvents"]
+            }
+            self.assertIn(
+                "atomic.source_issue.shared_insert_completion_publish."
+                "fetch_add#0",
+                names,
+            )
+
+    def test_v5_insert_completion_atomic_metadata_rejects_mismatch(
+        self,
+    ) -> None:
+        cases = (
+            ("unsupported", "fetch_max", "must be fetch_add or compare_exchange"),
+            ("fetch_add_with_cas", "fetch_add", "invalid direct Atomic"),
+        )
+        for label, atomic_name, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                capture = _v5_shared_register_atomic_capture()
+                metadata = capture["metadata"]
+                assert isinstance(metadata, dict)
+                metadata["shared_insert_completion_atomic"] = atomic_name
+                input_path = Path(directory) / "mismatch.raw.json"
+                output_path = Path(directory) / "mismatch.merged.json"
+                input_path.write_text(json.dumps(capture), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, expected):
+                    convert(input_path, output_path)
+                self.assertFalse(output_path.exists())
+
+    def test_v5_historical_central_ticket_rejects_mixed_handoff_ops(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capture = _v5_shared_register_atomic_capture()
+            rows = capture["fdwic_events"]
+            assert isinstance(rows, list)
+            first_handoff = next(
+                row for row in rows
+                if row[5] == "Atomic" and row[9] == 20
+            )
+            first_handoff[8] = 0x02
+            _refresh_summary(capture)
+            input_path = Path(directory) / "mixed.raw.json"
+            output_path = Path(directory) / "mixed.merged.json"
+            input_path.write_text(json.dumps(capture), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "mixes FetchAdd"):
+                convert(input_path, output_path)
+            self.assertFalse(output_path.exists())
+
     def test_v4_shared_register_atomics_keep_cpu_source_issue_boundary(
         self,
     ) -> None:

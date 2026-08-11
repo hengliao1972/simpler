@@ -25,7 +25,7 @@ Usage:
   ./run.sh build-perf-clock cpu|ccec
   ./run.sh perf-clock       cpu|ccec [benchmark options]
 
-本目录固定为 cross-core shared TensorMap PA：
+本目录固定为 cross-core ordinary Host 预制 TaskPlan PA：
   - 不接受 private/shared 模式参数；
   - 不构建 AscendC；
   - 首阶段只保留 swimlane 与无泳道端到端构建，不提供 submit-PMU；

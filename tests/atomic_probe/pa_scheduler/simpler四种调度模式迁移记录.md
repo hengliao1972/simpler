@@ -1,5 +1,10 @@
 # Simpler 四种调度模式迁移记录
 
+> 目录口径（2026-08-11）：`cross_core_ordinary/` 已恢复为 Host 预制
+> `SharedHostTaskPlan` 的 Scalar ordinary 基线；无 Host 预制计划的 S7 动态
+> replay 及后续运行时 TaskPlan 开发位于 `cross_core_ordinary_dynamic/`。
+> 本文更早章节中的同名路径按当时提交语义理解，不据此改写历史测量结果。
+
 ## 1. 目标与边界
 
 本文记录以独立调度器为参考，将下列四种模式接入 Simpler 真实
