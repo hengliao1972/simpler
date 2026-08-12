@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -159,10 +167,10 @@ for policy_index in "${!POLICY_IDS[@]}"; do
     AARCH64_SOS+=("$AARCH64_SO")
 done
 
-# Host smoke 只能锁死“同一地址清零后连续生产两轮”的协议顺序，不能模拟
-# AICPU 对 Host DMA 的 stale clean cache。对最终 AArch64 产物再加一道指令
-# 门槛：initialize 必须先执行 cell-control civac，完成 dsb+isb 后才出现
-# 第一次 acquire load。这样至少不会因编译重排或后续重构静默删掉复用修复。
+# Host smoke 只能锁死“同一地址连续生产两轮”的协议顺序，不能模拟
+# AICPU 对 Host DMA 的 stale cache。最终 AArch64 门槛按 policy 分开：
+# StreamingFuture 保留 cell-control civac；PlanAheadClosed 必须由 stlr 0
+# 覆盖即将使用的 control，且不得把旧 dirty line civac 回 GM。
 LLVM_OBJDUMP_BIN="${LLVM_OBJDUMP:-$ASCEND_HOME_PATH/bin/llvm-objdump}"
 if [[ ! -x "$LLVM_OBJDUMP_BIN" ]]; then
     echo "Missing llvm-objdump for AICPU cache-order gate: $LLVM_OBJDUMP_BIN" >&2
@@ -173,6 +181,17 @@ for policy_index in "${!AARCH64_SOS[@]}"; do
     policy_name="${POLICY_NAMES[$policy_index]}"
 INITIALIZE_DISASSEMBLY="$($LLVM_OBJDUMP_BIN -d --demangle \
     --disassemble-symbols=aicpu_plan_adapter_initialize "$AARCH64_SO")"
+if [[ "$policy_name" == "plan-ahead-closed" ]]; then
+if ! awk '
+    /stlr/ && !reset { reset = NR }
+    /ldar/ && reset && !load { load = NR }
+    END { exit(reset && load && reset < load ? 0 : 1) }
+' <<< "$INITIALIZE_DISASSEMBLY" ||
+   grep -Eq 'dc[[:space:]]+civac' <<< "$INITIALIZE_DISASSEMBLY"; then
+    echo "AICPU Plan reuse gate failed for policy=$policy_name: expected stlr-zero -> ldar without cell civac" >&2
+    exit 1
+fi
+else
 if ! awk '
     /dc[[:space:]]+civac/ && !civac { civac = NR }
     /dsb[[:space:]]+sy/ && civac && !dsb { dsb = NR }
@@ -186,10 +205,33 @@ if ! awk '
     echo "AICPU Plan reuse cache-order gate failed for policy=$policy_name: expected civac -> dsb sy -> isb -> ldar" >&2
     exit 1
 fi
+fi
 
-# 两条 policy 的 initialize 都必须先完成 cell Empty 检查和 reset
-# control clean，之后才允许进入 Ready/ReadyFailed 的隔离 closed-line
-# 发布路径。正常 Ready 的具体时机由上面的双 policy Host smoke 直接断言。
+# 两条 policy 的 initialize 都必须先完成 cell Empty 建立/检查和 reset
+# control clean，之后才允许进入 Ready/ReadyFailed。PlanAheadClosed 由
+# AICPU stlr 建立 Empty；StreamingFuture 继续消费 Host reset 并先 civac。
+if [[ "$policy_name" == "plan-ahead-closed" ]]; then
+if ! awk '
+    /stlr/ && !cell_reset { cell_reset = NR }
+    /ldar/ && cell_reset && !empty_load { empty_load = NR }
+    /dc[[:space:]]+cvac/ && empty_load && !reset_clean {
+        reset_clean = NR; next
+    }
+    /dsb[[:space:]]+sy/ && reset_clean && !reset_barrier {
+        reset_barrier = NR; next
+    }
+    /isb/ && reset_barrier && !reset_isb { reset_isb = NR }
+    END {
+        exit(cell_reset && empty_load && reset_clean && reset_barrier &&
+             reset_isb && cell_reset < empty_load &&
+             empty_load < reset_clean && reset_clean < reset_barrier &&
+             reset_barrier < reset_isb ? 0 : 1)
+    }
+' <<< "$INITIALIZE_DISASSEMBLY"; then
+    echo "AICPU Plan ready-order gate failed for policy=$policy_name: stlr Empty must precede reset-control publication" >&2
+    exit 1
+fi
+else
 if ! awk '
     /dc[[:space:]]+civac/ && !cell_civac { cell_civac = NR }
     /ldar/ && cell_civac && !empty_load { empty_load = NR }
@@ -226,6 +268,7 @@ if ! awk '
 ' <<< "$INITIALIZE_DISASSEMBLY"; then
     echo "AICPU Plan ready-order gate failed for policy=$policy_name: isolated closed publish must follow cell/reset completion" >&2
     exit 1
+fi
 fi
 
 # owner 在 backend bind 之前也可能因 request/tensor metadata 失败。
@@ -267,9 +310,9 @@ if ! awk '
 fi
 
 # Finish callback 只预写 control=Empty 的 GM payload。PlanAheadClosed
-# 可在 pack 前按需执行 cell-control civac+barrier+Empty 检查，
-# 但最终 flags 尚未知道时不得对 payload 执行 cvac，更不得
-# 发布 control；真正的 payload 可见性边界只在 publish_staged。
+# 可在 pack 前按需用 stlr 0 建立 cell-control 所有权并检查 Empty，
+# 但最终 flags 尚未知道时不得对 payload 执行 cvac，更不得发布
+# Published control；真正的 payload 可见性边界只在 publish_staged。
 STAGE_DISASSEMBLY="$($LLVM_OBJDUMP_BIN -d --demangle \
     --disassemble-symbols=aicpu_plan_adapter_stage "$AARCH64_SO")"
 if [[ "$policy_name" == "plan-ahead-closed" ]]; then
@@ -289,28 +332,16 @@ if ! grep -Eq 'str[[:space:]]+x[0-9]+,' <<< "$STAGE_DISASSEMBLY"; then
     exit 1
 fi
 
-# StreamingFuture 必须逐 task 完成 payload -> Published 发布。
-# PlanAheadClosed 没有并发 consumer，只发出 exact payload/control
-# clean，由 close 的最终 frontier DSB 统一等待完成。
+# StreamingFuture 必须逐 task 完成保守的 payload -> Published 发布。
+# PlanAheadClosed 使用同构门禁验证过的 ordinary payload -> release
+# atomic control，task.publish 中不得再出现 dc cvac/civac 或显式 barrier。
 PUBLISH_DISASSEMBLY="$($LLVM_OBJDUMP_BIN -d --demangle \
     --disassemble-symbols=aicpu_plan_adapter_publish_staged "$AARCH64_SO")"
 if [[ "$policy_name" == "plan-ahead-closed" ]]; then
-if ! awk '
-    /dc[[:space:]]+cvac/ && !payload_clean { payload_clean = NR; next }
-    /str[[:space:]]+x[0-9]+,/ && payload_clean && !control_store {
-        control_store = NR; next
-    }
-    /dc[[:space:]]+cvac/ && control_store && !control_clean {
-        control_clean = NR; next
-    }
-    END {
-        exit(payload_clean && control_store && control_clean &&
-             payload_clean < control_store &&
-             control_store < control_clean ? 0 : 1)
-    }
-' <<< "$PUBLISH_DISASSEMBLY" ||
-   grep -Eq 'dsb[[:space:]]+sy|isb' <<< "$PUBLISH_DISASSEMBLY"; then
-    echo "AICPU Plan-ahead publish gate failed for policy=$policy_name: expected deferred payload cvac -> control store -> cvac without a per-task barrier" >&2
+if ! grep -Eq 'stlr' <<< "$PUBLISH_DISASSEMBLY" ||
+   grep -Eq 'dc[[:space:]]+(cvac|civac)|dmb|dsb[[:space:]]+sy|isb' \
+       <<< "$PUBLISH_DISASSEMBLY"; then
+    echo "AICPU Plan-ahead publish gate failed for policy=$policy_name: expected release store without producer cache maintenance" >&2
     exit 1
 fi
 

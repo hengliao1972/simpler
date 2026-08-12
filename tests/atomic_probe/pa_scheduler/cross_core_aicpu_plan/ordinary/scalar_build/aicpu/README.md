@@ -14,33 +14,44 @@ Materialize、TensorMap、Build 或 kernel，也不把 PA task 公式放到 Host
 - 一个 AICPU 私有 pending cell 用于等待下一次真实 Begin，从而确定
   `UP.has_following_group` 与 batch 尾；返回给 orchestration 的
   `SharedTaskOutputs` 仍然立即由 `(task_id, output_count)` 构造；
-- payload 与 control 均使用 ordinary store + exact clean；AICore consumer
-  负责 return-ready atomic observe 和 invalidate。
+- PlanAheadClosed 使用 ordinary payload store + release atomic control；
+  producer 不执行逐 task `dc cvac`/显式 barrier，AICore consumer 负责
+  return-ready atomic observe、payload DCCI 和 DSB；
+- StreamingFuture 保留 ordinary store + payload/control exact clean 和
+  逐 task barrier，因为 consumer 会与 producer 并发读取 future cell。
 
 ## 同一 Plan storage 跨 run 复用
 
 正式 Host 会在每轮开始时用 `aclrtMemset` 清零同一块
-`RuntimeTaskPlanCell[]` GM。Host DMA 不会 snoop AICPU cache；上一轮由
-AICPU 发布并执行 `dc cvac + dsb sy + isb` 的 cell control 可能仍以
-clean-valid 形式驻留，因此不能直接用普通 load 判断本轮是否 Empty。
+`RuntimeTaskPlanCell[]` GM。Host DMA 不会 snoop AICPU cache，因此不能把
+Host 清零与 AICPU/AICore atomic 发布混成一个一致性域。当前按 policy
+分别建立 cell-control 所有权。
 
-本机没有已验证的地址型 pure-invalidate 指令：AICPU EL0 的 `dc ivac`
-在当前运行环境会因 UCI 权限被静默处理为 NOP。这里复用仓库已经用于
-Host-DMA → AICPU 的精确协议：
+PlanAheadClosed 没有并发 consumer。AICPU 不消费 Host 对 cell control 的
+清零结果，而是在按需扩展的 128-cell 单调前缀上执行：
 
 ```text
-对每个 cell control 的第一条 64B line 发出 dc civac
-  -> 统一 dsb sy
-  -> isb
-  -> 才逐 cell LoadControl 并要求 Empty
+release-store Empty(0)
+  -> acquire-load 同一 control 并要求 Empty
+  -> stage payload
+  -> release-store Published control
 ```
 
-`dc civac` 在这里安全的前提是明确的，而不是把它冒充 pure invalidate：
-上一轮唯一 control 写路径已经完成 `ordinary store -> dc cvac -> dsb sy ->
-isb`，此后 AICPU 不再 ordinary-store 该 line，所以复用入口只允许
-clean-valid；本轮 AICore 尚未启动，也没有并发 writer。若未来新增任何
-可能令 cell control 重新变 dirty 的路径，必须先修改该协议，不能继续沿用
-此处的前提。
+这样 AICPU 会覆盖上一轮可能仍 dirty 的 Published control，不会先执行
+`dc civac` 而把旧值写回 GM。A5 同址 5 轮和“不做 Host cell reset”的
+native 双轮门禁都已通过。
+
+StreamingFuture 的 consumer 会与 producer 并发，因此仍在 bind 时对全容量
+control 执行：
+
+```text
+dc civac -> dsb sy -> isb -> acquire-load Empty
+```
+
+该路径沿用旧前提：上一轮 StreamingFuture control 已经
+`ordinary store -> dc cvac -> dsb sy -> isb`，所以复用入口只允许
+clean-valid。Owner request、tensor metadata、scalar、context 等
+Host/SDMA 输入也继续使用独立的 Host→AICPU 维护协议。
 
 验证：
 
@@ -59,8 +70,11 @@ tests/atomic_probe/pa_scheduler/cross_core_aicpu_plan/ordinary/scalar_build/aicp
 3. 每个 cell 重新执行公共 payload 校验，核对 engine/function/output/ref；
 4. `readelf` 核对入口与 backend 导出，并拒绝未闭合的 `dist_*`/bridge 符号；
 5. 用 CANN HCC 生成 AArch64 SO，并重复 ELF 导出/未解析符号门槛；
-6. 反汇编最终 AArch64 `aicpu_plan_adapter_initialize`，要求第一条 control
-   acquire load 之前严格出现 `dc civac -> dsb sy -> isb`。
+6. 反汇编最终 AArch64 产物并按 policy 锁死协议：PlanAheadClosed 的
+   initialize 必须是 `stlr Empty -> ldar` 且不得出现 cell `civac`，publish
+   必须包含 `stlr Published` 且不得出现 `cvac/civac/dmb/dsb/isb`；
+   StreamingFuture 继续要求 `civac -> dsb sy -> isb -> ldar` 及逐 task
+   payload/control clean 和 barrier。
 
 2026-08-10 的 A5 同地址复用门槛使用完整 CCEC swimlane 产物：
 
@@ -110,3 +124,20 @@ tests/atomic_probe/pa_scheduler/cross_core_aicpu_plan/ordinary/scalar_build/run.
 
 Host smoke 本身仍只负责 producer 协议；上述 A5 证据来自同一源码生成的
 正式 CCEC producer + Scalar Build + Execute 完整路径。
+
+## 2026-08-12 当前 PlanAheadClosed 发布合同
+
+基于独立 AICPU→AICore 同构门禁，当前 PlanAheadClosed 已删除
+`task.publish` 中的 payload/control `dc cvac` 和显式 barrier，改为：
+
+```text
+ordinary payload store -> release atomic Published control
+```
+
+AICore 仍在 return-ready atomic observe 后对 payload 执行 DCCI + DSB。
+StreamingFuture 与 Host/SDMA→AICPU 输入维护不变。B256、1280 tasks、
+`real-compute=6,28,4,1`、trace-free 20 轮中位数从
+`producer_exec=1279.676us`、`pipeline_e2e=3834.191us` 降为
+`1062.002us`、`3626.891us`，分别减少 17.01% 和 5.41%；AICore wall
+只变化 +0.08%。完整结构计数、正确性门禁和复现命令见
+[`test_record/2026-08-12/README.md`](../../../test_record/2026-08-12/README.md)。

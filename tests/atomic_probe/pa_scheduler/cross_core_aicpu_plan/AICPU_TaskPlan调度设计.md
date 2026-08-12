@@ -85,8 +85,8 @@ AICPU（唯一 Plan producer）
   绑定本轮 PlanProducerContext
   执行 orchestration entry 一次
     -> callback N 完整序列化 PlanCell[N]
-    -> clean 实际 payload cache lines
-    -> 发布 PlanCell[N]
+    -> ordinary store 完整 payload
+    -> release atomic 发布 PlanCell[N] control
     -> 推进无缺口 planned_frontier
   发布 closed_task_count == planned_frontier
   结束 AICPU 阶段
@@ -178,9 +178,10 @@ Plan backend 保持现有 orchestration API 签名，但改变其 device 实现�
   Tensor/TensorCreateInfo、scalar、显式依赖和 symbolic output reference
   single-Pack 到目标 GM PlanCell，control 仍保持 Empty；
 - 下一次 Begin 或最终 Close 只补 final flags、校验同一份 GM wire，再按
-  payload clean、Published control 的逻辑顺序发布，不保留完整
-  payload staging 副本；StreamingFuture 在每个 task 上完成 barrier，
-  PlanAheadClosed 则在 Close 发布最终 frontier 前统一完成；
+  policy 发布，不保留完整 payload staging 副本；PlanAheadClosed 使用
+  `ordinary payload store -> release atomic Published control`，producer
+  不做逐 task cache maintenance；StreamingFuture 仍在每个 task 上执行
+  payload/control exact clean 和完整 barrier；
 - orchestration entry 正常返回后才封口 Plan；
 - SO 加载、config、符号或 descriptor 校验失败时 fail-closed，不唤醒
   AICore 进入半发布 Plan。
@@ -318,11 +319,15 @@ A5 Scalar 之间不假定 cache coherence。每个 PlanCell 必须遵守：
 
 ```text
 AICPU producer:
-  ordinary store 完整 payload
-  -> exact cache clean(payload_lines)
-  -> StreamingFuture: DSB -> ordinary store + exact clean(cell control) -> DSB -> ISB
-  -> PlanAheadClosed: ordinary store + exact clean(cell control)，Close 的最终 frontier DSB
-     统一完成全部先行 clean
+  PlanAheadClosed:
+    ordinary store 完整 payload
+    -> release atomic store(Published control)
+    -> 不执行逐 task cvac/civac/DSB/ISB
+
+  StreamingFuture:
+    ordinary store 完整 payload
+    -> exact clean(payload_lines) -> DSB
+    -> ordinary store + exact clean(cell control) -> DSB -> ISB
 
 AICore consumer:
   return-ready observe cell control
@@ -331,18 +336,25 @@ AICore consumer:
   -> ordinary load payload
 ```
 
-control 与 payload 分离 cache line。atomic-only line 不存普通 payload，也不执行
-可回写 stale dirty snapshot 的 payload clean-out。
+control 与 payload 分离 cache line。PlanAheadClosed 的发布合同来自独立
+A5 同构门禁：AICPU ordinary payload 写入后以 release atomic 发布 control，
+AICore 返回型 atomic 观察 control 后执行 DCCI，再读取 payload。它不等价于
+Host/SDMA 写入，也不能把结论外推到 StreamingFuture 的并发 producer/consumer。
+atomic-only line 不存普通 payload，也不执行可回写 stale dirty snapshot 的
+payload clean-out。
 
 同一 Plan storage 跨 run 复用时还必须处理 Host DMA 与 AICPU cache
-不一致：Host 清零同一 GM 后，AICPU 在读取 cell control 前先丢弃上一轮
-clean-valid control 行，并在统一 `dsb sy + isb` 后再检查 Empty。
-StreamingFuture 在 bind 时处理全容量；PlanAheadClosed 没有并发 consumer，
-按 128-cell 单调前缀分块只覆盖实际 `[0,N)`。当前实现
-使用仓内已验证的 `dc civac`；它成立的前提是上一轮唯一 producer 写已经
-`dc cvac + dsb` 变成 clean，之后没有 ordinary writer，且新一轮 AICore
-尚未启动。不得把该协议扩展到可能含 dirty ordinary payload 或并发 atomic
-writer 的 cache line。
+不一致，但两条 policy 的所有权协议不同：
+
+- PlanAheadClosed 没有并发 consumer。AICPU 按 128-cell 单调前缀对本轮
+  即将使用的 control release-store Empty，再 acquire-load 校验，不消费
+  Host 对 cell control 的清零结果，也不对可能 dirty 的旧 Published line
+  执行 `dc civac`；
+- StreamingFuture 会与 consumer 并发，仍在 bind 时对全容量 control 执行
+  `dc civac -> dsb sy -> isb -> acquire-load Empty`。它成立的前提是该 policy
+  上一轮 control 已经 `dc cvac + dsb` 成为 clean-valid；
+- Owner request、tensor metadata、scalar 和 context 等 Host/SDMA 输入仍按
+  Host→AICPU 协议维护，不能用 PlanAheadClosed 的 AICPU→AICore 结论删除。
 
 ## 4. Build、TensorMap 与 Execute 不变量
 

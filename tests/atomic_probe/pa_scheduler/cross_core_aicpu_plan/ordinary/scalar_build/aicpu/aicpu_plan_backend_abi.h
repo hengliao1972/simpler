@@ -1,6 +1,12 @@
 /*
  * Copyright (c) PyPTO Contributors.
- * SPDX-License-Identifier: CANN-2.0
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
  */
 
 #ifndef PA_SCHEDULER_AICPU_PLAN_BACKEND_ABI_H
@@ -30,7 +36,7 @@ struct AicpuPlanBackendConfig {
 // task 发布完成后开始；orchestration 区间是 Begin 返回到 Finish 进入，
 // stage 是 Finish backend 打包 canonical payload，defer_publish 是等待
 // 下一个 callback（或 backend close）确定 flags，publish 是最终 flags
-// patch、payload clean 和 cell-control 发布。整个结构恰好一条 cache line，
+// patch、wire 校验和 policy-specific cell-control 发布。整个结构恰好一条 cache line，
 // AICPU 在 owner 结束前统一 clean，Host 只在 plan stream 闭合后回拷。
 struct alignas(64) AicpuPlanTaskTraceRecord {
     uint64_t build_begin_ns;

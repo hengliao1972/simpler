@@ -1,6 +1,12 @@
 /*
  * Copyright (c) PyPTO Contributors.
- * SPDX-License-Identifier: CANN-2.0
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
  */
 
 #ifndef PA_SCHEDULER_AICPU_PLAN_ADAPTER_BRIDGE_H
@@ -32,8 +38,9 @@ int32_t aicpu_plan_adapter_stage(
 
 // 下一个真实 Begin 到来后，backend 才能知道前一个 UP 是否还有下一组，
 // 或前一个 UP/Alloc 是否为 batch 尾。桥接层只 patch 最终
-// flags，对同一份 GM wire 完整校验后再按
-// payload clean -> barrier -> cell Published 的顺序发布。
+// flags，对同一份 GM wire 完整校验后再按 policy 发布：PlanAheadClosed
+// 使用 ordinary payload -> release atomic Published control；
+// StreamingFuture 保留 payload/control exact clean 与逐 task barrier。
 int32_t aicpu_plan_adapter_publish_staged(
     void *control, void *cells, uint32_t capacity,
     const void *staged_metadata, uint32_t payload_lines,

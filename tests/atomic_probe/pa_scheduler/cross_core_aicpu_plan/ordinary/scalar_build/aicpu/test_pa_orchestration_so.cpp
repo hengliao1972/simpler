@@ -1,6 +1,12 @@
 /*
  * Copyright (c) PyPTO Contributors.
- * SPDX-License-Identifier: CANN-2.0
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
  */
 
 #include "aicpu_plan_backend_abi.h"
@@ -140,9 +146,13 @@ bool CheckBackendTrace(
     bool saw_isb = false;
     bool saw_store = false;
     bool saw_scalar = false;
+    bool saw_atomic_store_release = false;
     bool saw_merged_bind_cell_discard = false;
     bool saw_merged_bind_cell_load = false;
     uint64_t prepared_cell_discard_calls = 0U;
+    uint64_t prepared_cell_reset_release_calls = 0U;
+    uint64_t task_publish_cache_clean_calls = 0U;
+    uint64_t task_publish_release_calls = 0U;
     uint64_t task_publish_dsb_calls = 0U;
     uint64_t task_publish_isb_calls = 0U;
     for (uint32_t index = 0U; valid && index < result.operation_trace_count; ++index) {
@@ -166,8 +176,17 @@ bool CheckBackendTrace(
             operation == pa_scheduler::aicpu_plan_trace::Operation::CacheDiscardCivac) {
             prepared_cell_discard_calls += record.calls;
         }
+        if (target == pa_scheduler::aicpu_plan_trace::Target::CellControl &&
+            operation == pa_scheduler::aicpu_plan_trace::Operation::AtomicStoreRelease &&
+            scope != pa_scheduler::aicpu_plan_trace::Scope::TaskPublish) {
+            prepared_cell_reset_release_calls += record.calls;
+        }
         if (scope == pa_scheduler::aicpu_plan_trace::Scope::TaskPublish) {
-            if (operation == pa_scheduler::aicpu_plan_trace::Operation::BarrierDsbSy) {
+            if (operation == pa_scheduler::aicpu_plan_trace::Operation::CacheCleanCvac) {
+                task_publish_cache_clean_calls += record.calls;
+            } else if (operation == pa_scheduler::aicpu_plan_trace::Operation::AtomicStoreRelease) {
+                task_publish_release_calls += record.calls;
+            } else if (operation == pa_scheduler::aicpu_plan_trace::Operation::BarrierDsbSy) {
                 task_publish_dsb_calls += record.calls;
             } else if (operation == pa_scheduler::aicpu_plan_trace::Operation::BarrierIsb) {
                 task_publish_isb_calls += record.calls;
@@ -203,13 +222,15 @@ bool CheckBackendTrace(
         case pa_scheduler::aicpu_plan_trace::Operation::ScalarWork:
             saw_scalar = true;
             break;
+        case pa_scheduler::aicpu_plan_trace::Operation::AtomicStoreRelease:
+            saw_atomic_store_release = true;
+            break;
         case pa_scheduler::aicpu_plan_trace::Operation::Count:
             valid = false;
             break;
         }
     }
-    valid = valid && saw_atomic && saw_cache_clean && saw_cache_discard && saw_dsb && saw_isb && saw_store &&
-            saw_scalar;
+    valid = valid && saw_atomic && saw_cache_clean && saw_dsb && saw_isb && saw_store && saw_scalar;
     if constexpr (pa_scheduler::kRuntimePlanPipelineIsPlanAheadClosed) {
         // PlanAheadClosed 按需分块准备 cell control，不再要求 bind 阶段
         // 单条记录覆盖整个 capacity。它必须覆盖 [0, N)，最多只可
@@ -218,14 +239,17 @@ bool CheckBackendTrace(
         const uint64_t required = result.task_count == 0U ? 1U : result.task_count;
         const uint64_t rounded = (required + 127U) / 128U * 128U;
         const uint64_t maximum_prepared = rounded < records.size() ? rounded : records.size();
-        valid = valid && prepared_cell_discard_calls >= result.task_count &&
-                prepared_cell_discard_calls == maximum_prepared &&
+        valid = valid && saw_atomic_store_release && prepared_cell_discard_calls == 0U &&
+                prepared_cell_reset_release_calls == maximum_prepared &&
+                task_publish_release_calls == result.task_count && task_publish_cache_clean_calls == 0U &&
                 task_publish_dsb_calls == 0U && task_publish_isb_calls == 0U;
     } else {
         // StreamingFuture 有并发 consumer，仍必须在 bind 时一次性准备
         // 全容量，并在每个 task 的 payload/control 发布点完成两个 DSB
         // 和一个 ISB。
-        valid = valid && prepared_cell_discard_calls == records.size() &&
+        valid = valid && saw_cache_discard && !saw_atomic_store_release && prepared_cell_reset_release_calls == 0U &&
+                task_publish_release_calls == 0U && task_publish_cache_clean_calls != 0U &&
+                prepared_cell_discard_calls == records.size() &&
                 saw_merged_bind_cell_discard && saw_merged_bind_cell_load &&
                 task_publish_dsb_calls == 2U * result.task_count &&
                 task_publish_isb_calls == result.task_count;
@@ -664,16 +688,33 @@ int main(int argc, char **argv)
     // 同一份 GM storage，再重新 bind -> callback -> close。x86 本身是
     // cache coherent 的，因此这里只负责锁死协议顺序和同地址复用语义；
     // AICPU 对 Host DMA stale clean line 的真机门槛由 CCEC --runs 2 覆盖。
-    ok &= Check(
-        bind(&backend_config) != 0,
-        "same-address reuse without Host reset must reject Published cells"
-    );
-    ok &= Check(
-        control->closed_task_count.value ==
-            kPlanProducerReadyFailedTaskCount &&
-        control->fatal.value != 0,
-        "initialize failure did not wake NotReady consumer with -3"
-    );
+    if constexpr (pa_scheduler::kRuntimePlanPipelineIsPlanAheadClosed) {
+        // PlanAheadClosed 没有并发 consumer，AICPU 在 bind/stage 中以
+        // release store 0 重新取得即将使用的 cell-control 所有权；它不再
+        // 依赖 Host reset，也不得先 civac 旧 Published line。
+        ok &= Check(
+            bind(&backend_config) == 0,
+            "PlanAheadClosed did not overwrite same-address Published controls"
+        );
+        if (ok) entry(args);
+        ok &= Check(
+            close() == 0 &&
+                control->closed_task_count.value == kExpectedTasks &&
+                control->fatal.value == 0,
+            "PlanAheadClosed no-Host-reset reuse did not close exactly"
+        );
+    } else {
+        ok &= Check(
+            bind(&backend_config) != 0,
+            "StreamingFuture reuse without Host reset must reject Published cells"
+        );
+        ok &= Check(
+            control->closed_task_count.value ==
+                kPlanProducerReadyFailedTaskCount &&
+            control->fatal.value != 0,
+            "initialize failure did not wake NotReady consumer with -3"
+        );
+    }
     std::memset(control_memory, 0, sizeof(RuntimePlanControl));
     std::memset(
         cells_memory, 0,

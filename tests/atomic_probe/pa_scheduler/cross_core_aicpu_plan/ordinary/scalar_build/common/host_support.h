@@ -2666,7 +2666,7 @@ inline const char *AicpuOperationScopeName(uint16_t scope) {
 inline const char *AicpuOperationName(uint8_t operation) {
     const char *names[] = {
         "atomic_load_acquire", "cache_clean_cvac", "cache_discard_civac", "barrier_dsb_sy",
-        "barrier_isb",         "gm_store",         "scalar_work",
+        "barrier_isb",         "gm_store",         "scalar_work",         "atomic_store_release",
     };
     return operation < sizeof(names) / sizeof(names[0]) ? names[operation] : "unknown";
 }
@@ -2851,6 +2851,7 @@ inline bool ValidateAicpuOperationTraceForExport(
             (operation == Operation::GmStore &&
              (target == Target::Fatal || target == Target::ClosedTaskCount || target == Target::PlannedFrontier ||
               target == Target::CellControl || target == Target::CellPayload)) ||
+            (operation == Operation::AtomicStoreRelease && target == Target::CellControl) ||
             (operation == Operation::ScalarWork && target == Target::PayloadValidation);
         if (static_cast<uint16_t>(scope) >= static_cast<uint16_t>(Scope::Count) ||
             static_cast<uint8_t>(operation) >= static_cast<uint8_t>(Operation::Count) ||
@@ -2866,7 +2867,7 @@ inline bool ValidateAicpuOperationTraceForExport(
                                record.last_target_index >= kRuntimePlanConsumerCapacity :
                            record.first_target_index != kNoIndex || record.last_target_index != kNoIndex) ||
             ((operation != Operation::AtomicLoadAcquire && operation != Operation::GmStore &&
-              operation != Operation::ScalarWork) &&
+              operation != Operation::ScalarWork && operation != Operation::AtomicStoreRelease) &&
              (record.first_value != 0 || record.last_value != 0))) {
             std::fprintf(
                 stderr,

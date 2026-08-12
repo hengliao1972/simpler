@@ -1,6 +1,12 @@
 /*
  * Copyright (c) PyPTO Contributors.
- * SPDX-License-Identifier: CANN-2.0
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
  */
 
 #include "aicpu_plan_adapter_bridge.h"
@@ -124,9 +130,10 @@ RuntimeTaskPlanCell *g_plan_ahead_cells = nullptr;
 uint32_t g_plan_ahead_capacity = 0U;
 uint32_t g_plan_ahead_prepared_prefix = 0U;
 
-// AICPU 与 AICore 不具备 Scalar cache coherence。payload 使用 ordinary
-// store + exact clean；control 也使用 ordinary store + exact clean，返回型
-// atomic observe 由 AIC/AIV consumer 承担。x86 smoke 只替换为顺序一致 fence。
+// 当前 A5 main aicpu_scheduler Path-A 已通过独立同构门禁验证：AICPU
+// ordinary payload store 可由 release atomic control 直接发布给 AICore，
+// 无需 producer 侧 dc cvac/显式 barrier。Host/SDMA -> AICPU 是另一条非一致
+// 路径，复用初始化和 StreamingFuture 的保守协议不能据此顺带删除。
 struct AicpuProducerOps {
     // Host 通过 DMA/aclrtMemset 重置同一块 GM 后，AICPU 不会自动丢弃
     // 上一轮留下的 clean-valid control line。AICPU EL0 的 dc ivac 在当前
@@ -291,6 +298,24 @@ struct AicpuProducerOps {
         FlushRegion(const_cast<const int64_t *>(address), sizeof(int64_t));
     }
 
+    static void StoreReleaseControl(
+        volatile int64_t *address, int64_t value
+    )
+    {
+#if PA_BUILD_SWIMLANE
+        const uint64_t trace_begin = pa_scheduler::aicpu_plan_trace::TimestampNanoseconds();
+#endif
+        __atomic_store_n(address, value, __ATOMIC_RELEASE);
+#if PA_BUILD_SWIMLANE
+        const uint64_t trace_end = pa_scheduler::aicpu_plan_trace::TimestampNanoseconds();
+        const TraceTarget target = ClassifyTraceAddress(const_cast<const int64_t *>(address));
+        (void)RecordOperation(
+            trace_begin, trace_end, Operation::AtomicStoreRelease, target.target, 1U, 0U, target.index, target.index,
+            value, value, true
+        );
+#endif
+    }
+
     static void PublishControl(volatile int64_t *address, int64_t value)
     {
         StoreAndCleanControl(address, value);
@@ -318,13 +343,17 @@ struct AicpuProducerOps {
     const uint32_t new_prefix = rounded < view.capacity
         ? rounded
         : view.capacity;
+    // task.publish 不再 cvac 后，上一轮 cell control 可能仍由 AICPU
+    // cache 持有；此时若对 Host memset 后的地址执行 civac，会冒险把旧
+    // Published 写回覆盖 0。PlanAheadClosed 没有并发 consumer，因此由
+    // AICPU 直接覆盖本轮即将使用的 control，重新建立唯一 writer 所有权。
+    // Host/SDMA 输入区以及 StreamingFuture 的并发复用协议不走这里。
     for (uint32_t task = g_plan_ahead_prepared_prefix;
          task < new_prefix; ++task) {
-        AicpuProducerOps::DiscardPreviouslyCleanControlLine(
-            &view.cells[task].control.value
+        AicpuProducerOps::StoreReleaseControl(
+            &view.cells[task].control.value, 0
         );
     }
-    AicpuProducerOps::FinishCacheMaintenance();
     for (uint32_t task = g_plan_ahead_prepared_prefix;
          task < new_prefix; ++task) {
         if (AicpuProducerOps::LoadControl(
@@ -341,10 +370,10 @@ struct AicpuProducerOps {
 // close）到来后才能确定。Finish callback 里的 L0TaskArgs 及其指向的
 // descriptor 都属于 orchestration 栈，不能把指针留到下一个 Begin。
 // 所以 Finish 趁 callback 仍存活时把 canonical payload 唯一一次
-// Pack 到目标 GM cell，但保持 cell control=Empty 且不 clean payload。
-// 下一个 Begin/close 只补上最终 flags，校验最终 GM wire，再执行
-// payload clean -> barrier -> cell Published。consumer 永远不会读
-// Empty cell 的 payload，而 backend 也不再保留任何 callback 指针。
+// Pack 到目标 GM cell，但保持 cell control=Empty。下一个 Begin/close 只补上
+// 最终 flags、校验最终 GM wire，再以 release atomic 发布 cell control。
+// PlanAheadClosed 的 AICore consumer 永远不会读 Empty cell 的 payload，
+// backend 也不再保留任何 callback 指针；StreamingFuture 仍保留原保守 clean。
 constexpr uint64_t kStagedPlanMetadataMagic = 0x5041535441470001ULL;
 
 struct StagedPlanMetadata {
@@ -465,22 +494,21 @@ PlanPublishResult FinalizeStagedPlan(
         return PlanPublishResult::InvalidInput;
     }
 
-    AicpuProducerOps::FlushRegion(
-        &cell.payload,
-        metadata.payload_lines * kPlanCacheLineBytes
-    );
     const int64_t published = static_cast<int64_t>(EncodePlanCellControl(
         PlanCellPhase::Published, metadata.payload_lines, task_id
     ));
     if constexpr (kRuntimePlanPipelineIsStreamingFuture) {
+        AicpuProducerOps::FlushRegion(
+            &cell.payload,
+            metadata.payload_lines * kPlanCacheLineBytes
+        );
         AicpuProducerOps::StoreBarrier();
         AicpuProducerOps::PublishControl(&cell.control.value, published);
     } else {
-        // PlanAheadClosed 的 AICore consumer 只会在 close 完成后启动。
-        // 每个 cell 仍精确 clean payload/control，但不在每 task 后等待
-        // cache maintenance 完成；close 推进最终 frontier 前的 DSB
-        // 一次性收口所有先前操作。
-        AicpuProducerOps::StoreAndCleanControl(
+        // 独立 A5 Path-A 门禁验证了同一地址连续复用 20480 轮：ordinary
+        // payload + release atomic control 对 AICore 可见，无需 AICPU cvac。
+        // AICore 仍以返回型 atomic 观察 control，并在读取 payload 前 DCCI。
+        AicpuProducerOps::StoreReleaseControl(
             &cell.control.value, published
         );
     }
@@ -544,11 +572,11 @@ aicpu_plan_adapter_initialize(void *control, void *cells, uint32_t capacity, Sta
         &view.control->closed_task_count.value,
         kPlanProducerNotReadyTaskCount
     );
-    // Host aclrtMemset 不会 snoop 上一轮留在 AICPU cache 中的
-    // clean-valid control。StreamingFuture 的 consumer 会提前领 future
-    // ticket，因此在 Ready 前仍完成全容量 discard/Empty 校验。
-    // PlanAheadClosed 没有并发 consumer，在 stage 中按单调前缀分块
-    // 准备，close 只补齐实际 [0, N)，避免为未使用 capacity 付费。
+    // Host aclrtMemset 不会 snoop 上一轮留在 AICPU cache 中的 control。
+    // StreamingFuture 的 consumer 会提前领 future ticket，且旧发布协议
+    // 保证 control 为 clean-valid，因此在 Ready 前仍完成全容量
+    // discard/Empty 校验。PlanAheadClosed 没有并发 consumer，改由 AICPU
+    // release-store 0 覆盖本轮单调前缀，避免 dirty line 在 civac 时回写旧值。
     if constexpr (kRuntimePlanPipelineIsStreamingFuture) {
         for (uint32_t task = 0U; task < capacity; ++task) {
             AicpuProducerOps::DiscardPreviouslyCleanControlLine(
@@ -812,10 +840,9 @@ extern "C" int32_t aicpu_plan_adapter_close(
     if (!MakeView(control, cells, capacity, view)) return -1;
     if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
         // 串行 policy 在 Close 前不允许任何 Build consumer 已经启动。
-        // consumer 只会读 [0, N)；cell[N] 及更后的未用容量已由
-        // Host 清零，且上一轮唯一 producer 在结束前已把它们
-        // clean 到 GM。AICPU 本轮不访问这些 line，不需要为额外的
-        // sentinel 再扩一个 128-cell 准备块。
+        // consumer 只会读 [0, N)；AICPU 已主动把该前缀 control 覆盖为
+        // Empty 后再逐 task 发布。cell[N] 及更后的未用容量不参与本轮，
+        // 不需要为额外 sentinel 再扩一个 128-cell 准备块。
         if (!PreparePlanAheadCellControls(view, final_task_count)) {
             return -3;
         }

@@ -939,6 +939,10 @@ Scalar 和 DAG SIMT 都继续冻结，不在 limited-K 或 pipeline A/B 中顺�
 
 ### 8.7 PlanAheadClosed 发布维护收缩
 
+本节记录 2026-08-11 的第一阶段收缩及当时的协议结论；2026-08-12 的
+同构门禁进一步证明 PlanAheadClosed 不需要逐 task clean，当前实现和最终
+数据以 8.8 节为准。
+
 operation 明细暴露出的 4,381 次 `dc civac`、3,082 次 `dsb sy`和
 1,544 次 `isb` 中，有三类是 PlanAheadClosed 不需要的过度维护：
 
@@ -980,3 +984,92 @@ execution/semantic/postprocess PASS；基线为优化前 10 轮。
 减少 662.370us（34.07%），pipeline E2E 减少 678.831us（14.99%）。
 AICore wall 只变化 0.15%，说明收益确实来自 AICPU Plan 维护收缩，
 没有通过减少 task 数、计算负载或 AICore 工作量获得。
+
+### 8.8 基于 AICPU/AICore 同构门禁删除 task.publish 维护
+
+`tests/atomic_probe/aicpu_aicore_cache` 已把 Host/SDMA→AICPU 与
+AICPU→AICore 分开验证。对当前 A5 main aicpu_scheduler，后一个方向的
+Path-A 门禁支持以下最小发布合同：
+
+```text
+AICPU PlanAheadClosed producer
+  ordinary store 完整 payload
+  -> release atomic store(Published control)
+
+AICore Scalar consumer
+  return-ready atomic observe control
+  -> DSB
+  -> DCCI payload lines
+  -> DSB
+  -> decode/validate payload
+```
+
+因此 PlanAheadClosed 的 `task.publish` 删除 payload `dc cvac`、control
+ordinary store + `dc cvac` 及显式 DSB/ISB，只保留 payload wire 校验和
+release atomic control。StreamingFuture 的 consumer 会与 producer 并发，
+仍保留旧的逐 task payload/control clean 与 barrier，不能跟随删除。
+
+删除 control clean 后，上一轮 Published line 可能仍由 AICPU cache 持有；
+若在 Host memset 后继续 `dc civac`，反而可能把旧 Published 写回覆盖 GM
+中的 Empty。PlanAheadClosed 没有并发 consumer，所以复用协议同步改为：
+AICPU 对即将使用的 128-cell 单调前缀 release-store Empty，再 acquire-load
+核对，然后才 stage/publish。它主动重建 AICPU 对 cell control 的所有权，
+不再消费 Host 对这些 cell 的清零。StreamingFuture 和 29 条真正的
+Host/SDMA→AICPU Owner 输入维护仍保留 `dc civac`。
+
+#### 8.8.1 结构计数
+
+真实 A5 device 0，B256、1280 tasks、`real-compute=6,28,4,1`，full
+operation trace 重新采集并通过 converter 全部门槛。下表以 8.7 节最终
+结构图为旧版本；`Calls` 是合并前真实调用量，不是 Perfetto event 数。
+
+| 操作 | 8.7 版本 Calls | 当前 Calls | 变化 |
+| ---- | -----------: | ---------: | ---: |
+| atomic acquire load | 15,382 | 15,382 | 0 |
+| `dc cvac` | 14,864 | 16 | -14,848（-99.89%） |
+| `dc civac` | 1,309 | 29 | -1,280（-97.78%） |
+| `dsb sy` | 21 | 11 | -10 |
+| `isb` | 18 | 8 | -10 |
+| ordinary GM store | 2,564 | 1,284 | -1,280 |
+| release atomic store | 0 | 2,560 | +2,560 |
+| payload validation | 1,280 | 1,280 | 0 |
+
+新增的 2,560 次 release store 由 1,280 次前缀 Empty reset 和 1,280 次
+Published control 组成。`task_publish` 内精确得到 1,280 次 release store，
+payload/control cache clean、DSB 和 ISB 均为 0；剩余 16 次 `cvac`、29 次
+`civac` 和 Owner/Close barrier 不属于 task publish。完整 trace 共 16,714
+条 operation record、`dropped=0`。full trace 的
+`pipeline_e2e=7229.859us`、`producer_exec=3781.946us` 含逐操作取时，只作
+结构证据，不能作为性能数据。
+
+#### 8.8.2 trace-free 性能
+
+优化前后都在同一分支工作区、同一 A5 device 0、B256、1280 tasks、
+`real-compute=6,28,4,1`、perf-clock、同进程 20 轮下测量；两组均 20/20
+execution/semantic/postprocess PASS。
+
+| 指标 | 删除前中位数 | 删除后中位数 | 差值 | 相对变化 |
+| ---- | -----: | -----: | ---: | -------: |
+| Plan wall | 1356.843us | 1149.669us | -207.174us | -15.27% |
+| Producer exec | 1279.676us | 1062.002us | -217.674us | -17.01% |
+| AICore wall | 2475.957us | 2477.879us | +1.922us | +0.08% |
+| startup→FinalDrain | 2447.496us | 2450.675us | +3.179us | +0.13% |
+| Pipeline E2E | 3834.191us | 3626.891us | -207.300us | -5.41% |
+
+AICore wall 与 startup→FinalDrain 基本不变，说明 task 数、workload 和
+AICore 执行路径没有被偷减；约 207us 的端到端收益来自 AICPU producer
+缩短，并直接落在串行 `AICPU Plan -> AICore` 的 Pipeline E2E 上。
+
+#### 8.8.3 正确性与静态门禁
+
+- A5 B1 scalar-nop=0 同一 Plan allocation 连续 5 轮全部 PASS，证明
+  Host memset 后由 AICPU 覆盖 control 的跨轮复用可用；
+- native Host smoke 同地址、不做 Host cell reset 的第二轮中，
+  PlanAheadClosed 仍能覆盖旧 Published control 并精确 Close；
+  StreamingFuture 仍必须拒绝该用法；
+- AArch64 反汇编要求 PlanAheadClosed initialize 出现
+  `stlr Empty -> ldar` 且无 cell `civac`，publish 出现 `stlr Published`
+  且无 `cvac/civac/dmb/dsb/isb`；StreamingFuture 门禁保持原序列；
+- CPU protocol、双 policy AICPU SO smoke、CCEC B1/B256 语义和泳道 converter
+  均通过。详细命令与数据口径见
+  `test_record/2026-08-12/README.md`。

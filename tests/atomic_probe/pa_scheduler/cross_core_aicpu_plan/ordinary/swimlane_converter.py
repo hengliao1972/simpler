@@ -154,6 +154,7 @@ AICPU_OPERATION_NAMES = (
     "barrier_isb",
     "gm_store",
     "scalar_work",
+    "atomic_store_release",
 )
 AICPU_OPERATION_TARGETS = (
     "none",
@@ -490,7 +491,7 @@ def _scaled_nearest(value: int, scale_num: int, scale_den: int) -> int:
     return (value * scale_num + scale_den // 2) // scale_den
 
 
-def _validate_aicpu_runtime_plan_producer(
+def _validate_aicpu_runtime_plan_producer(  # noqa: PLR0912, PLR0915
     data: dict[str, Any],
     metadata: dict[str, Any],
     frequency_hz: int,
@@ -1018,6 +1019,9 @@ def _validate_aicpu_runtime_plan_producer(
                 "cell_control", "cell_payload",
             }
         ) or (
+            operation == "atomic_store_release"
+            and target == "cell_control"
+        ) or (
             operation == "scalar_work"
             and target == "payload_validation"
         )
@@ -1052,7 +1056,8 @@ def _validate_aicpu_runtime_plan_producer(
             )
             or (
                 operation not in {
-                    "atomic_load_acquire", "gm_store", "scalar_work"
+                    "atomic_load_acquire", "gm_store", "scalar_work",
+                    "atomic_store_release",
                 }
                 and (first_value != 0 or last_value != 0)
             )
@@ -5027,10 +5032,17 @@ def convert(  # noqa: PLR0912, PLR0915
                     lines = int(operation["lines"])
                     suffix = f"#{task_id}" if task_id >= 0 else "#owner"
                     call_suffix = f"×{calls}" if calls > 1 else ""
-                    if operation_name == "atomic_load_acquire":
+                    if operation_name in {
+                        "atomic_load_acquire", "atomic_store_release"
+                    }:
                         category = "aicpu.atomic"
+                        instruction = (
+                            "load_acquire"
+                            if operation_name == "atomic_load_acquire"
+                            else "store_release"
+                        )
                         event_name = (
-                            f"atomic.{scope}.{target}.load_acquire"
+                            f"atomic.{scope}.{target}.{instruction}"
                             f"{call_suffix}{suffix}"
                         )
                     elif operation_name in {
