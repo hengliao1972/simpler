@@ -10,6 +10,7 @@
  */
 
 #include "aicpu_plan_backend_abi.h"
+#include "aicpu_plan_adapter_bridge.h"
 
 #include <dlfcn.h>
 
@@ -146,6 +147,7 @@ bool CheckBackendTrace(
     bool saw_isb = false;
     bool saw_store = false;
     bool saw_scalar = false;
+    uint64_t task_publish_payload_validation_calls = 0U;
     bool saw_atomic_store_release = false;
     bool saw_merged_bind_cell_discard = false;
     bool saw_merged_bind_cell_load = false;
@@ -191,6 +193,10 @@ bool CheckBackendTrace(
             } else if (operation == pa_scheduler::aicpu_plan_trace::Operation::BarrierIsb) {
                 task_publish_isb_calls += record.calls;
             }
+            if (operation == pa_scheduler::aicpu_plan_trace::Operation::ScalarWork &&
+                target == pa_scheduler::aicpu_plan_trace::Target::PayloadValidation) {
+                task_publish_payload_validation_calls += record.calls;
+            }
         }
         if (scope == pa_scheduler::aicpu_plan_trace::Scope::BackendBind &&
             target == pa_scheduler::aicpu_plan_trace::Target::CellControl && record.calls == records.size() &&
@@ -230,17 +236,18 @@ bool CheckBackendTrace(
             break;
         }
     }
-    valid = valid && saw_atomic && saw_cache_clean && saw_dsb && saw_isb && saw_store && saw_scalar;
+    valid = valid && saw_atomic && saw_cache_clean && saw_dsb && saw_isb && saw_store;
+#if PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION
+    valid = valid && saw_scalar && task_publish_payload_validation_calls == result.task_count;
+#else
+    valid = valid && !saw_scalar && task_publish_payload_validation_calls == 0U;
+#endif
     if constexpr (pa_scheduler::kRuntimePlanPipelineIsPlanAheadClosed) {
-        // PlanAheadClosed 按需分块准备 cell control，不再要求 bind 阶段
-        // 单条记录覆盖整个 capacity。它必须覆盖 [0, N)，最多只可
-        // 因 128-cell 分块多准备 127 个 cell；task publish 内不得重新
-        // 引入逐 task DSB/ISB。
-        const uint64_t required = result.task_count == 0U ? 1U : result.task_count;
-        const uint64_t rounded = (required + 127U) / 128U * 128U;
-        const uint64_t maximum_prepared = rounded < records.size() ? rounded : records.size();
+        // PlanAheadClosed 不再用 release Empty + acquire readback 预处理
+        // cell；只有每个真实 task 的 Published release store。task publish
+        // 内也不得重新引入逐 task DSB/ISB。
         valid = valid && saw_atomic_store_release && prepared_cell_discard_calls == 0U &&
-                prepared_cell_reset_release_calls == maximum_prepared &&
+                prepared_cell_reset_release_calls == 0U &&
                 task_publish_release_calls == result.task_count && task_publish_cache_clean_calls == 0U &&
                 task_publish_dsb_calls == 0U && task_publish_isb_calls == 0U;
     } else {
@@ -391,7 +398,48 @@ int main(int argc, char **argv)
     args.add_input(query, key, value, block_table, context, output);
     args.add_scalar(uint64_t{0x3f800000U});
 
-    bool ok = Check(!args.has_error, "failed to construct real L2TaskArgs");
+    // 同一 14-cell storage 上的 long->short 复用门槛：先生成上面的
+    // G1+G2 14-task Plan，再不清 cell control 地生成单 batch G1 5-task
+    // Plan。正常 Close 必须以本轮 frontier=5 为唯一边界，忽略旧后缀。
+    alignas(64) int32_t short_reuse_context_lens[1] = {4096};
+    const uint32_t short_reuse_query_shape[3] = {
+        1U, kHeads, kHeadDim,
+    };
+    const uint32_t short_reuse_block_table_shape[2] = {
+        1U, kBlockTableWidth,
+    };
+    const uint32_t short_reuse_context_shape[1] = {1U};
+    const uint32_t short_reuse_output_shape[3] = {
+        1U, kHeads, kHeadDim,
+    };
+    Tensor short_reuse_query = External(
+        &dummy_buffers[0], short_reuse_query_shape, 3U,
+        DataType::BFLOAT16
+    );
+    Tensor short_reuse_block_table = External(
+        &dummy_buffers[3], short_reuse_block_table_shape, 2U,
+        DataType::INT32
+    );
+    Tensor short_reuse_context = External(
+        short_reuse_context_lens, short_reuse_context_shape, 1U,
+        DataType::INT32
+    );
+    Tensor short_reuse_output = External(
+        &dummy_buffers[4], short_reuse_output_shape, 3U,
+        DataType::FLOAT32
+    );
+    L2TaskArgs short_reuse_args;
+    short_reuse_args.reset();
+    short_reuse_args.add_input(
+        short_reuse_query, key, value, short_reuse_block_table,
+        short_reuse_context, short_reuse_output
+    );
+    short_reuse_args.add_scalar(uint64_t{0x3f800000U});
+
+    bool ok = Check(
+        !args.has_error && !short_reuse_args.has_error,
+        "failed to construct real L2TaskArgs"
+    );
     ok &= Check(
         orch_config(args).expected_arg_count == 7,
         "real PA orchestration config expected_arg_count changed"
@@ -484,6 +532,78 @@ int main(int argc, char **argv)
     );
     std::free(partial_cells_memory);
     std::free(partial_control_memory);
+
+    // 发布前整包 wire 复核只能存在于显式 debug 构建。构造一份 stage
+    // 成功后才被破坏的 canonical-zero word：debug 构建必须在 control
+    // 发布前拦截；正常构建必须不做第二次 producer 扫描，并由这里模拟
+    // AICore consumer 的权威 Validate 捕获损坏。
+    alignas(kAtomicIsolationBytes) RuntimePlanControl validation_control{};
+    alignas(kAtomicIsolationBytes)
+        RuntimeTaskPlanCell validation_cells[kPartialCapacity]{};
+    std::vector<pa_scheduler::aicpu_plan_trace::Record>
+        validation_operation_records;
+    pa_scheduler::aicpu_plan_trace::State validation_operation_state{};
+    ok &= Check(
+        initialize(
+            &validation_control, validation_cells, kPartialCapacity,
+            MakeOperationTraceState(
+                kPartialCapacity, validation_operation_records,
+                validation_operation_state
+            )
+        ) == 0,
+        "publish-validation initialize failed"
+    );
+    validation_cells[0].control.value = static_cast<int64_t>(
+        EncodePlanCellControl(PlanCellPhase::Published, 1U, 0U)
+    );
+    L0TaskArgs valid_reference_args;
+    valid_reference_args.reset();
+    FdwicOutputRef valid_reference{0, 0, 0U, 0U, 0U, 0U};
+    valid_reference_args.add_input(valid_reference);
+    alignas(kAtomicIsolationBytes)
+        std::array<uint8_t, kAtomicIsolationBytes>
+            validation_staged_metadata{};
+    uint32_t validation_lines = 0U;
+    uint16_t validation_outputs = 0U;
+    ok &= Check(
+        stage(
+            &validation_control, validation_cells, kPartialCapacity,
+            &valid_reference_args, 1U, 0, 1U, 0x81U, 0U,
+            validation_staged_metadata.data(), &validation_lines,
+            &validation_outputs
+        ) == 0 && validation_lines != 0U &&
+            validation_cells[1].control.value == 0,
+        "valid publish-validation stage failed"
+    );
+    // tensor canonical 区固定 16 words；引用只有前 2 words 有效，因此
+    // 第 3 word 必须为零，翻转它不会改变 header 或发布边界。
+    validation_cells[1].payload.words[kPlanHeaderWords + 2U] ^= 1U;
+    const int32_t corrupted_publish = publish_staged(
+        &validation_control, validation_cells, kPartialCapacity,
+        validation_staged_metadata.data(), validation_lines, 0x81U
+    );
+#if PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION
+    ok &= Check(
+        corrupted_publish != 0 &&
+            validation_cells[1].control.value == 0,
+        "debug publish validation did not reject corrupted GM wire"
+    );
+#else
+    const DecodedPlanCellControl validation_decoded =
+        DecodePlanCellControl(validation_cells[1].control.value);
+    RuntimeTaskPlanHeader validation_header{};
+    RuntimeTaskPlanLayout validation_layout{};
+    ok &= Check(
+        corrupted_publish == 0 && validation_decoded.valid &&
+            validation_decoded.phase == PlanCellPhase::Published &&
+            !ValidateRuntimeTaskPlanPayload(
+                validation_cells[1].payload, 1U,
+                validation_decoded.payload_lines,
+                validation_header, validation_layout
+            ),
+        "normal publish path rescanned payload or consumer validation missed corruption"
+    );
+#endif
 
     alignas(kAtomicIsolationBytes) RuntimePlanControl close_control{};
     alignas(kAtomicIsolationBytes) RuntimeTaskPlanCell close_cell{};
@@ -684,17 +804,15 @@ int main(int argc, char **argv)
         first_run_cells.data(), cells_memory, g1_g2_cells_bytes
     );
 
-    // 在完全相同的 control/cells 地址上模拟正式 Host 的下一轮：先清零
-    // 同一份 GM storage，再重新 bind -> callback -> close。x86 本身是
+    // 在完全相同的 control/cells 地址上模拟正式 Host 的下一轮。x86 本身是
     // cache coherent 的，因此这里只负责锁死协议顺序和同地址复用语义；
     // AICPU 对 Host DMA stale clean line 的真机门槛由 CCEC --runs 2 覆盖。
     if constexpr (pa_scheduler::kRuntimePlanPipelineIsPlanAheadClosed) {
-        // PlanAheadClosed 没有并发 consumer，AICPU 在 bind/stage 中以
-        // release store 0 重新取得即将使用的 cell-control 所有权；它不再
-        // 依赖 Host reset，也不得先 civac 旧 Published line。
+        // PlanAheadClosed 没有并发 consumer，直接由本轮 Published release
+        // store 覆盖同地址的上一轮 Published，不依赖 Empty 预清零。
         ok &= Check(
             bind(&backend_config) == 0,
-            "PlanAheadClosed did not overwrite same-address Published controls"
+            "PlanAheadClosed rejected same-address Published controls"
         );
         if (ok) entry(args);
         ok &= Check(
@@ -702,6 +820,23 @@ int main(int argc, char **argv)
                 control->closed_task_count.value == kExpectedTasks &&
                 control->fatal.value == 0,
             "PlanAheadClosed no-Host-reset reuse did not close exactly"
+        );
+
+        // 再次不清 control，直接从 14-task 缩短到 5-task。cell[5..13]
+        // 仍保留上一轮 Published，证明 Close 不再依赖 cell[N]==Empty。
+        ok &= Check(
+            bind(&backend_config) == 0,
+            "PlanAheadClosed long-to-short reuse bind failed"
+        );
+        if (ok) entry(short_reuse_args);
+        ok &= Check(
+            close() == 0 &&
+                result().task_count == 5U &&
+                control->planned_frontier.value == 5 &&
+                control->closed_task_count.value == 5 &&
+                DecodePlanCellControl(cells[5].control.value).valid &&
+                DecodePlanCellControl(cells[5].control.value).task_id == 5U,
+            "PlanAheadClosed long-to-short reuse consumed stale suffix"
         );
     } else {
         ok &= Check(

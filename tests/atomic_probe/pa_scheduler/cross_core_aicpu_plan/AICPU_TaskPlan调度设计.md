@@ -177,8 +177,9 @@ Plan backend 保持现有 orchestration API 签名，但改变其 device 实现�
 - Finish 在 callback 引用仍有效时，将 MixedKernels、
   Tensor/TensorCreateInfo、scalar、显式依赖和 symbolic output reference
   single-Pack 到目标 GM PlanCell，control 仍保持 Empty；
-- 下一次 Begin 或最终 Close 只补 final flags、校验同一份 GM wire，再按
-  policy 发布，不保留完整 payload staging 副本；PlanAheadClosed 使用
+- 下一次 Begin 或最终 Close 只补 final flags，再按 policy 发布，不保留
+  完整 payload staging 副本；正常 PlanAheadClosed 不重扫同一 producer
+  刚 Pack 的 GM wire，完整复核只由显式 debug 构建启用；PlanAheadClosed 使用
   `ordinary payload store -> release atomic Published control`，producer
   不做逐 task cache maintenance；StreamingFuture 仍在每个 task 上执行
   payload/control exact clean 和完整 barrier；
@@ -239,7 +240,8 @@ ABI v2 的历史缺字段 raw 推断 legacy `plan-ahead-closed`，并标记
   推演时间；
 - 第三级 operation 明细必须落回上述真实父区间：acquire load、AICPU
   cache maintenance（`dc cvac/dc civac`）、`dsb sy/isb`、关键 GM store
-  和 payload 校验均保存 scope/target/次数。这里不能把 ARM `dc` 指令
+  和 debug 构建启用的 payload 校验均保存 scope/target/次数。正常构建
+  不得为了泳道图隐式打开 payload 全扫描。这里不能把 ARM `dc` 指令
   假称为 AICore `dcci`；两者承担相似的 GM 可见性职责，但 ISA 与执行核
   不同。
 
@@ -346,10 +348,10 @@ payload clean-out。
 同一 Plan storage 跨 run 复用时还必须处理 Host DMA 与 AICPU cache
 不一致，但两条 policy 的所有权协议不同：
 
-- PlanAheadClosed 没有并发 consumer。AICPU 按 128-cell 单调前缀对本轮
-  即将使用的 control release-store Empty，再 acquire-load 校验，不消费
-  Host 对 cell control 的清零结果，也不对可能 dirty 的旧 Published line
-  执行 `dc civac`；
+- PlanAheadClosed 没有并发 consumer。AICPU 不消费 Host 对 cell control
+  的清零结果，也不预写 Empty；每个实际 task 直接用本轮 release-store
+  Published 覆盖同地址旧 Published，未用后缀只由本轮 `frontier=N` 隔离，
+  不对旧 Published line 执行 `dc civac`；
 - StreamingFuture 会与 consumer 并发，仍在 bind 时对全容量 control 执行
   `dc civac -> dsb sy -> isb -> acquire-load Empty`。它成立的前提是该 policy
   上一轮 control 已经 `dc cvac + dsb` 成为 clean-valid；
@@ -396,6 +398,14 @@ Streaming 观察 Close 后若手中 `ticket<N`，必须重新 acquire 同一 cel
 不能直接报告缺失。Plan-ahead 则已经在 attach 时一次性 acquire 并交叉
 校验 immutable close/frontier/capacity，热循环不再读取 future cell、close
 或 frontier。
+
+每个 ordinary Scalar 取得 PlanCell 后仍必须执行
+`control -> DCCI(payload lines) -> control` 的稳定观察。正常构建随后只校验
+安全解码所需的 task-id/ABI/count/layout/published-lines envelope，再由 PA
+decode 校验实际使用的 tag/ref/adapter metadata；inactive tag、固定 tensor
+slot padding 和末尾 cache-line padding 不参与执行，只由
+`PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION=1` 与 Host 事后 oracle 全量扫描。
+泳道图开关本身不得改变这一选择。
 
 中央 ticket 只解决“每个 PlanCell 只 Build 一次”，不放宽 TensorMap
 顺序。task N 可以在串行链外完成 Plan acquire 与 Materialize，但 writer

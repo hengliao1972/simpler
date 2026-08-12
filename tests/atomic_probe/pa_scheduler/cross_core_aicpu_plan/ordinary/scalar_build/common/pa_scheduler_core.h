@@ -6435,16 +6435,28 @@ PA_DEVICE bool BuildRuntimePlanTask(
         static_cast<uint64_t>(decoded.payload_lines) *
             aicpu_plan::kPlanCacheLineBytes
     );
-    if (TraceAtomicControlLoad<Ops>(
-            stats.trace, stats.result,
-            static_cast<int32_t>(task_id),
-            AtomicSite::RuntimePlanCellControlLoad,
-            &cell.control.value, /*result_used=*/true
-        ) != first ||
-        !aicpu_plan::ValidateRuntimeTaskPlanPayload(
+    const int64_t second = TraceAtomicControlLoad<Ops>(
+        stats.trace, stats.result,
+        static_cast<int32_t>(task_id),
+        AtomicSite::RuntimePlanCellControlLoad,
+        &cell.control.value, /*result_used=*/true
+    );
+    if (second != first) {
+        PublishRuntimePlanConsumerFatal<Ops>(
+            state, stats, static_cast<int32_t>(task_id)
+        );
+        return false;
+    }
+    const bool payload_envelope_valid =
+#if PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION
+        aicpu_plan::ValidateRuntimeTaskPlanPayload(
+#else
+        aicpu_plan::ValidateRuntimeTaskPlanEnvelope(
+#endif
             cell.payload, task_id, decoded.payload_lines,
             header, layout
-        )) {
+        );
+    if (!payload_envelope_valid) {
         PublishRuntimePlanConsumerFatal<Ops>(
             state, stats, static_cast<int32_t>(task_id)
         );

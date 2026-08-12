@@ -16,7 +16,11 @@ Materialize、TensorMap、Build 或 kernel，也不把 PA task 公式放到 Host
   `SharedTaskOutputs` 仍然立即由 `(task_id, output_count)` 构造；
 - PlanAheadClosed 使用 ordinary payload store + release atomic control；
   producer 不执行逐 task `dc cvac`/显式 barrier，AICore consumer 负责
-  return-ready atomic observe、payload DCCI 和 DSB；
+  return-ready atomic observe、payload DCCI 和 DSB；正常 publish 不重扫
+  自己刚 Pack 的 payload，也不重复读取 stage 已锁定的串行状态；
+- PlanAheadClosed 在 Close 时一次性验证 `[0,N)` Published 连续前缀；
+  AICore 正常 consumer 只校验安全解码所需 envelope，canonical padding
+  全扫描由 debug 构建与 Host 事后 oracle 负责；
 - StreamingFuture 保留 ordinary store + payload/control exact clean 和
   逐 task barrier，因为 consumer 会与 producer 并发读取 future cell。
 
@@ -28,18 +32,17 @@ Host 清零与 AICPU/AICore atomic 发布混成一个一致性域。当前按 po
 分别建立 cell-control 所有权。
 
 PlanAheadClosed 没有并发 consumer。AICPU 不消费 Host 对 cell control 的
-清零结果，而是在按需扩展的 128-cell 单调前缀上执行：
+清零结果，也不再预先把 cell control 写成 Empty。实际使用的 cell 直接执行：
 
 ```text
-release-store Empty(0)
-  -> acquire-load 同一 control 并要求 Empty
-  -> stage payload
+stage payload（此时 consumer 尚未启动）
   -> release-store Published control
 ```
 
-这样 AICPU 会覆盖上一轮可能仍 dirty 的 Published control，不会先执行
-`dc civac` 而把旧值写回 GM。A5 同址 5 轮和“不做 Host cell reset”的
-native 双轮门禁都已通过。
+本轮 Published store 本身会覆盖上一轮同地址 Published；未使用后缀允许
+保留旧 control，只由本轮 `frontier=N` 限定可消费范围。这样既不消费 Host
+reset，也不先执行 `dc civac` 把旧值写回 GM。A5 同址 20 轮，以及 Host
+native 不清 cell control 的同长复用和 14-task→5-task long-to-short 门槛均通过。
 
 StreamingFuture 的 consumer 会与 producer 并发，因此仍在 bind 时对全容量
 control 执行：
@@ -63,15 +66,16 @@ tests/atomic_probe/pa_scheduler/cross_core_aicpu_plan/ordinary/scalar_build/aicp
 门槛包括：
 
 1. x86 Host 真实 `dlopen(RTLD_NOW | RTLD_LOCAL)` PA orchestration SO；
-2. 在相同 control/cells 地址连续运行两轮真实
-   `bind -> aicpu_orchestration_entry -> close`；每轮 G1+G2 两 batch都应
-   生成 14 个 PlanCell；Host 门槛用于锁死清零、复用和重新发布顺序，AICPU
-   cache 行为仍必须由 A5 同地址 `--runs 2` 验证；
-3. 每个 cell 重新执行公共 payload 校验，核对 engine/function/output/ref；
+2. 在相同 control/cells 地址、不清 cell control 地连续运行真实
+   `bind -> aicpu_orchestration_entry -> close`；覆盖 14-task 同长复用以及
+   14-task→5-task long-to-short，锁定直接覆盖与旧后缀隔离；AICPU cache
+   行为仍由 A5 同地址多轮验证；
+3. Host 对每个已发布 cell 执行完整公共 payload 校验，核对
+   engine/function/output/ref/canonical padding；这不属于 AICPU 正常热路；
 4. `readelf` 核对入口与 backend 导出，并拒绝未闭合的 `dist_*`/bridge 符号；
 5. 用 CANN HCC 生成 AArch64 SO，并重复 ELF 导出/未解析符号门槛；
 6. 反汇编最终 AArch64 产物并按 policy 锁死协议：PlanAheadClosed 的
-   initialize 必须是 `stlr Empty -> ldar` 且不得出现 cell `civac`，publish
+   initialize/stage 不得出现 cell Empty `stlr` 或 cell `civac`，publish
    必须包含 `stlr Published` 且不得出现 `cvac/civac/dmb/dsb/isb`；
    StreamingFuture 继续要求 `civac -> dsb sy -> isb -> ldar` 及逐 task
    payload/control clean 和 barrier。
@@ -135,9 +139,14 @@ ordinary payload store -> release atomic Published control
 ```
 
 AICore 仍在 return-ready atomic observe 后对 payload 执行 DCCI + DSB。
-StreamingFuture 与 Host/SDMA→AICPU 输入维护不变。B256、1280 tasks、
-`real-compute=6,28,4,1`、trace-free 20 轮中位数从
-`producer_exec=1279.676us`、`pipeline_e2e=3834.191us` 降为
-`1062.002us`、`3626.891us`，分别减少 17.01% 和 5.41%；AICore wall
-只变化 +0.08%。完整结构计数、正确性门禁和复现命令见
+PlanAheadClosed 正常路径还删除了发布前整 payload 重扫、stage/publish
+重复共享状态读取、AICore 未消费 padding 扫描，以及 1,280 次 Empty reset
+store + 1,280 次配对 readback；
+`PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION=1` 的专门调试构建会恢复这些
+诊断。StreamingFuture 与 Host/SDMA→AICPU 输入维护不变。
+
+B256、1280 tasks、`real-compute=6,28,4,1`、trace-free 20 轮中位数：
+删除 Empty 预清零前后，`producer_exec=989.205→793.615us`，
+`pipeline_e2e=3528.444→3363.339us`，端到端减少 165.105us（4.68%）。
+完整结构计数、正确性门槛和复现命令见
 [`test_record/2026-08-12/README.md`](../../../test_record/2026-08-12/README.md)。

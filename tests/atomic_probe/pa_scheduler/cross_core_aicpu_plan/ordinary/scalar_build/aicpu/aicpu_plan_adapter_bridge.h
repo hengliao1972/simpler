@@ -16,6 +16,18 @@
 
 #include "aicpu_plan_operation_trace.h"
 
+// 正常发布路径信任同一 producer 在 stage 阶段已经完成的 canonical Pack，
+// 不再逐 task 重读并扫描整份 GM wire。只有专门的协议调试构建才打开
+// 发布前全量复核；泳道图并不隐式打开它，避免观测路径改变正常性能。
+#ifndef PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION
+#define PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION 0
+#endif
+
+#if PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION != 0 && \
+    PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION != 1
+#error "PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION must be 0 or 1"
+#endif
+
 extern "C" {
 
 int32_t aicpu_plan_adapter_initialize(
@@ -38,9 +50,12 @@ int32_t aicpu_plan_adapter_stage(
 
 // 下一个真实 Begin 到来后，backend 才能知道前一个 UP 是否还有下一组，
 // 或前一个 UP/Alloc 是否为 batch 尾。桥接层只 patch 最终
-// flags，对同一份 GM wire 完整校验后再按 policy 发布：PlanAheadClosed
+// flags，再按 policy 发布：PlanAheadClosed
 // 使用 ordinary payload -> release atomic Published control；
 // StreamingFuture 保留 payload/control exact clean 与逐 task barrier。
+// 完整 wire 与串行 producer 状态复核只由
+// PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION=1 的专门调试构建启用；AICore
+// consumer 在 acquire 后仍执行权威校验。
 int32_t aicpu_plan_adapter_publish_staged(
     void *control, void *cells, uint32_t capacity,
     const void *staged_metadata, uint32_t payload_lines,

@@ -105,9 +105,12 @@ for policy_index in "${!POLICY_IDS[@]}"; do
     HOST_TEST="$host_policy_dir/test_pa_orchestration_so"
     HOST_TRACE_SO="$host_policy_dir/libpaged_attention_aicpu_plan_trace.so"
     HOST_TRACE_TEST="$host_policy_dir/test_pa_orchestration_so_trace"
+    HOST_DEBUG_VALIDATE_SO="$host_policy_dir/libpaged_attention_aicpu_plan_debug_validate.so"
+    HOST_DEBUG_VALIDATE_TEST="$host_policy_dir/test_pa_orchestration_so_debug_validate"
     AARCH64_SO="$aarch64_policy_dir/libpaged_attention_aicpu_plan.so"
     rm -f -- \
         "$HOST_SO" "$HOST_TEST" "$HOST_TRACE_SO" "$HOST_TRACE_TEST" \
+        "$HOST_DEBUG_VALIDATE_SO" "$HOST_DEBUG_VALIDATE_TEST" \
         "$AARCH64_SO"
 
     echo "[BUILD] AICPU policy=$policy_name host smoke"
@@ -147,6 +150,23 @@ for policy_index in "${!POLICY_IDS[@]}"; do
         -o "$HOST_TRACE_TEST"
     "$HOST_TRACE_TEST" "$HOST_TRACE_SO"
 
+    echo "[BUILD] AICPU policy=$policy_name debug publish-wire validation smoke"
+    build_so \
+        "${CXX:-g++}" "$HOST_DEBUG_VALIDATE_SO" "$policy" \
+        -DPA_BUILD_SWIMLANE=1 \
+        -DPA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION=1 \
+        "${HOST_SANITIZE_FLAGS[@]}"
+    "${CXX:-g++}" -std=c++17 -O2 -g -Wall -Wextra -Werror \
+        "${COMMON_DEFINES[@]}" \
+        -DPA_BUILD_SWIMLANE=1 \
+        -DPA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION=1 \
+        "-DPA_RUNTIME_PLAN_PIPELINE_POLICY=$policy" \
+        "${COMMON_INCLUDES[@]}" \
+        "${HOST_SANITIZE_FLAGS[@]}" \
+        "$SCRIPT_DIR/test_pa_orchestration_so.cpp" -ldl \
+        -o "$HOST_DEBUG_VALIDATE_TEST"
+    "$HOST_DEBUG_VALIDATE_TEST" "$HOST_DEBUG_VALIDATE_SO"
+
     echo "[BUILD] AICPU policy=$policy_name AArch64 SO"
     build_so \
         "$HCC" "$AARCH64_SO" "$policy" \
@@ -169,8 +189,8 @@ done
 
 # Host smoke 只能锁死“同一地址连续生产两轮”的协议顺序，不能模拟
 # AICPU 对 Host DMA 的 stale cache。最终 AArch64 门槛按 policy 分开：
-# StreamingFuture 保留 cell-control civac；PlanAheadClosed 必须由 stlr 0
-# 覆盖即将使用的 control，且不得把旧 dirty line civac 回 GM。
+# StreamingFuture 保留 cell-control civac；PlanAheadClosed 不消费 Host
+# reset，也不预写 Empty，实际 task 直接以 Published release-store 覆盖旧值。
 LLVM_OBJDUMP_BIN="${LLVM_OBJDUMP:-$ASCEND_HOME_PATH/bin/llvm-objdump}"
 if [[ ! -x "$LLVM_OBJDUMP_BIN" ]]; then
     echo "Missing llvm-objdump for AICPU cache-order gate: $LLVM_OBJDUMP_BIN" >&2
@@ -182,13 +202,8 @@ for policy_index in "${!AARCH64_SOS[@]}"; do
 INITIALIZE_DISASSEMBLY="$($LLVM_OBJDUMP_BIN -d --demangle \
     --disassemble-symbols=aicpu_plan_adapter_initialize "$AARCH64_SO")"
 if [[ "$policy_name" == "plan-ahead-closed" ]]; then
-if ! awk '
-    /stlr/ && !reset { reset = NR }
-    /ldar/ && reset && !load { load = NR }
-    END { exit(reset && load && reset < load ? 0 : 1) }
-' <<< "$INITIALIZE_DISASSEMBLY" ||
-   grep -Eq 'dc[[:space:]]+civac' <<< "$INITIALIZE_DISASSEMBLY"; then
-    echo "AICPU Plan reuse gate failed for policy=$policy_name: expected stlr-zero -> ldar without cell civac" >&2
+if grep -Eq 'stlr|dc[[:space:]]+civac' <<< "$INITIALIZE_DISASSEMBLY"; then
+    echo "AICPU Plan reuse gate failed for policy=$policy_name: initialize must not pre-reset cell control" >&2
     exit 1
 fi
 else
@@ -207,14 +222,12 @@ if ! awk '
 fi
 fi
 
-# 两条 policy 的 initialize 都必须先完成 cell Empty 建立/检查和 reset
-# control clean，之后才允许进入 Ready/ReadyFailed。PlanAheadClosed 由
-# AICPU stlr 建立 Empty；StreamingFuture 继续消费 Host reset 并先 civac。
+# 两条 policy 的 initialize 都必须完成 reset control 发布，之后才允许进入
+# Ready/ReadyFailed。PlanAheadClosed 没有 cell Empty 准备；StreamingFuture
+# 继续消费 Host reset，并在 reset control 发布前先 civac + Empty 校验。
 if [[ "$policy_name" == "plan-ahead-closed" ]]; then
 if ! awk '
-    /stlr/ && !cell_reset { cell_reset = NR }
-    /ldar/ && cell_reset && !empty_load { empty_load = NR }
-    /dc[[:space:]]+cvac/ && empty_load && !reset_clean {
+    /dc[[:space:]]+cvac/ && !reset_clean {
         reset_clean = NR; next
     }
     /dsb[[:space:]]+sy/ && reset_clean && !reset_barrier {
@@ -222,13 +235,12 @@ if ! awk '
     }
     /isb/ && reset_barrier && !reset_isb { reset_isb = NR }
     END {
-        exit(cell_reset && empty_load && reset_clean && reset_barrier &&
-             reset_isb && cell_reset < empty_load &&
-             empty_load < reset_clean && reset_clean < reset_barrier &&
+        exit(reset_clean && reset_barrier && reset_isb &&
+             reset_clean < reset_barrier &&
              reset_barrier < reset_isb ? 0 : 1)
     }
 ' <<< "$INITIALIZE_DISASSEMBLY"; then
-    echo "AICPU Plan ready-order gate failed for policy=$policy_name: stlr Empty must precede reset-control publication" >&2
+    echo "AICPU Plan ready-order gate failed for policy=$policy_name: reset-control publication is incomplete" >&2
     exit 1
 fi
 else
@@ -309,15 +321,16 @@ if ! awk '
     exit 1
 fi
 
-# Finish callback 只预写 control=Empty 的 GM payload。PlanAheadClosed
-# 可在 pack 前按需用 stlr 0 建立 cell-control 所有权并检查 Empty，
-# 但最终 flags 尚未知道时不得对 payload 执行 cvac，更不得发布
+# Finish callback 只预写尚未发布的 GM payload。PlanAheadClosed 不再在
+# pack 前用 stlr 0 建立 Empty；最终 flags 尚未知道时不得对 payload
+# 执行 cvac，更不得发布
 # Published control；真正的 payload 可见性边界只在 publish_staged。
 STAGE_DISASSEMBLY="$($LLVM_OBJDUMP_BIN -d --demangle \
     --disassemble-symbols=aicpu_plan_adapter_stage "$AARCH64_SO")"
 if [[ "$policy_name" == "plan-ahead-closed" ]]; then
-    if grep -Eq 'dc[[:space:]]+cvac' <<< "$STAGE_DISASSEMBLY"; then
-        echo "AICPU Plan stage unexpectedly cleaned Empty-cell payload for policy=$policy_name" >&2
+    if grep -Eq 'stlr|dc[[:space:]]+(cvac|civac)|dsb[[:space:]]+sy|isb' \
+        <<< "$STAGE_DISASSEMBLY"; then
+        echo "AICPU Plan stage unexpectedly prepared cell control or cleaned payload for policy=$policy_name" >&2
         exit 1
     fi
 else

@@ -36,7 +36,8 @@ struct AicpuPlanBackendConfig {
 // task 发布完成后开始；orchestration 区间是 Begin 返回到 Finish 进入，
 // stage 是 Finish backend 打包 canonical payload，defer_publish 是等待
 // 下一个 callback（或 backend close）确定 flags，publish 是最终 flags
-// patch、wire 校验和 policy-specific cell-control 发布。整个结构恰好一条 cache line，
+// patch 和 policy-specific cell-control 发布。发布前整包 wire 复核只属于
+// 显式 debug 构建；正常路径由 AICore acquire 后做权威校验。整个结构恰好一条 cache line，
 // AICPU 在 owner 结束前统一 clean，Host 只在 plan stream 闭合后回拷。
 struct alignas(64) AicpuPlanTaskTraceRecord {
     uint64_t build_begin_ns;

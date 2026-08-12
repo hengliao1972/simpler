@@ -1003,6 +1003,33 @@ void TestMalformedPlans()
             "duplicate Build arrival was accepted"
         );
     }
+
+    {
+        PlanFixture fixture(3U);
+        RuntimePlanView view = fixture.View();
+        PublishOne(view, MakeSmallInlineTask(0U));
+        Expect(
+            AdvancePlannedFrontier<CpuOps>(view, 0U),
+            "stale-suffix Plan did not advance its current-run prefix"
+        );
+        // 模拟同一 storage 上一轮更长：cell[1] 仍是合法 Published。
+        // 本轮 frontier=1，Close 必须忽略该后缀，不得要求 Empty。
+        CpuOps::PublishControl(
+            &view.cells[1].control.value,
+            static_cast<int64_t>(EncodePlanCellControl(
+                PlanCellPhase::Published, 1U, 1U
+            ))
+        );
+        Expect(
+            CloseRuntimePlan<CpuOps>(view, 1U),
+            "Plan close rejected a stale Published suffix beyond the current frontier"
+        );
+        const PlanReadyObservation ready = ObserveRuntimePlanReady<CpuOps>(view);
+        Expect(
+            ready.status == PlanReadyStatus::Closed && ready.task_count == 1U,
+            "stale Published suffix leaked past the current-run frontier"
+        );
+    }
     std::printf("[PASS] malformed-payload-control-ref-duplicate-missing-overflow\n");
 }
 

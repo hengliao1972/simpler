@@ -15,6 +15,17 @@
 #include <cstddef>
 #include <cstdint>
 
+// 正常 consumer 只校验安全解码所需的 task/header/layout envelope；
+// canonical padding、未使用 tag 等诊断不变量只在显式 debug 构建复核。
+#ifndef PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION
+#define PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION 0
+#endif
+
+#if PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION != 0 && \
+    PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION != 1
+#error "PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION must be 0 or 1"
+#endif
+
 #ifndef AICPU_PLAN_DEVICE
 #ifdef PA_DEVICE
 #define AICPU_PLAN_DEVICE PA_DEVICE
@@ -615,7 +626,8 @@ template <typename Ops, typename Source>
 AICPU_PLAN_DEVICE bool PackRuntimeTaskPlan(
     AICPU_PLAN_GM RuntimeTaskPlanCell &cell,
     const RuntimeTaskPlanSpec &spec,
-    const Source &source, RuntimeTaskPlanLayout &layout
+    const Source &source, RuntimeTaskPlanLayout &layout,
+    RuntimeTaskPlanHeader *packed_header = nullptr
 )
 {
     uint8_t tags[kMaxTaskTensors] = {};
@@ -700,6 +712,11 @@ AICPU_PLAN_DEVICE bool PackRuntimeTaskPlan(
     while (word < flushed_words) {
         Ops::StorePayloadWord(&destination[word++], 0U);
     }
+    // Producer 若还需要 staged metadata，直接复用本次 Pack 已构造并
+    // 成功写完的 header；不要再从刚写的 GM payload 读回并解码一遍。
+    if (packed_header != nullptr) {
+        *packed_header = header;
+    }
     return true;
 }
 
@@ -738,7 +755,7 @@ AICPU_PLAN_DEVICE RuntimeTaskPlanHeader DecodeRuntimeTaskPlanHeader(
     return header;
 }
 
-AICPU_PLAN_DEVICE bool ValidateRuntimeTaskPlanPayload(
+AICPU_PLAN_DEVICE bool ValidateRuntimeTaskPlanEnvelope(
     AICPU_PLAN_GM const RuntimeTaskPlanStorage &payload,
     uint32_t expected_task_id,
     uint32_t published_lines, RuntimeTaskPlanHeader &header,
@@ -765,6 +782,22 @@ AICPU_PLAN_DEVICE bool ValidateRuntimeTaskPlanPayload(
         header.task_id != expected_task_id ||
         !ComputeRuntimeTaskPlanLayout(spec, header.tensor_tags, layout) ||
         layout.payload_lines != published_lines) {
+        return false;
+    }
+    return true;
+}
+
+AICPU_PLAN_DEVICE bool ValidateRuntimeTaskPlanPayload(
+    AICPU_PLAN_GM const RuntimeTaskPlanStorage &payload,
+    uint32_t expected_task_id,
+    uint32_t published_lines, RuntimeTaskPlanHeader &header,
+    RuntimeTaskPlanLayout &layout
+)
+{
+    if (!ValidateRuntimeTaskPlanEnvelope(
+            payload, expected_task_id, published_lines,
+            header, layout
+        )) {
         return false;
     }
     for (uint32_t tensor = header.tensor_count;
@@ -983,12 +1016,9 @@ AICPU_PLAN_DEVICE bool CloseRuntimePlan(const RuntimePlanView &view, uint32_t fi
         ProducerOps::LoadControl(&view.control->fatal.value) != 0) {
         return false;
     }
-    // 发布严格连续，因此 N 位置仍 Empty 足以证明不存在被遗漏在最终
-    // task_count 之外的已发布后缀；N==capacity 时没有哨兵 cell。
-    if (final_task_count < view.capacity &&
-        ProducerOps::LoadControl(&view.cells[final_task_count].control.value) != 0) {
-        return false;
-    }
+    // planned_frontier 是本轮唯一有效前缀边界；同一 storage 跨轮复用时，
+    // [N, capacity) 允许保留上一轮 control，不能把 cell[N]==Empty 当作
+    // 正常路径条件。AdvancePlannedFrontierTo 已逐项验证本轮 [0,N)。
     ProducerOps::StoreBarrier();
     ProducerOps::PublishControl(&view.control->closed_task_count.value, final_task_count);
     return true;

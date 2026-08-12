@@ -572,6 +572,40 @@ void TestFullPaAdapterRoundTrip()
     ExpectNoSourcePointers(
         fixture.cells[kTaskId], layout, source
     );
+
+    // 正常 consumer 只需要 envelope 来保证后续解码不会越界；未使用
+    // canonical padding 属于诊断不变量，不应进入生产热路。这里锁定两层
+    // 语义：padding 损坏仍通过 envelope，但完整 debug/oracle 校验必须失败。
+    uint32_t output_word_offset = 0U;
+    Expect(
+        RuntimeTaskPlanTensorWordOffset(
+            header, 1U, output_word_offset
+        ),
+        "failed to locate Output canonical slot"
+    );
+    const uint32_t padding_word =
+        output_word_offset + kTensorCreateInfoWords;
+    const uint64_t saved_padding =
+        fixture.cells[kTaskId].payload.words[padding_word];
+    fixture.cells[kTaskId].payload.words[padding_word] = 1U;
+    RuntimeTaskPlanHeader envelope_header{};
+    RuntimeTaskPlanLayout envelope_layout{};
+    Expect(
+        ValidateRuntimeTaskPlanEnvelope(
+            fixture.cells[kTaskId].payload, kTaskId,
+            layout.payload_lines, envelope_header, envelope_layout
+        ),
+        "consumer envelope incorrectly scanned diagnostic padding"
+    );
+    Expect(
+        !ValidateRuntimeTaskPlanPayload(
+            fixture.cells[kTaskId].payload, kTaskId,
+            layout.payload_lines, envelope_header, envelope_layout
+        ),
+        "full debug validation accepted corrupted canonical padding"
+    );
+    fixture.cells[kTaskId].payload.words[padding_word] =
+        saved_padding;
 }
 
 void ExpectMakeSpecRejected(

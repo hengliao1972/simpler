@@ -985,7 +985,11 @@ execution/semantic/postprocess PASS；基线为优化前 10 轮。
 AICore wall 只变化 0.15%，说明收益确实来自 AICPU Plan 维护收缩，
 没有通过减少 task 数、计算负载或 AICore 工作量获得。
 
-### 8.8 基于 AICPU/AICore 同构门禁删除 task.publish 维护
+### 8.8 基于 AICPU/AICore 同构门禁删除 task.publish 维护（历史阶段）
+
+> 本节记录当时“用 Empty 重建 cell control 所有权”的过渡方案。
+> 后续 8.10 已证明 PlanAheadClosed 不需要该预清零和读回，
+> 并已从正常路径实现中删除。
 
 `tests/atomic_probe/aicpu_aicore_cache` 已把 Host/SDMA→AICPU 与
 AICPU→AICore 分开验证。对当前 A5 main aicpu_scheduler，后一个方向的
@@ -1005,8 +1009,8 @@ AICore Scalar consumer
 ```
 
 因此 PlanAheadClosed 的 `task.publish` 删除 payload `dc cvac`、control
-ordinary store + `dc cvac` 及显式 DSB/ISB，只保留 payload wire 校验和
-release atomic control。StreamingFuture 的 consumer 会与 producer 并发，
+ordinary store + `dc cvac` 及显式 DSB/ISB；该阶段暂时保留 payload wire
+校验和 release atomic control。StreamingFuture 的 consumer 会与 producer 并发，
 仍保留旧的逐 task payload/control clean 与 barrier，不能跟随删除。
 
 删除 control clean 后，上一轮 Published line 可能仍由 AICPU cache 持有；
@@ -1073,3 +1077,144 @@ AICore 执行路径没有被偷减；约 207us 的端到端收益来自 AICPU pr
 - CPU protocol、双 policy AICPU SO smoke、CCEC B1/B256 语义和泳道 converter
   均通过。详细命令与数据口径见
   `test_record/2026-08-12/README.md`。
+
+### 8.9 把诊断性重复校验移出正常热路（中间状态）
+
+8.8 完成后，full AICPU operation trace 仍显示每个 task 的 publish 都会
+扫描整份 payload；PlanAheadClosed 的 stage 和 publish 还分别重复读取
+`fatal/closed/frontier/current/predecessor`。这不是跨核可见性的必要步骤：
+
+- payload 是同一 AICPU producer 在 stage 中 single-Pack 的 immutable GM
+  wire，publish 只 patch header word2 的最终 flags；
+- PlanAheadClosed 只有一个串行 producer，AICore consumer 必须等 Close
+  后才启动；
+- Close 的 `AdvancePlannedFrontierTo(0,N)` 已经逐 cell 验证 `[0,N)` 的
+  Published control、task id 和连续性。
+
+因此正常 PlanAheadClosed 改为：
+
+1. publish 只保留 staged magic、payload line、task-id 容量边界和最终
+   PA metadata 检查，然后 patch flags + release-store Published；
+2. stage/publish 不再逐 task 重复观察共享状态；128-cell Empty 前缀准备
+   及 Close 的一次性完整前缀检查保持不变；
+3. `PackRuntimeTaskPlan` 直接回传它已经构造成功的 header，stage 不再从
+   刚写完的 GM payload 读回 64B 再解码；
+4. AICore 正常 consumer 在 DCCI 和第二次 control 观察后只校验
+   task-id/ABI/count/layout/published-lines envelope；不会参与解码的 inactive
+   tag、tensor padding 和末尾 padding 由 debug/Host oracle 全量校验。
+
+`PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION=1` 会恢复 producer 状态复核、
+发布前完整 wire 扫描和 consumer canonical-padding 扫描。`build_smoke.sh`
+显式构建该 debug 变体，并用“stage 成功后破坏 canonical-zero word”的反例
+证明：正常 producer 不重扫、模拟 consumer 完整校验能拒绝；debug producer
+必须在 Published control 前拒绝。StreamingFuture 因存在并发 consumer，
+其 stage/publish 状态复核不随正常宏关闭。
+
+#### 8.9.1 结构变化
+
+同一 A5 device 0、B256、1280 tasks、`real-compute=6,28,4,1` 的联合
+full trace：
+
+| 项目 | 8.8 历史图 | 8.9 最终图 | 变化 |
+| ---- | ---------: | ---------: | ---: |
+| AICPU operation records | 16,714 | 2,636 | -14,078 |
+| task_publish acquire loads | 6,399 | 0 | -6,399 |
+| task_stage acquire loads | 7,551 | 1,152 | -6,399 |
+| task_publish payload validation | 1,280 | 0 | -1,280 |
+| task_publish release Published | 1,280 | 1,280 | 0 |
+
+最终 stage 的 1,152 次 load 只对应 9 个 128-cell 分块 Empty reset 后的配对
+检查。publish phase 总计由 1458.735us 降至 330.491us，p50 由
+1.093us 降至 0.229us；这些是 trace-on 结构时间，不是 trace-free 收益。
+
+#### 8.9.2 trace-free 性能
+
+20 轮中位数对比 8.8 最终版：
+
+| 指标 | 8.8 重复校验版 | 8.9 最终版 | 差值 | 相对变化 |
+| ---- | -------------: | ---------: | ---: | -------: |
+| Plan wall | 1149.669us | 1059.846us | -89.823us | -7.81% |
+| Producer exec | 1062.002us | 989.205us | -72.797us | -6.85% |
+| AICore wall | 2477.879us | 2473.651us | -4.228us | -0.17% |
+| startup→FinalDrain | 2450.675us | 2443.734us | -6.941us | -0.28% |
+| Pipeline E2E | 3626.891us | 3528.444us | -98.447us | -2.71% |
+
+task 数、计算负载和 Plan/Build/Execute 终态均未改变。进一步审计还看到
+`ValidatePaPlanSource`、通用 Pack 与 PA decode 中有少量字段级交叉检查，
+但它们分别保护输入指针、通用 wire 与实际消费语义；当前没有第二个正常
+路径整 payload 重扫，不能把这些必要边界检查与诊断性 padding 扫描混删。
+
+### 8.10 删除 PlanAheadClosed 的 cell Empty 预清零
+
+8.9 之后的正常路径仍会在发布任务前，把本轮使用的每个
+cell control 先 `release-store Empty(0)`，再 `acquire-load` 读回确认。
+这不是 PlanAheadClosed 的必要发布协议：
+
+1. PlanAheadClosed 只有一个 AICPU producer，AICore consumer 在 Close
+   完成前不会启动；
+2. 本轮对 `[0,N)` 的每个实际 cell 都会有一次最终
+   `release-store Published`，可直接覆盖上轮留下的 Published control；
+3. 本轮 `frontier=N` 是 consumer 可访问范围的唯一边界；`[N,capacity)`
+   留有上轮的 control 不会成为本轮任务；
+4. Close 时的 `AdvancePlannedFrontierTo(0,N)` 已逐 cell 校验
+   `[0,N)` 是 task-id 连续的 Published 前缀，不需要再用
+   `cell[N]==Empty` 作后缀哨兵。
+
+因此实现中删除了 `PreparePlanAheadCellControls`、分块准备状态以及
+initialize/stage/close 中的 Empty 预清零调用；通用 Close 协议也不再
+要求 `cell[N]` 为 Empty。StreamingFuture 会与 consumer 并发，它的
+cell 复用、cache maintenance、barrier 和状态复核全部保持原状。
+
+#### 8.10.1 结构计数
+
+同一 A5 device 0、B256、1280 tasks、`real-compute=6,28,4,1` 的
+full operation trace 对比如下。Calls 是合并前的源码级调用量。
+
+| 项目 | 8.9 中间图 | 8.10 最终图 | 变化 |
+| ---- | -----------: | ------------: | ---: |
+| AICPU operation records | 2,636 | 2,615 | -21 |
+| Empty reset release stores | 1,280 | 0 | -1,280 |
+| Empty readback acquire loads | 1,280 | 0 | -1,280 |
+| `cell[N]` 后缀哨兵 acquire load | 1 | 0 | -1 |
+| `task_publish` release Published | 1,280 | 1,280 | 0 |
+| Close `[0,N)` Published loads | 1,280 | 1,280 | 0 |
+| operation trace dropped | 0 | 0 | 0 |
+
+这一步共删除 2,561 次 atomic 调用。中间版的 1,280 次 Empty
+store/load 分布为 backend_bind 的 128+128 次和 task_stage 的
+1,152+1,152 次；最终图中这两个 scope 的 cell-control atomic 均为
+0。仍保留的 1,280 次 Published release store 是 payload 发布点，Close 的
+1,280 次 load 是 `[0,N)` 的唯一终态连续性校验。
+
+#### 8.10.2 trace-free 性能
+
+同一工作区、同一 A5 device 0、B256、`real-compute=6,28,4,1`、
+perf-clock、同进程 20 轮中位数：
+
+| 指标 | 8.9 Empty 预清零 | 8.10 直接 Published | 差值 | 相对变化 |
+| ---- | -----------------: | ---------------------: | ---: | -------: |
+| Plan wall | 1059.846us | 876.248us | -183.598us | -17.32% |
+| Producer exec | 989.205us | 793.615us | -195.590us | -19.77% |
+| AICore wall | 2473.651us | 2481.426us | +7.775us | +0.31% |
+| startup→FinalDrain | 2443.734us | 2444.319us | +0.585us | +0.02% |
+| Pipeline E2E | 3528.444us | 3363.339us | -165.105us | -4.68% |
+
+20/20 execution/semantic/postprocess PASS。AICore wall 和计算 workload 未变，
+因此端到端的 165.105us 收益来自 AICPU producer 缩短，不是减少
+task 数或计算负载。相对 8.8 重复校验版的 3626.891us，两步
+累计使 Pipeline E2E 减少 263.552us（7.27%）。
+
+#### 8.10.3 正确性门禁
+
+- native Host smoke 新增同一 Plan allocation、不清 cell control 的
+  14-task→5-task 长到短复用；第二轮 Close/frontier 精确为 5，
+  `cell[5]` 保留上轮 Published 也不会泄漏成本轮任务；
+- 默认、trace-on 和 `PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION=1` 三种 Host
+  smoke 全部 PASS；
+- AArch64 反汇编门禁要求 PlanAhead initialize/stage 没有 cell Empty
+  `stlr`、`civac`或 barrier，publish 仍必须有 Published `stlr`；
+- Runtime Plan protocol/PA adapter CPU 测试、CCEC 真实 A5 B256 语义、
+  postprocess 与 joint full atomic/DCCI converter 门禁全部 PASS。
+
+最终泳道图保存为
+`test_record/2026-08-12/ordinary_scalar_plan_ahead_closed_b256_real_compute_6_28_4_1_direct_publish_5069us_joint_full_atomic_swimlane.json`。

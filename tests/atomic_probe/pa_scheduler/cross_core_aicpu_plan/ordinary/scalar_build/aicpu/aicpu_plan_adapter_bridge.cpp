@@ -124,12 +124,6 @@ private:
 };
 #endif
 
-constexpr uint32_t kPlanAheadControlPrepareChunk = 128U;
-RuntimePlanControl *g_plan_ahead_control = nullptr;
-RuntimeTaskPlanCell *g_plan_ahead_cells = nullptr;
-uint32_t g_plan_ahead_capacity = 0U;
-uint32_t g_plan_ahead_prepared_prefix = 0U;
-
 // 当前 A5 main aicpu_scheduler Path-A 已通过独立同构门禁验证：AICPU
 // ordinary payload store 可由 release atomic control 直接发布给 AICore，
 // 无需 producer 侧 dc cvac/显式 barrier。Host/SDMA -> AICPU 是另一条非一致
@@ -324,54 +318,13 @@ struct AicpuProducerOps {
     }
 };
 
-[[maybe_unused]] bool PreparePlanAheadCellControls(
-    const RuntimePlanView &view, uint32_t required_prefix
-)
-{
-    if (view.control == nullptr || view.cells == nullptr ||
-        view.control != g_plan_ahead_control ||
-        view.cells != g_plan_ahead_cells ||
-        view.capacity != g_plan_ahead_capacity ||
-        required_prefix > view.capacity) {
-        return false;
-    }
-    if (required_prefix <= g_plan_ahead_prepared_prefix) return true;
-
-    const uint32_t rounded =
-        ((required_prefix + kPlanAheadControlPrepareChunk - 1U) /
-         kPlanAheadControlPrepareChunk) * kPlanAheadControlPrepareChunk;
-    const uint32_t new_prefix = rounded < view.capacity
-        ? rounded
-        : view.capacity;
-    // task.publish 不再 cvac 后，上一轮 cell control 可能仍由 AICPU
-    // cache 持有；此时若对 Host memset 后的地址执行 civac，会冒险把旧
-    // Published 写回覆盖 0。PlanAheadClosed 没有并发 consumer，因此由
-    // AICPU 直接覆盖本轮即将使用的 control，重新建立唯一 writer 所有权。
-    // Host/SDMA 输入区以及 StreamingFuture 的并发复用协议不走这里。
-    for (uint32_t task = g_plan_ahead_prepared_prefix;
-         task < new_prefix; ++task) {
-        AicpuProducerOps::StoreReleaseControl(
-            &view.cells[task].control.value, 0
-        );
-    }
-    for (uint32_t task = g_plan_ahead_prepared_prefix;
-         task < new_prefix; ++task) {
-        if (AicpuProducerOps::LoadControl(
-                &view.cells[task].control.value
-            ) != 0) {
-            return false;
-        }
-    }
-    g_plan_ahead_prepared_prefix = new_prefix;
-    return true;
-}
-
 // UP 的 has-following/last-in-batch 只有下一个真实 Begin（或
 // close）到来后才能确定。Finish callback 里的 L0TaskArgs 及其指向的
 // descriptor 都属于 orchestration 栈，不能把指针留到下一个 Begin。
 // 所以 Finish 趁 callback 仍存活时把 canonical payload 唯一一次
 // Pack 到目标 GM cell，但保持 cell control=Empty。下一个 Begin/close 只补上
-// 最终 flags、校验最终 GM wire，再以 release atomic 发布 cell control。
+// 最终 flags，再以 release atomic 发布 cell control；完整 GM wire 回读校验
+// 仅属于显式 debug 构建，不进入正常发布热路。
 // PlanAheadClosed 的 AICore consumer 永远不会读 Empty cell 的 payload，
 // backend 也不再保留任何 callback 指针；StreamingFuture 仍保留原保守 clean。
 constexpr uint64_t kStagedPlanMetadataMagic = 0x5041535441470001ULL;
@@ -389,6 +342,7 @@ static_assert(
     "staged PA metadata unexpectedly exceeds one isolated line"
 );
 
+#if PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION
 bool HeaderMatchesExpected(
     const RuntimeTaskPlanHeader &header,
     const RuntimeTaskPlanHeader &expected
@@ -418,6 +372,7 @@ bool HeaderMatchesExpected(
     }
     return true;
 }
+#endif
 
 PlanPublishResult FinalizeStagedPlan(
     const RuntimePlanView &view, const StagedPlanMetadata &metadata,
@@ -426,37 +381,59 @@ PlanPublishResult FinalizeStagedPlan(
 {
     const uint32_t task_id = metadata.provisional_header.task_id;
     if (view.control == nullptr || view.cells == nullptr ||
-        task_id >= view.capacity ||
-        AicpuProducerOps::LoadControl(&view.control->fatal.value) != 0 ||
-        AicpuProducerOps::LoadControl(
-            &view.cells[task_id].control.value
-        ) != 0) {
+        task_id >= view.capacity) {
         return PlanPublishResult::CellUnavailable;
     }
-    const int64_t closed = AicpuProducerOps::LoadControl(
-        &view.control->closed_task_count.value
-    );
-    if (closed != kPlanProducerNotReadyTaskCount &&
-        closed != kPlanOpenTaskCount) {
-        return PlanPublishResult::CellUnavailable;
-    }
-    const int64_t frontier = AicpuProducerOps::LoadControl(
-        &view.control->planned_frontier.value
-    );
-    if (frontier < 0 || frontier > static_cast<int64_t>(task_id)) {
-        return PlanPublishResult::CellUnavailable;
-    }
-    if (static_cast<int64_t>(task_id) > frontier) {
-        const uint32_t predecessor = task_id - 1U;
-        const DecodedPlanCellControl decoded = DecodePlanCellControl(
-            AicpuProducerOps::LoadControl(
-                &view.cells[predecessor].control.value
-            )
-        );
-        if (!decoded.valid ||
-            decoded.phase != PlanCellPhase::Published ||
-            decoded.task_id != predecessor) {
+    // StreamingFuture 有并发 consumer，发布时必须重新观察共享状态。
+    // PlanAheadClosed 的唯一 producer 由 callback 单调 task-id 和 staged
+    // magic 锁定，consumer 又要等 Close 后才启动；正常路径不做逐 task
+    // 重复检查，Close 的 AdvancePlannedFrontierTo 会一次性验证 [0, N)
+    // 的完整连续前缀。
+    if constexpr (
+        kRuntimePlanPipelineIsStreamingFuture ||
+        PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION
+    ) {
+        if (AicpuProducerOps::LoadControl(
+                &view.control->fatal.value
+            ) != 0) {
             return PlanPublishResult::CellUnavailable;
+        }
+        // StreamingFuture 会和 consumer 并发复用 cell，必须要求当前
+        // control 为 Empty。PlanAheadClosed 在 Close 前没有 consumer，
+        // 可以直接用本轮 Published 覆盖上一轮同地址 Published；旧值不再
+        // 是该 policy 的协议前置条件。
+        if constexpr (kRuntimePlanPipelineIsStreamingFuture) {
+            if (AicpuProducerOps::LoadControl(
+                    &view.cells[task_id].control.value
+                ) != 0) {
+                return PlanPublishResult::CellUnavailable;
+            }
+        }
+        const int64_t closed = AicpuProducerOps::LoadControl(
+            &view.control->closed_task_count.value
+        );
+        if (closed != kPlanProducerNotReadyTaskCount &&
+            closed != kPlanOpenTaskCount) {
+            return PlanPublishResult::CellUnavailable;
+        }
+        const int64_t frontier = AicpuProducerOps::LoadControl(
+            &view.control->planned_frontier.value
+        );
+        if (frontier < 0 || frontier > static_cast<int64_t>(task_id)) {
+            return PlanPublishResult::CellUnavailable;
+        }
+        if (static_cast<int64_t>(task_id) > frontier) {
+            const uint32_t predecessor = task_id - 1U;
+            const DecodedPlanCellControl decoded = DecodePlanCellControl(
+                AicpuProducerOps::LoadControl(
+                    &view.cells[predecessor].control.value
+                )
+            );
+            if (!decoded.valid ||
+                decoded.phase != PlanCellPhase::Published ||
+                decoded.task_id != predecessor) {
+                return PlanPublishResult::CellUnavailable;
+            }
         }
     }
 
@@ -468,9 +445,11 @@ PlanPublishResult FinalizeStagedPlan(
         RuntimeTaskPlanHeaderWord(expected, 2U)
     );
 
-    // control 发布前对最终 GM wire 本身做完整校验。这不是
-    // 对 staging 副本的替代校验；consumer 之后 acquire 到的就是
-    // 此处校验的同一份 bytes。
+    // 正常路径不重读刚刚由同一 producer canonical Pack 的整份 GM
+    // payload。专门的协议调试构建可在 Published control 前复核最终
+    // wire；无论该门禁是否开启，AICore consumer acquire 后都保留
+    // 跨处理器边界上的权威校验。
+#if PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION
     RuntimeTaskPlanHeader header{};
     RuntimeTaskPlanLayout validated_layout{};
 #if PA_BUILD_SWIMLANE
@@ -493,6 +472,7 @@ PlanPublishResult FinalizeStagedPlan(
     if (!payload_valid) {
         return PlanPublishResult::InvalidInput;
     }
+#endif
 
     const int64_t published = static_cast<int64_t>(EncodePlanCellControl(
         PlanCellPhase::Published, metadata.payload_lines, task_id
@@ -543,10 +523,6 @@ bool MakeView(
 
 extern "C" int32_t
 aicpu_plan_adapter_initialize(void *control, void *cells, uint32_t capacity, State *operation_trace_state) {
-    g_plan_ahead_control = nullptr;
-    g_plan_ahead_cells = nullptr;
-    g_plan_ahead_capacity = 0U;
-    g_plan_ahead_prepared_prefix = 0U;
     RuntimePlanView view{};
     if (!MakeView(control, cells, capacity, view)) return -1;
 #if PA_BUILD_SWIMLANE
@@ -575,8 +551,9 @@ aicpu_plan_adapter_initialize(void *control, void *cells, uint32_t capacity, Sta
     // Host aclrtMemset 不会 snoop 上一轮留在 AICPU cache 中的 control。
     // StreamingFuture 的 consumer 会提前领 future ticket，且旧发布协议
     // 保证 control 为 clean-valid，因此在 Ready 前仍完成全容量
-    // discard/Empty 校验。PlanAheadClosed 没有并发 consumer，改由 AICPU
-    // release-store 0 覆盖本轮单调前缀，避免 dirty line 在 civac 时回写旧值。
+    // discard/Empty 校验。PlanAheadClosed 在 Close 前没有 consumer，实际
+    // task 会由本轮 release Published 直接覆盖同地址旧值；不再为所有 cell
+    // 额外执行 release Empty + acquire readback。
     if constexpr (kRuntimePlanPipelineIsStreamingFuture) {
         for (uint32_t task = 0U; task < capacity; ++task) {
             AicpuProducerOps::DiscardPreviouslyCleanControlLine(
@@ -591,14 +568,6 @@ aicpu_plan_adapter_initialize(void *control, void *cells, uint32_t capacity, Sta
                 (void)PublishRuntimePlanReadyFailed<AicpuProducerOps>(view);
                 return -2;
             }
-        }
-    } else {
-        g_plan_ahead_control = view.control;
-        g_plan_ahead_cells = view.cells;
-        g_plan_ahead_capacity = view.capacity;
-        if (!PreparePlanAheadCellControls(view, 1U)) {
-            (void)PublishRuntimePlanReadyFailed<AicpuProducerOps>(view);
-            return -2;
         }
     }
     view.control->planned_frontier.value = 0;
@@ -654,41 +623,50 @@ extern "C" int32_t aicpu_plan_adapter_stage(
         task_id >= view.capacity) {
         return -2;
     }
-    if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
-        if (!PreparePlanAheadCellControls(view, task_id + 1U)) {
+    // PlanAheadClosed 只有一个串行 producer，且 Close 前无 consumer。
+    // 正常路径由 callback 单调 task-id 和 Close 的完整前缀检查共同锁定；
+    // 逐 task 状态复核仅留给 debug。
+    if constexpr (
+        kRuntimePlanPipelineIsStreamingFuture ||
+        PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION
+    ) {
+        if (AicpuProducerOps::LoadControl(
+                &view.control->fatal.value
+            ) != 0) {
             return -2;
         }
-    }
-    if (AicpuProducerOps::LoadControl(&view.control->fatal.value) != 0 ||
-        AicpuProducerOps::LoadControl(
-            &view.cells[task_id].control.value
-        ) != 0) {
-        return -2;
-    }
-    const int64_t closed = AicpuProducerOps::LoadControl(
-        &view.control->closed_task_count.value
-    );
-    if (closed != kPlanProducerNotReadyTaskCount &&
-        closed != kPlanOpenTaskCount) {
-        return -2;
-    }
-    const int64_t frontier = AicpuProducerOps::LoadControl(
-        &view.control->planned_frontier.value
-    );
-    if (frontier < 0 || frontier > static_cast<int64_t>(task_id)) {
-        return -2;
-    }
-    if (static_cast<int64_t>(task_id) > frontier) {
-        const uint32_t predecessor = task_id - 1U;
-        const DecodedPlanCellControl decoded = DecodePlanCellControl(
-            AicpuProducerOps::LoadControl(
-                &view.cells[predecessor].control.value
-            )
+        if constexpr (kRuntimePlanPipelineIsStreamingFuture) {
+            if (AicpuProducerOps::LoadControl(
+                    &view.cells[task_id].control.value
+                ) != 0) {
+                return -2;
+            }
+        }
+        const int64_t closed = AicpuProducerOps::LoadControl(
+            &view.control->closed_task_count.value
         );
-        if (!decoded.valid ||
-            decoded.phase != PlanCellPhase::Published ||
-            decoded.task_id != predecessor) {
+        if (closed != kPlanProducerNotReadyTaskCount &&
+            closed != kPlanOpenTaskCount) {
             return -2;
+        }
+        const int64_t frontier = AicpuProducerOps::LoadControl(
+            &view.control->planned_frontier.value
+        );
+        if (frontier < 0 || frontier > static_cast<int64_t>(task_id)) {
+            return -2;
+        }
+        if (static_cast<int64_t>(task_id) > frontier) {
+            const uint32_t predecessor = task_id - 1U;
+            const DecodedPlanCellControl decoded = DecodePlanCellControl(
+                AicpuProducerOps::LoadControl(
+                    &view.cells[predecessor].control.value
+                )
+            );
+            if (!decoded.valid ||
+                decoded.phase != PlanCellPhase::Published ||
+                decoded.task_id != predecessor) {
+                return -2;
+            }
         }
     }
 
@@ -710,16 +688,14 @@ extern "C" int32_t aicpu_plan_adapter_stage(
     RuntimeTaskPlanLayout layout{};
     const PaRuntimeTaskPlanSource source{args};
     if (!PackRuntimeTaskPlan<AicpuProducerOps>(
-            view.cells[task_id], spec, source, layout
+            view.cells[task_id], spec, source, layout,
+            &metadata.provisional_header
         )) {
         // Pack 中途失败只会留下不可见 payload；control 仍为
         // Empty，FinishTask 会立即发布 fatal，consumer 不会 acquire。
         return -4;
     }
 
-    metadata.provisional_header = DecodeRuntimeTaskPlanHeader(
-        view.cells[task_id].payload
-    );
     metadata.payload_lines = layout.payload_lines;
     metadata.output_count = spec.output_count;
     metadata.reserved = 0U;
@@ -749,10 +725,13 @@ extern "C" int32_t aicpu_plan_adapter_publish_staged(
     const RuntimeTaskPlanHeader &provisional =
         metadata.provisional_header;
     if (metadata.magic != kStagedPlanMetadataMagic ||
-        metadata.reserved != 0U ||
         metadata.payload_lines != payload_lines ||
+        provisional.task_id >= capacity) {
+        return -3;
+    }
+#if PA_RUNTIME_PLAN_DEBUG_FULL_VALIDATION
+    if (metadata.reserved != 0U ||
         metadata.output_count != provisional.output_count ||
-        provisional.task_id >= capacity ||
         provisional.tensor_count > aicpu_plan::kMaxTaskTensors ||
         provisional.scalar_count > aicpu_plan::kMaxTaskScalars ||
         provisional.explicit_dep_count >
@@ -760,6 +739,7 @@ extern "C" int32_t aicpu_plan_adapter_publish_staged(
         provisional.abi_version != kRuntimePlanAbiVersion) {
         return -3;
     }
+#endif
 #if PA_BUILD_SWIMLANE
     TraceScopeGuard trace_scope(Scope::TaskPublish, provisional.task_id);
 #endif
@@ -840,12 +820,8 @@ extern "C" int32_t aicpu_plan_adapter_close(
     if (!MakeView(control, cells, capacity, view)) return -1;
     if constexpr (kRuntimePlanPipelineIsPlanAheadClosed) {
         // 串行 policy 在 Close 前不允许任何 Build consumer 已经启动。
-        // consumer 只会读 [0, N)；AICPU 已主动把该前缀 control 覆盖为
-        // Empty 后再逐 task 发布。cell[N] 及更后的未用容量不参与本轮，
-        // 不需要为额外 sentinel 再扩一个 128-cell 准备块。
-        if (!PreparePlanAheadCellControls(view, final_task_count)) {
-            return -3;
-        }
+        // consumer 只会读本轮逐 task release-Published 并在此处验证过的
+        // [0,N)；未用后缀允许保留上一轮值，不参与本轮协议。
         if (AicpuProducerOps::LoadControl(
                 &view.control->build_next.value
             ) != 0 ||
