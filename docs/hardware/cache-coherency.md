@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD060 -->
+
 # Cache Coherency (GM ↔ AICore/AICPU)
 
 This page is the authoritative reference for **when to insert a cache
@@ -25,18 +27,34 @@ asymmetry is the entire reason this page exists.
 
 Likewise, **AICore's own cache is non-coherent with GM** in the other
 direction: AICore-side writes stay in its data cache until explicitly
-pushed out with `dcci`. AICPU writes that AICore needs to see follow a
-mirror of this table (AICore must `dcci` to invalidate before reading
-host- or AICPU-written GM).
+pushed out with `dcci`. On the current A5 main `aicpu_scheduler` Path-A,
+AICPU stores reach the shared coherency point without an explicit AICPU
+`dc cvac`; however, an AICore consumer that primed its local DCache must
+still `dcci` that payload line before an ordinary load.
 
 The rest of this doc fills in why each row of the table is what it is,
 and what code lives on each side.
+
+Do not collapse the model into a single "GM is coherent with AICPU" rule.
+There are two distinct scenarios:
+
+1. **Host/SDMA → AICPU** asks whether a DMA writer snoops AICPU cache.
+   Host DMA does not; SDMA remains conservatively non-coherent. The AICPU
+   consumer invalidates with `dc civac`.
+2. **AICPU ↔ AICore Scalar** asks about the current A5 Path-A snoop domain
+   and AICore's private Scalar DCache. AICPU publication needs release
+   ordering but no `dc cvac`; a Scalar ordinary payload consumer still
+   needs DCCI. In the reverse direction, Scalar performs DCCI before
+   publication and AICPU does not invalidate again.
+
+Evidence or cache operations from one scenario must not be used to infer the
+other.
 
 ## The two cache primitives
 
 | Primitive | Side | Purpose | Cost (rough, a2a3 / DAV_3510) |
 | --------- | ---- | ------- | ----------------------------- |
-| `dcci` (`__attribute__((aicore))` intrinsic) | AICore | Push a cache line out to GM (clean+invalidate). Required after AICore stores that AICPU or peer AICore must read. | 1 cache line per call + a following `dsb` to commit ordering. |
+| `dcci` (`__attribute__((aicore))` intrinsic) | AICore | Push a cache line out to GM (clean+invalidate). Required after AICore stores that AICPU or peer AICore must read. | 1 cache line per call; keep a following `dsb` at an unverified dependency boundary. The current A5 `DCCI lines -> atomicExch(control)` path has a direct no-DSB gate. |
 | `cache_invalidate_range(addr, size)` (`src/{a2a3,a5}/platform/onboard/aicpu/cache_ops.cpp`) | AICPU | `dc civac` + `dsb sy` + `isb` over a byte range. Required before AICPU reads GM that **a non-coherent writer** (host DMA, SDMA) most recently published. | `dsb sy` dominates (tens to hundreds of cycles, fixed regardless of range). |
 
 `cache_invalidate_range` is the protocol-correct primitive for the
@@ -72,6 +90,13 @@ AICore                              AICPU
   dsb (commit dcci before FIN)        read slot fields     ← Normal cacheable
   write FIN → COND                ←
 ```
+
+The explicit `dsb` remains part of this FIN/COND handshake: the 2026-08-12
+no-DSB result does not cover a Device-MMIO FIN write. That result is narrower:
+on current A5, 32 dirty lines followed by 32 DCCI operations and an immediate
+`atomicExch` control publication passed without an intervening explicit DSB.
+See the direct-gate evidence below. Do not transfer that exception to this
+MMIO sequence or to another successor primitive without a matching gate.
 
 Two separate concerns, often conflated:
 
@@ -124,6 +149,37 @@ is `rmb()` (for load-load ordering against a prior COND read) plus
 making sure the AICore side does `dcci` before signaling. The cache
 invalidate itself is not needed on this path.
 
+## The "AICPU → AICore" path on A5 Path-A: release, not clean
+
+The main `aicpu_scheduler` Path-A used by `cross_core_aicpu_plan` is in the
+A5 AICore snoop domain. The validated publication sequence is:
+
+```text
+AICPU                              AICore Scalar
+  ordinary store payload             return-value atomic poll control
+  release atomic store control  →    dsb
+    (HCC: stlr)                       dcci payload line
+                                      dsb
+                                      ordinary load payload
+```
+
+The AICPU producer does **not** need per-publication `dc cvac`, `dsb sy`, or
+`isb` in this path. The release store is load-bearing: it preserves the
+payload-before-control publication order. Do not replace it with an ordinary
+store merely because the weaker variant happened to be fresh in the current
+probe.
+
+The AICore-side `dcci` remains load-bearing for ordinary payload reads. The
+atomic control observation does not invalidate a separately cached payload
+line. This rule is therefore not "delete all cache operations"; it moves the
+protocol boundary to the actual non-coherent local cache.
+
+This result is launch-path specific. A repository incident involving a cust
+AICPU subprocess pinned to another cluster observed stale AICPU L1 data and
+showed that the process was outside the AICore snoop domain. Re-run the same
+direct-doorbell probe before applying this rule to a different AICPU loader,
+cluster affinity, chip, or CANN version.
+
 ## The "host DMA → AICPU" path: AICPU MUST invalidate
 
 When the host writes via `rtMemcpy`, the AICPU cache is not snooped.
@@ -158,6 +214,61 @@ If a hardware confirmation lifts that assumption — i.e. SDMA writes
 become snooped — these invalidates can be removed using the same
 reasoning as the AICore case. Until that confirmation exists, **leave
 them in place**.
+
+## A5 single-point evidence (2026-08-12)
+
+The standalone
+[AICPU/AICore cache and atomic probe](../../tests/atomic_probe/aicpu_aicore_cache/README.md)
+tests both directions with a real HCC AICPU owner and CCEC AIV Scalar
+kernels. It reuses the same addresses for 4096 rounds per case and ran five
+independent host processes on device 0. Every classified sample was an exact
+current generation or the exact primed stale generation; no torn, historical,
+or otherwise invalid value was observed.
+
+| Case | Five-run result | Protocol implication |
+| ---- | --------------- | -------------------- |
+| AICPU ordinary payload stores, then release atomic control; no `dc cvac`, explicit DMB/DSB, ISB, or separate done publication | 20480/20480 fresh | This is the current A5 Path-A production gate; per-publication AICPU clean/barrier is unnecessary. |
+| Same release publication, but AICore omits payload `dcci` | 0 fresh / 20480 stale / 0 other; same-round `ld_dev` is 20480 fresh | A fresh atomic control does not invalidate a separate payload line. |
+| AICPU ordinary payload/control, then a separate release atomic doorbell; no clean | 20480/20480 fresh | Release ordering works independently of control and doorbell sharing an address. |
+| AICPU ordinary payload/control with no clean and no ordering primitive | 20480/20480 fresh | Observation only; do not turn a microarchitectural result into an ordinary-store publication contract. |
+| AICore reuses a cached ordinary control load after a release doorbell | 0 fresh / 20480 stale / 0 other; same-round return-value atomic is 20480 fresh | Do not poll a cross-domain control with an ordinary cached load. |
+| AICore stores 32 payload lines, executes default DCCI for every line + one trailing DSB, then `atomicExch` control | 20480/20480 fresh rounds; 655360/655360 lines | Positive DSB control; AICPU does not need `dc civac`. |
+| Same 32-line path, but no explicit DSB between the final default DCCI and `atomicExch` | 20480/20480 fresh rounds; 655360/655360 lines; OUT DCCI gives the same result; 320 quiet post-publish ACK windows per selector pass | On this exact A5/CANN atomic publication path, a separate DSB is not required for correctness. |
+| AICore stores the same 32 lines but executes no DCCI; DSB present or absent before `atomicExch` | 0 fresh / 20480 stale / 0 other in both variants, including the later AICPU `dc civac` reference | DSB is not a writeback primitive and cannot replace producer DCCI. |
+| AICore omits producer `dcci` for payload or ordinary control | 0/20480/0 both before and after AICPU `dc civac` | Consumer invalidation cannot publish a dirty line still held by the producer. |
+
+The direct release case excludes hidden clean assistance: the tested control
+is the doorbell, and AICPU waits for a final AICore acknowledgement before it
+may clean results or exit. Owner-ELF disassembly shows ordinary `str` payload
+stores followed by `stlr`, with no `dc cvac`, DMB, DSB, or ISB. The weaker
+ordinary-store case and a single AICore `st_dev` were also fresh in all 20480
+observations, but remain observation-only and do not relax ordering rules or
+the repository ban on `st_dev` as a general business write path.
+
+For the no-DSB AICore cases, compiler-inserted Scalar DCCI and kernel-end DCCI
+were disabled. Optimized device LLVM IR goes from the last
+`llvm.hivm.DCCI.DST` to `llvm.hivm.atom.EXCH.G.s64` without an intervening
+`llvm.hivm.DSB`; the with-DSB branch contains the DSB intrinsic. This is
+runtime plus optimized-IR evidence, not final-machine-code disassembly. No
+public CANN/ISA contract was found stating that DCCI itself completes before
+every successor or that every atomic replaces DSB. Therefore the exception
+is limited to the gated `DCCI lines -> atomicExch(control)` sequence; retain
+DSB for reader-side DCCI, MMIO publication, other successors, and untested
+chips/toolchains.
+
+The AICPU consumer does not hide a compensating barrier. It reads payload in
+reverse line order immediately after the acquire control observation, so the
+last DCCI target is sampled first. AArch64 owner-ELF disassembly shows `ldar`
+followed by the primary payload `ldr` loop; the first subsequent `dc civac`
+and `dsb sy` belong to the later reference read and occur after primary values
+have already been captured.
+
+Nor can the next Scalar atomic hide completion in the quiet samples. Every
+64th no-DSB round executes 1048576 pure NOPs after `atomicExch`, with no GM,
+atomic, or DSB operation. AICPU release-publishes an ACK only after capturing
+primary payload, and the producer's first later memory instruction checks that
+ACK. Optimized device IR is `atomicExch -> NOP loop -> atomicAdd ACK`; all 320
+quiet windows per selector passed across five processes.
 
 ## Quick decision table
 

@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD060 -->
+
 # A5 Cache-Line Cross-Core Probe
 
 ## Goal
@@ -48,6 +50,22 @@ DCCI、`st_dev` 与 atomic 的 API 功能、隔离规则和代码评审清单见
   上 1/7 个 reader、两种 opcode、四种地址关系共八种模式均通过地址、计数、旧值、轮次和
   拓扑门禁；同地址 atomic 严格串行，同 cacheline 异 word 不进入该同址串行顺序，已经完成
   并离开的 31 次读取也没有给后续同址写留下按 31 次累加的残余罚时。
+- 2026-08-12：新增真实 HCC AICPU 与 CCEC AIV Scalar 双向单点探针
+  `aicpu_aicore_cache`。32 个 AICPU→AICore case、20 个 AICore→AICPU case
+  各执行五个独立进程、每项 4096 轮。无隐藏 clean 的 direct case 证明当前 A5
+  main `aicpu_scheduler` Path-A 可使用 `ordinary payload -> release atomic control`，
+  不再需要逐次 AICPU `dc cvac + dsb sy + isb`；正式协议与预期 stale 负例全部精确
+  通过，所有 `other/torn/history=0`。完整矩阵见
+  [`aicpu_aicore_cache/README.md`](aicpu_aicore_cache/README.md)。
+- 2026-08-12：同一探针增加 Scalar producer 的 32-line DSB 对照。default/OUT DCCI
+  后不显式执行 DSB、直接以 `atomicExch` 发布唯一 control 的两项各为
+  `20480 fresh / 0 stale / 0 other` 轮，即每项 655360 条 line 全 fresh；带尾随 DSB
+  的同构对照一致。不执行 DCCI 的两项无论有没有 DSB 都是 `0/20480/0`，证明当前
+  A5 精确 `DCCI lines -> atomicExch` 路径可省独立 DSB，但 DSB 不能替代 DCCI；该
+  结果不外推到 reader DCCI、MMIO 或其他未验证后继。每个 no-DSB selector 另有
+  320 个 post-publish 静默窗口：Scalar 在 `atomicExch` 后只执行 1048576 个 NOP，
+  第一条后续内存指令即检查 AICPU 已完成 primary payload 读取的 ACK，全部通过，排除
+  下一轮 ready atomic 暗中促成 DCCI 完成。
 - 原始环境与定量结果记录在 `tests/ATOMIC_MINIBENCH_ONBOARD_LOG.md` 的 2026-07-11 与 2026-07-13 小节。
 
 ## 权威覆盖矩阵
@@ -645,6 +663,39 @@ PTO_ISA_ROOT="$PWD/build/pto-isa" ATOMIC_PROBE_DEVICE=0 ATOMIC_PROBE_AIVS=8 \
   tests/atomic_probe/ccec/run_all.sh atomic_poll_exchange_contention run
 ```
 
+## AICPU 与 AICore cache/atomic 单点验证
+
+[`aicpu_aicore_cache/`](aicpu_aicore_cache/README.md) 不运行 PA 调度器，只保留真实
+AICPU、AIV Scalar、GM、atomic 与 cache maintenance，逐项拆开
+`cross_core_aicpu_plan` 的发布协议。每个被测 control 独占 128 B，payload 与 atomic
+control 分 line。direct case 由被测 control 自己充当 doorbell，末轮 AICore 读取完成
+后再 ACK；因此没有独立 clean-done 或退出阶段 clean 帮助被测写入变得可见。
+
+该矩阵只回答 AICPU ↔ AICore Scalar。Host/SDMA → AICPU 是另一类 DMA writer
+场景：Host DMA 后 AICPU 仍需 civac，SDMA 在专项硬件结论前也继续按非一致处理；不能
+用本节的“Path-A AICPU producer 不需 cvac”去删除 DMA consumer 的 civac。
+
+当前 A5 device 0 五个独立进程的累计结果为：
+
+| 方向/场景 | 累计结果 | 可以得到的结论 |
+|---|---:|---|
+| AICPU ordinary payload + release atomic control；均不 cvac，control 即 doorbell | `20480/20480 fresh` | 当前 A5 Path-A 正式门禁通过；逐次 AICPU clean/barrier 不需要保留 |
+| 同一 release 发布，但 AICore payload 不 DCCI | `0 fresh / 20480 stale / 0 other` | atomic control fresh 不会刷新另一条 payload line；同轮 `ld_dev` 为 `20480 fresh` |
+| ordinary payload/control 后以独立 release atomic doorbell 发布；均不 cvac | `20480/20480 fresh` | release 排序不依赖 control 与 doorbell 同址 |
+| ordinary payload/control 均不 clean、无 barrier，ordinary control 即 doorbell | 当前 `20480/20480 fresh` | 仅作 A5 观察；不能用普通 store 替代 release 发布顺序 |
+| release doorbell 已发布；AICore 使用已缓存 ordinary control | `0 fresh / 20480 stale / 0 other` | control 不能用普通 cached load 轮询；同轮返回型 atomic 为 `20480 fresh` |
+| AICore ordinary payload + DCCI + DSB，再 atomic 发布；AICPU acquire/ordinary load | `20480/20480 fresh` | 当前正式 AICore→AICPU 协议门禁通过；AICPU 无需再 civac payload |
+| AICore 写 32 条 line，default/OUT DCCI 后不显式 DSB，直接 `atomicExch` 发布 | 两种 selector 各 `20480/20480 fresh`；每项 655360 条 line 全 fresh；每项 320 个静默 ACK 窗口通过 | 当前 A5 精确 atomic 发布路径可省独立 DSB；带 DSB 同构对照相同；下一轮 Scalar atomic 未参与静默样本 |
+| AICore 写 32 条 line，不 DCCI；有/无 DSB 后 `atomicExch` 发布 | 两项均 `0 fresh / 20480 stale / 0 other`，AICPU civac reference 仍 stale | DSB 本身不写回 Scalar dirty line，不能替代 DCCI |
+| AICore payload 或 ordinary control 不 DCCI | `0/20480/0` | AICPU 随后执行 civac 仍为 stale；消费者不能补救生产者未写回的 dirty line |
+| AICore 单次 `st_dev` | 当前 `20480/20480 fresh` | 只作本机观察，不改变 repeated `st_dev` 禁用规则 |
+
+两边都校验 4096 轮精确 generation、实际 primed stale 值、atomic 返回旧值、magic、
+参与轮数和 guard。`ld_dev` 只在已确认 writer 完成后做一次 reference，不用同址
+tight-poll 干扰 writer。构建、运行、32+20 case 明细、ARM atomic 反汇编、AICore
+优化后 device IR 和适用边界见
+[`详细记录`](aicpu_aicore_cache/README.md)。
+
 ## 其余探针
 
 | 文件 | 类型 | 验证内容 |
@@ -663,6 +714,7 @@ PTO_ISA_ROOT="$PWD/build/pto-isa" ATOMIC_PROBE_DEVICE=0 ATOMIC_PROBE_AIVS=8 \
 | `ccec/atomic_scalar_pmu.cpp` | gating + PMU classification | 单 AIV dependent atomicAdd 完成延迟与同构 scalar control 对照；核实 atomic 等待是否计入 scalar busy |
 | `ccec/icache_scalar_pmu.cpp` | gating + PMU classification | 单 AIV 同一 target 的 WARM/COLD I-cache 对照；核实 miss 回填等待是否计入 scalar busy |
 | `ccec/atomic_poll_exchange_contention.cpp` | gating + controlled timing | 一写多读、四种地址关系、两种 identity RMW load；区分异 line、同 line 异 word、已结束 31 次同址预读和持续同址串行对 completion exchange 的影响 |
+| `aicpu_aicore_cache/` | cross-domain gating + observation | 真实 HCC AICPU 与 CCEC AIV Scalar 双向发布；拆分 ARM/AICore atomic、ordinary cached load/store、DCCI、`dc cvac/civac`、`ld_dev/st_dev` 的 fresh/stale 精确矩阵 |
 | `ascendc/dcci_atomic_stress.asc` | legacy observation | 旧的混合 stress；不再作为 DCCI selector 语义证据 |
 | `ccec/dcci_clean_clobber.cpp` | gating | 有序 dirty/clean line 的 dcci clobber 与 control |
 | `ascendc/mb2_flags_clobber.asc` | gating + observation | AtomicMax flags 无丢失；store+dcci 仅统计 |

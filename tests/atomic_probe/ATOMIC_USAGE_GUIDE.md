@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD060 -->
+
 # A5 DCCI、`st_dev` 与 atomic 使用手册
 
 ## 适用范围
@@ -167,28 +169,57 @@ ENTIRE 不会直接操作其他核的 cache，但它可能把本核持有的任�
 用例。确认发指令核没有共享 dirty line、执行期间没有其他核更新相关 line，只能作为必要的审计前提，
 当前证据尚未证明这些条件足以构成通用硬件安全保证。
 
-### 2.6 DCCI 之后仍需要 DSB
+### 2.6 DCCI 没有隐藏 DSB；显式 DSB 能否省略取决于后继路径
 
 本机 CANN 9.1 的 AscendC `DataCacheCleanAndInvalid` wrapper 只调用 `DcciGMImpl`，后者直接下沉为
 `dcci(...)`；这条调用链没有隐含 `dsb`。本机头文件也没有给出“DCCI 返回即代表 cache clean/
-invalidation 已完成、后续访问可立即依赖”的契约。因此本仓不能把 DCCI 当作 DSB 的替代品。
+invalidation 已完成、后续访问可立即依赖”的契约。因此不能把 DCCI 本身写成 DSB 的替代品。
 
-只要后续动作依赖 DCCI 已经完成，就必须在 DCCI 后显式执行
-`DataSyncBarrier<MemDsbT::ALL>()`/`dsb(DSB_ALL)`：
+但这不等于每个 DCCI 依赖边界都必须额外出现一条独立 DSB。2026-08-12 的真实 A5
+[`aicpu_aicore_cache`](aicpu_aicore_cache/README.md) 增加了以下 direct 门禁：
 
-- 写者发布 ordinary dirty data：`ordinary store -> DCCI OUT -> DSB -> atomic publish`；
+```text
+Scalar ordinary-store 32 条 dirty data cacheline
+  -> 对全部 line 执行 default DCCI 或 SINGLE CACHELINE_OUT DCCI
+  -> [被测分支不执行显式 DSB]
+  -> atomicExch(isolated_control, generation)  // 唯一 doorbell
+  -> AICPU acquire control
+  -> ordinary-load 并精确校验全部 32 条 line
+```
+
+五个独立进程中，两种无 DSB case 各为 `20480 fresh / 0 stale / 0 other` 轮；每轮要求
+32 条 line 同时全 fresh，相当于每个 case 精确检查 655360 条 line。带一个尾随 DSB 的
+同构对照结果完全相同。两个“不执行 DCCI”的强负例无论是否执行 DSB 都是
+`0 fresh / 20480 stale / 0 other`，证明 DSB 本身不会发布 Scalar dirty line。
+
+构建显式关闭编译器自动 Scalar DCCI 和 kernel-end DCCI。优化后 device LLVM IR 也确认
+no-DSB 分支从最后一个 `llvm.hivm.DCCI.DST` 直接到 `llvm.hivm.atom.EXCH.G.s64`，中间
+没有 `llvm.hivm.DSB`。AICPU owner ELF 反汇编同时确认 direct mode 在 control `ldar`
+后先执行逆序 payload `ldr` 循环，首个后续 `dc civac`/`dsb sy` 位于 primary payload
+读取之后，不存在 consumer reference barrier 帮助被测发布完成。
+
+下一轮 Scalar atomic 也被排除：两个 no-DSB case 每 64 轮抽取一轮，Scalar 在
+`atomicExch` 后先执行 1048576 个纯 NOP，不执行 GM/atomic/DSB；AICPU 保存 primary
+payload 后才用 `stlr` 发布 ACK，Scalar 的第一条后续内存指令才读取该 ACK。优化后
+device IR 为 `atomicExch -> NOP loop -> atomicAdd ACK`。五进程中每个 selector 的
+320 个静默窗口全部在 ACK 已到达后结束。因此，**对当前 A5/CANN 下这条精确的
+`DCCI lines -> atomicExch(control)` 发布序列，额外显式 DSB 不是正确性必需项**。
+
+这个结论不能扩写成“DCCI 自动完成”或“所有 atomic 都等价于 DSB”。当前没有找到相应
+公开 API/ISA 契约；实测只说明紧随其后的 `atomicExch` 在该编译产物和硬件路径中形成了
+足够的发布边界。以下场景仍保留显式 `DataSyncBarrier<MemDsbT::ALL>()`/
+`dsb(DSB_ALL)`，直到获得各自契约或同构门禁：
+
+- DCCI 后不是被测 `atomicExch` 发布，或中间已经有动作依赖 DCCI 完成；
 - 读者取得所有权后刷新 stale entry：`atomic acquire -> DSB -> DCCI -> DSB -> ordinary load`；
-- 连续处理多条 cacheline 时，可以先对所有目标 line 发出 DCCI，再在真正读取、发布或交权前统一执行
-  一次 DSB；不能在中间已经依赖某条 line 完成时把 barrier 推迟到最后。
+- 不同 atomic primitive、芯片、CANN、AICPU launch/affinity 或 cache 拓扑；
+- TaskCell 等仍以 `DCCI + DSB -> phase` 定义“clean 已明确完成”的既有协议。
 
-HCCL 的 `FlushDataCache` helper 和本仓 fdwic 的 cache-region helper 都采用“DCCI 后显式 DSB”，只能
-作为本机实际用法的佐证，不能代替 API/ISA 契约。反过来也要注意：DSB 只等待发指令核的相关 memory
-access，不提供跨核会合或 coherence，更不能修复一个本来就会覆盖其他核新值的 stale dirty DCCI。
-
-这不表示每一条 DCCI 指令后都必须机械追加一条 DSB。连续发出多条 DCCI、期间没有动作依赖其完成时，
-可以在依赖边界前统一执行一次 DSB。本手册的 TaskCell 专项探针固定使用
-`SINGLE_CACHE_LINE + CACHELINE_OUT + DSB_ALL`，是为了让随后发布的 `phase=2` 精确表示“DCCI 已经
-完成”；若去掉 DSB，后续观察只能说明 DCCI 已发射或正在处理，不能用于判定完成后的目标值。
+连续处理多条 cacheline 时，也不需要每条 DCCI 后机械追加 DSB；可以先发出全部 DCCI，
+再在尚未覆盖的依赖边界前统一执行一次。HCCL `FlushDataCache` 和本仓 fdwic cache-region
+helper 的“DCCI 后显式 DSB”只能作为保守实际用法，不能代替 API/ISA 契约。DSB 也只等待
+发指令核的相关 memory access，不提供跨核会合或 coherence，更不能修复会覆盖其他核新值的
+stale dirty DCCI。
 
 ## 3. `st_dev` / bypass load-store
 
@@ -484,6 +515,91 @@ repeated `st_dev` 终值问题，也不能使 `st_dev` 写路径重新可用。�
 | ordinary `deps` 写后 SINGLE OUT DCCI | 共线与独占行均由 DCCI 前 `0/100` 变为后 `100/100` | ordinary payload 必须按所有权协议发布 |
 | ordinary `deps` 写且无 DCCI | 当前窗口和最终快照均 `0/100` 可见 | 只作负对照，不外推“永不自然写回” |
 
+### 6.1 AICPU ↔ AICore 跨域交权
+
+必须先把两类 GM 交互分开；它们的 writer 和一致性域不同，结论不能互相套用：
+
+| 场景 | writer → reader | 当前处理 |
+|---|---|---|
+| Host/SDMA 写入，AICPU 读取 | DMA engine → AICPU | Host DMA 已验证不 snoop AICPU cache；SDMA 在缺少硬件放行前也按非一致处理。AICPU 读前执行目标范围 `dc civac + dsb sy`；这与下述 Scalar 协议无关 |
+| AICPU 与 AICore Scalar 交互 | AICPU ↔ 当前 A5 main Path-A 的 Scalar | 属于本节实测的 A5 Path-A 共享域；AICPU→Scalar 用 release control，不做 AICPU cvac，Scalar 对已缓存 ordinary payload 做 DCCI；Scalar→AICPU 由 Scalar 发布前 DCCI，AICPU 不再 civac |
+
+因此，“AICPU→Scalar 不需要 cvac”绝不表示“Host/SDMA→AICPU 不需要 civac”；同样，
+Host/SDMA 路径需要 civac，也不能反推 AICPU 与 Scalar 之间每次交互都要 clean/invalidate。
+
+2026-08-12 的 [`aicpu_aicore_cache`](aicpu_aicore_cache/README.md) 使用真实 HCC
+AICPU 与 CCEC AIV Scalar，连续复用同一批地址。探针通过仓库正式
+`src/common/aicpu_loader` 启动，与 `cross_core_aicpu_plan` 使用相同的 main
+`aicpu_scheduler` Path-A。五个独立进程、每个 case 4096 轮的精确结果支持以下工程
+协议：
+
+```text
+AICPU -> AICore
+  AICPU ordinary payload store
+    -> __atomic_store_n(isolated_control, generation, __ATOMIC_RELEASE)
+       // HCC: stlr；不执行 dc cvac / 显式 dmb/dsb / isb
+  AICore return-ready atomic observe control
+    -> DSB
+    -> DCCI ordinary payload line
+    -> DSB
+    -> ordinary payload load
+
+AICore -> AICPU
+  AICore ordinary payload store
+    -> DCCI payload line
+    -> [当前 A5、紧随 atomicExch 的精确路径可省显式 DSB]
+    -> atomicExch publish isolated control
+  AICPU acquire control
+    -> ordinary payload load
+```
+
+五个独立进程的工程结论如下；每行累计 20480 个样本：
+
+| 方向/场景 | 精确结果 | 工程结论 |
+|---|---:|---|
+| AICPU ordinary payload + release control，均不 cvac；control 自己作为 doorbell | `20480 fresh / 0 stale / 0 other` | 当前 A5 Path-A 的正式 AICPU→AICore 门禁通过；每次发布不需要 AICPU `dc cvac + dsb sy + isb` |
+| 同一 release 发布，但 AICore payload 不 DCCI | `0/20480/0`；同轮 `ld_dev` 为 `20480/0/0` | producer 不 clean 不等于 consumer 可省 DCCI；atomic control fresh 不会刷新独立 payload line |
+| ordinary payload/control 后，以独立 release atomic doorbell 发布；均不 cvac | control/payload 均 `20480/0/0` | release doorbell 可以排序先前 ordinary stores；不是依赖 control 与 doorbell 同址 |
+| ordinary payload/control 均不 clean、无 barrier，ordinary control 自己作为 doorbell | 当前为 `20480/0/0` | 只作当前 A5 观察；普通 store 缺少明确发布顺序，不能替代 release control |
+| release doorbell 已发布；AICore 使用预先缓存的 ordinary control | `0/20480/0`；同轮返回型 atomic 为 `20480/0/0` | 跨域 control 不能用普通 cached load 轮询 |
+| 32-line default DCCI + DSB，再 `atomicExch`；AICPU acquire/ordinary load | `20480/0/0` | AICore→AICPU DSB 正对照通过；AICPU 不需要再 civac payload |
+| 同一 32-line 路径去掉显式 DSB，DCCI 后直接 `atomicExch` | `20480/0/0`；每个 case 累计检查 655360 条 line；另有 320 个 post-publish 静默 ACK 窗口 | 当前 A5 精确 atomic 发布路径可省显式 DSB；default 与 OUT selector 均通过 |
+| 32-line 路径不执行 DCCI，只保留 DSB | `0/20480/0`；随后 AICPU civac reference 仍 stale | DSB 不能替代 DCCI，也不能把 Scalar dirty line 发布到 GM |
+| AICore payload 或 ordinary control 不 DCCI | AICPU primary 与随后 civac reference 都为 `0/20480/0` | consumer invalidate 不能补救 producer 未写回的 dirty line |
+| AICore 单次 `st_dev` | 当前为 `20480/0/0` | 仅作观察，不改变 repeated `st_dev` 业务写路径禁用规则 |
+
+因此：
+
+- 对当前 A5 main `aicpu_scheduler` Path-A，应把原来的 AICPU
+  `ordinary store -> dc cvac -> dsb sy -> ordinary control -> dc cvac -> dsb sy/isb`
+  收缩为 `ordinary payload -> release atomic control`；这不是简单裸删 barrier，而是用
+  `stlr` 保留 payload-before-control 的发布顺序；
+- direct 门禁没有隐藏 producer clean/doorbell：被测 control 本身就是唯一 producer
+  doorbell；AICPU 只在 primary payload 已保存后以 `done` 发布 ACK，无法反向帮助该次
+  primary 读取；末轮 AICore 读取完成后再发 `rounds+1` ACK，AICPU 收到 ACK 后才允许
+  clean 结果或退出；
+- owner ELF 反汇编确认 direct release 路径为 payload ordinary `str` + control `stlr`，
+  中间及其后没有 `dc cvac`、DMB、DSB 或 ISB；五次运行的单轮最大 atomic poll 尝试为
+  43，无超时；
+- atomic control 的 fresh 不会自动刷新独立 ordinary payload line；
+- AICore→AICPU 的 32-line direct 门禁说明，当前精确
+  `DCCI lines -> atomicExch(control)` 序列可省独立 DSB；default/OUT 两种 selector
+  各五进程 20480 轮全 fresh，带 DSB 对照相同；每个 selector 的 320 个静默窗口还
+  排除了下一轮 Scalar atomic 助攻；
+- 该结论不是 DCCI 或任意 atomic 的公开通用保证；未被同构门禁覆盖的路径继续保留 DSB；
+- AICPU 不需要对已由 AICore DCCI 发布的数据再做 `dc civac`；
+- AICPU consumer 的 invalidate 不能把仍停留在 AICore local cache 的 dirty line
+  发布出来；
+- AICPU ordinary store 无 clean、无 barrier 虽然也是 20480 次 fresh，仍只作观察；
+  放行的是带明确 release 顺序的 control 发布，不是无条件删除所有 cache/order 操作；
+- AICore 单次 `st_dev` 的 fresh 观察不改变 repeated `st_dev` 业务写路径禁用规则。
+
+本机 HCC 产物中，acquire load/release store 分别落为 `ldar/stlr`，exchange、
+fetch-add、compare-exchange 落为 `ldaxr/stlxr` 重试循环。上述结论严格限定于与当前
+调度器相同的 Path-A；仓库记录过 cust AICPU 子进程被绑到另一 cluster 后不在 AICore
+snoop domain 的历史故障。换 AICPU launch/affinity、芯片或 CANN 版本必须同构复测，
+不能把当前编译器产物和 A5 实测冒充跨平台公开 ABI/ISA 保证。
+
 ## 7. DSB 与跨核同步
 
 本机调用链为：
@@ -541,8 +657,9 @@ CCEC runner 对全部 probe 显式关闭；AscendC runner 当前只对 `mb8_dcci
 - [ ] 没有把 OUT/ATOMIC selector 当成 invalid-only 或 atomic 保护开关。
 - [ ] 没有在缺少 scope/order 证据时把无参 `dci()` 当成按地址 invalid-only。
 - [ ] DCCI 只在取得被处理 data line 的唯一所有权后执行。
-- [ ] 所有 DCCI 在后续普通访问、atomic 发布或跨核交权依赖其完成之前都有显式 DSB；批量 DCCI 只在
-      中间没有依赖动作时合并到一个末尾 DSB。
+- [ ] 所有 DCCI 在后续动作依赖其完成前都有经过契约或同构门禁证明的完成边界；默认使用显式 DSB。
+      仅当前 A5 精确 `DCCI lines -> atomicExch(control)` 路径允许按 2.6 节省略，且对应门禁必须保留；
+      批量 DCCI 只在中间没有依赖动作时合并到一个末尾边界。
 - [ ] 业务代码没有使用 `st_dev`/`WriteGmByPassDCache` 写 GM；探针或待迁移例外已明确隔离和标注。
 - [ ] 仍保留的 `st_dev` 例外在发布前有 DSB，跨核交权使用独立 atomic phase/lock，且没有把这些
       必要条件写成安全性保证。
@@ -566,6 +683,7 @@ CCEC runner 对全部 probe 显式关闭；AscendC runner 当前只对 `mb8_dcci
 - AtomicExch 同构对照：`ascendc/atomic_exch_same_line.asc`、`ccec/atomic_exch_same_line.cpp`
 - TaskCell `deps_prepared` 五场景：`ccec/taskcell_atomic_dcci.cpp`、
   `ccec/taskcell_atomic_dcci_host.cpp`
+- AICPU ↔ AICore 双向 cache/atomic：[`aicpu_aicore_cache/README.md`](aicpu_aicore_cache/README.md)
 
 本机 CANN 定义依据：
 
